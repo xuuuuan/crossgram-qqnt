@@ -1,18 +1,18 @@
 {
   "name": "qqnt-bridge",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "build": "esbuild src/main.ts --bundle --outfile=dist/main.js --platform=node --target=node22"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "private": true,
+  "description": "Local streaming bridge exposing the QQNT kernel to mtproto-relay",
   "type": "module",
+  "scripts": {
+    "build": "esbuild src/main.ts --bundle --outfile=dist/main.js --platform=node --target=node22 --format=esm",
+    "test": "vitest run",
+    "test:e2e": "QQNT_BRIDGE_E2E=1 vitest run src/e2e.test.ts"
+  },
   "devDependencies": {
     "@types/node": "^26.1.1",
-    "esbuild": "^0.28.1"
+    "esbuild": "^0.28.1",
+    "typescript": "^5.9.3",
+    "vitest": "^2.1.9"
   }
 }
