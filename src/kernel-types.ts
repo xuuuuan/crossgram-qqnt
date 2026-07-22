@@ -159,6 +159,8 @@ export interface KernelBuddyService {
   addKernelBuddyListener(listener: unknown): string
   removeKernelBuddyListener(listenerId: string): void
   getBuddyList(force: boolean): Promise<{ result: number, errMsg: string }>
+  getBuddyNick?(uids: string[]): Map<string, string>
+  getBuddyRemark?(uids: string[]): Map<string, string>
 }
 
 export interface KernelGroupService {

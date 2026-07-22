@@ -212,6 +212,7 @@ export class QQKernelBridge {
       }
       if (!this.buddySnapshotLoaded) await new Promise((resolve) => setTimeout(resolve, 250))
     }
+    this.enrichBuddyNames()
     const all = [...this.users.values()].sort((left, right) => left.name.localeCompare(right.name))
     const offset = parseCursor(cursor)
     const selected = all.slice(offset, offset + clamp(limit, 1, 1_000))
@@ -704,6 +705,7 @@ export class QQKernelBridge {
         const categories = Array.isArray(value) ? value : value.data
         log('info', `buddy list update received: ${categories.reduce((sum, item) => sum + item.buddyList.length, 0)} users`)
         this.replaceBuddySnapshot(categories)
+        this.enrichBuddyNames()
       },
       onBuddyInfoChange: (value: Map<string, ProfileSimpleInfo> | { infos: Map<string, ProfileSimpleInfo> }) => {
         const infos = value instanceof Map ? value : value.infos
@@ -1042,6 +1044,30 @@ export class QQKernelBridge {
       timestamp: Number(item.msgTime) || Math.floor(Date.now() / 1000),
       outgoing: Boolean(item.senderUid && item.senderUid === this.config?.selfUid),
       parts: text ? [{ type: 'text', text }] : [],
+    }
+  }
+
+  private enrichBuddyNames(): void {
+    const service = this.requireBuddyService()
+    const uids = [...this.users.keys()].filter((uid) => uid !== this.config?.selfUid)
+    if (!uids.length) return
+    let nicks = new Map<string, string>()
+    let remarks = new Map<string, string>()
+    try {
+      nicks = service.getBuddyNick?.(uids) ?? nicks
+      remarks = service.getBuddyRemark?.(uids) ?? remarks
+    } catch (error) {
+      log('error', 'buddy name enrichment failed', error)
+      return
+    }
+    for (const uid of uids) {
+      const user = this.users.get(uid)
+      if (!user) continue
+      const name = remarks.get(uid) || nicks.get(uid) || user.name
+      if (!name || name === user.name) continue
+      this.users.set(uid, { ...user, name })
+      const conversation = this.contacts.get(uid)
+      if (conversation) this.contacts.set(uid, { ...conversation, title: name })
     }
   }
 

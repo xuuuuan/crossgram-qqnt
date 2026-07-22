@@ -55,6 +55,8 @@ function fixture() {
       return 'buddy-listener'
     }), removeKernelBuddyListener: vi.fn(),
     getBuddyList: vi.fn(async () => ({ result: 0, errMsg: '' })),
+    getBuddyNick: vi.fn((uids: string[]) => new Map(uids.map((uid) => [uid, `nick-${uid}`]))),
+    getBuddyRemark: vi.fn(() => new Map<string, string>()),
   }
   const group = {
     addKernelGroupListener: vi.fn(() => 'group-listener'), removeKernelGroupListener: vi.fn(),
@@ -189,6 +191,7 @@ describe('QQKernelBridge', () => {
     ]))
     const contacts = await bridge.getContacts()
     expect(contacts.users.map((user) => user.id)).toEqual(['self', 'friend-a', 'friend-b'])
+    expect(contacts.users.find((user) => user.id === 'friend-a')?.name).toBe('nick-friend-a')
     const dialogs = await bridge.getDialogs()
     expect(dialogs.conversations.map((item) => item.id)).toEqual(['uid-1715311957'])
 
