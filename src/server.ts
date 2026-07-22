@@ -3,6 +3,7 @@ import { once } from 'node:events'
 import type { Readable } from 'node:stream'
 import { PROTOCOL_VERSION, type QQMediaLocator, type SendManifest } from './protocol.js'
 import { QQKernelBridge } from './qq-kernel.js'
+import { log } from './log.js'
 
 export interface BridgeServerOptions {
   host?: string
@@ -26,7 +27,7 @@ export class QQBridgeServer {
     if (this.server) return
     this.server = createServer((request, response) => {
       void this.route(request, response).catch((error) => {
-        console.error('[qqnt-bridge] request failed', error)
+        log('error', 'request failed', error)
         if (!response.headersSent) json(response, 500, { error: errorMessage(error) })
         else response.destroy(error instanceof Error ? error : new Error(String(error)))
       })
@@ -35,8 +36,14 @@ export class QQBridgeServer {
     this.server.headersTimeout = 70_000
     this.server.requestTimeout = 0
     this.server.listen(this.port, this.host)
-    await once(this.server, 'listening')
-    console.log(`[qqnt-bridge] listening on http://${this.host}:${this.port}/v1`)
+    try {
+      await once(this.server, 'listening')
+    } catch (error) {
+      this.server.close()
+      this.server = undefined
+      throw error
+    }
+    log('info', `listening on http://${this.host}:${this.address().port}/v1`)
   }
 
   async stop(): Promise<void> {

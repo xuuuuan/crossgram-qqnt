@@ -5,7 +5,7 @@
   "description": "Local streaming bridge exposing the QQNT kernel to mtproto-relay",
   "type": "module",
   "scripts": {
-    "build": "esbuild src/main.ts --bundle --outfile=dist/main.js --platform=node --target=node22 --format=esm",
+    "build": "esbuild src/main.ts --bundle --outfile=dist/main.js --platform=node --target=node22 --format=cjs",
     "test": "vitest run",
     "test:e2e": "QQNT_BRIDGE_E2E=1 vitest run src/e2e.test.ts"
   },

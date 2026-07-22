@@ -101,7 +101,8 @@ export interface KernelMsgService {
   forwardMsg(msgIds: string[], source: Contact, destinations: Contact[], attrs: Map<number, unknown>): Promise<{ result: number, errMsg: string }>
   getMsgs(peer: Contact, msgId: string, count: number, queryOrder: boolean): Promise<{ result: number, errMsg: string, msgList: MsgRecord[] }>
   getMsgsByMsgId(peer: Contact, msgIds: string[]): Promise<{ result: number, errMsg: string, msgList: MsgRecord[] }>
-  getMsgUniqueId(time: string): string
+  getMsgUniqueId?(time: string): string
+  getLatestDbMsgs?(params: { peer: Contact, cnt: number }): Promise<{ result: number, errMsg: string, msgList: MsgRecord[] }>
 }
 
 export interface KernelRecentService {
@@ -161,9 +162,9 @@ export interface KernelSession {
 
 export interface KernelModule {
   NodeIQQNTWrapperSession: { prototype: { init(config: InitSessionConfig, ...args: unknown[]): unknown } }
-  NodeIKernelMsgListener: new (handlers: Record<string, (...args: never[]) => unknown>) => unknown
-  NodeIKernelBuddyListener: new (handlers: Record<string, (...args: never[]) => unknown>) => unknown
-  NodeIKernelGroupListener: new (handlers: Record<string, (...args: never[]) => unknown>) => unknown
+  NodeIKernelMsgListener?: new (handlers: Record<string, (...args: never[]) => unknown>) => unknown
+  NodeIKernelBuddyListener?: new (handlers: Record<string, (...args: never[]) => unknown>) => unknown
+  NodeIKernelGroupListener?: new (handlers: Record<string, (...args: never[]) => unknown>) => unknown
 }
 
 export interface InitSessionConfig {

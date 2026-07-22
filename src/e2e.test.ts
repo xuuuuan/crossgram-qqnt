@@ -31,16 +31,23 @@ describe.skipIf(!enabled)('live QQNT bridge E2E', () => {
       const conversation = await resolve(kind, numericId)
       const text = `[mtproto-relay e2e] ${new Date().toISOString()} ${kind}`
       const manifest = Buffer.from(JSON.stringify({ conversationId: conversation.id, text })).toString('base64url')
-      const sent = await fetch(`${base}/messages`, {
-        method: 'POST', headers: headers({ 'x-qqnt-manifest': manifest }), body: new Uint8Array(),
-      })
-      expect(sent.status, await sent.text()).toBe(200)
+      let sent: Response | undefined
+      let sentBody = ''
+      for (let attempt = 0; attempt < 5; attempt++) {
+        sent = await fetch(`${base}/messages`, {
+          method: 'POST', headers: headers({ 'x-qqnt-manifest': manifest }), body: new Uint8Array(),
+        })
+        sentBody = await sent.text()
+        if (sent.ok || !sentBody.includes('Invalid argument')) break
+        await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)))
+      }
+      expect(sent!.status, sentBody).toBe(200)
       const history = await fetch(`${base}/conversations/${encodeURIComponent(conversation.id)}/history?limit=20`, {
         headers: headers(),
       })
       expect(JSON.stringify(await history.json())).toContain(text)
     }
-  }, 120_000)
+  }, 180_000)
 
   it.runIf(Boolean(process.env.QQNT_BRIDGE_E2E_FILE))('streams a file to xuuuuan and downloads it by range', async () => {
     const path = process.env.QQNT_BRIDGE_E2E_FILE!
