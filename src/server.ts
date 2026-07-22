@@ -87,6 +87,17 @@ export class QQBridgeServer {
       ))
       return
     }
+    if (request.method === 'GET' && path === '/v1/contacts') {
+      json(response, 200, await this.bridge.getContacts(
+        url.searchParams.get('cursor') ?? undefined,
+        numberParam(url, 'limit', 500),
+      ))
+      return
+    }
+    if (request.method === 'GET' && path === '/v1/reactions/catalog') {
+      json(response, 200, this.bridge.getReactionCatalog())
+      return
+    }
     if (request.method === 'GET' && path === '/v1/conversations/resolve') {
       const kind = url.searchParams.get('kind')
       const numericId = requiredParam(url, 'id')
@@ -98,7 +109,7 @@ export class QQBridgeServer {
     if (request.method === 'GET' && conversationMatch) {
       const conversation = this.bridge.getConversation(decodeURIComponent(conversationMatch[1]))
       if (!conversationMatch[2]) {
-        json(response, 200, conversation)
+        json(response, 200, await this.bridge.getConversationDetails(conversation.id))
       } else if (conversationMatch[2] === 'history') {
         json(response, 200, await this.bridge.getHistory(conversation, {
           cursor: url.searchParams.get('cursor') ?? undefined,
@@ -132,6 +143,20 @@ export class QQBridgeServer {
         body.forEveryone ?? true,
       )
       json(response, 200, { ok: true })
+      return
+    }
+    if (request.method === 'GET' && path === '/v1/messages/reactions') {
+      const conversation = this.bridge.getConversation(requiredParam(url, 'conversationId'))
+      json(response, 200, await this.bridge.getMessageReactions(conversation, requiredParam(url, 'messageId')))
+      return
+    }
+    if (request.method === 'POST' && path === '/v1/messages/reactions') {
+      const body = await readJson<{ conversationId: string, messageId: string, reactionKeys: string[] }>(request)
+      json(response, 200, await this.bridge.setMessageReactions(
+        this.bridge.getConversation(body.conversationId),
+        body.messageId,
+        body.reactionKeys,
+      ))
       return
     }
     if (request.method === 'POST' && path === '/v1/messages/forward') {

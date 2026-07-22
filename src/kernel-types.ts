@@ -66,6 +66,7 @@ export interface MsgElement {
 
 export interface MsgRecord {
   msgId: string
+  msgSeq?: string
   chatType: number
   sendType: number
   senderUid: string
@@ -79,6 +80,12 @@ export interface MsgRecord {
   sendMemberName: string
   sendNickName: string
   elements: MsgElement[]
+  emojiLikesList?: Array<{
+    emojiId: string
+    emojiType: string
+    likesCnt: string
+    isClicked: boolean
+  }>
 }
 
 export interface FileTransNotifyInfo {
@@ -102,10 +109,20 @@ export interface KernelMsgService {
   getMsgs(peer: Contact, msgId: string, count: number, queryOrder: boolean): Promise<{ result: number, errMsg: string, msgList: MsgRecord[] }>
   getMsgsByMsgId(peer: Contact, msgIds: string[]): Promise<{ result: number, errMsg: string, msgList: MsgRecord[] }>
   getMsgUniqueId?(time: string): string
-  getLatestDbMsgs?(params: { peer: Contact, cnt: number }): Promise<{ result: number, errMsg: string, msgList: MsgRecord[] }>
+  getLatestDbMsgs?(peer: Contact, count: number): Promise<{ result: number, errMsg: string, msgList: MsgRecord[] }>
+  getEmojiResourcePath?(type: number): Promise<{ result: number, errMsg: string, resourcePath: string }>
+  setMsgEmojiLikes?(
+    peer: Contact,
+    msgSeq: string,
+    emojiId: string,
+    emojiType: string,
+    setEmoji: boolean,
+  ): Promise<{ result: number, errMsg: string }>
 }
 
 export interface KernelRecentService {
+  addKernelRecentContactListener?(listener: unknown): string
+  removeKernelRecentContactListener?(listenerId: string): void
   getRecentContactInfos(): Promise<{ result: number, errMsg: string, relation: RecentContactInfo[] }>
 }
 
@@ -154,6 +171,13 @@ export interface KernelSession {
   getBuddyService(): KernelBuddyService
   getGroupService(): KernelGroupService
   getRichMediaService(): KernelRichMediaService
+  getAvatarService?(): {
+    getAvatarPath(uid: string, size: number): string
+    forceDownloadAvatar(uid: string, size: number): Promise<{ result: number, errMsg: string }>
+    getGroupAvatarPath(groupCode: string, size: number): string
+    getConfGroupAvatarPath(groupCode: string): string
+    forceDownloadGroupAvatar(groupCode: string, size: number): Promise<{ result: number, errMsg: string }>
+  }
   getUixConvertService(): {
     getUid(uins: Set<string>): Promise<{ uidInfo: Map<string, string> }>
     getUin(uids: Set<string>): Promise<{ uinInfo: Map<string, string> }>
@@ -165,6 +189,7 @@ export interface KernelModule {
   NodeIKernelMsgListener?: new (handlers: Record<string, (...args: never[]) => unknown>) => unknown
   NodeIKernelBuddyListener?: new (handlers: Record<string, (...args: never[]) => unknown>) => unknown
   NodeIKernelGroupListener?: new (handlers: Record<string, (...args: never[]) => unknown>) => unknown
+  NodeIKernelRecentContactListener?: new (handlers: Record<string, (...args: never[]) => unknown>) => unknown
 }
 
 export interface InitSessionConfig {

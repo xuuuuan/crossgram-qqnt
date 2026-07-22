@@ -45,7 +45,9 @@ export interface QQMessage {
   senderId: string
   timestamp: number
   outgoing: boolean
+  msgSeq?: string
   parts: Array<{ type: 'text', text: string } | { type: 'media', media: QQMedia }>
+  reactionContext?: QQReactionContext
 }
 
 export interface QQConversation {
@@ -56,6 +58,7 @@ export interface QQConversation {
   peerUin: string
   chatType: QQChatType
   avatarUrl?: string
+  avatar?: QQMedia
   unreadCount?: number
   lastMessage?: QQMessage
 }
@@ -63,6 +66,40 @@ export interface QQConversation {
 export type QQEvent =
   | { type: 'message', conversation: QQConversation, message: QQMessage }
   | { type: 'message-delete', eventId: string, conversation: QQConversation, messageIds: string[], timestamp: number }
+  | {
+      type: 'message-reactions'
+      eventId: string
+      conversation: QQConversation
+      target: { conversationId: string, messageId: string, targetId: string }
+      context: QQReactionContext
+      timestamp: number
+    }
+
+export interface QQReactionDefinition {
+  key: string
+  title?: string
+  presentation:
+    | { type: 'emoji', emoticon: string }
+    | {
+        type: 'custom'
+        alt: string
+        resource: {
+          version: number
+          format: 'static'
+          mimeType: 'image/png'
+          width: number
+          height: number
+          size?: number
+          locator: { filePath: string }
+        }
+      }
+}
+
+export interface QQReactionContext {
+  available: QQReactionDefinition[]
+  reactions: Array<{ key: string, count: number, selected?: boolean }>
+  maxSelected: number
+}
 
 export interface SendManifest {
   conversationId: string
@@ -99,11 +136,16 @@ export interface BridgeStatus {
 }
 
 export function conversationId(chatType: QQChatType, peerUid: string): string {
-  return `${chatType}:${peerUid}`
+  // QQ UID and group code are already stable opaque identifiers. Keeping the
+  // native value also makes a direct conversation line up with its IM user.
+  return peerUid
 }
 
 export function parseConversationId(value: string): { chatType: QQChatType, peerUid: string } {
+  // Accept IDs emitted by older builds during a rolling restart. New responses
+  // never add a synthetic chat-type prefix.
   const match = /^(1|2):(.+)$/.exec(value)
-  if (!match) throw new Error(`invalid QQ conversation ID: ${value}`)
-  return { chatType: Number(match[1]) as QQChatType, peerUid: match[2] }
+  if (match) return { chatType: Number(match[1]) as QQChatType, peerUid: match[2] }
+  if (!value) throw new Error('invalid empty QQ conversation ID')
+  return { chatType: /^\d+$/.test(value) ? 2 : 1, peerUid: value }
 }

@@ -6,9 +6,10 @@ import { QQBridgeServer } from './server.js'
 
 function fixture() {
   let msgHandlers: Record<string, (...args: unknown[]) => unknown> = {}
+  let buddyHandlers: Record<string, (...args: unknown[]) => unknown> = {}
   const sentBodies: Buffer[] = []
   const message: MsgRecord = {
-    msgId: 'm1', chatType: 1, sendType: 1, senderUid: 'self', senderUin: '10000',
+    msgId: 'm1', msgSeq: 'seq1', chatType: 1, sendType: 1, senderUid: 'self', senderUin: '10000',
     peerUid: 'uid-1715311957', peerUin: '1715311957', peerName: 'xuuuuan',
     msgTime: '1800000000', sendStatus: 2, sendRemarkName: '', sendMemberName: '',
     sendNickName: 'Self', elements: [{ elementType: 1, elementId: 'e1', textElement: { content: 'hello' } }],
@@ -34,7 +35,9 @@ function fixture() {
     deleteMsg: vi.fn(async () => ({ result: 0, errMsg: '' })),
     forwardMsg: vi.fn(async () => ({ result: 0, errMsg: '', detailErr: new Map() })),
     getMsgs: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [message] })),
+    getLatestDbMsgs: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [message] })),
     getMsgsByMsgId: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [message] })),
+    setMsgEmojiLikes: vi.fn(async () => ({ result: 0, errMsg: '' })),
   }
   const recent = {
     getRecentContactInfos: vi.fn(async () => ({
@@ -45,7 +48,10 @@ function fixture() {
     })),
   }
   const buddy = {
-    addKernelBuddyListener: vi.fn(() => 'buddy-listener'), removeKernelBuddyListener: vi.fn(),
+    addKernelBuddyListener: vi.fn((listener: { handlers?: typeof buddyHandlers }) => {
+      buddyHandlers = listener.handlers ?? listener as unknown as typeof buddyHandlers
+      return 'buddy-listener'
+    }), removeKernelBuddyListener: vi.fn(),
     getBuddyList: vi.fn(async () => ({ result: 0, errMsg: '' })),
   }
   const group = {
@@ -78,12 +84,25 @@ function fixture() {
     getBuddyService: () => buddy,
     getGroupService: () => group,
     getRichMediaService: () => ({ downloadFile: vi.fn() }),
+    getAvatarService: () => ({
+      getAvatarPath: () => '/dev/null', forceDownloadAvatar: async () => ({ result: 0, errMsg: '' }),
+      getGroupAvatarPath: () => '', getConfGroupAvatarPath: () => '',
+      forceDownloadGroupAvatar: async () => ({ result: 0, errMsg: '' }),
+    }),
     getUixConvertService: () => ({
       getUid: async () => ({ uidInfo: new Map([['1715311957', 'uid-1715311957']]) }),
       getUin: async () => ({ uinInfo: new Map([['uid-1715311957', '1715311957']]) }),
     }),
   } as unknown as KernelSession
-  return { kernel, session, msg, sentBodies }
+  return {
+    kernel, session, msg, message, sentBodies,
+    emitMessages(records: MsgRecord[]) {
+      msgHandlers.onMsgInfoListUpdate?.(records)
+    },
+    emitBuddyList(categories: Array<{ buddyList: unknown[] }>) {
+      buddyHandlers.onBuddyListChange?.(categories)
+    },
+  }
 }
 
 describe('QQKernelBridge', () => {
@@ -93,10 +112,13 @@ describe('QQKernelBridge', () => {
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
     const dialogs = await bridge.getDialogs()
     expect(dialogs.conversations[0]).toMatchObject({
-      id: '1:uid-1715311957', peerUin: '1715311957', title: 'xuuuuan',
+      id: 'uid-1715311957', peerUin: '1715311957', title: 'xuuuuan',
     })
     const history = await bridge.getHistory(dialogs.conversations[0])
     expect(history.messages[0]).toMatchObject({ id: 'm1', parts: [{ type: 'text', text: 'hello' }] })
+    expect(f.msg.getLatestDbMsgs).toHaveBeenCalledWith(expect.objectContaining({
+      chatType: 1, peerUid: 'uid-1715311957',
+    }), 50)
     const sent = await bridge.send({
       conversationId: dialogs.conversations[0].id, text: 'hello',
     }, Readable.from([]))
@@ -110,10 +132,50 @@ describe('QQKernelBridge', () => {
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
     const chunks = [Buffer.alloc(64 * 1024, 0x61), Buffer.alloc(64 * 1024, 0x62)]
     await bridge.send({
-      conversationId: '1:uid-1715311957',
+      conversationId: 'uid-1715311957',
       media: [{ kind: 'file', name: 'stream.bin', size: chunks.reduce((sum, chunk) => sum + chunk.length, 0) }],
     }, Readable.from(chunks))
     expect(f.sentBodies).toEqual([Buffer.concat(chunks)])
+  })
+
+  it('returns every buddy as a contact without adding the full buddy list to dialogs', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.emitBuddyList([{ buddyList: [
+      { uid: 'friend-a', uin: '1', nick: 'A', remark: '', avatarUrl: '' },
+      { uid: 'friend-b', uin: '2', nick: 'B', remark: '', avatarUrl: '' },
+    ] }])
+    const contacts = await bridge.getContacts()
+    expect(contacts.users.map((user) => user.id)).toEqual(['self', 'friend-a', 'friend-b'])
+    const dialogs = await bridge.getDialogs()
+    expect(dialogs.conversations.map((item) => item.id)).toEqual(['uid-1715311957'])
+  })
+
+  it('writes multiple reactions sequentially and emits updates for history messages', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const conversation = (await bridge.getDialogs()).conversations[0]
+    await bridge.getHistory(conversation)
+    await expect(bridge.setMessageReactions(conversation, 'm1', ['2:128522', '1:14']))
+      .resolves.toMatchObject({ reactions: [
+        { key: '2:128522', selected: true },
+        { key: '1:14', selected: true },
+      ] })
+    expect(f.msg.setMsgEmojiLikes.mock.calls).toEqual([
+      [expect.objectContaining({ peerUid: 'uid-1715311957' }), 'seq1', '128522', '2', true],
+      [expect.objectContaining({ peerUid: 'uid-1715311957' }), 'seq1', '14', '1', true],
+    ])
+
+    const events = bridge.subscribe()[Symbol.asyncIterator]()
+    f.emitMessages([{
+      ...f.message,
+      emojiLikesList: [{ emojiType: '2', emojiId: '128522', likesCnt: '3', isClicked: true }],
+    }])
+    await expect(events.next()).resolves.toMatchObject({
+      value: { type: 'message-reactions', context: { reactions: [{ key: '2:128522', count: 3 }] } },
+    })
   })
 })
 
@@ -136,7 +198,7 @@ describe('QQBridgeServer', () => {
       conversations: [{ peerUin: '1715311957' }],
     })
     const manifest = Buffer.from(JSON.stringify({
-      conversationId: '1:uid-1715311957', text: 'via HTTP',
+      conversationId: 'uid-1715311957', text: 'via HTTP',
     })).toString('base64url')
     const response = await fetch(`${base}/messages`, {
       method: 'POST', headers: { 'x-qqnt-manifest': manifest }, body: new Uint8Array(),

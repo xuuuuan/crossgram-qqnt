@@ -49,6 +49,30 @@ describe.skipIf(!enabled)('live QQNT bridge E2E', () => {
     }
   }, 180_000)
 
+  it('streams a PNG image to xuuuuan and returns a confirmed image element', async () => {
+    const png = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+      'base64',
+    )
+    const conversation = await resolve('direct', allowedDirect)
+    const manifest = Buffer.from(JSON.stringify({
+      conversationId: conversation.id,
+      media: [{ kind: 'image', name: 'qqnt-bridge-e2e.png', size: png.length, mimeType: 'image/png' }],
+    })).toString('base64url')
+    const sent = await fetch(`${base}/messages`, {
+      method: 'POST',
+      headers: headers({ 'x-qqnt-manifest': manifest, 'content-length': String(png.length) }),
+      body: png,
+      duplex: 'half',
+    } as RequestInit)
+    const body = await sent.text()
+    expect(sent.status, body).toBe(200)
+    expect(JSON.parse(body)).toMatchObject({
+      conversationId: conversation.id,
+      parts: [{ type: 'media', media: { kind: 'image' } }],
+    })
+  }, 180_000)
+
   it.runIf(Boolean(process.env.QQNT_BRIDGE_E2E_FILE))('streams a file to xuuuuan and downloads it by range', async () => {
     const path = process.env.QQNT_BRIDGE_E2E_FILE!
     const info = await stat(path)
@@ -64,8 +88,9 @@ describe.skipIf(!enabled)('live QQNT bridge E2E', () => {
       // Node fetch requires duplex for streaming request bodies.
       duplex: 'half',
     } as RequestInit)
-    expect(sent.status, await sent.text()).toBe(200)
-    const message = await sent.json() as { parts: Array<{ type: string, media?: { locator: unknown } }> }
+    const body = await sent.text()
+    expect(sent.status, body).toBe(200)
+    const message = JSON.parse(body) as { parts: Array<{ type: string, media?: { locator: unknown } }> }
     const locator = message.parts.find((part) => part.type === 'media')?.media?.locator
     expect(locator).toBeTruthy()
     const downloaded = await fetch(`${base}/media/open`, {
