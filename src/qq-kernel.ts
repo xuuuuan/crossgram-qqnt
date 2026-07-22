@@ -1136,7 +1136,7 @@ export class QQKernelBridge {
     if (cached && !force) return cached
     try {
       const service = this.getAvatarService()
-      if (!service) return cached
+      if (!service) return cached ?? avatarMedia(cacheKey)
       let filePath = service.getAvatarPath(uid, 0)
       if (force && (!filePath || !existsSync(filePath))) {
         await service.forceDownloadAvatar(uid, 0).catch(() => undefined)
@@ -1147,9 +1147,13 @@ export class QQKernelBridge {
         this.avatarCache.set(cacheKey, avatar)
         return avatar
       }
-      return cached
+      const placeholder = cached ?? avatarMedia(cacheKey)
+      this.avatarCache.set(cacheKey, placeholder)
+      return placeholder
     } catch {
-      return cached
+      const placeholder = cached ?? avatarMedia(cacheKey)
+      this.avatarCache.set(cacheKey, placeholder)
+      return placeholder
     }
   }
 
@@ -1159,7 +1163,11 @@ export class QQKernelBridge {
     if (cached && !force) return { ...conversation, avatar: cached }
     try {
       const service = this.getAvatarService()
-      if (!service) return cached ? { ...conversation, avatar: cached } : conversation
+      if (!service) {
+        const placeholder = cached ?? avatarMedia(cacheKey)
+        this.avatarCache.set(cacheKey, placeholder)
+        return { ...conversation, avatar: placeholder }
+      }
       let avatar: QQMedia | undefined
       if (conversation.chatType === CHAT_C2C) {
         avatar = await this.userAvatar(conversation.peerUid, force)
@@ -1177,9 +1185,13 @@ export class QQKernelBridge {
           this.avatarCache.set(cacheKey, avatar)
         }
       }
-      return avatar || cached ? { ...conversation, avatar: avatar ?? cached } : conversation
+      const result = avatar ?? cached ?? avatarMedia(cacheKey)
+      this.avatarCache.set(cacheKey, result)
+      return { ...conversation, avatar: result }
     } catch {
-      return cached ? { ...conversation, avatar: cached } : conversation
+      const placeholder = cached ?? avatarMedia(cacheKey)
+      this.avatarCache.set(cacheKey, placeholder)
+      return { ...conversation, avatar: placeholder }
     }
   }
 
@@ -1452,12 +1464,12 @@ async function retryTransientInvalidArgumentResult(
   throw new Error('unreachable')
 }
 
-function avatarMedia(id: string, filePath: string): QQMedia {
-  const size = statSync(filePath).size
+function avatarMedia(id: string, filePath?: string): QQMedia {
+  const size = filePath ? statSync(filePath).size : undefined
   return {
     id: `avatar:${id}`,
     kind: 'image',
-    name: basename(filePath),
+    name: filePath ? basename(filePath) : undefined,
     size,
     locator: {
       messageId: `avatar:${id}`,
@@ -1465,8 +1477,8 @@ function avatarMedia(id: string, filePath: string): QQMedia {
       chatType: id.startsWith('group:') ? 2 : 1,
       peerUid: id.slice(id.indexOf(':') + 1),
       kind: 'image',
-      fileName: basename(filePath),
-      fileSize: String(size),
+      fileName: filePath ? basename(filePath) : `avatar-${id.slice(id.indexOf(':') + 1)}`,
+      fileSize: size === undefined ? undefined : String(size),
       filePath,
     },
   }
