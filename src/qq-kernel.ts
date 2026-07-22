@@ -23,6 +23,7 @@ const ELEMENT_FILE = 3
 const SEND_FROM_SELF = new Set([1, 2])
 const MEMBER_ADMIN = 3
 const MEMBER_OWNER = 4
+const TELEGRAM_STANDARD_REACTIONS = new Set(['👍', '❤️', '😂', '😢', '🔥', '🎉', '👏', '🤔', '🤯'])
 
 export interface QQKernelOptions {
   tempPath?: string
@@ -35,9 +36,15 @@ export class QQKernelBridge {
   private session?: KernelSession
   private kernel?: KernelModule
   private config?: InitSessionConfig
+  private msgService?: ReturnType<KernelSession['getMsgService']>
+  private buddyService?: ReturnType<KernelSession['getBuddyService']>
+  private groupService?: ReturnType<KernelSession['getGroupService']>
+  private recentService?: ReturnType<KernelSession['getRecentContactService']>
+  private avatarService?: NonNullable<ReturnType<NonNullable<KernelSession['getAvatarService']>>>
   private readonly contacts = new Map<string, QQConversation>()
   private readonly users = new Map<string, { id: string, numericId?: string, name: string, avatarUrl?: string }>()
   private readonly groups = new Map<string, { name: string, avatarUrl?: string }>()
+  private readonly avatarCache = new Map<string, QQMedia>()
   private buddySnapshotLoaded = false
   private readonly messages = new Map<string, QQMessage[]>()
   private reactionDefinitions: QQReactionDefinition[] = []
@@ -85,6 +92,7 @@ export class QQKernelBridge {
     this.contacts.clear()
     this.users.clear()
     this.groups.clear()
+    this.avatarCache.clear()
     this.messages.clear()
     this.buddySnapshotLoaded = false
     this.kernel = kernel
@@ -106,10 +114,10 @@ export class QQKernelBridge {
   detach(): void {
     if (this.listenerRetry) clearTimeout(this.listenerRetry)
     this.listenerRetry = undefined
-    const msgService = this.session?.getMsgService()
-    const buddyService = this.session?.getBuddyService()
-    const groupService = this.session?.getGroupService()
-    const recentService = this.session?.getRecentContactService()
+    const msgService = this.msgService
+    const buddyService = this.buddyService
+    const groupService = this.groupService
+    const recentService = this.recentService
     if (msgService && this.listenerId) msgService.removeKernelMsgListener(this.listenerId)
     if (buddyService && this.buddyListenerId) buddyService.removeKernelBuddyListener(this.buddyListenerId)
     if (groupService && this.groupListenerId) groupService.removeKernelGroupListener(this.groupListenerId)
@@ -117,6 +125,11 @@ export class QQKernelBridge {
       recentService.removeKernelRecentContactListener(this.recentListenerId)
     }
     this.listenerId = this.buddyListenerId = this.groupListenerId = undefined
+    this.msgService = undefined
+    this.buddyService = undefined
+    this.groupService = undefined
+    this.recentService = undefined
+    this.avatarService = undefined
     this.session = undefined
     for (const pending of this.pendingMessages.values()) pending.reject(new Error('QQNT session detached'))
     for (const pending of this.pendingDownloads.values()) pending.reject(new Error('QQNT session detached'))
@@ -167,7 +180,7 @@ export class QQKernelBridge {
     const dialogs = [...this.contacts.values()]
     const offset = parseCursor(cursor)
     const page = await Promise.all(dialogs.slice(offset, offset + clamp(limit, 1, 500))
-      .map((conversation) => this.withConversationAvatar(conversation)))
+      .map((conversation) => this.withConversationAvatar(conversation, false)))
     return {
       conversations: page,
       nextCursor: offset + page.length < dialogs.length ? String(offset + page.length) : undefined,
@@ -195,7 +208,7 @@ export class QQKernelBridge {
     // cold-cache miss does not stay permanent.
     const users = await mapConcurrent(selected, 4, async (user) => ({
       ...user,
-      avatar: await this.userAvatar(user.id),
+      avatar: await this.userAvatar(user.id, false),
     }))
     return { users, nextCursor: offset + users.length < all.length ? String(offset + users.length) : undefined }
   }
@@ -248,7 +261,7 @@ export class QQKernelBridge {
   }
 
   async getHistory(conversation: QQConversation, query: HistoryQuery = {}): Promise<{ messages: QQMessage[], nextCursor?: string }> {
-    const service = this.requireSession().getMsgService()
+    const service = this.requireMsgService()
     const limit = clamp(query.limit ?? 50, 1, 100)
     const anchor = query.beforeId ?? query.afterId ?? query.cursor ?? '0'
     const peer = contact(conversation)
@@ -297,9 +310,9 @@ export class QQKernelBridge {
   }
 
   async getMessage(conversation: QQConversation, id: string): Promise<QQMessage | null> {
-    const service = this.requireSession().getMsgService()
+    const service = this.requireMsgService()
     const peer = contact(conversation)
-    const response = await service.getMsgsByMsgId(peer, [id])
+    const response = await retryTransientInvalidArgument(() => service.getMsgsByMsgId(peer, [id]))
     if (response.result !== 0) throw new Error(`getMsgsByMsgId: ${response.errMsg} (${response.result})`)
     if (!response.msgList[0]) return null
     const message = this.mapMessage(response.msgList[0])
@@ -331,9 +344,14 @@ export class QQKernelBridge {
         body.resume()
       }
       if (!elements.length) throw new Error('message must contain text or media')
-      const service = this.requireSession().getMsgService()
+      const service = this.requireMsgService()
       const startedAt = Math.floor(Date.now() / 1000)
-      const id = service.getMsgUniqueId?.(String(Math.floor(Date.now() / 1000))) ?? '0'
+      let id = '0'
+      try {
+        id = service.getMsgUniqueId?.(String(Math.floor(Date.now() / 1000))) ?? id
+      } catch (error) {
+        log('error', 'getMsgUniqueId failed; matching send confirmation by content', error)
+      }
       const pending = deferred<MsgRecord>()
       if (id === '0') this.pendingUnassigned.push({
         conversationId: conversation.id,
@@ -401,7 +419,7 @@ export class QQKernelBridge {
   }
 
   async deleteMessages(conversation: QQConversation, ids: string[], forEveryone: boolean): Promise<void> {
-    const service = this.requireSession().getMsgService()
+    const service = this.requireMsgService()
     const peer = contact(conversation)
     const result = forEveryone
       ? await service.recallMsg(peer, ids)
@@ -410,7 +428,7 @@ export class QQKernelBridge {
   }
 
   async forwardMessages(source: QQConversation, ids: string[], destination: QQConversation): Promise<void> {
-    const result = await this.requireSession().getMsgService().forwardMsg(
+    const result = await this.requireMsgService().forwardMsg(
       ids, contact(source), [contact(destination)], new Map(),
     )
     if (result.result !== 0) throw new Error(`forwardMsg: ${result.errMsg} (${result.result})`)
@@ -418,10 +436,10 @@ export class QQKernelBridge {
 
   async getUser(uid: string) {
     const cached = this.users.get(uid)
-    if (cached) return { ...cached, avatar: await this.userAvatar(uid) }
+    if (cached) return { ...cached, avatar: await this.userAvatar(uid, false) }
     const numeric = await this.requireSession().getUixConvertService().getUin(new Set([uid]))
     const numericId = numeric.uinInfo.get(uid)
-    return numericId ? { id: uid, numericId, name: numericId, avatar: await this.userAvatar(uid) } : null
+    return numericId ? { id: uid, numericId, name: numericId, avatar: await this.userAvatar(uid, false) } : null
   }
 
   getReactionCatalog(): QQReactionContext {
@@ -439,14 +457,29 @@ export class QQKernelBridge {
     messageId: string,
     reactionKeys: readonly string[],
   ): Promise<QQReactionContext> {
-    const service = this.requireSession().getMsgService()
+    const service = this.requireMsgService()
     if (!service.setMsgEmojiLikes) throw new Error('QQ reactions are unavailable in this QQNT build')
-    const message = (this.messages.get(conversation.id) ?? []).find((item) => item.id === messageId)
-      ?? await this.getMessage(conversation, messageId)
+    const cached = (this.messages.get(conversation.id) ?? []).find((item) => item.id === messageId)
+    // onAddSendMsg may expose a temporary group msgSeq at sendStatus=1. The
+    // stable msgId can already be returned to callers, but reaction writes must
+    // refresh the record and use QQ's final msgSeq.
+    let message = await withTimeout(
+      this.getMessage(conversation, messageId),
+      5_000,
+      'QQ reaction target refresh timed out',
+    ).catch(() => cached ?? null)
+    // getMsgsByMsgId can keep returning the optimistic sendStatus=1 record for
+    // a newly sent group message. Its msgSeq points at the previous database
+    // row; the latest-history view contains the final server msgSeq.
+    if (conversation.chatType === CHAT_GROUP) {
+      const history = await this.getHistory(conversation, { limit: 20 }).catch(() => null)
+      message = history?.messages.find((item) => item.id === messageId) ?? message
+    }
     if (!message) throw new Error(`QQ reaction target not found: ${messageId}`)
     const current = new Set((message.reactionContext?.reactions ?? []).filter((item) => item.selected)
       .map((item) => item.key))
     const desired = new Set(reactionKeys)
+    const stateChanged = current.size !== desired.size || [...current].some((key) => !desired.has(key))
     const pendingKey = `${conversation.id}\u0000${message.id}`
     try {
       for (const key of new Set([...current, ...desired])) {
@@ -460,6 +493,9 @@ export class QQKernelBridge {
           const native = Promise.resolve().then(() => service.setMsgEmojiLikes!(
             contact(conversation), message.msgSeq ?? message.id, emojiId, emojiType, desired.has(key),
           )).then((result) => {
+            // QQ reports an idempotent add as an error even though the desired
+            // state has already been reached (commonly after a retry).
+            if (result.result === 65002 && desired.has(key)) return
             if (result.result !== 0) throw new Error(`setMsgEmojiLikes: ${result.errMsg} (${result.result})`)
           })
           try {
@@ -487,6 +523,17 @@ export class QQKernelBridge {
       })
       message.reactionContext = { available: this.reactionDefinitions, reactions, maxSelected: 20 }
       this.rememberMessage(message)
+      // Some QQNT builds apply setMsgEmojiLikes without emitting
+      // onMsgInfoListUpdate. Publish the confirmed local state immediately;
+      // a later native snapshot remains authoritative and harmlessly repeats it.
+      if (stateChanged) this.dispatch({
+        type: 'message-reactions',
+        eventId: `reaction-local:${message.id}:${Date.now()}`,
+        conversation,
+        target: { conversationId: conversation.id, messageId: message.id, targetId: message.id },
+        context: message.reactionContext,
+        timestamp: message.timestamp,
+      })
       return message.reactionContext
     } finally {
       this.pendingReactions.delete(pendingKey)
@@ -495,7 +542,7 @@ export class QQKernelBridge {
 
   async getMembers(conversation: QQConversation, cursor?: string, limit = 100): Promise<MemberPage> {
     if (conversation.chatType !== CHAT_GROUP) return { members: [], total: 0 }
-    const service = this.requireSession().getGroupService()
+    const service = this.requireGroupService()
     const scene = service.createMemberListScene(conversation.peerUin || conversation.peerUid, `mtproto-${randomUUID()}`)
     try {
       const start = decodeMemberCursor(cursor)
@@ -517,6 +564,9 @@ export class QQKernelBridge {
 
   async openMedia(locator: QQMediaLocator, offset = 0, limit?: number): Promise<Readable> {
     let path = locator.filePath
+    if ((!path || !existsSync(path)) && locator.messageId.startsWith('avatar:')) {
+      path = await this.refreshAvatarFile(locator)
+    }
     if (!path || !existsSync(path)) path = await this.downloadMedia(locator)
     const size = statSync(path).size
     const end = limit === undefined ? size - 1 : Math.min(size - 1, offset + Math.max(0, limit) - 1)
@@ -562,6 +612,15 @@ export class QQKernelBridge {
     const groupService = session.getGroupService()
     const recentService = session.getRecentContactService()
     if (!msgService || !buddyService || !groupService) throw new Error('QQNT kernel services are not initialized yet')
+    this.msgService = msgService
+    this.buddyService = buddyService
+    this.groupService = groupService
+    this.recentService = recentService
+    try {
+      this.avatarService = session.getAvatarService?.()
+    } catch {
+      this.avatarService = undefined
+    }
     const msgListener = makeListener(kernel.NodeIKernelMsgListener, {
       onRecvMsg: (value: MsgRecord[] | { msgList: MsgRecord[] }) =>
         this.onMessages(Array.isArray(value) ? value : value.msgList),
@@ -594,13 +653,14 @@ export class QQKernelBridge {
         data: Array<{ buddyList: ProfileSimpleInfo[] }>
       }) => {
         const categories = Array.isArray(value) ? value : value.data
-        this.buddySnapshotLoaded = true
         log('info', `buddy list update received: ${categories.reduce((sum, item) => sum + item.buddyList.length, 0)} users`)
-        for (const category of categories) for (const buddy of category.buddyList) this.upsertBuddy(buddy)
+        this.replaceBuddySnapshot(categories)
       },
       onBuddyInfoChange: (value: Map<string, ProfileSimpleInfo> | { infos: Map<string, ProfileSimpleInfo> }) => {
         const infos = value instanceof Map ? value : value.infos
-        for (const buddy of infos.values()) this.upsertBuddy(buddy)
+        // QQ emits profile changes for strangers that merely appeared in a
+        // group or message. Only the full buddy snapshot may add contacts.
+        for (const buddy of infos.values()) if (this.users.has(buddy.uid)) this.upsertBuddy(buddy)
       },
     })
     this.buddyListenerId = buddyService.addKernelBuddyListener(buddyListener)
@@ -674,8 +734,8 @@ export class QQKernelBridge {
   }
 
   private async requestBuddyList(): Promise<void> {
-    const method = this.requireSession().getBuddyService().getBuddyList
-      .bind(this.requireSession().getBuddyService())
+    const buddyService = this.requireBuddyService()
+    const method = buddyService.getBuddyList.bind(buddyService)
     let result: unknown
     try {
       result = await method(true)
@@ -709,8 +769,8 @@ export class QQKernelBridge {
   }
 
   private async requestGroupList(): Promise<void> {
-    const method = this.requireSession().getGroupService().getGroupList
-      .bind(this.requireSession().getGroupService())
+    const groupService = this.requireGroupService()
+    const method = groupService.getGroupList.bind(groupService)
     try {
       await method(false)
     } catch (firstError) {
@@ -733,15 +793,14 @@ export class QQKernelBridge {
     }
     const candidate = object.data ?? object.categories
     if (Array.isArray(candidate)) {
-      this.buddySnapshotLoaded = true
-      for (const category of candidate) {
-        if (!category || typeof category !== 'object') continue
+      const categories = candidate.flatMap((category) => {
+        if (!category || typeof category !== 'object') return []
         const buddies = (category as { buddyList?: unknown }).buddyList
-        if (Array.isArray(buddies)) for (const buddy of buddies) this.upsertBuddy(buddy as ProfileSimpleInfo)
-      }
+        return Array.isArray(buddies) ? [{ buddyList: buddies as ProfileSimpleInfo[] }] : []
+      })
+      this.replaceBuddySnapshot(categories)
     } else if (Array.isArray(object.buddyList)) {
-      this.buddySnapshotLoaded = true
-      for (const buddy of object.buddyList) this.upsertBuddy(buddy as ProfileSimpleInfo)
+      this.replaceBuddySnapshot([{ buddyList: object.buddyList as ProfileSimpleInfo[] }])
     }
   }
 
@@ -883,6 +942,8 @@ export class QQKernelBridge {
     if (item.chatType !== CHAT_C2C && item.chatType !== CHAT_GROUP) return
     const user = item.chatType === CHAT_C2C ? this.users.get(item.peerUid) : undefined
     const group = item.chatType === CHAT_GROUP ? this.groups.get(item.peerUin || item.peerUid) : undefined
+    const current = this.contacts.get(conversationId(item.chatType, item.peerUid))
+    const summary = this.messageFromRecent(item)
     const conversation: QQConversation = {
       id: conversationId(item.chatType, item.peerUid),
       kind: item.chatType === CHAT_GROUP ? 'group' : 'direct',
@@ -892,6 +953,7 @@ export class QQKernelBridge {
       chatType: item.chatType,
       avatarUrl: user?.avatarUrl || group?.avatarUrl || item.avatarUrl,
       unreadCount: Number(item.unreadCnt) || 0,
+      lastMessage: current?.lastMessage?.id === item.msgId ? current.lastMessage : summary,
     }
     this.contacts.set(conversation.id, conversation)
   }
@@ -911,6 +973,30 @@ export class QQKernelBridge {
       chatType: CHAT_C2C, avatarUrl: buddy.avatarUrl, unreadCount: current?.unreadCount,
       lastMessage: current?.lastMessage,
     })
+  }
+
+  private replaceBuddySnapshot(categories: Array<{ buddyList: ProfileSimpleInfo[] }>): void {
+    const buddies = categories.flatMap((category) => category.buddyList)
+    const keep = new Set(buddies.map((buddy) => buddy.uid))
+    if (this.config?.selfUid) keep.add(this.config.selfUid)
+    for (const uid of this.users.keys()) if (!keep.has(uid)) this.users.delete(uid)
+    for (const buddy of buddies) this.upsertBuddy(buddy)
+    this.buddySnapshotLoaded = true
+  }
+
+  private messageFromRecent(item: RecentContactInfo): QQMessage | undefined {
+    if (!item.msgId) return
+    const text = (item.abstractContent ?? []).map((element) =>
+      element.content || element.fileName || abstractCustomContent(element.custom_content))
+      .filter(Boolean).join('')
+    return {
+      id: item.msgId,
+      conversationId: conversationId(item.chatType as 1 | 2, item.peerUid),
+      senderId: item.senderUid || item.senderUin || item.peerUid,
+      timestamp: Number(item.msgTime) || Math.floor(Date.now() / 1000),
+      outgoing: Boolean(item.senderUid && item.senderUid === this.config?.selfUid),
+      parts: text ? [{ type: 'text', text }] : [],
+    }
   }
 
   private conversationFromRecord(record: MsgRecord): QQConversation {
@@ -966,7 +1052,7 @@ export class QQKernelBridge {
   }
 
   private async loadReactionCatalog(): Promise<void> {
-    const service = this.requireSession().getMsgService()
+    const service = this.requireMsgService()
     const localRoot = this.findLocalReactionRoot()
     let configPath = localRoot ? join(localRoot, 'face_config.json') : ''
     let facePath = localRoot ? join(localRoot, 'sysface_res') : ''
@@ -990,6 +1076,7 @@ export class QQKernelBridge {
     const aliases = new Map<string, QQReactionDefinition>()
     for (const item of config.emoji ?? []) {
       if (item.QHide === '1' || !item.QSid) continue
+      if (!TELEGRAM_STANDARD_REACTIONS.has(item.QSid)) continue
       const emojiId = item.QCid || item.AQLid
       if (!emojiId) continue
       const definition: QQReactionDefinition = {
@@ -1006,6 +1093,7 @@ export class QQKernelBridge {
       const filePath = join(facePath, 'static', `s${item.QSid}.png`)
       if (!existsSync(filePath)) continue
       const info = await stat(filePath)
+      const dimensions = pngDimensions(await readFile(filePath))
       definitions.push({
         key: reactionKey('1', item.QSid),
         title: cleanFaceName(item.QDes),
@@ -1016,8 +1104,8 @@ export class QQKernelBridge {
             version: Math.trunc(info.mtimeMs),
             format: 'static',
             mimeType: 'image/png',
-            width: 200,
-            height: 200,
+            width: dimensions?.width ?? 128,
+            height: dimensions?.height ?? 128,
             size: info.size,
             locator: { filePath },
           },
@@ -1043,47 +1131,100 @@ export class QQKernelBridge {
   }
 
   private async userAvatar(uid: string, force = true): Promise<QQMedia | undefined> {
-    const service = this.requireSession().getAvatarService?.()
-    if (!service) return
+    const cacheKey = `user:${uid}`
+    const cached = this.avatarCache.get(cacheKey)
+    if (cached && !force) return cached
     try {
+      const service = this.getAvatarService()
+      if (!service) return cached
       let filePath = service.getAvatarPath(uid, 0)
       if (force && (!filePath || !existsSync(filePath))) {
         await service.forceDownloadAvatar(uid, 0).catch(() => undefined)
         filePath = await waitForAvatarPath(() => service.getAvatarPath(uid, 0))
       }
-      return filePath && existsSync(filePath) ? avatarMedia(`user:${uid}`, filePath) : undefined
+      if (filePath && existsSync(filePath)) {
+        const avatar = avatarMedia(cacheKey, filePath)
+        this.avatarCache.set(cacheKey, avatar)
+        return avatar
+      }
+      return cached
     } catch {
-      return
+      return cached
     }
   }
 
-  private async withConversationAvatar(conversation: QQConversation): Promise<QQConversation> {
-    const service = this.requireSession().getAvatarService?.()
-    if (!service) return conversation
+  private async withConversationAvatar(conversation: QQConversation, force = true): Promise<QQConversation> {
+    const cacheKey = `${conversation.chatType === CHAT_C2C ? 'user' : 'group'}:${conversation.peerUid}`
+    const cached = conversation.avatar ?? this.avatarCache.get(cacheKey)
+    if (cached && !force) return { ...conversation, avatar: cached }
     try {
+      const service = this.getAvatarService()
+      if (!service) return cached ? { ...conversation, avatar: cached } : conversation
       let avatar: QQMedia | undefined
       if (conversation.chatType === CHAT_C2C) {
-        avatar = await this.userAvatar(conversation.peerUid)
+        avatar = await this.userAvatar(conversation.peerUid, force)
       } else {
         let filePath = service.getGroupAvatarPath(conversation.peerUin || conversation.peerUid, 0)
           || service.getConfGroupAvatarPath(conversation.peerUin || conversation.peerUid)
-        if (!filePath || !existsSync(filePath)) {
+        if (force && (!filePath || !existsSync(filePath))) {
           await service.forceDownloadGroupAvatar(conversation.peerUin || conversation.peerUid, 0).catch(() => undefined)
           filePath = await waitForAvatarPath(() =>
             service.getGroupAvatarPath(conversation.peerUin || conversation.peerUid, 0)
             || service.getConfGroupAvatarPath(conversation.peerUin || conversation.peerUid))
         }
-        if (filePath && existsSync(filePath)) avatar = avatarMedia(`group:${conversation.peerUid}`, filePath)
+        if (filePath && existsSync(filePath)) {
+          avatar = avatarMedia(cacheKey, filePath)
+          this.avatarCache.set(cacheKey, avatar)
+        }
       }
-      return avatar ? { ...conversation, avatar } : conversation
+      return avatar || cached ? { ...conversation, avatar: avatar ?? cached } : conversation
     } catch {
-      return conversation
+      return cached ? { ...conversation, avatar: cached } : conversation
     }
+  }
+
+  private async refreshAvatarFile(locator: QQMediaLocator): Promise<string> {
+    const service = this.getAvatarService()
+    if (!service) throw new Error('QQ avatar service is unavailable')
+    const key = `${locator.chatType === CHAT_GROUP ? 'group' : 'user'}:${locator.peerUid}`
+    let filePath = ''
+    if (locator.chatType === CHAT_GROUP) {
+      await service.forceDownloadGroupAvatar(locator.peerUid, 0).catch(() => undefined)
+      filePath = await waitForAvatarPath(() =>
+        service.getGroupAvatarPath(locator.peerUid, 0) || service.getConfGroupAvatarPath(locator.peerUid))
+    } else {
+      await service.forceDownloadAvatar(locator.peerUid, 0).catch(() => undefined)
+      filePath = await waitForAvatarPath(() => service.getAvatarPath(locator.peerUid, 0))
+    }
+    if (!filePath || !existsSync(filePath)) throw new Error(`QQ avatar is unavailable: ${locator.peerUid}`)
+    this.avatarCache.set(key, avatarMedia(key, filePath))
+    return filePath
   }
 
   private requireSession(): KernelSession {
     if (!this.session) throw new Error('QQNT kernel is not ready')
     return this.session
+  }
+
+  private requireMsgService(): ReturnType<KernelSession['getMsgService']> {
+    return this.msgService ??= this.requireSession().getMsgService()
+  }
+
+  private requireBuddyService(): ReturnType<KernelSession['getBuddyService']> {
+    return this.buddyService ??= this.requireSession().getBuddyService()
+  }
+
+  private requireGroupService(): ReturnType<KernelSession['getGroupService']> {
+    return this.groupService ??= this.requireSession().getGroupService()
+  }
+
+  private getAvatarService(): NonNullable<ReturnType<NonNullable<KernelSession['getAvatarService']>>> | undefined {
+    if (this.avatarService) return this.avatarService
+    try {
+      return this.avatarService = this.requireSession().getAvatarService?.()
+    } catch {
+      return
+    }
   }
 }
 
@@ -1344,4 +1485,26 @@ function splitReactionKey(key: string): [string, string] {
 function cleanFaceName(value?: string): string | undefined {
   const name = value?.replace(/^\//, '').trim()
   return name || undefined
+}
+
+function abstractCustomContent(value?: string): string {
+  if (!value) return ''
+  try {
+    const parsed = JSON.parse(value) as { prompt?: unknown, desc?: unknown }
+    if (typeof parsed.prompt === 'string') return parsed.prompt
+    if (typeof parsed.desc === 'string') return parsed.desc
+  } catch {
+    // Recent-contact custom content is often JSON, but plain text is also a
+    // valid fallback in older QQNT builds.
+  }
+  return value
+}
+
+function pngDimensions(bytes: Uint8Array): { width: number, height: number } | undefined {
+  if (bytes.length < 24
+    || bytes[0] !== 0x89 || bytes[1] !== 0x50 || bytes[2] !== 0x4e || bytes[3] !== 0x47) return
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  const width = view.getUint32(16)
+  const height = view.getUint32(20)
+  return width > 0 && height > 0 ? { width, height } : undefined
 }

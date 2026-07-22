@@ -43,7 +43,9 @@ function fixture() {
     getRecentContactInfos: vi.fn(async () => ({
       result: 0, errMsg: '', relation: [{
         chatType: 1, peerUid: 'uid-1715311957', peerUin: '1715311957', peerName: 'xuuuuan',
-        remark: '', avatarUrl: '', unreadCnt: '0', msgId: 'm1',
+        remark: '', avatarUrl: '', unreadCnt: '0', msgId: 'm1', msgTime: '1800000000',
+        senderUid: 'uid-1715311957', senderUin: '1715311957',
+        abstractContent: [{ elementType: 1, content: 'hello preview' }],
       }],
     })),
   }
@@ -102,6 +104,9 @@ function fixture() {
     emitBuddyList(categories: Array<{ buddyList: unknown[] }>) {
       buddyHandlers.onBuddyListChange?.(categories)
     },
+    emitBuddyInfo(infos: Map<string, unknown>) {
+      buddyHandlers.onBuddyInfoChange?.(infos)
+    },
   }
 }
 
@@ -113,6 +118,7 @@ describe('QQKernelBridge', () => {
     const dialogs = await bridge.getDialogs()
     expect(dialogs.conversations[0]).toMatchObject({
       id: 'uid-1715311957', peerUin: '1715311957', title: 'xuuuuan',
+      lastMessage: { id: 'm1', parts: [{ type: 'text', text: 'hello preview' }] },
     })
     const history = await bridge.getHistory(dialogs.conversations[0])
     expect(history.messages[0]).toMatchObject({ id: 'm1', parts: [{ type: 'text', text: 'hello' }] })
@@ -146,10 +152,21 @@ describe('QQKernelBridge', () => {
       { uid: 'friend-a', uin: '1', nick: 'A', remark: '', avatarUrl: '' },
       { uid: 'friend-b', uin: '2', nick: 'B', remark: '', avatarUrl: '' },
     ] }])
+    f.emitBuddyInfo(new Map([
+      ['friend-a', { uid: 'friend-a', uin: '1', nick: 'Updated A', remark: '', avatarUrl: '' }],
+      ['stranger', { uid: 'stranger', uin: '999', nick: 'Seen in a group', remark: '', avatarUrl: '' }],
+    ]))
     const contacts = await bridge.getContacts()
     expect(contacts.users.map((user) => user.id)).toEqual(['self', 'friend-a', 'friend-b'])
     const dialogs = await bridge.getDialogs()
     expect(dialogs.conversations.map((item) => item.id)).toEqual(['uid-1715311957'])
+
+    f.emitBuddyList([{ buddyList: [
+      { uid: 'friend-a', uin: '1', nick: 'A', remark: '', avatarUrl: '' },
+    ] }])
+    await expect(bridge.getContacts()).resolves.toMatchObject({
+      users: [{ id: 'self' }, { id: 'friend-a' }],
+    })
   })
 
   it('writes multiple reactions sequentially and emits updates for history messages', async () => {
@@ -175,6 +192,36 @@ describe('QQKernelBridge', () => {
     }])
     await expect(events.next()).resolves.toMatchObject({
       value: { type: 'message-reactions', context: { reactions: [{ key: '2:128522', count: 3 }] } },
+    })
+  })
+
+  it('uses the final group msgSeq and accepts an idempotent reaction add', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const conversation = await bridge.resolveConversation(2, '1058754719')
+    const optimistic = {
+      ...f.message, msgId: 'group-message', msgSeq: 'old-seq', chatType: 2,
+      peerUid: '1058754719', peerUin: '1058754719', sendStatus: 1,
+    }
+    const confirmed = { ...optimistic, msgSeq: 'final-seq', sendStatus: 2 }
+    f.msg.getMsgsByMsgId.mockResolvedValue({ result: 0, errMsg: '', msgList: [optimistic] })
+    f.msg.getLatestDbMsgs.mockResolvedValue({ result: 0, errMsg: '', msgList: [confirmed] })
+    f.msg.setMsgEmojiLikes.mockResolvedValue({ result: 65002, errMsg: '已经设置过该表情' })
+    const events = bridge.subscribe()[Symbol.asyncIterator]()
+
+    await expect(bridge.setMessageReactions(conversation, 'group-message', ['1:14']))
+      .resolves.toMatchObject({ reactions: [{ key: '1:14', selected: true }] })
+    expect(f.msg.setMsgEmojiLikes).toHaveBeenCalledWith(
+      expect.objectContaining({ chatType: 2, peerUid: '1058754719' }),
+      'final-seq', '14', '1', true,
+    )
+    await expect(events.next()).resolves.toMatchObject({
+      value: {
+        type: 'message-reactions',
+        target: { conversationId: '1058754719', messageId: 'group-message' },
+        context: { reactions: [{ key: '1:14', selected: true }] },
+      },
     })
   })
 })

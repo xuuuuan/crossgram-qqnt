@@ -21,6 +21,15 @@ export interface RecentContactInfo {
   avatarUrl: string
   unreadCnt: string
   msgId: string
+  msgTime?: string
+  senderUid?: string
+  senderUin?: string
+  abstractContent?: Array<{
+    elementType: number
+    content?: string
+    custom_content?: string
+    fileName?: string
+  }>
 }
 
 export interface MemberInfo {
