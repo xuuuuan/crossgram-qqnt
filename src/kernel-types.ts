@@ -55,6 +55,9 @@ export interface MsgElement {
     sourcePath?: string
     fileUuid: string
     fileSubId: string
+    originImageMd5?: string
+    thumbFileSize?: number
+    original?: boolean
     fileBizId?: number
     originImageUrl?: string
     thumbPath?: Map<number, string>
@@ -103,6 +106,9 @@ export interface FileTransNotifyInfo {
   msgId: string
   fileErrCode: string
   fileErrMsg: string
+  fileSrvErrCode?: string
+  clientMsg?: string
+  step?: number
   filePath: string
   totalSize: string
   trasferStatus: number
@@ -120,6 +126,20 @@ export interface KernelMsgService {
   getMsgUniqueId?(time: string): string
   getLatestDbMsgs?(peer: Contact, count: number): Promise<{ result: number, errMsg: string, msgList: MsgRecord[] }>
   getEmojiResourcePath?(type: number): Promise<{ result: number, errMsg: string, resourcePath: string }>
+  getRichMediaFilePath?(
+    elementType: number, elementSubType: number, md5HexStr: string, fileName: string,
+    fileType: number, thumbSize: number, needCreate: boolean,
+  ): string
+  getRichMediaFilePathForMobileQQSend?(pathInfo: {
+    elementType: number
+    elementSubType: number
+    md5HexStr: string
+    fileName: string
+    downloadType: number
+    thumbSize: number
+    file_uuid: string
+    needCreate: boolean
+  }): string
   setMsgEmojiLikes?(
     peer: Contact,
     msgSeq: string,
@@ -155,6 +175,7 @@ export interface KernelGroupService {
 }
 
 export interface KernelRichMediaService {
+  getRichMediaFileDir?(elementType: number, downType: number, isTemp: boolean): string
   downloadFile(fileInfo: {
     fileModelId: string
     msgId: string

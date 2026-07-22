@@ -125,6 +125,10 @@ describe('QQKernelBridge', () => {
     expect(f.msg.getLatestDbMsgs).toHaveBeenCalledWith(expect.objectContaining({
       chatType: 1, peerUid: 'uid-1715311957',
     }), 50)
+    f.msg.sendMsg.mockImplementationOnce(async () => {
+      queueMicrotask(() => f.emitMessages([{ ...f.message, sendStatus: 1 }]))
+      return { result: 0, errMsg: '' }
+    })
     const sent = await bridge.send({
       conversationId: dialogs.conversations[0].id, text: 'hello',
     }, Readable.from([]))
@@ -142,6 +146,33 @@ describe('QQKernelBridge', () => {
       media: [{ kind: 'file', name: 'stream.bin', size: chunks.reduce((sum, chunk) => sum + chunk.length, 0) }],
     }, Readable.from(chunks))
     expect(f.sentBodies).toEqual([Buffer.concat(chunks)])
+  })
+
+  it('sends images with real source metadata and rejects kSendFailed', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const png = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+      'base64',
+    )
+    f.msg.sendMsg.mockImplementation(async () => {
+      setTimeout(() => f.emitMessages([{ ...f.message, sendStatus: 0 }]), 5)
+      return { result: 0, errMsg: '' }
+    })
+
+    await expect(bridge.send({
+      conversationId: 'uid-1715311957',
+      media: [{ kind: 'image', name: 'tiny.png', size: png.length }],
+    }, Readable.from([png]))).rejects.toThrow('QQ send failed')
+    expect(f.msg.sendMsg).toHaveBeenCalledWith(
+      'm1', expect.objectContaining({ peerUid: 'uid-1715311957' }), [expect.objectContaining({
+        picElement: expect.objectContaining({
+          fileSize: String(png.length), picWidth: 1, picHeight: 1,
+          md5HexStr: 'e44e7ecfec99356632c13cd3eaa3e250',
+        }),
+      })], expect.any(Map),
+    )
   })
 
   it('returns every buddy as a contact without adding the full buddy list to dialogs', async () => {

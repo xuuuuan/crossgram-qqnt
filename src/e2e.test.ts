@@ -50,27 +50,31 @@ describe.skipIf(!enabled)('live QQNT bridge E2E', () => {
   }, 180_000)
 
   it('streams a PNG image to xuuuuan and returns a confirmed image element', async () => {
-    const png = Buffer.from(
-      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
-      'base64',
-    )
+    const imagePath = new URL('../../mtproto-relay-cordis/packages/platform-static/src/test-image.png', import.meta.url)
+    const image = await stat(imagePath)
     const conversation = await resolve('direct', allowedDirect)
     const manifest = Buffer.from(JSON.stringify({
-      conversationId: conversation.id,
-      media: [{ kind: 'image', name: 'qqnt-bridge-e2e.png', size: png.length, mimeType: 'image/png' }],
+      conversationId: conversation.id, media: [{
+        kind: 'image', name: basename(imagePath.pathname), size: image.size, mimeType: 'image/png',
+      }],
     })).toString('base64url')
     const sent = await fetch(`${base}/messages`, {
       method: 'POST',
-      headers: headers({ 'x-qqnt-manifest': manifest, 'content-length': String(png.length) }),
-      body: png,
+      headers: headers({ 'x-qqnt-manifest': manifest, 'content-length': String(image.size) }),
+      body: createReadStream(imagePath) as never,
       duplex: 'half',
     } as RequestInit)
     const body = await sent.text()
     expect(sent.status, body).toBe(200)
-    expect(JSON.parse(body)).toMatchObject({
+    const message = JSON.parse(body) as { id: string, conversationId: string, parts: unknown[] }
+    expect(message).toMatchObject({
       conversationId: conversation.id,
       parts: [{ type: 'media', media: { kind: 'image' } }],
     })
+    const history = await fetch(`${base}/conversations/${encodeURIComponent(conversation.id)}/history?limit=20`, {
+      headers: headers(),
+    })
+    expect(await history.text()).toContain(message.id)
   }, 180_000)
 
   it.runIf(Boolean(process.env.QQNT_BRIDGE_E2E_FILE))('streams a file to xuuuuan and downloads it by range', async () => {

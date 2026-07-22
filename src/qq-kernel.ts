@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { createReadStream, createWriteStream, existsSync, mkdirSync, statSync } from 'node:fs'
-import { readFile, rm, stat } from 'node:fs/promises'
+import { open as openFile, readFile, rename, rm, stat } from 'node:fs/promises'
 import { basename, dirname, extname, join } from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import type { Readable } from 'node:stream'
@@ -50,9 +50,12 @@ export class QQKernelBridge {
   private reactionDefinitions: QQReactionDefinition[] = []
   private readonly reactionByKey = new Map<string, QQReactionDefinition>()
   private readonly pendingMessages = new Map<string, ReturnType<typeof deferred<MsgRecord>>>()
+  private readonly pendingAcceptances = new Map<string, ReturnType<typeof deferred<void>>>()
+  private readonly pendingMinimumStatuses = new Map<string, number>()
   private readonly pendingUnassigned: Array<{
     conversationId: string
     pending: ReturnType<typeof deferred<MsgRecord>>
+    accepted: ReturnType<typeof deferred<void>>
     minimumStatus: number
     startedAt: number
     expectedText?: string
@@ -98,6 +101,7 @@ export class QQKernelBridge {
     this.kernel = kernel
     this.session = session
     this.config = config
+    mkdirSync(this.stagingPath(), { recursive: true })
     this.users.set(config.selfUid, {
       id: config.selfUid,
       numericId: config.selfUin,
@@ -132,8 +136,15 @@ export class QQKernelBridge {
     this.avatarService = undefined
     this.session = undefined
     for (const pending of this.pendingMessages.values()) pending.reject(new Error('QQNT session detached'))
+    for (const accepted of this.pendingAcceptances.values()) accepted.resolve()
+    for (const item of this.pendingUnassigned) {
+      item.pending.reject(new Error('QQNT session detached'))
+      item.accepted.resolve()
+    }
     for (const pending of this.pendingDownloads.values()) pending.reject(new Error('QQNT session detached'))
     this.pendingMessages.clear()
+    this.pendingAcceptances.clear()
+    this.pendingMinimumStatuses.clear()
     this.pendingUnassigned.splice(0)
     this.pendingDownloads.clear()
     for (const pending of this.pendingReactions.values()) pending.reject(new Error('QQNT session detached'))
@@ -330,16 +341,25 @@ export class QQKernelBridge {
       if (manifest.media?.length) {
         if (manifest.media.length !== 1) throw new Error('the streaming endpoint accepts exactly one media item per request')
         const spec = manifest.media[0]
-        const path = join(this.tempPath, `${randomUUID()}${safeExtension(spec.name)}`)
+        const stagingRoot = this.stagingPath(spec.kind)
+        mkdirSync(stagingRoot, { recursive: true })
+        const path = join(stagingRoot, `${randomUUID()}${safeExtension(spec.name)}`)
         cleanup.push(path)
         await pipeline(body, createWriteStream(path, { flags: 'wx' }))
         const size = statSync(path).size
         if (spec.size !== undefined && size !== spec.size) {
           throw new Error(`incomplete upload: expected ${spec.size} bytes, received ${size}`)
         }
-        elements.push(spec.kind === 'image'
-          ? imageElement(path)
-          : await fileElement(path, spec.name, size))
+        if (spec.kind === 'image') {
+          const prepared = await this.prepareImageElement(path, spec.name, size)
+          if (prepared.path !== path) {
+            cleanup.splice(cleanup.indexOf(path), 1)
+            if (prepared.owned) cleanup.push(prepared.path)
+          }
+          elements.push(prepared.element)
+        } else {
+          elements.push(await fileElement(path, spec.name, size))
+        }
       } else {
         body.resume()
       }
@@ -353,16 +373,25 @@ export class QQKernelBridge {
         log('error', 'getMsgUniqueId failed; matching send confirmation by content', error)
       }
       const pending = deferred<MsgRecord>()
+      const accepted = deferred<void>()
+      const minimumStatus = manifest.media?.length ? 2 : 1
+      let wasAccepted = false
+      void accepted.promise.then(() => { wasAccepted = true })
       if (id === '0') this.pendingUnassigned.push({
         conversationId: conversation.id,
         pending,
-        minimumStatus: 1,
+        accepted,
+        minimumStatus,
         startedAt,
         expectedText: manifest.text,
         expectedMediaName: manifest.media?.[0]?.name,
         expectedMediaKind: manifest.media?.[0]?.kind,
       })
-      else this.pendingMessages.set(id, pending)
+      else {
+        this.pendingMessages.set(id, pending)
+        this.pendingAcceptances.set(id, accepted)
+        this.pendingMinimumStatuses.set(id, minimumStatus)
+      }
       const peer = contact(conversation)
       // This is the raw native service, not QQ's renderer-side generated
       // object-parameter proxy. sendMsg uses four positional arguments.
@@ -372,6 +401,7 @@ export class QQKernelBridge {
           5_000,
           'QQ sendMsg timed out',
         ),
+        () => wasAccepted,
       )
       const result = await Promise.race([
         nativeSend,
@@ -379,13 +409,21 @@ export class QQKernelBridge {
       ])
       if (result.result !== 0) {
         this.pendingMessages.delete(id)
+        this.pendingAcceptances.delete(id)
+        this.pendingMinimumStatuses.delete(id)
         removePending(this.pendingUnassigned, pending)
         throw new Error(`sendMsg: ${result.errMsg} (${result.result})`)
       }
       const pollController = new AbortController()
-      const confirmationPoll = manifest.media?.length
-        ? new Promise<MsgRecord>(() => undefined)
-        : this.pollSentMessage(conversation, manifest.text, startedAt, pollController.signal)
+      const confirmationPoll = this.pollSentMessage(
+        conversation,
+        manifest.text,
+        startedAt,
+        manifest.media?.[0]?.kind,
+        manifest.media?.[0]?.name,
+        minimumStatus,
+        pollController.signal,
+      )
       const record = await withTimeout(Promise.race([
         pending.promise,
         confirmationPoll,
@@ -393,6 +431,8 @@ export class QQKernelBridge {
         .finally(() => {
           pollController.abort()
           this.pendingMessages.delete(id)
+          this.pendingAcceptances.delete(id)
+          this.pendingMinimumStatuses.delete(id)
           removePending(this.pendingUnassigned, pending)
         })
       const message = this.mapMessage(record)
@@ -646,6 +686,15 @@ export class QQKernelBridge {
         : this.onDelete(value.chatType, value.peerUid, ids ?? []),
       onRichMediaDownloadComplete: (value: FileTransNotifyInfo | { notifyInfo: FileTransNotifyInfo }) =>
         this.onDownload('notifyInfo' in value ? value.notifyInfo : value),
+      onRichMediaUploadComplete: (value: FileTransNotifyInfo | { notifyInfo: FileTransNotifyInfo }) => {
+        const info = 'notifyInfo' in value ? value.notifyInfo : value
+        const details = `msg=${info.msgId} status=${info.trasferStatus} error=${info.fileErrCode} server=${info.fileSrvErrCode ?? ''} step=${info.step ?? ''}`
+        if (info.fileErrCode && info.fileErrCode !== '0') {
+          log('error', `QQ media upload failed ${details}: ${info.clientMsg || info.fileErrMsg}`)
+        } else {
+          log('info', `QQ media upload completed ${details}`)
+        }
+      },
     })
     this.listenerId = msgService.addKernelMsgListener(msgListener)
     const buddyListener = makeListener(kernel.NodeIKernelBuddyListener, {
@@ -811,16 +860,19 @@ export class QQKernelBridge {
         log('info', `outgoing message event id=${record.msgId} peer=${record.peerUid} status=${record.sendStatus}`)
       }
       const pending = this.pendingMessages.get(record.msgId)
-      // onAddSendMsg already carries QQ's final server-facing msgId/elementId.
-      // Some groups never emit a later sendStatus=2 update to this listener.
-      if (pending && record.sendStatus >= 1 && record.msgId !== '0') {
+      if (record.sendStatus >= 1) this.pendingAcceptances.get(record.msgId)?.resolve()
+      if (pending && record.sendStatus === 0) {
+        this.pendingMessages.delete(record.msgId)
+        pending.reject(new Error(`QQ send failed: ${record.msgId}`))
+      } else if (pending
+        && record.sendStatus >= (this.pendingMinimumStatuses.get(record.msgId) ?? 1)
+        && record.msgId !== '0') {
         this.pendingMessages.delete(record.msgId)
         pending.resolve(record)
-      } else if (record.sendStatus >= 1 && record.msgId !== '0') {
+      } else if (record.msgId !== '0') {
         const id = conversationId(record.chatType as 1 | 2, record.peerUid)
         const index = this.pendingUnassigned.findIndex((item) =>
           item.conversationId === id
-          && record.sendStatus >= item.minimumStatus
           && Number(record.msgTime) >= item.startedAt - 2
           && (!item.expectedText || record.elements.some((element) =>
             element.textElement?.content === item.expectedText))
@@ -830,7 +882,12 @@ export class QQKernelBridge {
             element.fileElement?.fileName === item.expectedMediaName
             || element.picElement?.fileName === item.expectedMediaName)
             || item.expectedMediaKind === 'image'))
-        if (index >= 0) this.pendingUnassigned.splice(index, 1)[0].pending.resolve(record)
+        if (index >= 0 && record.sendStatus >= 1) this.pendingUnassigned[index].accepted.resolve()
+        if (index >= 0 && record.sendStatus === 0) {
+          this.pendingUnassigned.splice(index, 1)[0].pending.reject(new Error('QQ send failed'))
+        } else if (index >= 0 && record.sendStatus >= this.pendingUnassigned[index].minimumStatus) {
+          this.pendingUnassigned.splice(index, 1)[0].pending.resolve(record)
+        }
       }
       const conversation = this.conversationFromRecord(record)
       const message = this.mapMessage(record)
@@ -893,47 +950,36 @@ export class QQKernelBridge {
     conversation: QQConversation,
     expectedText: string | undefined,
     startedAt: number,
+    expectedMediaKind: 'image' | 'file' | undefined,
+    expectedMediaName: string | undefined,
+    minimumStatus: number,
     signal: AbortSignal,
   ): Promise<MsgRecord> {
-    // Some QQ groups only emit the initial sendStatus=1 notification. Poll the
-    // native DB until the final server-assigned message ID appears.
+    // Some QQ groups omit the final listener notification. Text sends are
+    // accepted at kSending=1, while media must reach kSuccess=2 so an upload
+    // failure cannot escape as a successful HTTP response.
     await new Promise((resolve) => setTimeout(resolve, 300))
+    const service = this.requireMsgService()
     while (true) {
       if (signal.aborted) throw signal.reason ?? new Error('send confirmation polling aborted')
-      const cached = (this.messages.get(conversation.id) ?? []).slice(-20).reverse()
-      let found = cached.find((message) =>
-        message.outgoing
-        && message.timestamp >= startedAt - 2
-        && (expectedText === undefined || message.parts.some((part) => part.type === 'text' && part.text === expectedText)))
-      if (!found) {
-        const page = await withTimeout(
-          this.getHistory(conversation, { limit: 20 }),
+      const response = await withTimeout(
+        service.getLatestDbMsgs
+          ? service.getLatestDbMsgs(contact(conversation), 20)
+          : service.getMsgs(contact(conversation), '0', 20, true),
           2_000,
           'QQ history confirmation timed out',
-        ).catch(() => ({ messages: [] }))
-        found = page.messages.find((message) =>
-          message.outgoing
-          && message.timestamp >= startedAt - 2
-          && (expectedText === undefined || message.parts.some((part) => part.type === 'text' && part.text === expectedText)))
-      }
-      if (found) return {
-        msgId: found.id,
-        chatType: conversation.chatType,
-        sendType: 1,
-        senderUid: found.senderId,
-        senderUin: '',
-        peerUid: conversation.peerUid,
-        peerUin: conversation.peerUin,
-        peerName: conversation.title,
-        msgTime: String(found.timestamp),
-        sendStatus: 2,
-        sendRemarkName: '',
-        sendMemberName: '',
-        sendNickName: '',
-        elements: found.parts.map((part, index): MsgElement => part.type === 'text'
-          ? { elementType: ELEMENT_TEXT, elementId: found.sourceIds?.[index] ?? '', textElement: { content: part.text } }
-          : { elementType: part.media.kind === 'image' ? ELEMENT_IMAGE : ELEMENT_FILE, elementId: part.media.id }),
-      }
+        ).catch(() => ({ result: -1, errMsg: '', msgList: [] as MsgRecord[] }))
+      const found = response.msgList.find((record) =>
+        Number(record.msgTime) >= startedAt - 2
+        && (record.senderUid === this.config?.selfUid || SEND_FROM_SELF.has(record.sendType))
+        && (expectedText === undefined || record.elements.some((element) =>
+          element.textElement?.content === expectedText))
+        && (expectedMediaKind === undefined || record.elements.some((element) =>
+          expectedMediaKind === 'image' ? Boolean(element.picElement) : Boolean(element.fileElement)))
+        && (expectedMediaName === undefined || expectedMediaKind === 'image' || record.elements.some((element) =>
+          element.fileElement?.fileName === expectedMediaName)))
+      if (found?.sendStatus === 0) throw new Error(`QQ send failed: ${found.msgId}`)
+      if (found && found.sendStatus >= minimumStatus) return found
       await new Promise((resolve) => setTimeout(resolve, 500))
     }
   }
@@ -1218,6 +1264,59 @@ export class QQKernelBridge {
     return this.session
   }
 
+  private stagingPath(kind?: 'image' | 'file'): string {
+    if (kind === 'image') {
+      try {
+        const nativeDir = this.requireSession().getRichMediaService().getRichMediaFileDir?.(
+          ELEMENT_IMAGE, 1, true,
+        )
+        if (nativeDir) return join(nativeDir, '.qqnt-bridge-staging')
+      } catch {
+        // Fall through to the account-private staging directory.
+      }
+    }
+    return this.config?.userPath
+      ? join(this.config.userPath, '.qqnt-bridge-staging')
+      : this.tempPath
+  }
+
+  private async prepareImageElement(
+    stagingPath: string,
+    originalName: string,
+    size: number,
+  ): Promise<{ path: string, owned: boolean, element: MsgElement }> {
+    const [md5, dimensions] = await Promise.all([
+      hashFile(stagingPath, 'md5'),
+      imageFileDimensions(stagingPath),
+    ])
+    const service = this.requireMsgService()
+    let nativePath = ''
+    try {
+      nativePath = service.getRichMediaFilePath?.(
+        ELEMENT_IMAGE, 0, md5, originalName, 1, 0, true,
+      ) ?? service.getRichMediaFilePathForMobileQQSend?.({
+        elementType: ELEMENT_IMAGE, elementSubType: 0, md5HexStr: md5,
+        fileName: originalName, downloadType: 1, thumbSize: 0,
+        file_uuid: '', needCreate: true,
+      }) ?? ''
+    } catch (error) {
+      log('error', 'QQ image send path lookup failed; using native media staging path', error)
+    }
+    let path = stagingPath
+    let owned = true
+    if (nativePath && nativePath !== stagingPath) {
+      mkdirSync(dirname(nativePath), { recursive: true })
+      if (existsSync(nativePath)) {
+        await rm(stagingPath, { force: true })
+        owned = false
+      } else {
+        await rename(stagingPath, nativePath)
+      }
+      path = nativePath
+    }
+    return { path, owned, element: imageElement(path, size, md5, dimensions) }
+  }
+
   private requireMsgService(): ReturnType<KernelSession['getMsgService']> {
     return this.msgService ??= this.requireSession().getMsgService()
   }
@@ -1252,25 +1351,41 @@ function textElement(text: string): MsgElement {
   }
 }
 
-function imageElement(path: string): MsgElement {
+function imageElement(
+  path: string,
+  size: number,
+  md5: string,
+  dimensions?: { width: number, height: number },
+): MsgElement {
   return {
     elementType: ELEMENT_IMAGE,
     elementId: '',
     picElement: {
       picSubType: 0,
-      fileName: '',
-      fileSize: '0',
-      picWidth: 0,
-      picHeight: 0,
+      fileName: basename(path),
+      fileSize: String(size),
+      picWidth: dimensions?.width ?? 0,
+      picHeight: dimensions?.height ?? 0,
       original: true,
-      md5HexStr: '',
+      md5HexStr: md5,
+      originImageMd5: md5,
       sourcePath: path,
       fileUuid: '',
       fileSubId: '',
       thumbFileSize: 0,
-      originImageMd5: '',
       storeID: 0,
     } as never,
+  }
+}
+
+async function imageFileDimensions(path: string): Promise<{ width: number, height: number } | undefined> {
+  const handle = await openFile(path, 'r')
+  try {
+    const header = Buffer.alloc(24)
+    const { bytesRead } = await handle.read(header, 0, header.length, 0)
+    return pngDimensions(header.subarray(0, bytesRead))
+  } finally {
+    await handle.close()
   }
 }
 
@@ -1455,9 +1570,19 @@ function isTransientNativeError(error: unknown): boolean {
 
 async function retryTransientInvalidArgumentResult(
   operation: () => Promise<{ result: number, errMsg: string }>,
+  isAccepted: () => boolean = () => false,
 ): Promise<{ result: number, errMsg: string }> {
   for (let attempt = 0; attempt < 10; attempt++) {
-    const result = await retryTransientInvalidArgument(operation)
+    if (isAccepted()) return { result: 0, errMsg: '' }
+    let result: { result: number, errMsg: string }
+    try {
+      result = await operation()
+    } catch (error) {
+      if (isAccepted()) return { result: 0, errMsg: '' }
+      if (!isTransientNativeError(error) || attempt === 9) throw error
+      await new Promise((resolve) => setTimeout(resolve, 200 * (attempt + 1)))
+      continue
+    }
     if (result.result === 0 || !result.errMsg.includes('Invalid argument') || attempt === 9) return result
     await new Promise((resolve) => setTimeout(resolve, 200 * (attempt + 1)))
   }
