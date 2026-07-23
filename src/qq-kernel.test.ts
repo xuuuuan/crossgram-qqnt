@@ -488,7 +488,10 @@ describe('QQKernelBridge', () => {
       ...forwarded, msgId: 'merged-1',
       elements: [{
         elementType: 16, elementId: 'merged',
-        multiForwardMsgElement: { fileName: 'Alice 和 Bob 的聊天记录', resId: 'opaque-res' },
+        multiForwardMsgElement: {
+          fileName: 'deac5471-1df8-43e4-ab42-a00f66c5b360', resId: 'opaque-res',
+          xmlContent: '<msg><item><title size="34">Alice &amp; Bob 的聊天记录</title></item></msg>',
+        },
       }],
     }
     f.msg.getLatestDbMsgs
@@ -499,7 +502,7 @@ describe('QQKernelBridge', () => {
     })
     await expect(bridge.forwardMessages(conversation, ['m1', 'm2'], conversation, true)).resolves.toMatchObject([
       { id: 'merged-1', parts: [{
-        type: 'multi-forward', title: 'Alice 和 Bob 的聊天记录',
+        type: 'multi-forward', title: 'Alice & Bob 的聊天记录',
         locator: { conversationId: 'uid-1715311957', rootMessageId: 'merged-1' },
       }] },
     ])

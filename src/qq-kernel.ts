@@ -2145,7 +2145,7 @@ export class QQKernelBridge {
       } else if (element.elementType === ELEMENT_MULTI_FORWARD && element.multiForwardMsgElement) {
         parts.push({
           type: 'multi-forward',
-          title: element.multiForwardMsgElement.fileName || '聊天记录',
+          title: multiForwardTitle(element.multiForwardMsgElement),
           locator: {
             conversationId: conversationId(record.chatType as 1 | 2, record.peerUid),
             rootMessageId: multiForwardRootId ?? record.msgId,
@@ -3140,6 +3140,27 @@ function recordTextContent(record: MsgRecord): string {
 
 function isRecalledRecord(record: MsgRecord): boolean {
   return record.elements?.some((element) => element.grayTipElement?.revokeElement) ?? false
+}
+
+function multiForwardTitle(element: NonNullable<MsgElement['multiForwardMsgElement']>): string {
+  const xmlTitle = element.xmlContent?.match(/<title\b[^>]*>(?:<!\[CDATA\[([\s\S]*?)\]\]>|([\s\S]*?))<\/title>/i)
+  const title = decodeXmlText(xmlTitle?.[1] ?? xmlTitle?.[2] ?? '').trim()
+  if (title) return title
+  const fileName = element.fileName?.trim()
+  if (fileName && !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(fileName)) return fileName
+  return '聊天记录'
+}
+
+function decodeXmlText(text: string): string {
+  return text.replace(/&(amp|lt|gt|quot|apos|#\d+|#x[\da-f]+);/gi, (entity, code: string) => {
+    if (code[0] === '#') {
+      const value = code[1]?.toLowerCase() === 'x'
+        ? Number.parseInt(code.slice(2), 16)
+        : Number.parseInt(code.slice(1), 10)
+      return Number.isFinite(value) ? String.fromCodePoint(value) : entity
+    }
+    return ({ amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" })[code.toLowerCase()] ?? entity
+  })
 }
 
 function fallbackElementText(element: MsgElement): string {
