@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 4
+export const PROTOCOL_VERSION = 5
 
 export type QQChatType = 1 | 2
 
@@ -40,6 +40,57 @@ export interface QQMedia {
   locator: QQMediaLocator
 }
 
+export type QQStickerReference =
+  | {
+      kind: 'market'
+      packageId: string
+      stickerId: string
+      name: string
+      key: string
+      width: number
+      height: number
+      animated: boolean
+      staticPath?: string
+      dynamicPath?: string
+      favoriteResId?: string
+    }
+  | {
+      kind: 'favorite'
+      resId: string
+      path: string
+      name: string
+      md5?: string
+      size?: number
+      width?: number
+      height?: number
+      animated: boolean
+      locator?: QQMediaLocator
+    }
+
+export interface QQSticker {
+  stickerId: string
+  packId?: string
+  title?: string
+  format: 'static' | 'animated'
+  mimeType: string
+  width?: number
+  height?: number
+  size?: number
+  version?: number
+  reference: QQStickerReference
+}
+
+export interface QQStickerPackSummary {
+  packId: string
+  title: string
+  count?: number
+  version?: number
+}
+
+export interface QQStickerPack extends QQStickerPackSummary {
+  stickers: QQSticker[]
+}
+
 export interface QQMessage {
   id: string
   sourceIds?: string[]
@@ -57,7 +108,11 @@ export interface QQMessage {
   msgSeq?: string
   /** Adapter-generated correlation token used to suppress only its own listener echo. */
   originRequestId?: string
-  parts: Array<{ type: 'text', text: string } | { type: 'media', media: QQMedia }>
+  parts: Array<
+    | { type: 'text', text: string }
+    | { type: 'media', media: QQMedia }
+    | { type: 'sticker', sticker: QQSticker }
+  >
   /** Per-message state only. The shared definition catalog has its own endpoint. */
   reactionContext?: QQReactionState
 }
@@ -135,6 +190,7 @@ export interface SendManifest {
   conversationId: string
   text?: string
   originRequestId?: string
+  sticker?: QQStickerReference
   media?: Array<{
     kind: 'image' | 'file'
     name: string

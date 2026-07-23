@@ -1,7 +1,9 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { once } from 'node:events'
 import type { Readable } from 'node:stream'
-import { PROTOCOL_VERSION, type QQMediaLocator, type SendManifest } from './protocol.js'
+import {
+  PROTOCOL_VERSION, type QQMediaLocator, type QQStickerReference, type SendManifest,
+} from './protocol.js'
 import { QQKernelBridge } from './qq-kernel.js'
 import { log, recordSlowHttpRequest, slowHttpLogPath } from './log.js'
 
@@ -136,6 +138,56 @@ export class QQBridgeServer {
       const catalog = await this.bridge.getReactionCatalog()
       log('info', `HTTP API reaction catalog id=${requestId} available=${catalog.available.length}`)
       json(response, 200, catalog)
+      return
+    }
+    if (request.method === 'GET' && path === '/v1/stickers/packs') {
+      json(response, 200, await this.bridge.getStickerPacks(
+        url.searchParams.get('cursor') ?? undefined,
+        numberParam(url, 'limit', 100),
+      ))
+      return
+    }
+    const stickerPackMatch = /^\/v1\/stickers\/packs\/([^/]+)$/.exec(path)
+    if (request.method === 'GET' && stickerPackMatch) {
+      const pack = await this.bridge.getStickerPack(decodeURIComponent(stickerPackMatch[1]))
+      if (pack) json(response, 200, pack)
+      else json(response, 404, { error: 'sticker pack not found' })
+      return
+    }
+    if (request.method === 'GET' && path === '/v1/stickers/saved') {
+      json(response, 200, await this.bridge.getSavedStickers(
+        url.searchParams.get('cursor') ?? undefined,
+        numberParam(url, 'limit', 200),
+      ))
+      return
+    }
+    const stickerMatch = /^\/v1\/stickers\/([^/]+)$/.exec(path)
+    if (request.method === 'GET' && stickerMatch) {
+      const sticker = await this.bridge.getSticker(decodeURIComponent(stickerMatch[1]))
+      if (sticker) json(response, 200, sticker)
+      else json(response, 404, { error: 'sticker not found' })
+      return
+    }
+    if (request.method === 'POST' && path === '/v1/stickers/saved') {
+      const body = await readJson<{ reference: QQStickerReference, saved: boolean }>(request)
+      await this.bridge.setSavedSticker(body.reference, body.saved)
+      json(response, 200, { ok: true })
+      return
+    }
+    if (request.method === 'POST' && path === '/v1/stickers/asset') {
+      const reference = await readJson<QQStickerReference>(request)
+      const asset = await this.bridge.openSticker(
+        reference,
+        numberHeader(request, 'x-qqnt-offset', 0),
+        optionalNumberHeader(request, 'x-qqnt-limit'),
+      )
+      response.writeHead(200, {
+        'content-type': asset.mimeType,
+        'x-qqnt-size': String(asset.size ?? ''),
+        'cache-control': 'no-store',
+        'transfer-encoding': 'chunked',
+      })
+      await pipe(asset.stream, response)
       return
     }
     if (request.method === 'GET' && path === '/v1/conversations/resolve') {

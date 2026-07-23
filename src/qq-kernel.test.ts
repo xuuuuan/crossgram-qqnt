@@ -50,6 +50,22 @@ function fixture() {
     getMsgsBySeqAndCount: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [message] })),
     getMsgsByMsgId: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [message] })),
     setMsgEmojiLikes: vi.fn(async () => ({ result: 0, errMsg: '' })),
+    fetchFavEmojiList: vi.fn(async () => ({ result: 0, errMsg: '', emojiInfoList: [] })),
+    addFavEmoji: vi.fn(async () => ({ result: 0, errMsg: '', isExist: 0 })),
+    deleteFavEmoji: vi.fn(async () => ({ result: 0, errMsg: '' })),
+    fetchMarketEmoticonList: vi.fn(async () => ({
+      result: 0, errMsg: '', marketEmoticonInfo: { roamEmojiTab: {
+        timesTamp: 1, segmentFlag: -1, ordinaryTabinfoList: [], magicTabinfoList: [],
+        smallTabinfoList: [], epIds: [],
+      } },
+    })),
+    fetchMarketEmoticonShowImage: vi.fn(async () => ({ result: 0, errMsg: '' })),
+    fetchMarketEmoticonAioImage: vi.fn(async () => ({ result: 0, errMsg: '' })),
+    getMarketEmoticonPath: vi.fn(() => new Map()),
+    getMarketEmoticonEncryptKeys: vi.fn(async () => ({ result: 0, errMsg: '', encryptKeyMap: new Map() })),
+    getFavMarketEmoticonInfo: vi.fn(async () => ({
+      result: 0, errMsg: '', favMarketEmoticonInfo: { eId: '', width: 240, height: 240, faceName: '' },
+    })),
   }
   const recent = {
     getRecentContactInfos: vi.fn(async () => ({
@@ -352,6 +368,110 @@ describe('QQKernelBridge', () => {
         picElement: expect.objectContaining({ picWidth: 1096, picHeight: 892, picType: 1000 }),
       })], expect.any(Map),
     )
+  })
+
+  it('lists, decrypts, sends, and maps QQ market stickers', async () => {
+    const f = fixture()
+    const directory = await mkdtemp(join(tmpdir(), 'qqnt-market-sticker-'))
+    tempPaths.push(directory)
+    const detailPath = join(directory, 'pack.json')
+    const staticPath = join(directory, 'sticker.png')
+    const dynamicPath = join(directory, 'sticker.gif.encrypt')
+    await writeFile(detailPath, JSON.stringify({
+      isApng: 1,
+      imgs: [{ id: 'emoji-a', name: 'Wave', wWidthInPhone: 320, wHeightInPhone: 180 }],
+    }))
+    await writeFile(staticPath, Buffer.from('static'))
+    const gif = Buffer.from('GIF89a-decrypted-sticker')
+    await writeFile(dynamicPath, gif.map((byte, index) => index % 50 < 20 ? ~byte : byte))
+    f.msg.fetchMarketEmoticonList.mockResolvedValue({
+      result: 0, errMsg: '', marketEmoticonInfo: { roamEmojiTab: {
+        timesTamp: 7, segmentFlag: -1,
+        ordinaryTabinfoList: [{ epId: 42, wordingId: 9, tabType: 3, tabName: 'QQ Waves' }],
+        magicTabinfoList: [], smallTabinfoList: [], epIds: [42],
+      } },
+    })
+    f.msg.getMarketEmoticonPath.mockImplementation((epId, ids, serviceType) => {
+      if (serviceType === 1) return new Map([[String(epId), { isExist: true, path: detailPath }]])
+      if (serviceType === 3) return new Map(ids.map((id: string) => [id, { isExist: true, path: staticPath }]))
+      if (serviceType === 5) return new Map(ids.map((id: string) => [id, { isExist: true, path: dynamicPath }]))
+      return new Map()
+    })
+    f.msg.getMarketEmoticonEncryptKeys.mockResolvedValue({
+      result: 0, errMsg: '', encryptKeyMap: new Map([['emoji-a', 'secret']]),
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: directory })
+
+    await expect(bridge.getStickerPacks()).resolves.toMatchObject({
+      packs: [{ packId: '42', title: 'QQ Waves' }],
+    })
+    const pack = await bridge.getStickerPack('42')
+    expect(pack).toMatchObject({
+      packId: '42', count: 1,
+      stickers: [{ stickerId: 'market:42:emoji-a', format: 'animated', width: 320, height: 180 }],
+    })
+    expect(await readStream((await bridge.openSticker(pack!.stickers[0].reference)).stream)).toEqual(gif)
+
+    const record = {
+      ...f.message,
+      sendStatus: 2,
+      elements: [{
+        elementType: 11, elementId: 'market-element',
+        marketFaceElement: {
+          itemType: 6, faceInfo: 1, emojiPackageId: 42, subType: 3, mediaType: 0,
+          imageWidth: 320, imageHeight: 180, faceName: '[Wave]', emojiId: 'emoji-a',
+          key: 'secret', emojiType: 2, staticFacePath: staticPath, dynamicFacePath: dynamicPath,
+        },
+      }],
+    } satisfies MsgRecord
+    f.msg.sendMsg.mockImplementation(async () => {
+      queueMicrotask(() => f.emitMessages([record]))
+      return { result: 0, errMsg: '' }
+    })
+    const sent = await bridge.send({
+      conversationId: 'uid-1715311957', sticker: pack!.stickers[0].reference,
+    }, Readable.from([]))
+    expect(f.msg.sendMsg).toHaveBeenCalledWith(
+      'm1', expect.anything(), [expect.objectContaining({
+        elementType: 11,
+        marketFaceElement: expect.objectContaining({ emojiPackageId: 42, emojiId: 'emoji-a', key: 'secret' }),
+      })], expect.any(Map),
+    )
+    expect(sent.parts).toMatchObject([{ type: 'sticker', sticker: { stickerId: 'market:42:emoji-a' } }])
+  })
+
+  it('lists and mutates QQ favorite stickers through the native collection', async () => {
+    const f = fixture()
+    const directory = await mkdtemp(join(tmpdir(), 'qqnt-favorite-sticker-'))
+    tempPaths.push(directory)
+    const path = join(directory, 'favorite.png')
+    const png = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+      'base64',
+    )
+    await writeFile(path, png)
+    f.msg.fetchFavEmojiList.mockResolvedValue({
+      result: 0, errMsg: '', emojiInfoList: [{
+        emoPath: path, isExist: true, resId: 'fav-res', url: '', md5: 'fav-md5',
+        emoOriginalPath: path, thumbPath: path, isAPNG: false, isMarkFace: false,
+        eId: '', epId: '', desc: 'Saved image',
+      }],
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: directory })
+
+    const page = await bridge.getSavedStickers()
+    expect(page.stickers).toMatchObject([{
+      stickerId: 'favorite:fav-res', format: 'static', width: 1, height: 1,
+    }])
+    const reference = page.stickers[0].reference
+    await bridge.setSavedSticker(reference, true)
+    expect(f.msg.addFavEmoji).toHaveBeenCalledWith(expect.objectContaining({
+      emojiPath: path, isMarkFace: false, md5: 'fav-md5',
+    }))
+    await bridge.setSavedSticker(reference, false)
+    expect(f.msg.deleteFavEmoji).toHaveBeenCalledWith(['fav-res'])
   })
 
   it('returns every buddy as a contact without adding the full buddy list to dialogs', async () => {
@@ -829,7 +949,7 @@ describe('QQBridgeServer', () => {
     const { port } = server.address()
     const base = `http://127.0.0.1:${port}/v1`
     await expect(fetch(`${base}/status`).then((response) => response.json())).resolves.toMatchObject({
-      protocolVersion: 4, ready: true, selfUin: '10000',
+      protocolVersion: 5, ready: true, selfUin: '10000',
     })
     await expect(fetch(`${base}/dialogs`).then((response) => response.json())).resolves.toMatchObject({
       conversations: [{ peerUin: '1715311957' }],

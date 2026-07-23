@@ -8,13 +8,13 @@ import { AsyncQueue, deferred } from './async.js'
 import { markBridgeListener } from './listener-tee.js'
 import { log } from './log.js'
 import type {
-  FileTransNotifyInfo, GroupProfileInfo, InitSessionConfig, KernelModule, KernelSession, MemberInfo, MsgElement, MsgRecord,
-  ProfileSimpleInfo, RecentContactInfo,
+  CustomEmotionData, FileTransNotifyInfo, GroupProfileInfo, InitSessionConfig, KernelModule, KernelSession,
+  MarketStickerPackInfo, MemberInfo, MsgElement, MsgRecord, ProfileSimpleInfo, RecentContactInfo,
 } from './kernel-types.js'
 import {
   conversationId, parseConversationId, type HistoryQuery, type MemberPage, type QQConversation, type QQEvent,
   type QQMedia, type QQMediaLocator, type QQMessage, type QQReactionContext, type QQReactionDefinition, type QQReactionState,
-  type SendManifest,
+  type QQSticker, type QQStickerPack, type QQStickerPackSummary, type QQStickerReference, type SendManifest,
 } from './protocol.js'
 
 const CHAT_C2C = 1
@@ -22,6 +22,7 @@ const CHAT_GROUP = 2
 const ELEMENT_TEXT = 1
 const ELEMENT_IMAGE = 2
 const ELEMENT_FILE = 3
+const ELEMENT_MARKET_FACE = 11
 const SEND_FROM_SELF = new Set([1, 2])
 const MEMBER_ADMIN = 3
 const MEMBER_OWNER = 4
@@ -68,6 +69,9 @@ export class QQKernelBridge {
   private readonly reactionByKey = new Map<string, QQReactionDefinition>()
   private reactionCatalogPromise?: Promise<void>
   private reactionEventSequence = 0
+  private readonly stickerPacks = new Map<string, QQStickerPack>()
+  private readonly stickerPackInfo = new Map<string, MarketStickerPackInfo>()
+  private readonly stickers = new Map<string, QQSticker>()
   private readonly pendingMessages = new Map<string, ReturnType<typeof deferred<MsgRecord>>>()
   private readonly pendingAcceptances = new Map<string, ReturnType<typeof deferred<void>>>()
   private readonly pendingMinimumStatuses = new Map<string, number>()
@@ -80,7 +84,7 @@ export class QQKernelBridge {
     startedAt: number
     expectedText?: string
     expectedMediaName?: string
-    expectedMediaKind?: 'image' | 'file'
+    expectedMediaKind?: 'image' | 'file' | 'sticker'
     originRequestId?: string
   }> = []
   private readonly pendingDownloads = new Map<string, ReturnType<typeof deferred<FileTransNotifyInfo>>>()
@@ -138,6 +142,9 @@ export class QQKernelBridge {
     this.reactionDefinitions = []
     this.reactionByKey.clear()
     this.reactionCatalogPromise = undefined
+    this.stickerPacks.clear()
+    this.stickerPackInfo.clear()
+    this.stickers.clear()
     this.buddySnapshotLoaded = false
     this.kernel = kernel
     this.session = session
@@ -479,6 +486,180 @@ export class QQKernelBridge {
     return message
   }
 
+  async getStickerPacks(cursor?: string, limit = 100): Promise<{
+    packs: QQStickerPackSummary[]
+    nextCursor?: string
+  }> {
+    await this.loadStickerPackCatalog()
+    const offset = parseCursor(cursor)
+    const packs = [...this.stickerPackInfo.values()].map((item) => ({
+      packId: String(item.epId), title: item.tabName || String(item.epId), version: 1,
+      count: this.stickerPacks.get(String(item.epId))?.stickers.length,
+    }))
+    const selected = packs.slice(offset, offset + clamp(limit, 1, 200))
+    return {
+      packs: selected,
+      nextCursor: offset + selected.length < packs.length ? String(offset + selected.length) : undefined,
+    }
+  }
+
+  async getStickerPack(packId: string): Promise<QQStickerPack | null> {
+    const cached = this.stickerPacks.get(packId)
+    if (cached) return cached
+    await this.loadStickerPackCatalog()
+    const info = this.stickerPackInfo.get(packId)
+    if (!info) return null
+    const service = this.requireMsgService()
+    if (!service.fetchMarketEmoticonShowImage || !service.getMarketEmoticonPath) return null
+    const downloaded = await service.fetchMarketEmoticonShowImage({
+      epId: info.epId,
+      wordingId: String(info.wordingId),
+      type: info.tabType,
+      name: info.tabName,
+      valid: true,
+    })
+    if (downloaded.result !== 0) {
+      throw new Error(`fetchMarketEmoticonShowImage: ${downloaded.errMsg} (${downloaded.result})`)
+    }
+    const jsonPath = service.getMarketEmoticonPath(info.epId, [], 1).get(packId)?.path
+    if (!jsonPath || !existsSync(jsonPath)) throw new Error(`QQ sticker pack ${packId} has no detail JSON`)
+    const detail = JSON.parse(await readFile(jsonPath, 'utf8')) as {
+      isApng?: number
+      imgs?: Array<{ id?: string, name?: string, wWidthInPhone?: number, wHeightInPhone?: number }>
+    }
+    const rows = (detail.imgs ?? []).filter((item): item is {
+      id: string, name?: string, wWidthInPhone?: number, wHeightInPhone?: number
+    } => Boolean(item.id))
+    const ids = rows.map((item) => item.id)
+    const [staticPaths, dynamicPaths, keys] = await Promise.all([
+      Promise.resolve(service.getMarketEmoticonPath(info.epId, ids, 3)),
+      Promise.resolve(service.getMarketEmoticonPath(info.epId, ids, 5)),
+      service.getMarketEmoticonEncryptKeys?.(info.epId, ids),
+    ])
+    const keyMap = keys?.result === 0 ? keys.encryptKeyMap : new Map<string, string>()
+    const animated = detail.isApng === 1 || info.tabType === 3
+    const stickers = rows.map((item): QQSticker => {
+      const reference: QQStickerReference = {
+        kind: 'market', packageId: packId, stickerId: item.id,
+        name: item.name || info.tabName || '[表情]', key: keyMap.get(item.id) ?? '',
+        width: positiveInteger(item.wWidthInPhone, 240),
+        height: positiveInteger(item.wHeightInPhone, 240),
+        animated,
+        staticPath: staticPaths.get(item.id)?.path || undefined,
+        dynamicPath: dynamicPaths.get(item.id)?.path || undefined,
+      }
+      const sticker: QQSticker = {
+        stickerId: marketStickerId(packId, item.id), packId, title: item.name || info.tabName,
+        format: animated ? 'animated' : 'static',
+        mimeType: animated ? 'image/gif' : 'image/png',
+        width: reference.width, height: reference.height, version: 1, reference,
+      }
+      this.stickers.set(sticker.stickerId, sticker)
+      return sticker
+    })
+    const pack: QQStickerPack = {
+      packId, title: info.tabName || packId, version: 1, count: stickers.length, stickers,
+    }
+    this.stickerPacks.set(packId, pack)
+    return pack
+  }
+
+  async getSticker(stickerId: string): Promise<QQSticker | null> {
+    const cached = this.stickers.get(stickerId)
+    if (cached) return cached
+    const market = parseMarketStickerId(stickerId)
+    if (market) {
+      return (await this.getStickerPack(market.packageId))?.stickers
+        .find((item) => item.stickerId === stickerId) ?? null
+    }
+    if (stickerId.startsWith('favorite:')) {
+      let cursor: string | undefined
+      do {
+        const page = await this.getSavedStickers(cursor, 200)
+        const found = page.stickers.find((item) => item.stickerId === stickerId)
+        if (found) return found
+        cursor = page.nextCursor
+      } while (cursor)
+    }
+    return null
+  }
+
+  async getSavedStickers(cursor?: string, limit = 200): Promise<{
+    stickers: QQSticker[]
+    nextCursor?: string
+  }> {
+    const service = this.requireMsgService()
+    if (!service.fetchFavEmojiList) return { stickers: [] }
+    const result = await service.fetchFavEmojiList(cursor ?? '', clamp(limit, 1, 200), true, false)
+    if (result.result !== 0) throw new Error(`fetchFavEmojiList: ${result.errMsg} (${result.result})`)
+    const stickers = await mapConcurrent(result.emojiInfoList, 8, (item) => this.mapFavoriteSticker(item))
+    for (const sticker of stickers) this.stickers.set(sticker.stickerId, sticker)
+    return {
+      stickers,
+      nextCursor: stickers.length >= clamp(limit, 1, 200)
+        ? result.emojiInfoList.at(-1)?.resId || undefined
+        : undefined,
+    }
+  }
+
+  async openSticker(reference: QQStickerReference, offset = 0, limit?: number): Promise<{
+    stream: Readable
+    mimeType: string
+    size?: number
+  }> {
+    if (reference.kind === 'favorite') {
+      if (reference.path && existsSync(reference.path)) {
+        return {
+          stream: rangedFileStream(reference.path, false, offset, limit),
+          mimeType: imageMimeType(reference.path, reference.animated),
+          size: statSync(reference.path).size,
+        }
+      }
+      if (reference.locator) {
+        return {
+          stream: await this.openMedia(reference.locator, offset, limit),
+          mimeType: imageMimeType(reference.name, reference.animated),
+          size: reference.size,
+        }
+      }
+      throw new Error(`QQ favorite sticker file is missing: ${reference.resId}`)
+    }
+    const resolved = await this.resolveMarketStickerPath(reference)
+    return {
+      stream: rangedFileStream(resolved.path, resolved.encrypted, offset, limit),
+      mimeType: resolved.animated ? 'image/gif' : imageMimeType(resolved.path, false),
+      size: statSync(resolved.path).size,
+    }
+  }
+
+  async setSavedSticker(reference: QQStickerReference, saved: boolean): Promise<void> {
+    const service = this.requireMsgService()
+    if (!saved) {
+      if (!service.deleteFavEmoji) throw new Error('QQ favorite deletion is unavailable')
+      const resId = reference.kind === 'favorite'
+        ? reference.resId
+        : reference.favoriteResId ?? await this.findFavoriteResId(reference)
+      if (!resId) return
+      const result = await service.deleteFavEmoji([resId])
+      if (result.result !== 0) throw new Error(`deleteFavEmoji: ${result.errMsg} (${result.result})`)
+      return
+    }
+    if (!service.addFavEmoji) throw new Error('QQ favorite creation is unavailable')
+    const path = reference.kind === 'favorite'
+      ? reference.path || (reference.locator ? await this.downloadMedia(reference.locator) : '')
+      : (await this.resolveMarketStickerPath(reference)).path
+    if (!path) throw new Error('QQ sticker has no native file path')
+    const result = await service.addFavEmoji(reference.kind === 'market' ? {
+      emojiId: reference.stickerId, packageId: Number(reference.packageId), emojiPath: path,
+      fileSize: '0', fileName: '', md5: '', isMarkFace: true, isOrigin: false,
+    } : {
+      emojiId: '', packageId: 0, emojiPath: path,
+      fileSize: String(reference.size ?? (existsSync(path) ? statSync(path).size : 0)),
+      fileName: reference.name, md5: reference.md5 ?? '', isMarkFace: false, isOrigin: true,
+    })
+    if (result.result !== 0) throw new Error(`addFavEmoji: ${result.errMsg} (${result.result})`)
+  }
+
   async send(manifest: SendManifest, body: Readable): Promise<QQMessage> {
     const conversation = this.getConversation(manifest.conversationId)
     const elements: MsgElement[] = []
@@ -486,6 +667,25 @@ export class QQKernelBridge {
     const cleanup: string[] = []
     let preserveUntil: number | undefined
     try {
+      if (manifest.sticker && manifest.media?.length) throw new Error('a message cannot contain both sticker and media')
+      if (manifest.sticker?.kind === 'market') {
+        elements.push(marketFaceElement(manifest.sticker))
+      } else if (manifest.sticker?.kind === 'favorite') {
+        const stickerPath = manifest.sticker.path && existsSync(manifest.sticker.path)
+          ? manifest.sticker.path
+          : manifest.sticker.locator ? await this.downloadMedia(manifest.sticker.locator) : ''
+        if (!stickerPath) {
+          throw new Error(`QQ favorite sticker file is missing: ${manifest.sticker.resId}`)
+        }
+        const size = statSync(stickerPath).size
+        const prepared = await this.prepareImageElement(
+          stickerPath, manifest.sticker.name, size,
+          { width: manifest.sticker.width, height: manifest.sticker.height },
+        )
+        prepared.element.picElement!.picSubType = 1
+        if (prepared.owned) cleanup.push(prepared.path)
+        elements.push(prepared.element)
+      }
       if (manifest.media?.length) {
         if (manifest.media.length !== 1) throw new Error('the streaming endpoint accepts exactly one media item per request')
         const spec = manifest.media[0]
@@ -514,7 +714,7 @@ export class QQKernelBridge {
       } else {
         body.resume()
       }
-      if (!elements.length) throw new Error('message must contain text or media')
+      if (!elements.length) throw new Error('message must contain text, media, or sticker')
       const service = this.requireMsgService()
       const startedAt = Math.floor(Date.now() / 1000)
       let id = '0'
@@ -525,7 +725,7 @@ export class QQKernelBridge {
       }
       const pending = deferred<MsgRecord>()
       const accepted = deferred<void>()
-      const minimumStatus = manifest.media?.length ? 2 : 1
+      const minimumStatus = manifest.media?.length || manifest.sticker ? 2 : 1
       let wasAccepted = false
       void accepted.promise.then(() => { wasAccepted = true })
       if (id === '0') this.pendingUnassigned.push({
@@ -536,7 +736,7 @@ export class QQKernelBridge {
         startedAt,
         expectedText: manifest.text,
         expectedMediaName: manifest.media?.[0]?.name,
-        expectedMediaKind: manifest.media?.[0]?.kind,
+        expectedMediaKind: manifest.sticker ? 'sticker' : manifest.media?.[0]?.kind,
         originRequestId: manifest.originRequestId,
       })
       else {
@@ -574,7 +774,7 @@ export class QQKernelBridge {
         conversation,
         manifest.text,
         startedAt,
-        manifest.media?.[0]?.kind,
+        manifest.sticker ? 'sticker' : manifest.media?.[0]?.kind,
         manifest.media?.[0]?.name,
         minimumStatus,
         pollController.signal,
@@ -1357,7 +1557,7 @@ export class QQKernelBridge {
           && (!item.expectedText || record.elements.some((element) =>
             element.textElement?.content === item.expectedText))
           && (!item.expectedMediaKind || record.elements.some((element) =>
-            item.expectedMediaKind === 'image' ? Boolean(element.picElement) : Boolean(element.fileElement)))
+            matchesElementKind(element, item.expectedMediaKind!)))
           && (!item.expectedMediaName || record.elements.some((element) =>
             element.fileElement?.fileName === item.expectedMediaName
             || element.picElement?.fileName === item.expectedMediaName)
@@ -1471,7 +1671,7 @@ export class QQKernelBridge {
     conversation: QQConversation,
     expectedText: string | undefined,
     startedAt: number,
-    expectedMediaKind: 'image' | 'file' | undefined,
+    expectedMediaKind: 'image' | 'file' | 'sticker' | undefined,
     expectedMediaName: string | undefined,
     minimumStatus: number,
     signal: AbortSignal,
@@ -1499,7 +1699,7 @@ export class QQKernelBridge {
         && (expectedText === undefined || record.elements.some((element) =>
           element.textElement?.content === expectedText))
         && (expectedMediaKind === undefined || record.elements.some((element) =>
-          expectedMediaKind === 'image' ? Boolean(element.picElement) : Boolean(element.fileElement)))
+          matchesElementKind(element, expectedMediaKind)))
         && (expectedMediaName === undefined || expectedMediaKind === 'image' || record.elements.some((element) =>
           element.fileElement?.fileName === expectedMediaName)))
       if (found?.sendStatus === 0) throw new Error(`QQ send failed: ${found.msgId}`)
@@ -1710,7 +1910,11 @@ export class QQKernelBridge {
   private mapMessage(record: MsgRecord): QQMessage {
     const parts: QQMessage['parts'] = []
     for (const element of record.elements ?? []) {
-      if (element.elementType === ELEMENT_TEXT && element.textElement?.content) {
+      const sticker = mapSticker(record, element)
+      if (sticker) {
+        this.stickers.set(sticker.stickerId, sticker)
+        parts.push({ type: 'sticker', sticker })
+      } else if (element.elementType === ELEMENT_TEXT && element.textElement?.content) {
         parts.push({ type: 'text', text: element.textElement.content })
       } else {
         const media = mapMedia(record, element)
@@ -2068,6 +2272,131 @@ export class QQKernelBridge {
       return
     }
   }
+
+  private async loadStickerPackCatalog(): Promise<void> {
+    if (this.stickerPackInfo.size) return
+    const service = this.requireMsgService()
+    if (!service.fetchMarketEmoticonList) return
+    let timestamp = 0
+    let segment = 0
+    for (let page = 0; page < 100; page++) {
+      const result = await service.fetchMarketEmoticonList(timestamp, segment)
+      if (result.result !== 0) throw new Error(`fetchMarketEmoticonList: ${result.errMsg} (${result.result})`)
+      const tab = result.marketEmoticonInfo.roamEmojiTab
+      for (const item of [
+        ...(tab.ordinaryTabinfoList ?? []),
+        ...(tab.magicTabinfoList ?? []),
+        ...(tab.smallTabinfoList ?? []),
+      ]) this.stickerPackInfo.set(String(item.epId), item)
+      timestamp = tab.timesTamp
+      if (tab.segmentFlag === -1) return
+      if (tab.segmentFlag === segment && page > 0) throw new Error('QQ sticker pack pagination did not advance')
+      segment = tab.segmentFlag
+    }
+    throw new Error('QQ sticker pack pagination exceeded 100 pages')
+  }
+
+  private async mapFavoriteSticker(item: CustomEmotionData): Promise<QQSticker> {
+    const service = this.requireMsgService()
+    if (item.isMarkFace && item.epId && item.eId) {
+      const packageId = item.epId
+      const epId = Number(packageId)
+      const [details, keys] = await Promise.all([
+        service.getFavMarketEmoticonInfo?.(epId, item.eId),
+        service.getMarketEmoticonEncryptKeys?.(epId, [item.eId]),
+      ])
+      const info = details?.result === 0 ? details.favMarketEmoticonInfo : undefined
+      const animated = item.isAPNG || extname(item.emoOriginalPath || item.emoPath).toLowerCase() === '.gif'
+      const reference: QQStickerReference = {
+        kind: 'market', packageId, stickerId: item.eId,
+        name: info?.faceName || item.desc || '[表情]',
+        key: keys?.result === 0 ? keys.encryptKeyMap.get(item.eId) ?? '' : '',
+        width: positiveInteger(info?.width, 240), height: positiveInteger(info?.height, 240),
+        animated,
+        staticPath: item.thumbPath || item.emoPath || undefined,
+        dynamicPath: item.emoOriginalPath || item.emoPath || undefined,
+        favoriteResId: item.resId,
+      }
+      return {
+        stickerId: marketStickerId(packageId, item.eId), packId: packageId,
+        title: reference.name, format: animated ? 'animated' : 'static',
+        mimeType: animated ? 'image/gif' : imageMimeType(reference.staticPath ?? '', false),
+        width: reference.width, height: reference.height, version: 1, reference,
+      }
+    }
+    const path = [item.emoOriginalPath, item.emoPath, item.thumbPath].find((value) => value && existsSync(value))
+      ?? (item.emoOriginalPath || item.emoPath || item.thumbPath)
+    const animated = item.isAPNG || /\.(?:gif|apng)$/i.test(path)
+    const dimensions = path && existsSync(path) ? await imageFileDimensions(path) : undefined
+    const reference: QQStickerReference = {
+      kind: 'favorite', resId: item.resId, path,
+      name: basename(path) || `${item.resId}.${animated ? 'gif' : 'png'}`,
+      md5: item.md5 || undefined,
+      size: path && existsSync(path) ? statSync(path).size : undefined,
+      width: dimensions?.width, height: dimensions?.height, animated,
+    }
+    return {
+      stickerId: favoriteStickerId(item.resId), title: item.desc || undefined,
+      format: animated ? 'animated' : 'static', mimeType: imageMimeType(path, animated),
+      width: dimensions?.width, height: dimensions?.height, size: reference.size,
+      version: 1, reference,
+    }
+  }
+
+  private async resolveMarketStickerPath(reference: Extract<QQStickerReference, { kind: 'market' }>): Promise<{
+    path: string
+    encrypted: boolean
+    animated: boolean
+  }> {
+    if (reference.animated && reference.dynamicPath && existsSync(reference.dynamicPath)) {
+      return { path: reference.dynamicPath, encrypted: true, animated: true }
+    }
+    const service = this.requireMsgService()
+    const epId = Number(reference.packageId)
+    const dynamic = service.getMarketEmoticonPath?.(epId, [reference.stickerId], 5).get(reference.stickerId)
+    if (reference.animated && dynamic?.isExist && dynamic.path && existsSync(dynamic.path)) {
+      reference.dynamicPath = dynamic.path
+      return { path: dynamic.path, encrypted: true, animated: true }
+    }
+    if (service.fetchMarketEmoticonAioImage) {
+      const result = await service.fetchMarketEmoticonAioImage({
+        epId, eId: reference.stickerId, name: reference.name, encryptKey: reference.key,
+        width: reference.width, height: reference.height, jobType: reference.animated ? 1 : 0,
+      })
+      if (result.result !== 0) throw new Error(`fetchMarketEmoticonAioImage: ${result.errMsg} (${result.result})`)
+      const downloaded = service.getMarketEmoticonPath?.(epId, [reference.stickerId], 5).get(reference.stickerId)
+      if (reference.animated && downloaded?.path && existsSync(downloaded.path)) {
+        reference.dynamicPath = downloaded.path
+        return { path: downloaded.path, encrypted: true, animated: true }
+      }
+    }
+    const staticPath = reference.staticPath
+      || service.getMarketEmoticonPath?.(epId, [reference.stickerId], 4).get(reference.stickerId)?.path
+      || service.getMarketEmoticonPath?.(epId, [reference.stickerId], 3).get(reference.stickerId)?.path
+    if (!staticPath || !existsSync(staticPath)) {
+      throw new Error(`QQ market sticker file is missing: ${reference.packageId}/${reference.stickerId}`)
+    }
+    reference.staticPath = staticPath
+    return { path: staticPath, encrypted: false, animated: false }
+  }
+
+  private async findFavoriteResId(
+    reference: Extract<QQStickerReference, { kind: 'market' }>,
+  ): Promise<string | undefined> {
+    const service = this.requireMsgService()
+    if (!service.fetchFavEmojiList) return
+    let cursor = ''
+    for (let page = 0; page < 20; page++) {
+      const result = await service.fetchFavEmojiList(cursor, 200, true, false)
+      if (result.result !== 0) throw new Error(`fetchFavEmojiList: ${result.errMsg} (${result.result})`)
+      const found = result.emojiInfoList.find((item) =>
+        item.isMarkFace && item.epId === reference.packageId && item.eId === reference.stickerId)
+      if (found) return found.resId
+      const next = result.emojiInfoList.at(-1)?.resId
+      if (result.emojiInfoList.length < 200 || !next || next === cursor) return
+      cursor = next
+    }
+  }
 }
 
 function contact(conversation: QQConversation) {
@@ -2079,6 +2408,28 @@ function textElement(text: string): MsgElement {
     elementType: ELEMENT_TEXT,
     elementId: '',
     textElement: { content: text, atType: 0, atUid: '', atTinyId: '', atNtUid: '' } as never,
+  }
+}
+
+function marketFaceElement(reference: Extract<QQStickerReference, { kind: 'market' }>): MsgElement {
+  return {
+    elementType: ELEMENT_MARKET_FACE,
+    elementId: '',
+    marketFaceElement: {
+      itemType: 6,
+      faceInfo: 1,
+      emojiPackageId: Number(reference.packageId),
+      subType: 3,
+      mediaType: 0,
+      imageWidth: reference.width,
+      imageHeight: reference.height,
+      faceName: reference.name.startsWith('[') ? reference.name : `[${reference.name}]`,
+      emojiId: reference.stickerId,
+      key: reference.key,
+      emojiType: reference.animated ? 2 : 1,
+      staticFacePath: reference.staticPath,
+      dynamicFacePath: reference.dynamicPath,
+    },
   }
 }
 
@@ -2187,6 +2538,46 @@ function mapMedia(record: MsgRecord, element: MsgElement): QQMedia | undefined {
   }
 }
 
+function mapSticker(record: MsgRecord, element: MsgElement): QQSticker | undefined {
+  const market = element.marketFaceElement
+  if (element.elementType === ELEMENT_MARKET_FACE && market?.emojiId) {
+    const packageId = String(market.emojiPackageId)
+    const animated = market.emojiType === 2 || Boolean(market.dynamicFacePath)
+    const reference: QQStickerReference = {
+      kind: 'market', packageId, stickerId: market.emojiId,
+      name: market.faceName?.replace(/^\[|\]$/g, '') || '[表情]', key: market.key ?? '',
+      width: positiveInteger(market.imageWidth, 240),
+      height: positiveInteger(market.imageHeight, 240),
+      animated, staticPath: market.staticFacePath, dynamicPath: market.dynamicFacePath,
+    }
+    return {
+      stickerId: marketStickerId(packageId, market.emojiId), packId: packageId,
+      title: reference.name, format: animated ? 'animated' : 'static',
+      mimeType: animated ? 'image/gif' : 'image/png',
+      width: reference.width, height: reference.height, version: 1, reference,
+    }
+  }
+  const picture = element.picElement
+  if (!picture || ![1, 2, 13].includes(picture.picSubType ?? 0)) return
+  const media = mapMedia(record, element)
+  if (!media) return
+  const animated = [2000, 2001].includes(picture.picType ?? 0) || /\.(?:gif|apng)$/i.test(picture.fileName)
+  const resId = picture.md5HexStr || element.elementId || `${record.msgId}:image`
+  const reference: QQStickerReference = {
+    kind: 'favorite', resId,
+    path: picture.sourcePath || [...(picture.thumbPath?.values() ?? [])][0] || '',
+    name: picture.fileName || `${resId}.${animated ? 'gif' : 'png'}`,
+    md5: picture.md5HexStr || undefined,
+    size: numberOrUndefined(picture.fileSize), width: picture.picWidth || undefined,
+    height: picture.picHeight || undefined, animated, locator: media.locator,
+  }
+  return {
+    stickerId: favoriteStickerId(resId), format: animated ? 'animated' : 'static',
+    mimeType: imageMimeType(picture.fileName, animated), width: reference.width,
+    height: reference.height, size: reference.size, version: 1, reference,
+  }
+}
+
 function mapMember(info: MemberInfo): MemberPage['members'][number] {
   return {
     user: {
@@ -2219,6 +2610,63 @@ function clamp(value: number, min: number, max: number): number {
 function numberOrUndefined(value?: string): number | undefined {
   const parsed = Number(value)
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined
+}
+
+function positiveInteger(value: number | undefined, fallback: number): number {
+  return Number.isSafeInteger(value) && value! > 0 ? value! : fallback
+}
+
+function marketStickerId(packageId: string, stickerId: string): string {
+  return `market:${packageId}:${stickerId}`
+}
+
+function parseMarketStickerId(value: string): { packageId: string, stickerId: string } | undefined {
+  if (!value.startsWith('market:')) return
+  const separator = value.indexOf(':', 'market:'.length)
+  if (separator < 0) return
+  return { packageId: value.slice('market:'.length, separator), stickerId: value.slice(separator + 1) }
+}
+
+function favoriteStickerId(resId: string): string {
+  return `favorite:${resId}`
+}
+
+function matchesElementKind(element: MsgElement, kind: 'image' | 'file' | 'sticker'): boolean {
+  if (kind === 'file') return Boolean(element.fileElement)
+  if (kind === 'sticker') {
+    return Boolean(element.marketFaceElement) || Boolean(
+      element.picElement && [1, 2, 13].includes(element.picElement.picSubType ?? 0),
+    )
+  }
+  return Boolean(element.picElement)
+}
+
+function imageMimeType(path: string, animated: boolean): string {
+  const extension = extname(path).toLowerCase()
+  if (extension === '.gif') return 'image/gif'
+  if (extension === '.webp') return 'image/webp'
+  if (extension === '.jpg' || extension === '.jpeg') return 'image/jpeg'
+  if (extension === '.bmp') return 'image/bmp'
+  return animated ? 'image/png' : 'image/png'
+}
+
+function rangedFileStream(path: string, encrypted: boolean, offset: number, limit?: number): Readable {
+  const size = statSync(path).size
+  const start = Math.min(size, Math.max(0, Math.trunc(offset)))
+  const requested = limit === undefined ? size - start : Math.max(0, Math.trunc(limit))
+  if (!requested || start >= size) return Readable.from([])
+  const end = Math.min(size - 1, start + requested - 1)
+  if (!encrypted) return createReadStream(path, { start, end })
+  return Readable.from((async function* () {
+    let position = start
+    for await (const source of createReadStream(path, { start, end })) {
+      const chunk = Buffer.from(source)
+      for (let index = 0; index < chunk.length; index++, position++) {
+        if (position % 50 < 20) chunk[index] = ~chunk[index]!
+      }
+      yield chunk
+    }
+  })())
 }
 
 function safeExtension(name: string): string {
@@ -2328,7 +2776,9 @@ function receivedMessageSummary(conversation: QQConversation, message: QQMessage
   const content = message.parts.length
     ? message.parts.map((part) => part.type === 'text'
       ? JSON.stringify(truncateLogText(part.text))
-      : `[${part.media.kind === 'image' ? 'image' : 'file'} name=${JSON.stringify(part.media.name || '')} size=${part.media.size ?? '?'}]`)
+      : part.type === 'sticker'
+        ? `[sticker id=${JSON.stringify(part.sticker.stickerId)}]`
+        : `[${part.media.kind === 'image' ? 'image' : 'file'} name=${JSON.stringify(part.media.name || '')} size=${part.media.size ?? '?'}]`)
       .join(' ')
     : '[empty]'
   return `received message conversation=${JSON.stringify(conversation.title)}(${conversation.id}) sender=${JSON.stringify(sender)}(${senderId}) seq=${message.msgSeq ?? ''} id=${message.id} content=${content}`

@@ -72,7 +72,10 @@ export interface MsgElement {
     fileBizId?: number
     originImageUrl?: string
     thumbPath?: Map<number, string>
+    picSubType?: number
+    picType?: number
   }
+  marketFaceElement?: MarketFaceElement
   fileElement?: {
     fileMd5: string
     fileName: string
@@ -85,6 +88,44 @@ export interface MsgElement {
     fileSubId: string
     fileBizId?: number
   }
+}
+
+export interface MarketFaceElement {
+  itemType: number
+  faceInfo: number
+  emojiPackageId: number
+  subType: number
+  mediaType: number
+  imageWidth: number
+  imageHeight: number
+  faceName?: string
+  emojiId?: string
+  key?: string
+  emojiType?: number
+  staticFacePath?: string
+  dynamicFacePath?: string
+}
+
+export interface CustomEmotionData {
+  emoPath: string
+  isExist: boolean
+  resId: string
+  url: string
+  md5: string
+  emoOriginalPath: string
+  thumbPath: string
+  isAPNG: boolean
+  isMarkFace: boolean
+  eId: string
+  epId: string
+  desc: string
+}
+
+export interface MarketStickerPackInfo {
+  epId: number
+  wordingId: number
+  tabType: number
+  tabName: string
 }
 
 export interface MsgRecord {
@@ -183,6 +224,64 @@ export interface KernelMsgService {
     emojiType: string,
     setEmoji: boolean,
   ): Promise<{ result: number, errMsg: string }>
+  fetchFavEmojiList?(
+    resId: string, count: number, backwardFetch: boolean, forceRefresh: boolean,
+  ): Promise<{ result: number, errMsg: string, emojiInfoList: CustomEmotionData[] }>
+  addFavEmoji?(request: {
+    emojiId: string
+    packageId: number
+    emojiPath: string
+    fileSize: string
+    fileName: string
+    md5: string
+    isMarkFace: boolean
+    isOrigin: boolean
+  }): Promise<{ result: number, errMsg: string, isExist: number }>
+  deleteFavEmoji?(resIds: string[]): Promise<{ result: number, errMsg: string }>
+  fetchMarketEmoticonList?(timeStamp: number, segmentFlag: number): Promise<{
+    result: number
+    errMsg: string
+    marketEmoticonInfo: {
+      roamEmojiTab: {
+        timesTamp: number
+        segmentFlag: number
+        ordinaryTabinfoList: MarketStickerPackInfo[]
+        magicTabinfoList: MarketStickerPackInfo[]
+        smallTabinfoList: MarketStickerPackInfo[]
+        epIds: number[]
+      }
+    }
+  }>
+  fetchMarketEmoticonShowImage?(request: {
+    epId: number
+    wordingId: string
+    type: number
+    name: string
+    valid: boolean
+  }): Promise<{ result: number, errMsg: string }>
+  fetchMarketEmoticonAioImage?(request: {
+    epId: number
+    eId: string
+    name: string
+    encryptKey: string
+    width: number
+    height: number
+    jobType: number
+  }): Promise<{ result: number, errMsg: string }>
+  getMarketEmoticonPath?(
+    epId: number, eIds: string[], serviceType: number,
+  ): Map<string, { isExist: boolean, path: string }>
+  getMarketEmoticonEncryptKeys?(
+    epId: number, eIds: string[],
+  ): Promise<{ result: number, errMsg: string, encryptKeyMap: Map<string, string> }>
+  getFavMarketEmoticonInfo?(
+    epId: number, eId: string,
+  ): Promise<{ result: number, errMsg: string, favMarketEmoticonInfo: {
+    eId: string
+    width: number
+    height: number
+    faceName: string
+  } }>
 }
 
 export interface KernelRecentService {
