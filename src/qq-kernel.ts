@@ -409,7 +409,8 @@ export class QQKernelBridge {
       throw new Error(`getMsgs: ${response.errMsg} (${response.result})`)
     }
     log('info', `native API complete name=history conversation=${conversation.id} result=${response.result} err=${JSON.stringify(response.errMsg)} messages=${response.msgList.length}`)
-    const messages = response.msgList.map((record) => this.mapMessage(record))
+    const visibleRecords = response.msgList.filter((record) => !isRecalledRecord(record))
+    const messages = visibleRecords.map((record) => this.mapMessage(record))
     for (const message of messages) this.rememberMessage(message)
     if (!messages.length && !query.beforeId && !query.afterId && !query.cursor) {
       const cached = this.messages.get(conversation.id) ?? []
@@ -494,7 +495,8 @@ export class QQKernelBridge {
     const response = await retryTransientInvalidArgument(() => service.getMsgsByMsgId(peer, [id]))
     log('info', `native API complete name=getMsgsByMsgId conversation=${conversation.id} message=${id} result=${response.result} err=${JSON.stringify(response.errMsg)} records=${response.msgList.length}`)
     if (response.result !== 0) throw new Error(`getMsgsByMsgId: ${response.errMsg} (${response.result})`)
-    return response.msgList[0] ?? null
+    const record = response.msgList[0]
+    return record && !isRecalledRecord(record) ? record : null
   }
 
   async getStickerPacks(cursor?: string, limit = 100): Promise<{
@@ -1673,7 +1675,7 @@ export class QQKernelBridge {
       this.rememberRecordSender(record)
       const outgoing = record.senderUid === this.config?.selfUid || SEND_FROM_SELF.has(record.sendType)
       log('info', `native message event source=${source} id=${record.msgId} seq=${record.msgSeq ?? ''} peer=${record.peerUid} chatType=${record.chatType} outgoing=${outgoing} status=${record.sendStatus} elements=${record.elements?.length ?? 0} reactions=${record.emojiLikesList?.length ?? 0}`)
-      if (record.elements?.some((element) => element.grayTipElement?.revokeElement)) {
+      if (isRecalledRecord(record)) {
         this.onDelete(record.chatType, record.peerUid, [record.msgId])
         continue
       }
@@ -2129,6 +2131,10 @@ export class QQKernelBridge {
       } else {
         const media = mapMedia(record, element)
         if (media) parts.push({ type: 'media', media })
+        else {
+          const fallback = fallbackElementText(element)
+          if (fallback) parts.push({ type: 'text', text: fallback })
+        }
       }
     }
     return {
@@ -3106,6 +3112,114 @@ function recordTextContent(record: MsgRecord): string {
     element.textElement?.content
     ?? element.faceElement?.faceText
     ?? '').join('')
+}
+
+function isRecalledRecord(record: MsgRecord): boolean {
+  return record.elements?.some((element) => element.grayTipElement?.revokeElement) ?? false
+}
+
+function fallbackElementText(element: MsgElement): string {
+  if (element.pttElement) {
+    const transcript = element.pttElement.text?.trim()
+    return transcript ? `[语音] ${transcript}` : element.pttElement.duration > 0
+      ? `[语音 ${element.pttElement.duration}秒]`
+      : '[语音]'
+  }
+  if (element.videoElement) return element.videoElement.fileName
+    ? `[视频] ${element.videoElement.fileName}`
+    : '[视频]'
+  if (element.markdownElement?.content) return element.markdownElement.content
+  if (element.arkElement?.bytesData) {
+    const summary = structuredContentSummary(element.arkElement.bytesData)
+    return summary || '[卡片消息]'
+  }
+  if (element.grayTipElement) {
+    return element.grayTipElement.jsonGrayTipElement?.recentAbstract
+      || structuredContentSummary(element.grayTipElement.jsonGrayTipElement?.jsonStr)
+      || xmlText(element.grayTipElement.xmlElement?.content)
+      || element.grayTipElement.feedMsgElement?.content
+      || (element.grayTipElement.fileReceiptElement?.fileName
+        ? `[文件回执] ${element.grayTipElement.fileReceiptElement.fileName}` : '')
+      || '[系统消息]'
+  }
+  const xml = element.structLongMsgElement?.xmlContent || element.structMsgElement?.xmlContent
+  if (xml) return xmlText(xml) || '[结构化消息]'
+  if (element.giphyElement) return '[GIF]'
+  if (element.walletElement) return element.walletElement.name || '[红包/转账]'
+  if (element.liveGiftElement) {
+    const count = element.liveGiftElement.kUInt64GiftNum
+    return `[礼物] ${element.liveGiftElement.kStrGiftName}${count ? ` ×${count}` : ''}`
+  }
+  if (element.textGiftElement) return `[礼物] ${element.textGiftElement.giftName}`
+  if (element.calendarElement) {
+    return [element.calendarElement.summary, element.calendarElement.msg].filter(Boolean).join(' ')
+      || '[日程]'
+  }
+  if (element.avRecordElement) {
+    return element.avRecordElement.text || (element.avRecordElement.time
+      ? `[通话 ${element.avRecordElement.time}]` : '[通话]')
+  }
+  if (element.faceBubbleElement) {
+    return element.faceBubbleElement.content || element.faceBubbleElement.faceSummary
+      || element.faceBubbleElement.oldVersionStr || '[互动表情]'
+  }
+  if (element.shareLocationElement) return element.shareLocationElement.text || '[位置]'
+  if (element.tofuRecordElement) {
+    const text = [element.tofuRecordElement.descriptionContent, ...(element.tofuRecordElement.contentlist ?? [])]
+      .map((item) => item?.title).filter(Boolean).join(' ')
+    return text || '[应用消息]'
+  }
+  if (element.inlineKeyboardElement) {
+    const labels = element.inlineKeyboardElement.rows.flatMap((row) => row.buttons.map((button) => button.label))
+    return labels.length ? `[按钮] ${labels.join(' / ')}` : '[交互按钮]'
+  }
+  return `[暂不支持的消息 ${element.elementType}]`
+}
+
+function structuredContentSummary(value: string | undefined): string {
+  if (!value) return ''
+  try {
+    const parsed = JSON.parse(value) as unknown
+    const preferred = findStructuredString(parsed, new Set([
+      'prompt', 'desc', 'description', 'summary', 'title', 'text', 'content', 'brief',
+    ]))
+    return preferred || ''
+  } catch {
+    return xmlText(value)
+  }
+}
+
+function findStructuredString(value: unknown, preferredKeys: Set<string>, depth = 0): string {
+  if (depth > 5 || value === null || value === undefined) return ''
+  if (typeof value === 'string') return value.trim()
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findStructuredString(item, preferredKeys, depth + 1)
+      if (found) return found
+    }
+    return ''
+  }
+  if (typeof value !== 'object') return ''
+  const entries = Object.entries(value as Record<string, unknown>)
+  for (const [key, item] of entries) {
+    if (!preferredKeys.has(key.toLowerCase())) continue
+    const found = findStructuredString(item, preferredKeys, depth + 1)
+    if (found) return found
+  }
+  for (const [, item] of entries) {
+    const found = findStructuredString(item, preferredKeys, depth + 1)
+    if (found) return found
+  }
+  return ''
+}
+
+function xmlText(value: string | undefined): string {
+  if (!value) return ''
+  const attribute = /\b(?:summary|brief|title|desc)=(?:"([^"]+)"|'([^']+)')/i.exec(value)
+  const text = attribute?.[1] || attribute?.[2]
+    || value.replace(/<[^>]+>/g, ' ').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+      .replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+  return text.replace(/\s+/g, ' ').trim()
 }
 
 function summarizeCallbackArgs(args: unknown[]): string {

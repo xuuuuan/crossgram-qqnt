@@ -372,6 +372,39 @@ describe('QQKernelBridge', () => {
     })
   })
 
+  it('hides recalled records from history and renders unsupported elements as text fallbacks', async () => {
+    const f = fixture()
+    f.msg.getLatestDbMsgs.mockResolvedValueOnce({
+      result: 0, errMsg: '', msgList: [
+        { ...f.message, msgId: 'recalled', elements: [{
+          elementType: 8, elementId: 'revoke', grayTipElement: { revokeElement: {
+            operatorUid: 'peer', origMsgSenderUid: 'peer', isSelfOperate: false, wording: '',
+          } },
+        }] },
+        { ...f.message, msgId: 'fallbacks', elements: [
+          { elementType: 4, elementId: 'voice', pttElement: { duration: 3, text: '转写内容' } },
+          { elementType: 5, elementId: 'video', videoElement: { fileName: 'clip.mp4', fileTime: 4 } },
+          { elementType: 10, elementId: 'ark', arkElement: {
+            bytesData: JSON.stringify({ meta: { news: { title: '卡片标题' } } }),
+          } },
+          { elementType: 14, elementId: 'markdown', markdownElement: { content: '**Markdown**' } },
+          { elementType: 999, elementId: 'unknown' },
+        ] },
+      ],
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const history = await bridge.getHistory(bridge.getConversation('uid-1715311957'))
+    expect(history.messages).toHaveLength(1)
+    expect(history.messages[0]).toMatchObject({ id: 'fallbacks', parts: [
+      { type: 'text', text: '[语音] 转写内容' },
+      { type: 'text', text: '[视频] clip.mp4' },
+      { type: 'text', text: '卡片标题' },
+      { type: 'text', text: '**Markdown**' },
+      { type: 'text', text: '[暂不支持的消息 999]' },
+    ] })
+  })
+
   it('uses one batch unread lookup and loads only the opened chat around its unread boundary', async () => {
     const f = fixture()
     const previous = { ...f.message, msgId: 'm0', msgSeq: 'seq0', msgTime: '1799999999' }

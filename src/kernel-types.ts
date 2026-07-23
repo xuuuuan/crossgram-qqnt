@@ -95,7 +95,30 @@ export interface MsgElement {
       isSelfOperate: boolean
       wording: string
     }
+    jsonGrayTipElement?: { recentAbstract: string, jsonStr: string }
+    xmlElement?: { content: string }
+    fileReceiptElement?: { fileName: string }
+    feedMsgElement?: { content: string }
   }
+  pttElement?: { duration: number, text?: string }
+  videoElement?: { fileName: string, fileTime: number }
+  arkElement?: { bytesData: string }
+  markdownElement?: { content: string }
+  structLongMsgElement?: { xmlContent?: string, resId?: string }
+  structMsgElement?: { xmlContent?: string }
+  giphyElement?: { id: string }
+  walletElement?: { name: string }
+  liveGiftElement?: { kStrGiftName: string, kUInt64GiftNum: string }
+  textGiftElement?: { giftName: string }
+  calendarElement?: { summary: string, msg: string }
+  avRecordElement?: { text: string, time: string }
+  faceBubbleElement?: { content?: string, faceSummary?: string, oldVersionStr?: string }
+  shareLocationElement?: { text?: string }
+  tofuRecordElement?: {
+    descriptionContent?: { title?: string }
+    contentlist?: Array<{ title?: string }>
+  }
+  inlineKeyboardElement?: { rows: Array<{ buttons: Array<{ label: string }> }> }
   picElement?: {
     fileName: string
     fileSize: string
