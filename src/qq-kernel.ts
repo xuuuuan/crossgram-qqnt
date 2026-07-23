@@ -2337,6 +2337,7 @@ export class QQKernelBridge {
     if (!service.fetchMarketEmoticonList) return
     let timestamp = 0
     let segment = 0
+    let sameSegmentTimes = 0
     for (let page = 0; page < 100; page++) {
       const result = await service.fetchMarketEmoticonList(timestamp, segment)
       if (result.result !== 0) throw new Error(`fetchMarketEmoticonList: ${result.errMsg} (${result.result})`)
@@ -2348,7 +2349,11 @@ export class QQKernelBridge {
       ]) this.stickerPackInfo.set(String(item.epId), item)
       timestamp = tab.timesTamp
       if (tab.segmentFlag === -1) return
-      if (tab.segmentFlag === segment && page > 0) throw new Error('QQ sticker pack pagination did not advance')
+      sameSegmentTimes = tab.segmentFlag === segment ? sameSegmentTimes + 1 : 0
+      // Current QQ clients accept several pages with the same segment marker. The
+      // timestamp still advances, while the marker may only change after a batch.
+      // Match their bounded retry behavior so a stuck native response cannot loop.
+      if (sameSegmentTimes >= 4) return
       segment = tab.segmentFlag
     }
     throw new Error('QQ sticker pack pagination exceeded 100 pages')

@@ -539,6 +539,40 @@ describe('QQKernelBridge', () => {
     expect(sent.parts).toMatchObject([{ type: 'sticker', sticker: { stickerId: 'market:42:emoji-a' } }])
   })
 
+  it('accepts repeated sticker catalog segment markers like the QQ client', async () => {
+    const f = fixture()
+    f.msg.fetchMarketEmoticonList
+      .mockResolvedValueOnce({
+        result: 0, errMsg: '', marketEmoticonInfo: { roamEmojiTab: {
+          timesTamp: 1, segmentFlag: 0,
+          ordinaryTabinfoList: [{ epId: 41, wordingId: 0, tabType: 0, tabName: 'First' }],
+          magicTabinfoList: [], smallTabinfoList: [], epIds: [41],
+        } },
+      })
+      .mockResolvedValueOnce({
+        result: 0, errMsg: '', marketEmoticonInfo: { roamEmojiTab: {
+          timesTamp: 2, segmentFlag: 0,
+          ordinaryTabinfoList: [{ epId: 42, wordingId: 0, tabType: 0, tabName: 'Second' }],
+          magicTabinfoList: [], smallTabinfoList: [], epIds: [42],
+        } },
+      })
+      .mockResolvedValueOnce({
+        result: 0, errMsg: '', marketEmoticonInfo: { roamEmojiTab: {
+          timesTamp: 3, segmentFlag: -1,
+          ordinaryTabinfoList: [{ epId: 43, wordingId: 0, tabType: 0, tabName: 'Last' }],
+          magicTabinfoList: [], smallTabinfoList: [], epIds: [43],
+        } },
+      })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.getStickerPacks()).resolves.toMatchObject({
+      packs: [{ packId: '41' }, { packId: '42' }, { packId: '43' }],
+    })
+    expect(f.msg.fetchMarketEmoticonList).toHaveBeenNthCalledWith(2, 1, 0)
+    expect(f.msg.fetchMarketEmoticonList).toHaveBeenNthCalledWith(3, 2, 0)
+  })
+
   it('lists and mutates QQ favorite stickers through the native collection', async () => {
     const f = fixture()
     const directory = await mkdtemp(join(tmpdir(), 'qqnt-favorite-sticker-'))
