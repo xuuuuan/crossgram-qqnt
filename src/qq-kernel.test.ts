@@ -51,6 +51,9 @@ function fixture() {
     getMsgsBySeqAndCount: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [message] })),
     getMsgsByMsgId: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [message] })),
     setMsgEmojiLikes: vi.fn(async () => ({ result: 0, errMsg: '' })),
+    getMsgEmojiLikesList: vi.fn(async () => ({
+      result: 0, errMsg: '', emojiLikesList: [], cookie: '', isLastPage: true, isFirstPage: true,
+    })),
     fetchFavEmojiList: vi.fn(async () => ({ result: 0, errMsg: '', emojiInfoList: [] })),
     addFavEmoji: vi.fn(async () => ({ result: 0, errMsg: '', isExist: 0 })),
     deleteFavEmoji: vi.fn(async () => ({ result: 0, errMsg: '' })),
@@ -974,6 +977,50 @@ describe('QQKernelBridge', () => {
     })
     const state = await bridge.getMessageReactions(conversation, 'm1')
     expect(state).not.toHaveProperty('available')
+  })
+
+  it('loads and exposes the users behind each reaction', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const conversation = await bridge.resolveConversation(2, '1058754719')
+    const groupMessage = {
+      ...f.message,
+      chatType: 2 as const,
+      peerUid: '1058754719',
+      peerUin: '1058754719',
+      emojiLikesList: [{ emojiType: '2', emojiId: '128522', likesCnt: '3', isClicked: false }],
+    }
+    f.msg.getMsgsByMsgId.mockResolvedValue({ result: 0, errMsg: '', msgList: [groupMessage] })
+    f.msg.getMsgEmojiLikesList
+      .mockResolvedValueOnce({
+        result: 0, errMsg: '', cookie: 'next', isFirstPage: true, isLastPage: false,
+        emojiLikesList: [
+          { tinyId: 'actor-a', nickName: 'Alice', headUrl: 'https://example.com/a.jpg' },
+          { tinyId: 'actor-b', nickName: 'Bob', headUrl: '' },
+        ],
+      })
+      .mockResolvedValueOnce({
+        result: 0, errMsg: '', cookie: 'done', isFirstPage: false, isLastPage: true,
+        emojiLikesList: [
+          { tinyId: 'actor-b', nickName: 'Bob', headUrl: '' },
+          { tinyId: 'actor-c', nickName: 'Carol', headUrl: '' },
+        ],
+      })
+
+    await expect(bridge.getMessageReactions(conversation, 'm1')).resolves.toMatchObject({
+      reactions: [{
+        key: '2:128522', count: 3,
+        recentActors: [{ userId: 'actor-a' }, { userId: 'actor-b' }, { userId: 'actor-c' }],
+      }],
+    })
+    expect(f.msg.getMsgEmojiLikesList.mock.calls).toEqual([
+      [expect.objectContaining({ peerUid: '1058754719' }), 'seq1', '128522', '2', '', false, 10],
+      [expect.objectContaining({ peerUid: '1058754719' }), 'seq1', '128522', '2', 'next', false, 10],
+    ])
+    await expect(bridge.getUser('actor-a')).resolves.toMatchObject({
+      id: 'actor-a', name: 'Alice', avatarUrl: 'https://example.com/a.jpg',
+    })
   })
 
   it('preserves uncatalogued reactions and gives successive native updates unique event IDs', async () => {

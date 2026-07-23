@@ -200,13 +200,21 @@ export interface QQReactionDefinition {
 
 export interface QQReactionContext {
   available: QQReactionDefinition[]
-  reactions: Array<{ key: string, count: number, selected?: boolean }>
+  reactions: QQReactionSummary[]
   maxSelected: number
 }
 
 export interface QQReactionState {
-  reactions: Array<{ key: string, count: number, selected?: boolean }>
+  reactions: QQReactionSummary[]
   maxSelected: number
+}
+
+export interface QQReactionSummary {
+  key: string
+  count: number
+  selected?: boolean
+  /** QQNT exposes no reaction timestamp, so only the opaque actor ID is available. */
+  recentActors?: Array<{ userId: string }>
 }
 
 export interface SendManifest {

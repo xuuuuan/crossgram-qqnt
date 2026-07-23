@@ -191,6 +191,13 @@ export interface MsgRecord {
   }>
 }
 
+export interface EmojiLikesUserInfo {
+  /** Opaque QQ user identifier returned by the reaction member-list API. */
+  tinyId: string
+  nickName: string
+  headUrl: string
+}
+
 export interface ContactMsgBoxInfo {
   contact: Contact
   firstUnreadMsgInfo?: {
@@ -268,6 +275,22 @@ export interface KernelMsgService {
     emojiType: string,
     setEmoji: boolean,
   ): Promise<{ result: number, errMsg: string }>
+  getMsgEmojiLikesList?(
+    peer: Contact,
+    msgSeq: string,
+    emojiId: string,
+    emojiType: string,
+    cookie: string,
+    bForward: boolean,
+    number: number,
+  ): Promise<{
+    result: number
+    errMsg: string
+    emojiLikesList: EmojiLikesUserInfo[]
+    cookie: string
+    isLastPage: boolean
+    isFirstPage: boolean
+  }>
   fetchFavEmojiList?(
     resId: string, count: number, backwardFetch: boolean, forceRefresh: boolean,
   ): Promise<{ result: number, errMsg: string, emojiInfoList: CustomEmotionData[] }>

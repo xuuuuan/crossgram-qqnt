@@ -49,6 +49,46 @@ describe.skipIf(!enabled)('live QQNT bridge E2E', () => {
     }
   }, 180_000)
 
+  it('shows the QQ users behind a reaction in an approved group', async () => {
+    const conversation = await resolve('group', '1058754719')
+    const catalogResponse = await fetch(`${base}/reactions/catalog`, { headers: headers() })
+    expect(catalogResponse.status, await catalogResponse.clone().text()).toBe(200)
+    const catalog = await catalogResponse.json() as { available: Array<{ key: string }> }
+    expect(catalog.available.length).toBeGreaterThan(0)
+    const reactionKey = catalog.available[0]!.key
+    const text = `[mtproto-relay reaction actors e2e] ${new Date().toISOString()}`
+    const manifest = Buffer.from(JSON.stringify({ conversationId: conversation.id, text })).toString('base64url')
+    const sentResponse = await fetch(`${base}/messages`, {
+      method: 'POST', headers: headers({ 'x-qqnt-manifest': manifest }), body: new Uint8Array(),
+    })
+    const sentBody = await sentResponse.text()
+    expect(sentResponse.status, sentBody).toBe(200)
+    const sent = JSON.parse(sentBody) as { id: string }
+    const setResponse = await fetch(`${base}/messages/reactions`, {
+      method: 'POST',
+      headers: headers({ 'content-type': 'application/json' }),
+      body: JSON.stringify({ conversationId: conversation.id, messageId: sent.id, reactionKeys: [reactionKey] }),
+    })
+    expect(setResponse.status, await setResponse.clone().text()).toBe(200)
+
+    let actorId: string | undefined
+    for (let attempt = 0; attempt < 5 && !actorId; attempt++) {
+      const response = await fetch(`${base}/messages/reactions?conversationId=${encodeURIComponent(conversation.id)}&messageId=${encodeURIComponent(sent.id)}`, {
+        headers: headers(),
+      })
+      expect(response.status, await response.clone().text()).toBe(200)
+      const state = await response.json() as {
+        reactions: Array<{ key: string, recentActors?: Array<{ userId: string }> }>
+      }
+      actorId = state.reactions.find((item) => item.key === reactionKey)?.recentActors?.[0]?.userId
+      if (!actorId) await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)))
+    }
+    expect(actorId).toBeTruthy()
+    const userResponse = await fetch(`${base}/users/${encodeURIComponent(actorId!)}`, { headers: headers() })
+    expect(userResponse.status, await userResponse.clone().text()).toBe(200)
+    await expect(userResponse.json()).resolves.toMatchObject({ id: actorId, name: expect.any(String) })
+  }, 180_000)
+
   it('streams a PNG image to xuuuuan and returns a confirmed image element', async () => {
     const imagePath = new URL('../../mtproto-relay-cordis/packages/platform-static/src/test-image.png', import.meta.url)
     const image = await stat(imagePath)

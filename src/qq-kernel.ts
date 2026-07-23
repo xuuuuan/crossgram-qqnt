@@ -8,7 +8,7 @@ import { AsyncQueue, deferred } from './async.js'
 import { markBridgeListener } from './listener-tee.js'
 import { log } from './log.js'
 import type {
-  CustomEmotionData, FileTransNotifyInfo, GroupProfileInfo, InitSessionConfig, KernelModule, KernelSession,
+  CustomEmotionData, EmojiLikesUserInfo, FileTransNotifyInfo, GroupProfileInfo, InitSessionConfig, KernelModule, KernelSession,
   MarketStickerPackInfo, MemberInfo, MsgElement, MsgRecord, ProfileSimpleInfo, RecentContactInfo,
 } from './kernel-types.js'
 import {
@@ -477,16 +477,21 @@ export class QQKernelBridge {
   }
 
   async getMessage(conversation: QQConversation, id: string): Promise<QQMessage | null> {
+    const record = await this.getMessageRecord(conversation, id)
+    if (!record) return null
+    const message = this.mapMessage(record)
+    this.rememberMessage(message)
+    return message
+  }
+
+  private async getMessageRecord(conversation: QQConversation, id: string): Promise<MsgRecord | null> {
     const service = this.requireMsgService()
     const peer = contact(conversation)
     log('info', `native API start name=getMsgsByMsgId conversation=${conversation.id} message=${id}`)
     const response = await retryTransientInvalidArgument(() => service.getMsgsByMsgId(peer, [id]))
     log('info', `native API complete name=getMsgsByMsgId conversation=${conversation.id} message=${id} result=${response.result} err=${JSON.stringify(response.errMsg)} records=${response.msgList.length}`)
     if (response.result !== 0) throw new Error(`getMsgsByMsgId: ${response.errMsg} (${response.result})`)
-    if (!response.msgList[0]) return null
-    const message = this.mapMessage(response.msgList[0])
-    this.rememberMessage(message)
-    return message
+    return response.msgList[0] ?? null
   }
 
   async getStickerPacks(cursor?: string, limit = 100): Promise<{
@@ -1009,9 +1014,84 @@ export class QQKernelBridge {
 
   async getMessageReactions(conversation: QQConversation, messageId: string): Promise<QQReactionState> {
     if (conversation.chatType !== CHAT_GROUP) return { reactions: [], maxSelected: 0 }
-    const message = (this.messages.get(conversation.id) ?? []).find((item) => item.id === messageId)
-      ?? await withTimeout(this.getMessage(conversation, messageId), 5_000, 'QQ reaction lookup timed out')
-    return message?.reactionContext ?? { reactions: [], maxSelected: 20 }
+    const record = await withTimeout(
+      this.getMessageRecord(conversation, messageId),
+      5_000,
+      'QQ reaction lookup timed out',
+    )
+    if (!record) return { reactions: [], maxSelected: 20 }
+    const message = this.mapMessage(record)
+    const previous = (this.messages.get(conversation.id) ?? []).find((item) => item.id === messageId)
+    if (record.emojiLikesList === undefined && previous?.reactionContext) {
+      message.reactionContext = previous.reactionContext
+    }
+    if (message.reactionContext) {
+      message.reactionContext = await this.withReactionActors(conversation, record, message.reactionContext)
+    }
+    this.rememberMessage(message)
+    return message.reactionContext ?? { reactions: [], maxSelected: 20 }
+  }
+
+  private async withReactionActors(
+    conversation: QQConversation,
+    record: MsgRecord,
+    state: QQReactionState,
+  ): Promise<QQReactionState> {
+    const service = this.requireMsgService()
+    if (!service.getMsgEmojiLikesList || !record.msgSeq) return state
+    const nativeByKey = new Map((record.emojiLikesList ?? []).map((item) => [
+      this.reactionByKey.get(reactionKey(item.emojiType, item.emojiId))?.key
+        ?? reactionKey(item.emojiType, item.emojiId),
+      item,
+    ]))
+    const reactions = await mapConcurrent(state.reactions, 4, async (reaction) => {
+      const native = nativeByKey.get(reaction.key)
+      if (!native || reaction.count <= 0) return reaction
+      try {
+        const actors = await this.getReactionActors(
+          conversation, record.msgSeq!, native.emojiId, native.emojiType,
+        )
+        return { ...reaction, recentActors: actors.map((actor) => ({ userId: actor.tinyId })) }
+      } catch (error) {
+        log('error', `reaction actor lookup failed conversation=${conversation.id} message=${record.msgId} emoji=${native.emojiType}:${native.emojiId}`, error)
+        return reaction
+      }
+    })
+    return { ...state, reactions }
+  }
+
+  private async getReactionActors(
+    conversation: QQConversation,
+    msgSeq: string,
+    emojiId: string,
+    emojiType: string,
+  ): Promise<EmojiLikesUserInfo[]> {
+    const service = this.requireMsgService()
+    if (!service.getMsgEmojiLikesList) return []
+    const actors = new Map<string, EmojiLikesUserInfo>()
+    let cookie = ''
+    for (let page = 0; page < 10 && actors.size < 100; page++) {
+      log('info', `native API start name=getMsgEmojiLikesList conversation=${conversation.id} seq=${msgSeq} emoji=${emojiType}:${emojiId} page=${page + 1}`)
+      const result = await service.getMsgEmojiLikesList(
+        contact(conversation), msgSeq, emojiId, emojiType, cookie, false, 10,
+      )
+      log('info', `native API complete name=getMsgEmojiLikesList conversation=${conversation.id} seq=${msgSeq} emoji=${emojiType}:${emojiId} result=${result.result} actors=${result.emojiLikesList.length} last=${result.isLastPage} err=${JSON.stringify(result.errMsg)}`)
+      if (result.result !== 0) throw new Error(`getMsgEmojiLikesList: ${result.errMsg} (${result.result})`)
+      for (const actor of result.emojiLikesList) {
+        if (!actor.tinyId || actors.has(actor.tinyId)) continue
+        actors.set(actor.tinyId, actor)
+        const previous = this.seenUsers.get(actor.tinyId) ?? this.users.get(actor.tinyId)
+        this.seenUsers.set(actor.tinyId, {
+          ...previous,
+          id: actor.tinyId,
+          name: actor.nickName || previous?.name || actor.tinyId,
+          avatarUrl: actor.headUrl || previous?.avatarUrl,
+        })
+      }
+      if (result.isLastPage || result.emojiLikesList.length === 0 || result.cookie === cookie) break
+      cookie = result.cookie
+    }
+    return [...actors.values()].slice(0, 100)
   }
 
   async setMessageReactions(
