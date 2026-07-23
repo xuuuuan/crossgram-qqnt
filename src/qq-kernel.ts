@@ -212,7 +212,7 @@ export class QQKernelBridge {
     }
     const dialogs = [...this.contacts.values()]
     const offset = parseCursor(cursor)
-    const page = await mapConcurrent(dialogs.slice(offset, offset + clamp(limit, 1, 500)), 4, async (conversation) => {
+    const page = await mapConcurrent(dialogs.slice(offset, offset + clamp(limit, 1, 500)), 32, async (conversation) => {
       if (conversation.chatType === CHAT_GROUP && isFallbackTitle(conversation.title, conversation.peerUin || conversation.peerUid)) {
         await this.ensureGroupProfile(conversation.peerUin || conversation.peerUid).catch((error) =>
           log('error', `group profile fallback failed group=${conversation.peerUin || conversation.peerUid}`, error))
@@ -561,13 +561,13 @@ export class QQKernelBridge {
       log('info', `native API start name=getFirstUnreadMsgSeq conversation=${conversation.id}`)
       const unread = await withTimeout(
         retryHistoryCall(() => service.getFirstUnreadMsgSeq!(peer)),
-        2_000,
+        450,
         'QQ first-unread request timed out',
       )
       if (unread.result !== 0 || !unread.seq || unread.seq === '0') return undefined
       const around = await withTimeout(
         retryHistoryCall(() => service.getMsgsBySeqAndCount!(peer, unread.seq, 2, true, false)),
-        2_000,
+        450,
         'QQ read-marker history request timed out',
       )
       if (around.result !== 0) return undefined
