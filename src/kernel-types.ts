@@ -159,6 +159,14 @@ export interface MarketStickerPackInfo {
   tabName: string
 }
 
+export interface BottomEmojiTabInfo {
+  epId: number
+  wordingId: number
+  bottomEmojitabType: number
+  tabName: string
+  isHide: boolean
+}
+
 export interface MsgRecord {
   msgId: string
   msgSeq?: string
@@ -286,6 +294,18 @@ export interface KernelMsgService {
         smallTabinfoList: MarketStickerPackInfo[]
         epIds: number[]
       }
+    }
+  }>
+  fetchBottomEmojiTableList?(request: {
+    commonReqInfo: { appVersion: string, businessId: number }
+    timeStamp: number
+    segmentFlag: number
+  }): Promise<{
+    result: number
+    errMsg: string
+    marketEmoticonInfo: {
+      segmentFlag: number
+      emojiNewTabs: BottomEmojiTabInfo[]
     }
   }>
   fetchMarketEmoticonShowImage?(request: {

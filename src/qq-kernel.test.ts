@@ -60,6 +60,7 @@ function fixture() {
         smallTabinfoList: [], epIds: [],
       } },
     })),
+    fetchBottomEmojiTableList: undefined as import('./kernel-types.js').KernelMsgService['fetchBottomEmojiTableList'],
     fetchMarketEmoticonShowImage: vi.fn(async () => ({ result: 0, errMsg: '' })),
     fetchMarketEmoticonAioImage: vi.fn(async () => ({ result: 0, errMsg: '' })),
     getMarketEmoticonPath: vi.fn(() => new Map()),
@@ -571,6 +572,42 @@ describe('QQKernelBridge', () => {
     })
     expect(f.msg.fetchMarketEmoticonList).toHaveBeenNthCalledWith(2, 1, 0)
     expect(f.msg.fetchMarketEmoticonList).toHaveBeenNthCalledWith(3, 2, 0)
+  })
+
+  it('uses the current QQ bottom emoji table and exposes visible market packs', async () => {
+    const f = fixture()
+    f.msg.fetchBottomEmojiTableList = vi.fn()
+      .mockResolvedValueOnce({
+        result: 0, errMsg: '', marketEmoticonInfo: {
+          segmentFlag: 7,
+          emojiNewTabs: [
+            { epId: 51, wordingId: 1, bottomEmojitabType: 0, tabName: 'Installed', isHide: false },
+            { epId: 52, wordingId: 2, bottomEmojitabType: 0, tabName: 'Hidden', isHide: true },
+            { epId: 2, wordingId: 3, bottomEmojitabType: 6, tabName: 'QQ Faces', isHide: false },
+          ],
+        },
+      })
+      .mockResolvedValueOnce({
+        result: 0, errMsg: '', marketEmoticonInfo: {
+          segmentFlag: -1,
+          emojiNewTabs: [
+            { epId: 53, wordingId: 4, bottomEmojitabType: 0, tabName: 'Second', isHide: false },
+          ],
+        },
+      })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.getStickerPacks()).resolves.toMatchObject({
+      packs: [
+        { packId: '51', title: 'Installed' },
+        { packId: '53', title: 'Second' },
+      ],
+    })
+    expect(f.msg.fetchBottomEmojiTableList).toHaveBeenNthCalledWith(2, {
+      commonReqInfo: { appVersion: '', businessId: 0 }, timeStamp: 0, segmentFlag: 7,
+    })
+    expect(f.msg.fetchMarketEmoticonList).not.toHaveBeenCalled()
   })
 
   it('lists and mutates QQ favorite stickers through the native collection', async () => {

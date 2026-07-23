@@ -2334,6 +2334,39 @@ export class QQKernelBridge {
   private async loadStickerPackCatalog(): Promise<void> {
     if (this.stickerPackInfo.size) return
     const service = this.requireMsgService()
+    if (service.fetchBottomEmojiTableList) {
+      let segment = 0
+      let sameSegmentTimes = 0
+      for (let page = 0; page < 100; page++) {
+        const result = await service.fetchBottomEmojiTableList({
+          commonReqInfo: { appVersion: '', businessId: 0 },
+          timeStamp: 0,
+          segmentFlag: segment,
+        })
+        if (result.result !== 0) {
+          throw new Error(`fetchBottomEmojiTableList: ${result.errMsg} (${result.result})`)
+        }
+        const table = result.marketEmoticonInfo
+        const legacyTable = (table as typeof table & { roamEmojiTab?: {
+          ordinaryTabinfoList?: unknown[], magicTabinfoList?: unknown[], smallTabinfoList?: unknown[]
+        } }).roamEmojiTab
+        log('info', `native API complete name=fetchBottomEmojiTableList segment=${segment} next=${table.segmentFlag} tabs=${table.emojiNewTabs?.length ?? 0} legacyTabs=${(legacyTable?.ordinaryTabinfoList?.length ?? 0) + (legacyTable?.magicTabinfoList?.length ?? 0) + (legacyTable?.smallTabinfoList?.length ?? 0)} keys=${JSON.stringify(Object.keys(table))}`)
+        for (const item of table.emojiNewTabs ?? []) {
+          if (item.isHide || item.bottomEmojitabType !== 0) continue
+          this.stickerPackInfo.set(String(item.epId), {
+            epId: item.epId,
+            wordingId: item.wordingId,
+            tabType: item.bottomEmojitabType,
+            tabName: item.tabName,
+          })
+        }
+        if (table.segmentFlag === -1) return
+        sameSegmentTimes = table.segmentFlag === segment ? sameSegmentTimes + 1 : 0
+        if (sameSegmentTimes >= 4) return
+        segment = table.segmentFlag
+      }
+      throw new Error('QQ bottom sticker table pagination exceeded 100 pages')
+    }
     if (!service.fetchMarketEmoticonList) return
     let timestamp = 0
     let segment = 0
