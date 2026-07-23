@@ -185,13 +185,15 @@ describe('QQKernelBridge', () => {
       chatType: 1, peerUid: 'uid-1715311957',
     }), 50)
     f.msg.sendMsg.mockImplementationOnce(async () => {
-      queueMicrotask(() => f.emitMessages([{ ...f.message, sendStatus: 1 }]))
+      queueMicrotask(() => f.emitMessages([{ ...f.message, sendStatus: 2 }]))
       return { result: 0, errMsg: '' }
     })
     const sent = await bridge.send({
-      conversationId: dialogs.conversations[0].id, text: 'hello',
+      conversationId: dialogs.conversations[0].id, text: 'hello', originRequestId: 'relay-send-1',
     }, Readable.from([]))
-    expect(sent.id).toBe('m1')
+    expect(sent).toMatchObject({ id: 'm1', originRequestId: 'relay-send-1' })
+    expect(sent.sourceIds).toBeUndefined()
+    expect(f.msg.getMsgUniqueId).toHaveBeenCalledWith(expect.stringMatching(/^\d{13}$/))
     expect(f.msg.sendMsg).toHaveBeenCalledOnce()
   })
 
@@ -326,6 +328,28 @@ describe('QQKernelBridge', () => {
           fileSize: String(png.length), picWidth: 1, picHeight: 1,
           md5HexStr: 'e44e7ecfec99356632c13cd3eaa3e250',
         }),
+      })], expect.any(Map),
+    )
+  })
+
+  it('uses declared JPEG dimensions and type for the native image element', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xd9])
+    f.msg.sendMsg.mockImplementation(async () => {
+      queueMicrotask(() => f.emitMessages([{ ...f.message, sendStatus: 2 }]))
+      return { result: 0, errMsg: '' }
+    })
+
+    await bridge.send({
+      conversationId: 'uid-1715311957',
+      media: [{ kind: 'image', name: 'wide.jpeg', size: jpeg.length, width: 1096, height: 892 }],
+    }, Readable.from([jpeg]))
+
+    expect(f.msg.sendMsg).toHaveBeenCalledWith(
+      'm1', expect.objectContaining({ peerUid: 'uid-1715311957' }), [expect.objectContaining({
+        picElement: expect.objectContaining({ picWidth: 1096, picHeight: 892, picType: 1000 }),
       })], expect.any(Map),
     )
   })
@@ -805,7 +829,7 @@ describe('QQBridgeServer', () => {
     const { port } = server.address()
     const base = `http://127.0.0.1:${port}/v1`
     await expect(fetch(`${base}/status`).then((response) => response.json())).resolves.toMatchObject({
-      protocolVersion: 3, ready: true, selfUin: '10000',
+      protocolVersion: 4, ready: true, selfUin: '10000',
     })
     await expect(fetch(`${base}/dialogs`).then((response) => response.json())).resolves.toMatchObject({
       conversations: [{ peerUin: '1715311957' }],

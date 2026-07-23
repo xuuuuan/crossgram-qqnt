@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 3
+export const PROTOCOL_VERSION = 4
 
 export type QQChatType = 1 | 2
 
@@ -55,6 +55,8 @@ export interface QQMessage {
     avatar?: QQMedia
   }
   msgSeq?: string
+  /** Adapter-generated correlation token used to suppress only its own listener echo. */
+  originRequestId?: string
   parts: Array<{ type: 'text', text: string } | { type: 'media', media: QQMedia }>
   /** Per-message state only. The shared definition catalog has its own endpoint. */
   reactionContext?: QQReactionState
@@ -132,11 +134,14 @@ export interface QQReactionState {
 export interface SendManifest {
   conversationId: string
   text?: string
+  originRequestId?: string
   media?: Array<{
     kind: 'image' | 'file'
     name: string
     mimeType?: string
     size?: number
+    width?: number
+    height?: number
   }>
 }
 

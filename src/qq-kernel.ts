@@ -71,6 +71,7 @@ export class QQKernelBridge {
   private readonly pendingMessages = new Map<string, ReturnType<typeof deferred<MsgRecord>>>()
   private readonly pendingAcceptances = new Map<string, ReturnType<typeof deferred<void>>>()
   private readonly pendingMinimumStatuses = new Map<string, number>()
+  private readonly messageOrigins = new Map<string, string>()
   private readonly pendingUnassigned: Array<{
     conversationId: string
     pending: ReturnType<typeof deferred<MsgRecord>>
@@ -80,6 +81,7 @@ export class QQKernelBridge {
     expectedText?: string
     expectedMediaName?: string
     expectedMediaKind?: 'image' | 'file'
+    originRequestId?: string
   }> = []
   private readonly pendingDownloads = new Map<string, ReturnType<typeof deferred<FileTransNotifyInfo>>>()
   private readonly activeMediaDownloads = new Map<string, Promise<string>>()
@@ -132,6 +134,7 @@ export class QQKernelBridge {
     this.unreadBatchState = ''
     this.unreadBatchPromise = undefined
     this.messages.clear()
+    this.messageOrigins.clear()
     this.reactionDefinitions = []
     this.reactionByKey.clear()
     this.reactionCatalogPromise = undefined
@@ -496,7 +499,10 @@ export class QQKernelBridge {
           throw new Error(`incomplete upload: expected ${spec.size} bytes, received ${size}`)
         }
         if (spec.kind === 'image') {
-          const prepared = await this.prepareImageElement(path, spec.name, size)
+          const prepared = await this.prepareImageElement(path, spec.name, size, {
+            width: spec.width,
+            height: spec.height,
+          })
           if (prepared.path !== path) {
             cleanup.splice(cleanup.indexOf(path), 1)
             if (prepared.owned) cleanup.push(prepared.path)
@@ -513,7 +519,7 @@ export class QQKernelBridge {
       const startedAt = Math.floor(Date.now() / 1000)
       let id = '0'
       try {
-        id = service.getMsgUniqueId?.(String(Math.floor(Date.now() / 1000))) ?? id
+        id = service.getMsgUniqueId?.(String(Date.now())) ?? id
       } catch (error) {
         log('error', 'getMsgUniqueId failed; matching send confirmation by content', error)
       }
@@ -531,8 +537,10 @@ export class QQKernelBridge {
         expectedText: manifest.text,
         expectedMediaName: manifest.media?.[0]?.name,
         expectedMediaKind: manifest.media?.[0]?.kind,
+        originRequestId: manifest.originRequestId,
       })
       else {
+        this.rememberMessageOrigin(id, manifest.originRequestId)
         this.pendingMessages.set(id, pending)
         this.pendingAcceptances.set(id, accepted)
         this.pendingMinimumStatuses.set(id, minimumStatus)
@@ -582,6 +590,7 @@ export class QQKernelBridge {
           this.pendingMinimumStatuses.delete(id)
           removePending(this.pendingUnassigned, pending)
         })
+      this.rememberMessageOrigin(record.msgId, manifest.originRequestId)
       const message = this.mapMessage(record)
       log('info', `native API confirmed name=sendMsg conversation=${conversation.id} requestedMessage=${id} confirmedMessage=${message.id} status=${record.sendStatus}`)
       if (manifest.media?.length && cleanup[0]) {
@@ -589,6 +598,8 @@ export class QQKernelBridge {
         if (media?.type === 'media') {
           media.media.locator.filePath = cleanup[0]
           media.media.size ??= manifest.media[0].size
+          media.media.width ??= manifest.media[0].width
+          media.media.height ??= manifest.media[0].height
           preserveUntil = Date.now() + 10 * 60_000
         }
       }
@@ -1351,6 +1362,7 @@ export class QQKernelBridge {
             element.fileElement?.fileName === item.expectedMediaName
             || element.picElement?.fileName === item.expectedMediaName)
             || item.expectedMediaKind === 'image'))
+        if (index >= 0) this.rememberMessageOrigin(record.msgId, this.pendingUnassigned[index].originRequestId)
         if (index >= 0 && record.sendStatus >= 1) this.pendingUnassigned[index].accepted.resolve()
         if (index >= 0 && record.sendStatus === 0) {
           this.pendingUnassigned.splice(index, 1)[0].pending.reject(new Error('QQ send failed'))
@@ -1707,7 +1719,6 @@ export class QQKernelBridge {
     }
     return {
       id: record.msgId,
-      sourceIds: record.elements?.map((element) => element.elementId).filter(Boolean),
       conversationId: conversationId(record.chatType as 1 | 2, record.peerUid),
       senderId: record.senderUid || record.senderUin,
       sender: {
@@ -1722,6 +1733,7 @@ export class QQKernelBridge {
       timestamp: Number(record.msgTime) || Math.floor(Date.now() / 1000),
       outgoing: SEND_FROM_SELF.has(record.sendType) || record.senderUid === this.config?.selfUid,
       msgSeq: record.msgSeq,
+      originRequestId: this.messageOrigins.get(record.msgId),
       parts,
       reactionContext: record.chatType === CHAT_GROUP && record.emojiLikesList?.length
         ? this.mapReactionState(record)
@@ -1989,10 +2001,13 @@ export class QQKernelBridge {
     stagingPath: string,
     originalName: string,
     size: number,
+    declared: { width?: number, height?: number } = {},
   ): Promise<{ path: string, owned: boolean, element: MsgElement }> {
     const [md5, dimensions] = await Promise.all([
       hashFile(stagingPath, 'md5'),
-      imageFileDimensions(stagingPath),
+      declared.width && declared.height
+        ? Promise.resolve({ width: declared.width, height: declared.height })
+        : imageFileDimensions(stagingPath),
     ])
     const service = this.requireMsgService()
     let nativePath = ''
@@ -2019,7 +2034,18 @@ export class QQKernelBridge {
       }
       path = nativePath
     }
-    return { path, owned, element: imageElement(path, size, md5, dimensions) }
+    return { path, owned, element: imageElement(path, size, md5, dimensions, originalName) }
+  }
+
+  private rememberMessageOrigin(messageId: string, originRequestId?: string): void {
+    if (!originRequestId || !messageId || messageId === '0') return
+    this.messageOrigins.delete(messageId)
+    this.messageOrigins.set(messageId, originRequestId)
+    while (this.messageOrigins.size > 1024) {
+      const oldest = this.messageOrigins.keys().next().value as string | undefined
+      if (!oldest) break
+      this.messageOrigins.delete(oldest)
+    }
   }
 
   private requireMsgService(): ReturnType<KernelSession['getMsgService']> {
@@ -2061,6 +2087,7 @@ function imageElement(
   size: number,
   md5: string,
   dimensions?: { width: number, height: number },
+  originalName = basename(path),
 ): MsgElement {
   return {
     elementType: ELEMENT_IMAGE,
@@ -2078,6 +2105,7 @@ function imageElement(
       fileUuid: '',
       fileSubId: '',
       thumbFileSize: 0,
+      picType: imagePicType(originalName),
       storeID: 0,
     } as never,
   }
@@ -2086,9 +2114,9 @@ function imageElement(
 async function imageFileDimensions(path: string): Promise<{ width: number, height: number } | undefined> {
   const handle = await openFile(path, 'r')
   try {
-    const header = Buffer.alloc(24)
+    const header = Buffer.alloc(256 * 1024)
     const { bytesRead } = await handle.read(header, 0, header.length, 0)
-    return pngDimensions(header.subarray(0, bytesRead))
+    return encodedImageDimensions(header.subarray(0, bytesRead))
   } finally {
     await handle.close()
   }
@@ -2496,4 +2524,75 @@ function pngDimensions(bytes: Uint8Array): { width: number, height: number } | u
   const width = view.getUint32(16)
   const height = view.getUint32(20)
   return width > 0 && height > 0 ? { width, height } : undefined
+}
+
+function encodedImageDimensions(bytes: Uint8Array): { width: number, height: number } | undefined {
+  return pngDimensions(bytes) ?? gifDimensions(bytes) ?? jpegDimensions(bytes) ?? webpDimensions(bytes)
+}
+
+function gifDimensions(bytes: Uint8Array): { width: number, height: number } | undefined {
+  if (bytes.length < 10) return
+  const signature = String.fromCharCode(...bytes.subarray(0, 6))
+  if (signature !== 'GIF87a' && signature !== 'GIF89a') return
+  return positiveDimensions(readU16LE(bytes, 6), readU16LE(bytes, 8))
+}
+
+function jpegDimensions(bytes: Uint8Array): { width: number, height: number } | undefined {
+  if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) return
+  let offset = 2
+  while (offset + 3 < bytes.length) {
+    while (offset < bytes.length && bytes[offset] !== 0xff) offset++
+    while (offset < bytes.length && bytes[offset] === 0xff) offset++
+    if (offset >= bytes.length) return
+    const marker = bytes[offset++]!
+    if (marker === 0xd8 || marker === 0xd9 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue
+    if (offset + 2 > bytes.length) return
+    const length = readU16BE(bytes, offset)
+    if (length < 2 || offset + length > bytes.length) return
+    if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+      return positiveDimensions(readU16BE(bytes, offset + 5), readU16BE(bytes, offset + 3))
+    }
+    offset += length
+  }
+}
+
+function webpDimensions(bytes: Uint8Array): { width: number, height: number } | undefined {
+  if (bytes.length < 30 || ascii(bytes, 0, 4) !== 'RIFF' || ascii(bytes, 8, 4) !== 'WEBP') return
+  const chunk = ascii(bytes, 12, 4)
+  if (chunk === 'VP8X') return positiveDimensions(readU24LE(bytes, 24) + 1, readU24LE(bytes, 27) + 1)
+  if (chunk === 'VP8 ' && bytes[23] === 0x9d && bytes[24] === 0x01 && bytes[25] === 0x2a) {
+    return positiveDimensions(readU16LE(bytes, 26) & 0x3fff, readU16LE(bytes, 28) & 0x3fff)
+  }
+  if (chunk === 'VP8L' && bytes[20] === 0x2f) {
+    const bits = (bytes[21]! | bytes[22]! << 8 | bytes[23]! << 16 | bytes[24]! << 24) >>> 0
+    return positiveDimensions((bits & 0x3fff) + 1, ((bits >>> 14) & 0x3fff) + 1)
+  }
+}
+
+function positiveDimensions(width: number, height: number): { width: number, height: number } | undefined {
+  return width > 0 && height > 0 ? { width, height } : undefined
+}
+
+function imagePicType(name: string): number {
+  const extension = name.split('.').at(-1)?.toLowerCase()
+  return ({
+    jpg: 0, jpeg: 1000, png: 1001, webp: 1002, sharpp: 1004,
+    bmp: 1005, gif: 2000, apng: 2001,
+  } as Record<string, number | undefined>)[extension ?? ''] ?? 4
+}
+
+function ascii(bytes: Uint8Array, offset: number, length: number): string {
+  return String.fromCharCode(...bytes.subarray(offset, offset + length))
+}
+
+function readU16BE(bytes: Uint8Array, offset: number): number {
+  return bytes[offset]! * 0x100 + bytes[offset + 1]!
+}
+
+function readU16LE(bytes: Uint8Array, offset: number): number {
+  return bytes[offset]! + bytes[offset + 1]! * 0x100
+}
+
+function readU24LE(bytes: Uint8Array, offset: number): number {
+  return bytes[offset]! + bytes[offset + 1]! * 0x100 + bytes[offset + 2]! * 0x10000
 }
