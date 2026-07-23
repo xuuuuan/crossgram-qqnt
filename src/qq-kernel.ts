@@ -3,11 +3,11 @@ import { createReadStream, createWriteStream, existsSync, mkdirSync, statSync } 
 import { open as openFile, readFile, rename, rm, stat } from 'node:fs/promises'
 import { basename, dirname, extname, join } from 'node:path'
 import { pipeline } from 'node:stream/promises'
-import type { Readable } from 'node:stream'
+import { Readable } from 'node:stream'
 import { AsyncQueue, deferred } from './async.js'
 import { log } from './log.js'
 import type {
-  FileTransNotifyInfo, InitSessionConfig, KernelModule, KernelSession, MemberInfo, MsgElement, MsgRecord,
+  FileTransNotifyInfo, GroupProfileInfo, InitSessionConfig, KernelModule, KernelSession, MemberInfo, MsgElement, MsgRecord,
   ProfileSimpleInfo, RecentContactInfo,
 } from './kernel-types.js'
 import {
@@ -43,6 +43,7 @@ export class QQKernelBridge {
   private avatarService?: NonNullable<ReturnType<NonNullable<KernelSession['getAvatarService']>>>
   private readonly contacts = new Map<string, QQConversation>()
   private readonly users = new Map<string, { id: string, numericId?: string, name: string, avatarUrl?: string }>()
+  private readonly seenUsers = new Map<string, { id: string, numericId?: string, name: string, avatarUrl?: string }>()
   private readonly groups = new Map<string, { name: string, avatarUrl?: string }>()
   private readonly avatarCache = new Map<string, QQMedia>()
   private buddySnapshotLoaded = false
@@ -64,6 +65,8 @@ export class QQKernelBridge {
   }> = []
   private readonly pendingDownloads = new Map<string, ReturnType<typeof deferred<FileTransNotifyInfo>>>()
   private readonly pendingReactions = new Map<string, ReturnType<typeof deferred<QQReactionContext>>>()
+  private readonly pendingGroupProfiles = new Map<string, ReturnType<typeof deferred<void>>>()
+  private readonly groupProfileAttempts = new Map<string, number>()
   private listenerId?: string
   private buddyListenerId?: string
   private groupListenerId?: string
@@ -90,12 +93,15 @@ export class QQKernelBridge {
 
   attach(kernel: KernelModule, session: KernelSession, config: InitSessionConfig): void {
     this.detach()
+    log('info', `bridge attach start selfUin=${config.selfUin} selfUid=${config.selfUid} listenerConstructors=msg:${Boolean(kernel.NodeIKernelMsgListener)},buddy:${Boolean(kernel.NodeIKernelBuddyListener)},group:${Boolean(kernel.NodeIKernelGroupListener)},recent:${Boolean(kernel.NodeIKernelRecentContactListener)}`)
     // A native wrapper can be re-initialized after logout/account switching.
     // Never leak the previous account's seen peers into the new address book.
     this.contacts.clear()
     this.users.clear()
+    this.seenUsers.clear()
     this.groups.clear()
     this.avatarCache.clear()
+    this.groupProfileAttempts.clear()
     this.messages.clear()
     this.buddySnapshotLoaded = false
     this.kernel = kernel
@@ -109,8 +115,10 @@ export class QQKernelBridge {
     })
     try {
       this.registerListeners()
+      log('info', `bridge attach complete selfUin=${config.selfUin}`)
       void this.initializePlatformData()
-    } catch {
+    } catch (error) {
+      log('error', 'initial native listener registration failed; scheduling retry', error)
       this.scheduleListenerRegistration()
     }
   }
@@ -122,11 +130,14 @@ export class QQKernelBridge {
     const buddyService = this.buddyService
     const groupService = this.groupService
     const recentService = this.recentService
-    if (msgService && this.listenerId) msgService.removeKernelMsgListener(this.listenerId)
-    if (buddyService && this.buddyListenerId) buddyService.removeKernelBuddyListener(this.buddyListenerId)
-    if (groupService && this.groupListenerId) groupService.removeKernelGroupListener(this.groupListenerId)
+    if (this.listenerId || this.buddyListenerId || this.groupListenerId || this.recentListenerId) {
+      log('info', `bridge detach listeners msg=${this.listenerId ?? ''} buddy=${this.buddyListenerId ?? ''} group=${this.groupListenerId ?? ''} recent=${this.recentListenerId ?? ''}`)
+    }
+    if (msgService && this.listenerId) safeRemoveListener('message', this.listenerId, () => msgService.removeKernelMsgListener(this.listenerId!))
+    if (buddyService && this.buddyListenerId) safeRemoveListener('buddy', this.buddyListenerId, () => buddyService.removeKernelBuddyListener(this.buddyListenerId!))
+    if (groupService && this.groupListenerId) safeRemoveListener('group', this.groupListenerId, () => groupService.removeKernelGroupListener(this.groupListenerId!))
     if (recentService?.removeKernelRecentContactListener && this.recentListenerId) {
-      recentService.removeKernelRecentContactListener(this.recentListenerId)
+      safeRemoveListener('recent', this.recentListenerId, () => recentService.removeKernelRecentContactListener!(this.recentListenerId!))
     }
     this.listenerId = this.buddyListenerId = this.groupListenerId = undefined
     this.msgService = undefined
@@ -149,6 +160,8 @@ export class QQKernelBridge {
     this.pendingDownloads.clear()
     for (const pending of this.pendingReactions.values()) pending.reject(new Error('QQNT session detached'))
     this.pendingReactions.clear()
+    for (const pending of this.pendingGroupProfiles.values()) pending.reject(new Error('QQNT session detached'))
+    this.pendingGroupProfiles.clear()
   }
 
   subscribe(): AsyncQueue<QQEvent> {
@@ -166,8 +179,10 @@ export class QQKernelBridge {
     const session = this.requireSession()
     const recentService = session.getRecentContactService()
     let recentError: unknown
+    log('info', 'native API start name=getRecentContactInfos')
     try {
       const recent = await recentService.getRecentContactInfos()
+      log('info', `native API complete name=getRecentContactInfos result=${recent.result} err=${JSON.stringify(recent.errMsg)} contacts=${recent.relation.length}`)
       if (recent.result !== 0) throw new Error(`getRecentContactInfos: ${recent.errMsg} (${recent.result})`)
       for (const item of recent.relation) this.upsertRecent(item)
     } catch (error) {
@@ -178,6 +193,7 @@ export class QQKernelBridge {
       this.requestBuddyList(),
       this.requestGroupList(),
     ])
+    log('info', `contact refresh complete dialogs=${this.contacts.size} users=${this.users.size} groups=${this.groups.size}`)
     if (recentError) throw recentError
   }
 
@@ -190,8 +206,13 @@ export class QQKernelBridge {
     }
     const dialogs = [...this.contacts.values()]
     const offset = parseCursor(cursor)
-    const page = await Promise.all(dialogs.slice(offset, offset + clamp(limit, 1, 500))
-      .map((conversation) => this.withConversationAvatar(conversation, false)))
+    const page = await mapConcurrent(dialogs.slice(offset, offset + clamp(limit, 1, 500)), 4, async (conversation) => {
+      if (conversation.chatType === CHAT_GROUP && isFallbackTitle(conversation.title, conversation.peerUin || conversation.peerUid)) {
+        await this.ensureGroupProfile(conversation.peerUin || conversation.peerUid).catch((error) =>
+          log('error', `group profile fallback failed group=${conversation.peerUin || conversation.peerUid}`, error))
+      }
+      return this.withConversationAvatar(this.contacts.get(conversation.id) ?? conversation, false)
+    })
     return {
       conversations: page,
       nextCursor: offset + page.length < dialogs.length ? String(offset + page.length) : undefined,
@@ -229,10 +250,10 @@ export class QQKernelBridge {
     const known = this.contacts.get(id)
     if (known) return known
     const { chatType, peerUid } = parseConversationId(id)
-    return {
+    return this.mergeConversation({
       id, kind: chatType === CHAT_GROUP ? 'group' : 'direct', title: peerUid,
       peerUid, peerUin: chatType === CHAT_GROUP ? peerUid : '', chatType,
-    }
+    })
   }
 
   getConversationDetails(id: string): Promise<QQConversation> {
@@ -247,8 +268,10 @@ export class QQKernelBridge {
         id: conversationId(CHAT_GROUP, numericId), kind: 'group', title: numericId,
         peerUid: numericId, peerUin: numericId, chatType: CHAT_GROUP,
       }
-      this.contacts.set(created.id, created)
-      return this.withConversationAvatar(created)
+      this.mergeConversation(created)
+      await this.ensureGroupProfile(numericId).catch((error) =>
+        log('error', `group profile resolve failed group=${numericId}`, error))
+      return this.withConversationAvatar(this.contacts.get(created.id) ?? created)
     }
     const buddy = [...this.users.values()].find((user) => user.numericId === numericId)
     if (buddy) {
@@ -256,7 +279,7 @@ export class QQKernelBridge {
         id: conversationId(CHAT_C2C, buddy.id), kind: 'direct', title: buddy.name,
         peerUid: buddy.id, peerUin: numericId, chatType: CHAT_C2C,
       }
-      this.contacts.set(created.id, created)
+      this.mergeConversation(created)
       return this.withConversationAvatar(created)
     }
     const converted = await retryTransientInvalidArgument(
@@ -268,7 +291,7 @@ export class QQKernelBridge {
       id: conversationId(CHAT_C2C, peerUid), kind: 'direct', title: numericId,
       peerUid, peerUin: numericId, chatType: CHAT_C2C,
     }
-    this.contacts.set(created.id, created)
+    this.mergeConversation(created)
     return this.withConversationAvatar(created)
   }
 
@@ -279,6 +302,7 @@ export class QQKernelBridge {
     const peer = contact(conversation)
     const initial = !query.beforeId && !query.afterId && !query.cursor
     let response: { result: number, errMsg: string, msgList: MsgRecord[] }
+    log('info', `native API start name=${initial && service.getLatestDbMsgs ? 'getLatestDbMsgs' : 'getMsgs'} conversation=${conversation.id} anchor=${anchor} limit=${limit} after=${Boolean(query.afterId)}`)
     try {
       const request = Promise.resolve().then(() => initial && service.getLatestDbMsgs
         ? service.getLatestDbMsgs(peer, limit)
@@ -287,6 +311,7 @@ export class QQKernelBridge {
       // Some QQNT releases expose getLatestDbMsgs but return an initialization
       // error for it. getMsgs(peer, "0", ...) is the documented equivalent.
       if (initial && response.result !== 0) {
+        log('info', `native API fallback name=getMsgs conversation=${conversation.id} previousResult=${response.result}`)
         response = await withTimeout(
           service.getMsgs(peer, '0', limit, true),
           5_000,
@@ -311,6 +336,7 @@ export class QQKernelBridge {
       }
       throw new Error(`getMsgs: ${response.errMsg} (${response.result})`)
     }
+    log('info', `native API complete name=history conversation=${conversation.id} result=${response.result} err=${JSON.stringify(response.errMsg)} messages=${response.msgList.length}`)
     const messages = response.msgList.map((record) => this.mapMessage(record))
     for (const message of messages) this.rememberMessage(message)
     if (!messages.length && !query.beforeId && !query.afterId && !query.cursor) {
@@ -324,7 +350,9 @@ export class QQKernelBridge {
   async getMessage(conversation: QQConversation, id: string): Promise<QQMessage | null> {
     const service = this.requireMsgService()
     const peer = contact(conversation)
+    log('info', `native API start name=getMsgsByMsgId conversation=${conversation.id} message=${id}`)
     const response = await retryTransientInvalidArgument(() => service.getMsgsByMsgId(peer, [id]))
+    log('info', `native API complete name=getMsgsByMsgId conversation=${conversation.id} message=${id} result=${response.result} err=${JSON.stringify(response.errMsg)} records=${response.msgList.length}`)
     if (response.result !== 0) throw new Error(`getMsgsByMsgId: ${response.errMsg} (${response.result})`)
     if (!response.msgList[0]) return null
     const message = this.mapMessage(response.msgList[0])
@@ -396,6 +424,7 @@ export class QQKernelBridge {
       const peer = contact(conversation)
       // This is the raw native service, not QQ's renderer-side generated
       // object-parameter proxy. sendMsg uses four positional arguments.
+      log('info', `native API start name=sendMsg conversation=${conversation.id} message=${id} elements=${elements.length} minimumStatus=${minimumStatus}`)
       const nativeSend = retryTransientInvalidArgumentResult(
         () => withTimeout(
           service.sendMsg(id, peer, elements, new Map()),
@@ -415,6 +444,7 @@ export class QQKernelBridge {
         removePending(this.pendingUnassigned, pending)
         throw new Error(`sendMsg: ${result.errMsg} (${result.result})`)
       }
+      log('info', `native API accepted name=sendMsg conversation=${conversation.id} message=${id} result=${result.result} err=${JSON.stringify(result.errMsg)}`)
       const pollController = new AbortController()
       const confirmationPoll = this.pollSentMessage(
         conversation,
@@ -437,6 +467,7 @@ export class QQKernelBridge {
           removePending(this.pendingUnassigned, pending)
         })
       const message = this.mapMessage(record)
+      log('info', `native API confirmed name=sendMsg conversation=${conversation.id} requestedMessage=${id} confirmedMessage=${message.id} status=${record.sendStatus}`)
       if (manifest.media?.length && cleanup[0]) {
         const media = message.parts.find((part) => part.type === 'media')
         if (media?.type === 'media') {
@@ -462,25 +493,34 @@ export class QQKernelBridge {
   async deleteMessages(conversation: QQConversation, ids: string[], forEveryone: boolean): Promise<void> {
     const service = this.requireMsgService()
     const peer = contact(conversation)
+    log('info', `native API start name=${forEveryone ? 'recallMsg' : 'deleteMsg'} conversation=${conversation.id} messages=${ids.join(',')}`)
     const result = forEveryone
       ? await service.recallMsg(peer, ids)
       : await service.deleteMsg(peer, ids)
     if (result.result !== 0) throw new Error(`${forEveryone ? 'recallMsg' : 'deleteMsg'}: ${result.errMsg} (${result.result})`)
+    log('info', `native API complete name=${forEveryone ? 'recallMsg' : 'deleteMsg'} conversation=${conversation.id} result=${result.result} err=${JSON.stringify(result.errMsg)}`)
   }
 
   async forwardMessages(source: QQConversation, ids: string[], destination: QQConversation): Promise<void> {
+    log('info', `native API start name=forwardMsg from=${source.id} to=${destination.id} messages=${ids.join(',')}`)
     const result = await this.requireMsgService().forwardMsg(
       ids, contact(source), [contact(destination)], new Map(),
     )
     if (result.result !== 0) throw new Error(`forwardMsg: ${result.errMsg} (${result.result})`)
+    log('info', `native API complete name=forwardMsg from=${source.id} to=${destination.id} result=${result.result} err=${JSON.stringify(result.errMsg)}`)
   }
 
   async getUser(uid: string) {
-    const cached = this.users.get(uid)
+    const cached = this.seenUsers.get(uid) ?? this.users.get(uid)
     if (cached) return { ...cached, avatar: await this.userAvatar(uid, false) }
-    const numeric = await this.requireSession().getUixConvertService().getUin(new Set([uid]))
+    const numeric = await retryTransientInvalidArgument(
+      () => Promise.resolve().then(() => this.requireSession().getUixConvertService().getUin(new Set([uid]))),
+    )
     const numericId = numeric.uinInfo.get(uid)
-    return numericId ? { id: uid, numericId, name: numericId, avatar: await this.userAvatar(uid, false) } : null
+    if (!numericId) return null
+    const user = { id: uid, numericId, name: numericId }
+    this.seenUsers.set(uid, user)
+    return { ...user, avatar: qlogoAvatarMedia(uid, numericId) }
   }
 
   getReactionCatalog(): QQReactionContext {
@@ -531,6 +571,7 @@ export class QQKernelBridge {
         let completed = false
         let lastError: unknown
         for (let attempt = 0; !completed && attempt < 5; attempt++) {
+          log('info', `native API start name=setMsgEmojiLikes conversation=${conversation.id} message=${message.id} seq=${message.msgSeq ?? message.id} emoji=${emojiType}:${emojiId} selected=${desired.has(key)} attempt=${attempt + 1}`)
           const native = Promise.resolve().then(() => service.setMsgEmojiLikes!(
             contact(conversation), message.msgSeq ?? message.id, emojiId, emojiType, desired.has(key),
           )).then((result) => {
@@ -546,6 +587,7 @@ export class QQKernelBridge {
               'QQ reaction update timed out',
             )
             completed = true
+            log('info', `native API complete name=setMsgEmojiLikes conversation=${conversation.id} message=${message.id} emoji=${emojiType}:${emojiId} selected=${desired.has(key)} attempt=${attempt + 1}`)
           } catch (error) {
             lastError = error
             if (attempt < 4) await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)))
@@ -585,13 +627,18 @@ export class QQKernelBridge {
     if (conversation.chatType !== CHAT_GROUP) return { members: [], total: 0 }
     const service = this.requireGroupService()
     const scene = service.createMemberListScene(conversation.peerUin || conversation.peerUid, `mtproto-${randomUUID()}`)
+    log('info', `native API start name=getNextMemberList conversation=${conversation.id} scene=${scene} cursor=${cursor ?? ''} limit=${limit}`)
     try {
       const start = decodeMemberCursor(cursor)
       const response = await service.getNextMemberList(scene, start, clamp(limit, 1, 500))
       if (response.errCode !== 0) throw new Error(`getNextMemberList: ${response.errMsg} (${response.errCode})`)
+      log('info', `native API complete name=getNextMemberList conversation=${conversation.id} scene=${scene} result=${response.errCode} err=${JSON.stringify(response.errMsg)} ids=${response.result.ids.length} finish=${response.result.finish}`)
       const members = response.result.ids.flatMap(({ uid }) => {
         const info = response.result.infos.get(uid)
-        return info ? [mapMember(info)] : []
+        if (!info) return []
+        const member = mapMember(info)
+        this.rememberSeenUser(member.user)
+        return [member]
       })
       return {
         members,
@@ -600,10 +647,12 @@ export class QQKernelBridge {
       }
     } finally {
       service.destroyMemberListScene(scene)
+      log('info', `native API complete name=destroyMemberListScene conversation=${conversation.id} scene=${scene}`)
     }
   }
 
   async openMedia(locator: QQMediaLocator, offset = 0, limit?: number): Promise<Readable> {
+    if (locator.avatarUin) return this.openQlogoAvatar(locator.avatarUin, offset, limit)
     let path = locator.filePath
     if ((!path || !existsSync(path)) && locator.messageId.startsWith('avatar:')) {
       path = await this.refreshAvatarFile(locator)
@@ -611,7 +660,25 @@ export class QQKernelBridge {
     if (!path || !existsSync(path)) path = await this.downloadMedia(locator)
     const size = statSync(path).size
     const end = limit === undefined ? size - 1 : Math.min(size - 1, offset + Math.max(0, limit) - 1)
+    log('info', `media stream open message=${locator.messageId} element=${locator.elementId} peer=${locator.peerUid} path=${JSON.stringify(path)} size=${size} start=${Math.max(0, offset)} end=${end}`)
     return createReadStream(path, { start: Math.max(0, offset), end })
+  }
+
+  private async openQlogoAvatar(uin: string, offset = 0, limit?: number): Promise<Readable> {
+    if (!/^\d+$/.test(uin)) throw new Error(`invalid QQ avatar UIN: ${uin}`)
+    if (limit !== undefined && limit <= 0) return Readable.from([])
+    const start = Math.max(0, Math.trunc(offset))
+    const end = limit === undefined ? undefined : start + Math.max(0, Math.trunc(limit)) - 1
+    const url = new URL('https://q1.qlogo.cn/g')
+    url.search = new URLSearchParams({ b: 'qq', nk: uin, s: '640' }).toString()
+    const response = await withTimeout(fetch(url, {
+      headers: start || end !== undefined ? { range: `bytes=${start}-${end ?? ''}` } : undefined,
+    }), 10_000, `QQ qlogo request timed out: ${uin}`)
+    if (!response.ok || !response.body) {
+      throw new Error(`QQ qlogo request failed: ${uin} (${response.status})`)
+    }
+    log('info', `qlogo avatar stream open uin=${uin} start=${start} end=${end ?? '<all>'} status=${response.status}`)
+    return Readable.fromWeb(response.body)
   }
 
   private async downloadMedia(locator: QQMediaLocator): Promise<string> {
@@ -620,6 +687,7 @@ export class QQKernelBridge {
     this.pendingDownloads.set(key, pending)
     const directory = join(this.tempPath, 'downloads')
     mkdirSync(directory, { recursive: true })
+    log('info', `native API start name=downloadFile message=${locator.messageId} element=${locator.elementId} peer=${locator.peerUid} kind=${locator.kind} directory=${JSON.stringify(directory)}`)
     this.requireSession().getRichMediaService().downloadFile({
       fileModelId: '',
       msgId: locator.messageId,
@@ -642,6 +710,7 @@ export class QQKernelBridge {
       throw new Error(`QQ media download failed: ${completed.fileErrMsg} (${completed.fileErrCode})`)
     }
     if (!completed.filePath || !existsSync(completed.filePath)) throw new Error('QQ media download completed without a file')
+    log('info', `native API complete name=downloadFile message=${locator.messageId} element=${locator.elementId} status=${completed.trasferStatus} error=${completed.fileErrCode} path=${JSON.stringify(completed.filePath)} size=${completed.totalSize}`)
     return completed.filePath
   }
 
@@ -662,13 +731,13 @@ export class QQKernelBridge {
     } catch {
       this.avatarService = undefined
     }
-    const msgListener = makeListener(kernel.NodeIKernelMsgListener, {
+    const msgListener = makeListener('NodeIKernelMsgListener', kernel.NodeIKernelMsgListener, {
       onRecvMsg: (value: MsgRecord[] | { msgList: MsgRecord[] }) =>
-        this.onMessages(Array.isArray(value) ? value : value.msgList),
+        this.onMessages(normalizeMessageRecords(value), 'onRecvMsg'),
       onAddSendMsg: (value: MsgRecord | { msgRecord: MsgRecord }) =>
-        this.onMessages(['msgRecord' in value ? value.msgRecord : value]),
+        this.onMessages(normalizeSingleMessageRecord(value), 'onAddSendMsg'),
       onMsgInfoListUpdate: (value: MsgRecord[] | { msgList: MsgRecord[] }) =>
-        this.onMessages(Array.isArray(value) ? value : value.msgList, true),
+        this.onMessages(normalizeMessageRecords(value), 'onMsgInfoListUpdate'),
       onMsgRecall: (
         value: number | { chatType: number, peerUid: string, seq: string },
         peerUid?: string,
@@ -698,7 +767,8 @@ export class QQKernelBridge {
       },
     })
     this.listenerId = msgService.addKernelMsgListener(msgListener)
-    const buddyListener = makeListener(kernel.NodeIKernelBuddyListener, {
+    log('info', `native listener registered service=message id=${this.listenerId || '<empty>'}`)
+    const buddyListener = makeListener('NodeIKernelBuddyListener', kernel.NodeIKernelBuddyListener, {
       onBuddyListChange: (value: Array<{ buddyList: ProfileSimpleInfo[] }> | {
         data: Array<{ buddyList: ProfileSimpleInfo[] }>
       }) => {
@@ -709,60 +779,75 @@ export class QQKernelBridge {
       },
       onBuddyInfoChange: (value: Map<string, ProfileSimpleInfo> | { infos: Map<string, ProfileSimpleInfo> }) => {
         const infos = value instanceof Map ? value : value.infos
+        log('info', `buddy info update received: ${infos.size} users`)
         // QQ emits profile changes for strangers that merely appeared in a
         // group or message. Only the full buddy snapshot may add contacts.
-        for (const buddy of infos.values()) if (this.users.has(buddy.uid)) this.upsertBuddy(buddy)
+        for (const buddy of infos.values()) {
+          this.rememberSeenUser({
+            id: buddy.uid,
+            numericId: buddy.uin,
+            name: buddy.remark || buddy.nick || buddy.uin,
+            avatarUrl: buddy.avatarUrl,
+          })
+          if (this.users.has(buddy.uid)) this.upsertBuddy(buddy)
+        }
       },
     })
     this.buddyListenerId = buddyService.addKernelBuddyListener(buddyListener)
-    const groupListener = makeListener(kernel.NodeIKernelGroupListener, {
+    log('info', `native listener registered service=buddy id=${this.buddyListenerId || '<empty>'}`)
+    const groupListener = makeListener('NodeIKernelGroupListener', kernel.NodeIKernelGroupListener, {
       onGroupListUpdate: (
         value: number | {
           groupList: Array<{ groupCode: string, groupName: string, remarkName?: string, avatarUrl?: string }>
         },
         legacyGroups?: Array<{ groupCode: string, groupName: string, remarkName?: string, avatarUrl?: string }>,
       ) => {
-        const groups = typeof value === 'object' ? value.groupList : legacyGroups ?? []
+        const groups = typeof value === 'object' && value ? value.groupList ?? [] : legacyGroups ?? []
+        log('info', `group list update received: type=${typeof value === 'number' ? value : 'object'} groups=${groups.length}`)
         for (const group of groups) {
-          this.groups.set(group.groupCode, {
-            name: group.remarkName || group.groupName || group.groupCode,
-            avatarUrl: group.avatarUrl,
-          })
-          const id = conversationId(CHAT_GROUP, group.groupCode)
-          const current = this.contacts.get(id)
-          // Group membership is an address-book fact, not a recent dialog.
-          if (!current) continue
-          const item: QQConversation = {
-            id, kind: 'group',
-            title: group.remarkName || group.groupName || group.groupCode,
-            peerUid: group.groupCode, peerUin: group.groupCode, chatType: CHAT_GROUP,
-            avatarUrl: group.avatarUrl,
-          }
-          this.contacts.set(item.id, item)
+          this.upsertGroupProfile(group)
         }
+      },
+      onGroupDetailInfoChange: (value: GroupProfileInfo | { groupDetail: GroupProfileInfo }) => {
+        const group = value && 'groupDetail' in value ? value.groupDetail : value
+        if (!group?.groupCode) return
+        log('info', `group detail update received: group=${group.groupCode} name=${JSON.stringify(group.groupName || '')}`)
+        this.upsertGroupProfile(group)
+        this.pendingGroupProfiles.get(group.groupCode)?.resolve()
+      },
+      onGroupAllInfoChange: (value: GroupProfileInfo | { groupAll: GroupProfileInfo }) => {
+        const group = value && 'groupAll' in value ? value.groupAll : value
+        if (!group?.groupCode) return
+        log('info', `group all-info update received: group=${group.groupCode} name=${JSON.stringify(group.groupName || '')}`)
+        this.upsertGroupProfile(group)
+        this.pendingGroupProfiles.get(group.groupCode)?.resolve()
       },
     })
     this.groupListenerId = groupService.addKernelGroupListener(groupListener)
+    log('info', `native listener registered service=group id=${this.groupListenerId || '<empty>'}`)
     if (recentService.addKernelRecentContactListener) {
-      const recentListener = makeListener(kernel.NodeIKernelRecentContactListener, {
+      const recentListener = makeListener('NodeIKernelRecentContactListener', kernel.NodeIKernelRecentContactListener, {
         onRecentContactListChanged: (value: string[] | RecentContactInfo[] | {
           changedList: RecentContactInfo[]
         }, legacyChanged?: RecentContactInfo[]) => {
           const changed = Array.isArray(value)
             ? (typeof value[0] === 'string' ? legacyChanged ?? [] : value as RecentContactInfo[])
             : value.changedList ?? legacyChanged ?? []
+          log('info', `recent contact update received: version=1 changed=${changed.length}`)
           for (const item of changed) this.upsertRecent(item)
         },
         onRecentContactListChangedVer2: (value: Array<{ changedList?: RecentContactInfo[] }> | {
           changedRecentContactLists?: Array<{ changedList?: RecentContactInfo[] }>
         }) => {
           const lists = Array.isArray(value) ? value : value.changedRecentContactLists ?? []
+          log('info', `recent contact update received: version=2 lists=${lists.length} changed=${lists.reduce((sum, item) => sum + (item.changedList?.length ?? 0), 0)}`)
           for (const list of lists) {
             for (const item of list.changedList ?? []) this.upsertRecent(item)
           }
         },
       })
       this.recentListenerId = recentService.addKernelRecentContactListener(recentListener)
+      log('info', `native listener registered service=recent id=${this.recentListenerId || '<empty>'}`)
     }
   }
 
@@ -788,6 +873,7 @@ export class QQKernelBridge {
     const buddyService = this.requireBuddyService()
     const method = buddyService.getBuddyList.bind(buddyService)
     let result: unknown
+    log('info', 'native API start name=getBuddyList force=true')
     try {
       result = await method(true)
     } catch (firstError) {
@@ -799,6 +885,7 @@ export class QQKernelBridge {
         throw firstError
       }
     }
+    log('info', `native API complete name=getBuddyList payload=${summarizeNativeResult(result)}`)
     this.consumeBuddyPayload(result)
   }
 
@@ -822,16 +909,42 @@ export class QQKernelBridge {
   private async requestGroupList(): Promise<void> {
     const groupService = this.requireGroupService()
     const method = groupService.getGroupList.bind(groupService)
+    log('info', 'native API start name=getGroupList force=false')
     try {
-      await method(false)
+      const result = await method(false)
+      log('info', `native API complete name=getGroupList payload=${summarizeNativeResult(result)}`)
     } catch (firstError) {
       try {
-        await (method as unknown as (params: { forceFetch: boolean }) => Promise<unknown>)({
+        const result = await (method as unknown as (params: { forceFetch: boolean }) => Promise<unknown>)({
           forceFetch: false,
         })
+        log('info', `native API complete name=getGroupList form=object payload=${summarizeNativeResult(result)}`)
       } catch {
         throw firstError
       }
+    }
+  }
+
+  private async ensureGroupProfile(groupCode: string): Promise<void> {
+    const known = this.groups.get(groupCode)
+    if (known && !isFallbackTitle(known.name, groupCode)) return
+    const existing = this.pendingGroupProfiles.get(groupCode)
+    if (existing) return withTimeout(existing.promise, 2_000, `QQ group profile request timed out: ${groupCode}`)
+    const lastAttempt = this.groupProfileAttempts.get(groupCode) ?? 0
+    if (Date.now() - lastAttempt < 30_000) return
+    const method = this.requireGroupService().getGroupDetailInfo
+    if (!method) return
+    this.groupProfileAttempts.set(groupCode, Date.now())
+    const pending = deferred<void>()
+    this.pendingGroupProfiles.set(groupCode, pending)
+    log('info', `native API start name=getGroupDetailInfo group=${groupCode} source=5`)
+    try {
+      const result = await method.call(this.requireGroupService(), groupCode, 5)
+      log('info', `native API complete name=getGroupDetailInfo group=${groupCode} result=${result.result} err=${JSON.stringify(result.errMsg)}`)
+      if (result.result !== 0) throw new Error(`getGroupDetailInfo: ${result.errMsg} (${result.result})`)
+      await withTimeout(pending.promise, 1_000, `QQ group detail listener timed out: ${groupCode}`)
+    } finally {
+      if (this.pendingGroupProfiles.get(groupCode) === pending) this.pendingGroupProfiles.delete(groupCode)
     }
   }
 
@@ -855,12 +968,16 @@ export class QQKernelBridge {
     }
   }
 
-  private onMessages(records: MsgRecord[], informationUpdate = false): void {
+  private onMessages(
+    records: MsgRecord[],
+    source: 'onRecvMsg' | 'onAddSendMsg' | 'onMsgInfoListUpdate',
+  ): void {
+    log('info', `native message batch source=${source} count=${records.length}`)
     for (const record of records) {
       if (record.chatType !== CHAT_C2C && record.chatType !== CHAT_GROUP) continue
-      if (record.senderUid === this.config?.selfUid || SEND_FROM_SELF.has(record.sendType)) {
-        log('info', `outgoing message event id=${record.msgId} peer=${record.peerUid} status=${record.sendStatus}`)
-      }
+      this.rememberRecordSender(record)
+      const outgoing = record.senderUid === this.config?.selfUid || SEND_FROM_SELF.has(record.sendType)
+      log('info', `native message event source=${source} id=${record.msgId} seq=${record.msgSeq ?? ''} peer=${record.peerUid} chatType=${record.chatType} outgoing=${outgoing} status=${record.sendStatus} elements=${record.elements?.length ?? 0} reactions=${record.emojiLikesList?.length ?? 0}`)
       const pending = this.pendingMessages.get(record.msgId)
       if (record.sendStatus >= 1) this.pendingAcceptances.get(record.msgId)?.resolve()
       if (pending && record.sendStatus === 0) {
@@ -894,13 +1011,31 @@ export class QQKernelBridge {
       const conversation = this.conversationFromRecord(record)
       const message = this.mapMessage(record)
       const previous = (this.messages.get(message.conversationId) ?? []).find((item) => item.id === message.id)
+      if (record.sendStatus === 0) {
+        if (previous) {
+          this.forgetMessage(message)
+          this.dispatch({
+            type: 'message-delete',
+            eventId: `send-failed:${message.id}:${Date.now()}`,
+            conversation,
+            messageIds: [message.id],
+            timestamp: Math.floor(Date.now() / 1000),
+          })
+        }
+        log('error', `native message rejected id=${record.msgId} peer=${record.peerUid} source=${source}`)
+        continue
+      }
       this.rememberMessage(message)
-      const reactionsChanged = previous
-        && JSON.stringify(previous.reactionContext?.reactions) !== JSON.stringify(message.reactionContext?.reactions)
-      if (reactionsChanged || informationUpdate && record.emojiLikesList !== undefined) {
+      const reactionsChanged = Boolean(previous)
+        && JSON.stringify(previous?.reactionContext?.reactions) !== JSON.stringify(message.reactionContext?.reactions)
+      if (source === 'onMsgInfoListUpdate' && record.emojiLikesList !== undefined) {
         this.pendingReactions.get(`${conversation.id}\u0000${message.id}`)?.resolve(
           message.reactionContext ?? this.getReactionCatalog(),
         )
+      }
+      if (!previous) {
+        this.dispatch({ type: 'message', conversation, message })
+      } else if (reactionsChanged) {
         this.dispatch({
           type: 'message-reactions',
           eventId: `reaction:${message.id}:${record.msgSeq ?? Date.now()}`,
@@ -909,14 +1044,15 @@ export class QQKernelBridge {
           context: message.reactionContext ?? this.getReactionCatalog(),
           timestamp: message.timestamp,
         })
-      } else if (!previous) {
-        this.dispatch({ type: 'message', conversation, message })
+      } else {
+        log('info', `native message duplicate suppressed source=${source} id=${message.id} peer=${record.peerUid} status=${record.sendStatus}`)
       }
     }
   }
 
   private onDelete(chatType: number, peerUid: string, ids: string[]): void {
     if (chatType !== CHAT_C2C && chatType !== CHAT_GROUP) return
+    log('info', `native message delete chatType=${chatType} peer=${peerUid} messages=${ids.join(',')}`)
     const id = conversationId(chatType, peerUid)
     const conversation = this.contacts.get(id) ?? this.getConversation(id)
     this.dispatch({
@@ -929,6 +1065,7 @@ export class QQKernelBridge {
   }
 
   private onDownload(info: FileTransNotifyInfo): void {
+    log('info', `native media download event message=${info.msgId} element=${info.msgElementId} status=${info.trasferStatus} error=${info.fileErrCode} server=${info.fileSrvErrCode ?? ''} path=${JSON.stringify(info.filePath || '')} size=${info.totalSize}`)
     const pending = this.pendingDownloads.get(`${info.msgId}:${info.msgElementId}`)
     if (!pending) return
     this.pendingDownloads.delete(`${info.msgId}:${info.msgElementId}`)
@@ -936,6 +1073,7 @@ export class QQKernelBridge {
   }
 
   private dispatch(event: QQEvent): void {
+    log('info', `bridge event dispatch ${eventSummary(event)} subscribers=${this.events.size}`)
     for (const queue of this.events) queue.push(event)
   }
 
@@ -946,6 +1084,14 @@ export class QQKernelBridge {
     else messages.push(message)
     if (messages.length > 1_000) messages.splice(0, messages.length - 1_000)
     this.messages.set(message.conversationId, messages)
+  }
+
+  private forgetMessage(message: QQMessage): void {
+    const messages = this.messages.get(message.conversationId)
+    if (!messages) return
+    const index = messages.findIndex((item) => item.id === message.id)
+    if (index >= 0) messages.splice(index, 1)
+    if (!messages.length) this.messages.delete(message.conversationId)
   }
 
   private async pollSentMessage(
@@ -965,12 +1111,15 @@ export class QQKernelBridge {
     while (true) {
       if (signal.aborted) throw signal.reason ?? new Error('send confirmation polling aborted')
       const response = await withTimeout(
-        service.getLatestDbMsgs
+        Promise.resolve().then(() => service.getLatestDbMsgs
           ? service.getLatestDbMsgs(contact(conversation), 20)
-          : service.getMsgs(contact(conversation), '0', 20, true),
-          2_000,
-          'QQ history confirmation timed out',
-        ).catch(() => ({ result: -1, errMsg: '', msgList: [] as MsgRecord[] }))
+          : service.getMsgs(contact(conversation), '0', 20, true)),
+        2_000,
+        'QQ history confirmation timed out',
+        ).catch((error) => {
+          log('error', `send confirmation poll failed conversation=${conversation.id}`, error)
+          return { result: -1, errMsg: '', msgList: [] as MsgRecord[] }
+        })
       const found = response.msgList.find((record) =>
         Number(record.msgTime) >= startedAt - 2
         && (record.senderUid === this.config?.selfUid || SEND_FROM_SELF.has(record.sendType))
@@ -988,6 +1137,14 @@ export class QQKernelBridge {
 
   private upsertRecent(item: RecentContactInfo): void {
     if (item.chatType !== CHAT_C2C && item.chatType !== CHAT_GROUP) return
+    if (item.chatType === CHAT_C2C) {
+      this.rememberSeenUser({
+        id: item.peerUid,
+        numericId: item.peerUin || undefined,
+        name: item.peerName || item.remark || item.peerUin || item.peerUid,
+        avatarUrl: item.avatarUrl,
+      })
+    }
     const user = item.chatType === CHAT_C2C ? this.users.get(item.peerUid) : undefined
     const group = item.chatType === CHAT_GROUP ? this.groups.get(item.peerUin || item.peerUid) : undefined
     const current = this.contacts.get(conversationId(item.chatType, item.peerUid))
@@ -1003,7 +1160,7 @@ export class QQKernelBridge {
       unreadCount: Number(item.unreadCnt) || 0,
       lastMessage: current?.lastMessage?.id === item.msgId ? current.lastMessage : summary,
     }
-    this.contacts.set(conversation.id, conversation)
+    this.mergeConversation(conversation)
   }
 
   private upsertBuddy(buddy: ProfileSimpleInfo): void {
@@ -1011,16 +1168,67 @@ export class QQKernelBridge {
       id: buddy.uid, numericId: buddy.uin, name: buddy.remark || buddy.nick || buddy.uin, avatarUrl: buddy.avatarUrl,
     }
     this.users.set(buddy.uid, user)
+    this.rememberSeenUser({
+      ...user,
+      // A QQ nickname is global; the local buddy remark remains contact-only.
+      name: buddy.nick || buddy.remark || buddy.uin,
+    })
     const id = conversationId(CHAT_C2C, buddy.uid)
     const current = this.contacts.get(id)
     // Do not project the complete friend list as dialogs. Buddy updates only
     // enrich conversations introduced by RecentContact or explicit resolve.
     if (!current) return
-    this.contacts.set(id, {
+    this.mergeConversation({
       id, kind: 'direct', title: user.name, peerUid: buddy.uid, peerUin: buddy.uin,
       chatType: CHAT_C2C, avatarUrl: buddy.avatarUrl, unreadCount: current?.unreadCount,
       lastMessage: current?.lastMessage,
     })
+  }
+
+  private upsertGroupProfile(group: GroupProfileInfo & { avatarUrl?: string }): void {
+    const name = group.remarkName || group.groupName || group.groupCode
+    const previous = this.groups.get(group.groupCode)
+    this.groups.set(group.groupCode, {
+      name: !isFallbackTitle(name, group.groupCode) ? name : previous?.name || name,
+      avatarUrl: group.avatarUrl || previous?.avatarUrl,
+    })
+    const id = conversationId(CHAT_GROUP, group.groupCode)
+    if (!this.contacts.has(id)) return
+    this.mergeConversation({
+      id,
+      kind: 'group',
+      title: name,
+      peerUid: group.groupCode,
+      peerUin: group.groupCode,
+      chatType: CHAT_GROUP,
+      avatarUrl: group.avatarUrl,
+    })
+  }
+
+  private mergeConversation(next: QQConversation): QQConversation {
+    const current = this.contacts.get(next.id)
+    const peerKey = next.chatType === CHAT_GROUP
+      ? next.peerUin || current?.peerUin || next.peerUid
+      : next.peerUid
+    const profileTitle = next.chatType === CHAT_GROUP
+      ? this.groups.get(peerKey)?.name
+      : this.users.get(next.peerUid)?.name
+    const title = firstUsefulTitle(peerKey, profileTitle, next.title, current?.title, next.peerUin, next.peerUid)
+    const cacheKey = `${next.chatType === CHAT_C2C ? 'user' : 'group'}:${peerKey}`
+    const avatar = next.avatar ?? current?.avatar ?? this.avatarCache.get(cacheKey) ?? avatarMedia(cacheKey)
+    this.avatarCache.set(cacheKey, avatar)
+    const merged: QQConversation = {
+      ...current,
+      ...next,
+      title,
+      peerUin: next.peerUin || current?.peerUin || (next.chatType === CHAT_GROUP ? next.peerUid : ''),
+      avatarUrl: next.avatarUrl || current?.avatarUrl,
+      avatar,
+      unreadCount: next.unreadCount ?? current?.unreadCount,
+      lastMessage: next.lastMessage ?? current?.lastMessage,
+    }
+    this.contacts.set(merged.id, merged)
+    return merged
   }
 
   private replaceBuddySnapshot(categories: Array<{ buddyList: ProfileSimpleInfo[] }>): void {
@@ -1067,8 +1275,33 @@ export class QQKernelBridge {
       if (!name || name === user.name) continue
       this.users.set(uid, { ...user, name })
       const conversation = this.contacts.get(uid)
-      if (conversation) this.contacts.set(uid, { ...conversation, title: name })
+      if (conversation) this.mergeConversation({ ...conversation, title: name })
     }
+  }
+
+  private rememberRecordSender(record: MsgRecord): void {
+    if (!record.senderUid) return
+    this.rememberSeenUser({
+      id: record.senderUid,
+      numericId: record.senderUin || undefined,
+      name: record.sendNickName || record.sendRemarkName || record.senderUin || record.senderUid,
+    })
+  }
+
+  private rememberSeenUser(
+    candidate: { id: string, numericId?: string, name: string, avatarUrl?: string },
+  ): void {
+    if (!candidate.id) return
+    const current = this.seenUsers.get(candidate.id)
+    const currentFallback = !current?.name || current.name === current.id || current.name === current.numericId
+    const candidateFallback = !candidate.name || candidate.name === candidate.id || candidate.name === candidate.numericId
+    this.seenUsers.set(candidate.id, {
+      ...current,
+      ...candidate,
+      numericId: candidate.numericId || current?.numericId,
+      name: !candidateFallback || currentFallback ? candidate.name : current!.name,
+      avatarUrl: candidate.avatarUrl || current?.avatarUrl,
+    })
   }
 
   private conversationFromRecord(record: MsgRecord): QQConversation {
@@ -1082,11 +1315,11 @@ export class QQKernelBridge {
       peerUin: current?.peerUin || record.peerUin || (record.chatType === CHAT_GROUP ? record.peerUid : ''),
       chatType: record.chatType as 1 | 2,
       avatarUrl: current?.avatarUrl,
+      avatar: current?.avatar,
       unreadCount: current?.unreadCount,
     }
     conversation.lastMessage = this.mapMessage(record)
-    this.contacts.set(id, conversation)
-    return conversation
+    return this.mergeConversation(conversation)
   }
 
   private mapMessage(record: MsgRecord): QQMessage {
@@ -1104,6 +1337,15 @@ export class QQKernelBridge {
       sourceIds: record.elements?.map((element) => element.elementId).filter(Boolean),
       conversationId: conversationId(record.chatType as 1 | 2, record.peerUid),
       senderId: record.senderUid || record.senderUin,
+      sender: {
+        id: record.senderUid || record.senderUin,
+        numericId: record.senderUin || undefined,
+        name: record.sendNickName || record.sendRemarkName || record.senderUin || record.senderUid,
+        alias: record.chatType === CHAT_GROUP ? record.sendMemberName || undefined : undefined,
+        avatar: /^\d+$/.test(record.senderUin)
+          ? qlogoAvatarMedia(record.senderUid || record.senderUin, record.senderUin)
+          : undefined,
+      },
       timestamp: Number(record.msgTime) || Math.floor(Date.now() / 1000),
       outgoing: SEND_FROM_SELF.has(record.sendType) || record.senderUid === this.config?.selfUid,
       msgSeq: record.msgSeq,
@@ -1204,14 +1446,27 @@ export class QQKernelBridge {
 
   private async userAvatar(uid: string, force = true): Promise<QQMedia | undefined> {
     const cacheKey = `user:${uid}`
+    const numericId = this.seenUsers.get(uid)?.numericId
+      ?? this.users.get(uid)?.numericId
+      ?? (uid === this.config?.selfUid ? this.config.selfUin : undefined)
+    if (numericId && /^\d+$/.test(numericId)) {
+      const avatar = qlogoAvatarMedia(uid, numericId)
+      this.avatarCache.set(cacheKey, avatar)
+      return avatar
+    }
     const cached = this.avatarCache.get(cacheKey)
-    if (cached && !force) return cached
+    if (cached && !force && hasAvatarFile(cached)) return cached
     try {
       const service = this.getAvatarService()
       if (!service) return cached ?? avatarMedia(cacheKey)
       let filePath = service.getAvatarPath(uid, 0)
+      log('info', `avatar lookup kind=user peer=${uid} force=${force} cached=${Boolean(cached)} path=${JSON.stringify(filePath || '')}`)
       if (force && (!filePath || !existsSync(filePath))) {
-        await service.forceDownloadAvatar(uid, 0).catch(() => undefined)
+        const result = await service.forceDownloadAvatar(uid, 0).catch((error) => {
+          log('error', `avatar force download threw kind=user peer=${uid}`, error)
+          return undefined
+        })
+        if (result) log('info', `avatar force download complete kind=user peer=${uid} result=${result.result} err=${JSON.stringify(result.errMsg)}`)
         filePath = await waitForAvatarPath(() => service.getAvatarPath(uid, 0))
       }
       if (filePath && existsSync(filePath)) {
@@ -1222,7 +1477,8 @@ export class QQKernelBridge {
       const placeholder = cached ?? avatarMedia(cacheKey)
       this.avatarCache.set(cacheKey, placeholder)
       return placeholder
-    } catch {
+    } catch (error) {
+      log('error', `avatar lookup failed kind=user peer=${uid}`, error)
       const placeholder = cached ?? avatarMedia(cacheKey)
       this.avatarCache.set(cacheKey, placeholder)
       return placeholder
@@ -1230,27 +1486,31 @@ export class QQKernelBridge {
   }
 
   private async withConversationAvatar(conversation: QQConversation, force = true): Promise<QQConversation> {
-    const cacheKey = `${conversation.chatType === CHAT_C2C ? 'user' : 'group'}:${conversation.peerUid}`
+    const peerKey = conversation.chatType === CHAT_GROUP ? conversation.peerUin || conversation.peerUid : conversation.peerUid
+    const cacheKey = `${conversation.chatType === CHAT_C2C ? 'user' : 'group'}:${peerKey}`
     const cached = conversation.avatar ?? this.avatarCache.get(cacheKey)
-    if (cached && !force) return { ...conversation, avatar: cached }
+    if (cached && !force && hasAvatarFile(cached)) return this.mergeConversation({ ...conversation, avatar: cached })
     try {
       const service = this.getAvatarService()
       if (!service) {
         const placeholder = cached ?? avatarMedia(cacheKey)
         this.avatarCache.set(cacheKey, placeholder)
-        return { ...conversation, avatar: placeholder }
+        return this.mergeConversation({ ...conversation, avatar: placeholder })
       }
       let avatar: QQMedia | undefined
       if (conversation.chatType === CHAT_C2C) {
         avatar = await this.userAvatar(conversation.peerUid, force)
       } else {
-        let filePath = service.getGroupAvatarPath(conversation.peerUin || conversation.peerUid, 0)
-          || service.getConfGroupAvatarPath(conversation.peerUin || conversation.peerUid)
+        let filePath = service.getGroupAvatarPath(peerKey, 0) || service.getConfGroupAvatarPath(peerKey)
+        log('info', `avatar lookup kind=group peer=${peerKey} force=${force} cached=${Boolean(cached)} path=${JSON.stringify(filePath || '')}`)
         if (force && (!filePath || !existsSync(filePath))) {
-          await service.forceDownloadGroupAvatar(conversation.peerUin || conversation.peerUid, 0).catch(() => undefined)
+          const result = await service.forceDownloadGroupAvatar(peerKey, 0).catch((error) => {
+            log('error', `avatar force download threw kind=group peer=${peerKey}`, error)
+            return undefined
+          })
+          if (result) log('info', `avatar force download complete kind=group peer=${peerKey} result=${result.result} err=${JSON.stringify(result.errMsg)}`)
           filePath = await waitForAvatarPath(() =>
-            service.getGroupAvatarPath(conversation.peerUin || conversation.peerUid, 0)
-            || service.getConfGroupAvatarPath(conversation.peerUin || conversation.peerUid))
+            service.getGroupAvatarPath(peerKey, 0) || service.getConfGroupAvatarPath(peerKey))
         }
         if (filePath && existsSync(filePath)) {
           avatar = avatarMedia(cacheKey, filePath)
@@ -1259,11 +1519,12 @@ export class QQKernelBridge {
       }
       const result = avatar ?? cached ?? avatarMedia(cacheKey)
       this.avatarCache.set(cacheKey, result)
-      return { ...conversation, avatar: result }
-    } catch {
+      return this.mergeConversation({ ...conversation, avatar: result })
+    } catch (error) {
+      log('error', `avatar lookup failed kind=${conversation.kind} peer=${peerKey}`, error)
       const placeholder = cached ?? avatarMedia(cacheKey)
       this.avatarCache.set(cacheKey, placeholder)
-      return { ...conversation, avatar: placeholder }
+      return this.mergeConversation({ ...conversation, avatar: placeholder })
     }
   }
 
@@ -1271,6 +1532,7 @@ export class QQKernelBridge {
     const service = this.getAvatarService()
     if (!service) throw new Error('QQ avatar service is unavailable')
     const key = `${locator.chatType === CHAT_GROUP ? 'group' : 'user'}:${locator.peerUid}`
+    log('info', `avatar media refresh start kind=${locator.chatType === CHAT_GROUP ? 'group' : 'user'} peer=${locator.peerUid}`)
     let filePath = ''
     if (locator.chatType === CHAT_GROUP) {
       await service.forceDownloadGroupAvatar(locator.peerUid, 0).catch(() => undefined)
@@ -1281,7 +1543,13 @@ export class QQKernelBridge {
       filePath = await waitForAvatarPath(() => service.getAvatarPath(locator.peerUid, 0))
     }
     if (!filePath || !existsSync(filePath)) throw new Error(`QQ avatar is unavailable: ${locator.peerUid}`)
-    this.avatarCache.set(key, avatarMedia(key, filePath))
+    const avatar = avatarMedia(key, filePath)
+    this.avatarCache.set(key, avatar)
+    const conversation = [...this.contacts.values()].find((item) =>
+      item.chatType === locator.chatType
+      && (item.peerUid === locator.peerUid || item.peerUin === locator.peerUid))
+    if (conversation) this.mergeConversation({ ...conversation, avatar })
+    log('info', `avatar media refresh complete kind=${locator.chatType === CHAT_GROUP ? 'group' : 'user'} peer=${locator.peerUid} path=${JSON.stringify(filePath)}`)
     return filePath
   }
 
@@ -1482,7 +1750,13 @@ function mapMedia(record: MsgRecord, element: MsgElement): QQMedia | undefined {
 
 function mapMember(info: MemberInfo): MemberPage['members'][number] {
   return {
-    user: { id: info.uid, numericId: info.uin, name: info.cardName || info.remark || info.nick || info.uin },
+    user: {
+      id: info.uid,
+      numericId: info.uin,
+      name: info.nick || info.remark || info.uin,
+      alias: info.cardName || undefined,
+      avatar: /^\d+$/.test(info.uin) ? qlogoAvatarMedia(info.uid, info.uin) : undefined,
+    },
     role: info.role === MEMBER_OWNER ? 'owner' : info.role === MEMBER_ADMIN ? 'administrator' : 'member',
   }
 }
@@ -1559,12 +1833,89 @@ async function mapConcurrent<T, R>(items: readonly T[], concurrency: number, map
 }
 
 function makeListener(
+  name: string,
   Constructor: (new (handlers: Record<string, (...args: never[]) => unknown>) => unknown) | undefined,
   handlers: Record<string, (...args: never[]) => unknown>,
 ): unknown {
   // QQNT 6.9.96 exports listener wrapper constructors. QQNT 6.9.98 accepts a
   // plain callback object directly and no longer exports those constructors.
-  return Constructor ? new Constructor(handlers) : handlers
+  const protectedHandlers = Object.fromEntries(Object.entries(handlers).map(([event, handler]) => [event, (...args: unknown[]) => {
+    log('info', `native callback listener=${name} event=${event} ${summarizeCallbackArgs(args)}`)
+    try {
+      const result = (handler as (...values: unknown[]) => unknown)(...args)
+      if (result && typeof (result as PromiseLike<unknown>).then === 'function') {
+        void Promise.resolve(result).catch((error) => log('error', `native callback rejected listener=${name} event=${event}`, error))
+      }
+      return result
+    } catch (error) {
+      log('error', `native callback failed listener=${name} event=${event}`, error)
+      return undefined
+    }
+  }])) as Record<string, (...args: never[]) => unknown>
+  return Constructor ? new Constructor(protectedHandlers) : protectedHandlers
+}
+
+function normalizeMessageRecords(value: MsgRecord[] | { msgList?: MsgRecord[] } | null | undefined): MsgRecord[] {
+  if (Array.isArray(value)) return value
+  return value?.msgList ?? []
+}
+
+function normalizeSingleMessageRecord(value: MsgRecord | { msgRecord?: MsgRecord } | null | undefined): MsgRecord[] {
+  if (!value) return []
+  if ('msgId' in value) return [value]
+  return value.msgRecord ? [value.msgRecord] : []
+}
+
+function summarizeCallbackArgs(args: unknown[]): string {
+  const summary = args.map((value) => {
+    if (Array.isArray(value)) return `array(${value.length})`
+    if (value instanceof Map) return `map(${value.size})`
+    if (value && typeof value === 'object') return `object(${Object.keys(value).slice(0, 8).join(',')})`
+    return `${typeof value}(${String(value).slice(0, 80)})`
+  })
+  return `argc=${args.length} args=[${summary.join(';')}]`
+}
+
+function summarizeNativeResult(value: unknown): string {
+  if (!value || typeof value !== 'object') return `${typeof value}:${String(value)}`
+  const object = value as { result?: unknown, errMsg?: unknown, data?: unknown }
+  const data = Array.isArray(object.data) ? `array(${object.data.length})` : typeof object.data
+  return `result=${String(object.result ?? '<none>')} err=${JSON.stringify(String(object.errMsg ?? ''))} data=${data}`
+}
+
+function safeRemoveListener(service: string, id: string, remove: () => void): void {
+  try {
+    remove()
+    log('info', `native listener removed service=${service} id=${id}`)
+  } catch (error) {
+    log('error', `native listener removal failed service=${service} id=${id}`, error)
+  }
+}
+
+function eventSummary(event: QQEvent): string {
+  if (event.type === 'message') {
+    return `type=message conversation=${event.conversation.id} title=${JSON.stringify(event.conversation.title)} avatar=${event.conversation.avatar?.id ?? '<none>'} message=${event.message.id} outgoing=${event.message.outgoing}`
+  }
+  if (event.type === 'message-delete') {
+    return `type=message-delete conversation=${event.conversation.id} title=${JSON.stringify(event.conversation.title)} avatar=${event.conversation.avatar?.id ?? '<none>'} messages=${event.messageIds.join(',')}`
+  }
+  return `type=message-reactions conversation=${event.conversation.id} title=${JSON.stringify(event.conversation.title)} avatar=${event.conversation.avatar?.id ?? '<none>'} message=${event.target.messageId} reactions=${event.context.reactions.length}`
+}
+
+function hasAvatarFile(avatar: QQMedia): boolean {
+  return Boolean(avatar.locator.filePath && existsSync(avatar.locator.filePath))
+}
+
+function isFallbackTitle(title: string | undefined, peerKey: string): boolean {
+  return !title?.trim() || title.trim() === peerKey
+}
+
+function firstUsefulTitle(peerKey: string, ...candidates: Array<string | undefined>): string {
+  for (const candidate of candidates) {
+    const title = candidate?.trim()
+    if (title && title !== peerKey) return title
+  }
+  return candidates.find((candidate) => candidate?.trim())?.trim() || peerKey
 }
 
 function removePending(
@@ -1631,6 +1982,25 @@ function avatarMedia(id: string, filePath?: string): QQMedia {
       fileName: filePath ? basename(filePath) : `avatar-${id.slice(id.indexOf(':') + 1)}`,
       fileSize: size === undefined ? undefined : String(size),
       filePath,
+    },
+  }
+}
+
+function qlogoAvatarMedia(uid: string, uin: string): QQMedia {
+  const id = `user:${uid}`
+  return {
+    id: `avatar:${id}`,
+    kind: 'image',
+    name: `${uin}.jpg`,
+    mimeType: 'image/jpeg',
+    locator: {
+      messageId: `avatar:${id}`,
+      elementId: `avatar:${id}`,
+      chatType: CHAT_C2C,
+      peerUid: uid,
+      kind: 'image',
+      fileName: `${uin}.jpg`,
+      avatarUin: uin,
     },
   }
 }

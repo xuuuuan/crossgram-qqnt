@@ -7,6 +7,8 @@ import { QQBridgeServer } from './server.js'
 function fixture() {
   let msgHandlers: Record<string, (...args: unknown[]) => unknown> = {}
   let buddyHandlers: Record<string, (...args: unknown[]) => unknown> = {}
+  let groupHandlers: Record<string, (...args: unknown[]) => unknown> = {}
+  let avatarPath = '/dev/null'
   const sentBodies: Buffer[] = []
   const message: MsgRecord = {
     msgId: 'm1', msgSeq: 'seq1', chatType: 1, sendType: 1, senderUid: 'self', senderUin: '10000',
@@ -59,14 +61,18 @@ function fixture() {
     getBuddyRemark: vi.fn(() => new Map<string, string>()),
   }
   const group = {
-    addKernelGroupListener: vi.fn(() => 'group-listener'), removeKernelGroupListener: vi.fn(),
+    addKernelGroupListener: vi.fn((listener: { handlers?: typeof groupHandlers }) => {
+      groupHandlers = listener.handlers ?? listener as unknown as typeof groupHandlers
+      return 'group-listener'
+    }), removeKernelGroupListener: vi.fn(),
     getGroupList: vi.fn(async () => ({ result: 0, errMsg: '' })),
     createMemberListScene: vi.fn(() => 'scene'), destroyMemberListScene: vi.fn(),
     getNextMemberList: vi.fn(async () => ({
       errCode: 0, errMsg: '', result: {
         ids: [{ uid: 'member', index: 1 }],
         infos: new Map([['member', {
-          uid: 'member', uin: '42', nick: 'Member', remark: '', cardName: '', role: 2, avatarPath: '',
+          uid: 'member', uin: '42', nick: 'Personal Name', remark: '',
+          cardName: 'Group Alias', role: 2, avatarPath: '',
         }]]),
         finish: true,
       },
@@ -89,8 +95,8 @@ function fixture() {
     getGroupService: () => group,
     getRichMediaService: () => ({ downloadFile: vi.fn() }),
     getAvatarService: () => ({
-      getAvatarPath: () => '/dev/null', forceDownloadAvatar: async () => ({ result: 0, errMsg: '' }),
-      getGroupAvatarPath: () => '', getConfGroupAvatarPath: () => '',
+      getAvatarPath: () => avatarPath, forceDownloadAvatar: async () => ({ result: 0, errMsg: '' }),
+      getGroupAvatarPath: () => avatarPath, getConfGroupAvatarPath: () => '',
       forceDownloadGroupAvatar: async () => ({ result: 0, errMsg: '' }),
     }),
     getUixConvertService: () => ({
@@ -103,11 +109,23 @@ function fixture() {
     emitMessages(records: MsgRecord[]) {
       msgHandlers.onMsgInfoListUpdate?.(records)
     },
+    emitReceived(records: MsgRecord[]) {
+      msgHandlers.onRecvMsg?.(records)
+    },
+    emitSent(record: MsgRecord) {
+      msgHandlers.onAddSendMsg?.(record)
+    },
     emitBuddyList(categories: Array<{ buddyList: unknown[] }>) {
       buddyHandlers.onBuddyListChange?.(categories)
     },
     emitBuddyInfo(infos: Map<string, unknown>) {
       buddyHandlers.onBuddyInfoChange?.(infos)
+    },
+    emitGroupList(groups: Array<{ groupCode: string, groupName: string, remarkName?: string }>) {
+      groupHandlers.onGroupListUpdate?.(1, groups)
+    },
+    setAvatarPath(path: string) {
+      avatarPath = path
     },
   }
 }
@@ -201,6 +219,145 @@ describe('QQKernelBridge', () => {
     await expect(bridge.getContacts()).resolves.toMatchObject({
       users: [{ id: 'self' }, { id: 'friend-a' }],
     })
+  })
+
+  it('keeps the canonical group name and avatar on message events', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    await bridge.resolveConversation(2, '1058754719')
+    f.emitGroupList([{ groupCode: '1058754719', groupName: 'Bridge Test Group' }])
+    const events = bridge.subscribe()[Symbol.asyncIterator]()
+
+    f.emitReceived([{
+      ...f.message,
+      msgId: 'group-incoming',
+      chatType: 2,
+      sendType: 0,
+      senderUid: 'member',
+      senderUin: '42',
+      peerUid: '1058754719',
+      peerUin: '1058754719',
+      peerName: '',
+      sendNickName: 'Personal Name',
+      sendMemberName: 'Group Alias',
+    }])
+
+    await expect(events.next()).resolves.toMatchObject({
+      value: {
+        type: 'message',
+        conversation: {
+          id: '1058754719',
+          title: 'Bridge Test Group',
+          avatar: { id: 'avatar:group:1058754719', locator: { filePath: '/dev/null' } },
+        },
+        message: {
+          sender: {
+            id: 'member',
+            numericId: '42',
+            name: 'Personal Name',
+            alias: 'Group Alias',
+            avatar: { locator: { avatarUin: '42' } },
+          },
+        },
+      },
+    })
+  })
+
+  it('keeps a group member personal name and alias separate and adds a qlogo avatar', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const page = await bridge.getMembers(bridge.getConversation('1058754719'))
+    expect(page.members).toMatchObject([{
+      user: {
+        id: 'member',
+        numericId: '42',
+        name: 'Personal Name',
+        alias: 'Group Alias',
+        avatar: {
+          id: 'avatar:user:member',
+          mimeType: 'image/jpeg',
+          locator: { avatarUin: '42' },
+        },
+      },
+    }])
+    await expect(bridge.getUser('member')).resolves.toMatchObject({
+      id: 'member',
+      name: 'Personal Name',
+      avatar: { locator: { avatarUin: '42' } },
+    })
+  })
+
+  it('streams a ranged qlogo avatar from the fixed QQ endpoint', async () => {
+    const requested = vi.fn(async (input: URL | RequestInfo, init?: RequestInit) => {
+      expect(String(input)).toBe('https://q1.qlogo.cn/g?b=qq&nk=42&s=640')
+      expect(init?.headers).toEqual({ range: 'bytes=10-11' })
+      return new Response(Uint8Array.from([1, 2]), { status: 206 })
+    })
+    vi.stubGlobal('fetch', requested)
+    try {
+      const bridge = new QQKernelBridge()
+      const stream = await bridge.openMedia({
+        messageId: 'avatar:user:member',
+        elementId: 'avatar:user:member',
+        chatType: 1,
+        peerUid: 'member',
+        kind: 'image',
+        fileName: '42.jpg',
+        avatarUin: '42',
+      }, 10, 2)
+      const chunks: Buffer[] = []
+      for await (const chunk of stream) chunks.push(Buffer.from(chunk))
+      expect(Buffer.concat(chunks)).toEqual(Buffer.from([1, 2]))
+      expect(requested).toHaveBeenCalledOnce()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('publishes a first-seen info update as a message even with an empty reaction list', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const events = bridge.subscribe()[Symbol.asyncIterator]()
+
+    f.emitMessages([{ ...f.message, msgId: 'first-info', sendType: 0, senderUid: 'friend', emojiLikesList: [] }])
+
+    await expect(events.next()).resolves.toMatchObject({
+      value: { type: 'message', message: { id: 'first-info' } },
+    })
+  })
+
+  it('retracts an optimistic outgoing event when QQ later rejects it', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const events = bridge.subscribe()[Symbol.asyncIterator]()
+
+    f.emitSent({ ...f.message, msgId: 'eventually-failed', sendStatus: 1 })
+    f.emitMessages([{ ...f.message, msgId: 'eventually-failed', sendStatus: 0 }])
+
+    await expect(events.next()).resolves.toMatchObject({
+      value: { type: 'message', message: { id: 'eventually-failed' } },
+    })
+    await expect(events.next()).resolves.toMatchObject({
+      value: { type: 'message-delete', messageIds: ['eventually-failed'] },
+    })
+  })
+
+  it('rechecks an unresolved group-avatar placeholder instead of caching the miss forever', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.setAvatarPath('')
+    bridge.getConversation('1058754719')
+    const first = await bridge.getDialogs()
+    expect(first.conversations.find((item) => item.id === '1058754719')?.avatar?.locator.filePath).toBeUndefined()
+
+    f.setAvatarPath('/dev/null')
+    const second = await bridge.getDialogs()
+    expect(second.conversations.find((item) => item.id === '1058754719')?.avatar?.locator.filePath).toBe('/dev/null')
   })
 
   it('writes multiple reactions sequentially and emits updates for history messages', async () => {

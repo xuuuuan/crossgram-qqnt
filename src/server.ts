@@ -13,6 +13,7 @@ export interface BridgeServerOptions {
 
 export class QQBridgeServer {
   private server?: Server
+  private requestSequence = 0
   readonly host: string
   readonly port: number
   readonly token?: string
@@ -26,8 +27,19 @@ export class QQBridgeServer {
   async start(): Promise<void> {
     if (this.server) return
     this.server = createServer((request, response) => {
-      void this.route(request, response).catch((error) => {
-        log('error', 'request failed', error)
+      const requestId = ++this.requestSequence
+      const startedAt = Date.now()
+      const method = request.method ?? '<unknown>'
+      const target = request.url ?? '/'
+      log('info', `HTTP request start id=${requestId} method=${method} target=${JSON.stringify(target)} remote=${request.socket.remoteAddress ?? '<unknown>'}`)
+      response.once('finish', () => {
+        log('info', `HTTP request complete id=${requestId} method=${method} target=${JSON.stringify(target)} status=${response.statusCode} durationMs=${Date.now() - startedAt} contentLength=${response.getHeader('content-length') ?? '<stream>'}`)
+      })
+      response.once('close', () => {
+        if (!response.writableEnded) log('info', `HTTP request closed id=${requestId} method=${method} target=${JSON.stringify(target)} status=${response.statusCode} durationMs=${Date.now() - startedAt}`)
+      })
+      void this.route(request, response, requestId).catch((error) => {
+        log('error', `HTTP request failed id=${requestId} method=${method} target=${JSON.stringify(target)}`, error)
         if (!response.headersSent) json(response, 500, { error: errorMessage(error) })
         else response.destroy(error instanceof Error ? error : new Error(String(error)))
       })
@@ -60,7 +72,7 @@ export class QQBridgeServer {
     return { host: this.host, port: address.port }
   }
 
-  private async route(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  private async route(request: IncomingMessage, response: ServerResponse, requestId: number): Promise<void> {
     if (!this.authorize(request)) {
       json(response, 401, { error: 'unauthorized' })
       return
@@ -69,7 +81,9 @@ export class QQBridgeServer {
     const path = url.pathname
 
     if (request.method === 'GET' && path === '/v1/status') {
-      json(response, 200, { protocolVersion: PROTOCOL_VERSION, ...this.bridge.status })
+      const status = { protocolVersion: PROTOCOL_VERSION, ...this.bridge.status }
+      log('info', `HTTP API status id=${requestId} ready=${status.ready} selfUin=${status.selfUin ?? ''}`)
+      json(response, 200, status)
       return
     }
     if (!this.bridge.status.ready) {
@@ -77,31 +91,39 @@ export class QQBridgeServer {
       return
     }
     if (request.method === 'GET' && path === '/v1/events') {
-      await this.events(request, response)
+      await this.events(request, response, requestId)
       return
     }
     if (request.method === 'GET' && path === '/v1/dialogs') {
-      json(response, 200, await this.bridge.getDialogs(
+      const page = await this.bridge.getDialogs(
         url.searchParams.get('cursor') ?? undefined,
         numberParam(url, 'limit', 100),
-      ))
+      )
+      log('info', `HTTP API dialogs id=${requestId} count=${page.conversations.length} next=${page.nextCursor ?? ''}`)
+      json(response, 200, page)
       return
     }
     if (request.method === 'GET' && path === '/v1/contacts') {
-      json(response, 200, await this.bridge.getContacts(
+      const page = await this.bridge.getContacts(
         url.searchParams.get('cursor') ?? undefined,
         numberParam(url, 'limit', 500),
-      ))
+      )
+      log('info', `HTTP API contacts id=${requestId} count=${page.users.length} next=${page.nextCursor ?? ''}`)
+      json(response, 200, page)
       return
     }
     if (request.method === 'GET' && path === '/v1/reactions/catalog') {
-      json(response, 200, this.bridge.getReactionCatalog())
+      const catalog = this.bridge.getReactionCatalog()
+      log('info', `HTTP API reaction catalog id=${requestId} available=${catalog.available.length}`)
+      json(response, 200, catalog)
       return
     }
     if (request.method === 'GET' && path === '/v1/conversations/resolve') {
       const kind = url.searchParams.get('kind')
       const numericId = requiredParam(url, 'id')
-      json(response, 200, await this.bridge.resolveConversation(kind === 'group' ? 2 : 1, numericId))
+      const conversation = await this.bridge.resolveConversation(kind === 'group' ? 2 : 1, numericId)
+      log('info', `HTTP API resolve conversation id=${requestId} kind=${conversation.kind} conversation=${conversation.id} title=${JSON.stringify(conversation.title)} avatar=${conversation.avatar?.id ?? '<none>'}`)
+      json(response, 200, conversation)
       return
     }
 
@@ -109,26 +131,35 @@ export class QQBridgeServer {
     if (request.method === 'GET' && conversationMatch) {
       const conversation = this.bridge.getConversation(decodeURIComponent(conversationMatch[1]))
       if (!conversationMatch[2]) {
-        json(response, 200, await this.bridge.getConversationDetails(conversation.id))
+        const details = await this.bridge.getConversationDetails(conversation.id)
+        log('info', `HTTP API conversation details id=${requestId} conversation=${details.id} title=${JSON.stringify(details.title)} avatar=${details.avatar?.id ?? '<none>'}`)
+        json(response, 200, details)
       } else if (conversationMatch[2] === 'history') {
-        json(response, 200, await this.bridge.getHistory(conversation, {
+        const page = await this.bridge.getHistory(conversation, {
           cursor: url.searchParams.get('cursor') ?? undefined,
           beforeId: url.searchParams.get('beforeId') ?? undefined,
           afterId: url.searchParams.get('afterId') ?? undefined,
           limit: numberParam(url, 'limit', 50),
-        }))
+        })
+        log('info', `HTTP API history id=${requestId} conversation=${conversation.id} count=${page.messages.length} next=${page.nextCursor ?? ''}`)
+        json(response, 200, page)
       } else {
-        json(response, 200, await this.bridge.getMembers(
+        const page = await this.bridge.getMembers(
           conversation,
           url.searchParams.get('cursor') ?? undefined,
           numberParam(url, 'limit', 100),
-        ))
+        )
+        log('info', `HTTP API members id=${requestId} conversation=${conversation.id} count=${page.members.length} total=${page.total ?? ''} next=${page.nextCursor ?? ''}`)
+        json(response, 200, page)
       }
       return
     }
     if (request.method === 'POST' && path === '/v1/messages') {
       const manifest = decodeManifest(request.headers['x-qqnt-manifest'])
-      json(response, 200, await this.bridge.send(manifest, request))
+      log('info', `HTTP API send start id=${requestId} conversation=${manifest.conversationId} textLength=${manifest.text?.length ?? 0} media=${manifest.media?.map((item) => `${item.kind}:${item.name}:${item.size ?? '?'}`).join(',') || '<none>'}`)
+      const message = await this.bridge.send(manifest, request)
+      log('info', `HTTP API send complete id=${requestId} conversation=${manifest.conversationId} message=${message.id} parts=${message.parts.length}`)
+      json(response, 200, message)
       return
     }
     if (request.method === 'POST' && path === '/v1/messages/delete') {
@@ -142,21 +173,27 @@ export class QQBridgeServer {
         body.messageIds,
         body.forEveryone ?? true,
       )
+      log('info', `HTTP API delete messages id=${requestId} conversation=${body.conversationId} messages=${body.messageIds.join(',')} forEveryone=${body.forEveryone ?? true}`)
       json(response, 200, { ok: true })
       return
     }
     if (request.method === 'GET' && path === '/v1/messages/reactions') {
       const conversation = this.bridge.getConversation(requiredParam(url, 'conversationId'))
-      json(response, 200, await this.bridge.getMessageReactions(conversation, requiredParam(url, 'messageId')))
+      const messageId = requiredParam(url, 'messageId')
+      const context = await this.bridge.getMessageReactions(conversation, messageId)
+      log('info', `HTTP API get reactions id=${requestId} conversation=${conversation.id} message=${messageId} reactions=${context.reactions.length}`)
+      json(response, 200, context)
       return
     }
     if (request.method === 'POST' && path === '/v1/messages/reactions') {
       const body = await readJson<{ conversationId: string, messageId: string, reactionKeys: string[] }>(request)
-      json(response, 200, await this.bridge.setMessageReactions(
+      const context = await this.bridge.setMessageReactions(
         this.bridge.getConversation(body.conversationId),
         body.messageId,
         body.reactionKeys,
-      ))
+      )
+      log('info', `HTTP API set reactions id=${requestId} conversation=${body.conversationId} message=${body.messageId} requested=${body.reactionKeys.join(',')} resulting=${context.reactions.length}`)
+      json(response, 200, context)
       return
     }
     if (request.method === 'POST' && path === '/v1/messages/forward') {
@@ -166,11 +203,13 @@ export class QQBridgeServer {
         body.messageIds,
         this.bridge.getConversation(body.to),
       )
+      log('info', `HTTP API forward messages id=${requestId} from=${body.from} to=${body.to} messages=${body.messageIds.join(',')}`)
       json(response, 200, { ok: true })
       return
     }
     if (request.method === 'GET' && path.startsWith('/v1/users/')) {
       const user = await this.bridge.getUser(decodeURIComponent(path.slice('/v1/users/'.length)))
+      log('info', `HTTP API user id=${requestId} found=${Boolean(user)} user=${user?.id ?? '<none>'} avatar=${user?.avatar?.id ?? '<none>'}`)
       if (!user) json(response, 404, { error: 'user not found' })
       else json(response, 200, user)
       return
@@ -179,6 +218,7 @@ export class QQBridgeServer {
       const locator = await readJson<QQMediaLocator>(request)
       const offset = numberHeader(request, 'x-qqnt-offset', 0)
       const limit = optionalNumberHeader(request, 'x-qqnt-limit')
+      log('info', `HTTP API media open id=${requestId} kind=${locator.kind} message=${locator.messageId} element=${locator.elementId} peer=${locator.peerUid} offset=${offset} limit=${limit ?? '<all>'} pathPresent=${Boolean(locator.filePath)}`)
       const stream = await this.bridge.openMedia(locator, offset, limit)
       response.writeHead(200, {
         'content-type': 'application/octet-stream',
@@ -191,7 +231,7 @@ export class QQBridgeServer {
     json(response, 404, { error: 'not found' })
   }
 
-  private async events(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  private async events(request: IncomingMessage, response: ServerResponse, requestId: number): Promise<void> {
     response.writeHead(200, {
       'content-type': 'text/event-stream',
       'cache-control': 'no-cache, no-transform',
@@ -200,17 +240,20 @@ export class QQBridgeServer {
     })
     response.flushHeaders()
     const queue = this.bridge.subscribe()
+    log('info', `SSE subscriber connected request=${requestId} subscribers=${this.bridge.events.size}`)
     const heartbeat = setInterval(() => response.write(': heartbeat\n\n'), 15_000)
     const close = () => this.bridge.unsubscribe(queue)
     request.once('close', close)
     try {
       for await (const event of queue) {
+        log('info', `SSE event write request=${requestId} ${wireEventSummary(event)}`)
         if (!response.write(`data: ${JSON.stringify(event)}\n\n`)) await once(response, 'drain')
       }
     } finally {
       clearInterval(heartbeat)
       request.off('close', close)
       this.bridge.unsubscribe(queue)
+      log('info', `SSE subscriber disconnected request=${requestId} subscribers=${this.bridge.events.size}`)
       response.end()
     }
   }
@@ -219,6 +262,10 @@ export class QQBridgeServer {
     if (!this.token) return true
     return request.headers.authorization === `Bearer ${this.token}`
   }
+}
+
+function wireEventSummary(event: { type: string, conversation?: { id?: string }, message?: { id?: string }, eventId?: string }): string {
+  return `type=${event.type} conversation=${event.conversation?.id ?? ''} message=${event.message?.id ?? ''} eventId=${event.eventId ?? ''}`
 }
 
 function json(response: ServerResponse, status: number, value: unknown): void {

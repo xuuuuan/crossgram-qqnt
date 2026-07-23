@@ -25,6 +25,8 @@ export interface QQMediaLocator {
   md5?: string
   sha?: string
   sha3?: string
+  /** Numeric QQ account used to fetch a user avatar from the fixed qlogo endpoint. */
+  avatarUin?: string
 }
 
 export interface QQMedia {
@@ -45,6 +47,13 @@ export interface QQMessage {
   senderId: string
   timestamp: number
   outgoing: boolean
+  sender?: {
+    id: string
+    numericId?: string
+    name: string
+    alias?: string
+    avatar?: QQMedia
+  }
   msgSeq?: string
   parts: Array<{ type: 'text', text: string } | { type: 'media', media: QQMedia }>
   reactionContext?: QQReactionContext
@@ -121,7 +130,15 @@ export interface HistoryQuery {
 
 export interface MemberPage {
   members: Array<{
-    user: { id: string, numericId?: string, name: string, avatarUrl?: string }
+    user: {
+      id: string
+      numericId?: string
+      name: string
+      /** Conversation-scoped group card; never overwrite the global name with it. */
+      alias?: string
+      avatarUrl?: string
+      avatar?: QQMedia
+    }
     role: 'owner' | 'administrator' | 'member'
   }>
   total?: number

@@ -42,6 +42,12 @@ export interface MemberInfo {
   avatarPath: string
 }
 
+export interface GroupProfileInfo {
+  groupCode: string
+  groupName: string
+  remarkName?: string
+}
+
 export interface MsgElement {
   elementType: number
   elementId: string
@@ -167,6 +173,7 @@ export interface KernelGroupService {
   addKernelGroupListener(listener: unknown): string
   removeKernelGroupListener(listenerId: string): void
   getGroupList(force: boolean): Promise<{ result: number, errMsg: string }>
+  getGroupDetailInfo?(groupCode: string, source: number): Promise<{ result: number, errMsg: string }>
   createMemberListScene(groupCode: string, scene: string): string
   destroyMemberListScene(sceneId: string): void
   getNextMemberList(sceneId: string, lastId: { uid: string, index: number }, count: number): Promise<{
