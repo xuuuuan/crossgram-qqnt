@@ -1,6 +1,9 @@
 import Module from 'node:module'
-import type { InitSessionConfig, KernelModule, KernelMsgService, KernelSession } from './kernel-types.js'
-import { multiplexMsgService } from './listener-multiplexer.js'
+import type {
+  InitSessionConfig, KernelBuddyService, KernelGroupService, KernelModule, KernelMsgService,
+  KernelRecentService, KernelSession,
+} from './kernel-types.js'
+import { teeBuddyService, teeGroupService, teeMsgService, teeRecentService } from './listener-tee.js'
 import { log, logPath } from './log.js'
 import { QQKernelBridge } from './qq-kernel.js'
 import { QQBridgeServer } from './server.js'
@@ -122,6 +125,9 @@ function wrapKernelModule(kernel: KernelModule): KernelModule {
 function wrapSession(kernel: KernelModule, nativeSession: KernelSession): KernelSession {
   let attached = false
   let msgServiceFacade: KernelMsgService | undefined
+  let buddyServiceFacade: KernelBuddyService | undefined
+  let groupServiceFacade: KernelGroupService | undefined
+  let recentServiceFacade: KernelRecentService | undefined
   let facade: KernelSession
   facade = new Proxy(nativeSession, {
     get(target, property) {
@@ -148,7 +154,31 @@ function wrapSession(kernel: KernelModule, nativeSession: KernelSession): Kernel
           if (msgServiceFacade) return msgServiceFacade
           const nativeService = Reflect.apply(value, target, []) as KernelMsgService | undefined
           if (!nativeService) return nativeService
-          return msgServiceFacade = multiplexMsgService(kernel, nativeService)
+          return msgServiceFacade = teeMsgService(nativeService)
+        }
+      }
+      if (property === 'getBuddyService' && typeof value === 'function') {
+        return () => {
+          if (buddyServiceFacade) return buddyServiceFacade
+          const nativeService = Reflect.apply(value, target, []) as KernelBuddyService | undefined
+          if (!nativeService) return nativeService
+          return buddyServiceFacade = teeBuddyService(nativeService)
+        }
+      }
+      if (property === 'getGroupService' && typeof value === 'function') {
+        return () => {
+          if (groupServiceFacade) return groupServiceFacade
+          const nativeService = Reflect.apply(value, target, []) as KernelGroupService | undefined
+          if (!nativeService) return nativeService
+          return groupServiceFacade = teeGroupService(nativeService)
+        }
+      }
+      if (property === 'getRecentContactService' && typeof value === 'function') {
+        return () => {
+          if (recentServiceFacade) return recentServiceFacade
+          const nativeService = Reflect.apply(value, target, []) as KernelRecentService | undefined
+          if (!nativeService) return nativeService
+          return recentServiceFacade = teeRecentService(nativeService)
         }
       }
       // Native methods reject a JS Proxy as their receiver. Always bind them

@@ -5,7 +5,7 @@ import { basename, dirname, extname, join } from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { Readable } from 'node:stream'
 import { AsyncQueue, deferred } from './async.js'
-import { MULTIPLEXED_MSG_SERVICE } from './listener-multiplexer.js'
+import { markBridgeListener } from './listener-tee.js'
 import { log } from './log.js'
 import type {
   FileTransNotifyInfo, GroupProfileInfo, InitSessionConfig, KernelModule, KernelSession, MemberInfo, MsgElement, MsgRecord,
@@ -1038,11 +1038,9 @@ export class QQKernelBridge {
     } catch {
       this.avatarService = undefined
     }
-    const msgListener = makeListener(
+    const msgListener = markBridgeListener(makeListener(
       'NodeIKernelMsgListener',
-      (msgService as unknown as { [MULTIPLEXED_MSG_SERVICE]?: boolean })[MULTIPLEXED_MSG_SERVICE]
-        ? undefined
-        : kernel.NodeIKernelMsgListener,
+      kernel.NodeIKernelMsgListener,
       {
       onRecvMsg: (value: MsgRecord[] | { msgList: MsgRecord[] }) =>
         this.onMessages(normalizeMessageRecords(value), 'onRecvMsg'),
@@ -1078,10 +1076,10 @@ export class QQKernelBridge {
         }
       },
       },
-    )
+    ))
     this.listenerId = msgService.addKernelMsgListener(msgListener)
     log('info', `native listener registered service=message id=${this.listenerId || '<empty>'}`)
-    const buddyListener = makeListener('NodeIKernelBuddyListener', kernel.NodeIKernelBuddyListener, {
+    const buddyListener = markBridgeListener(makeListener('NodeIKernelBuddyListener', kernel.NodeIKernelBuddyListener, {
       onBuddyListChange: (value: Array<{ buddyList: ProfileSimpleInfo[] }> | {
         data: Array<{ buddyList: ProfileSimpleInfo[] }>
       }) => {
@@ -1105,10 +1103,10 @@ export class QQKernelBridge {
           if (this.users.has(buddy.uid)) this.upsertBuddy(buddy)
         }
       },
-    })
+    }))
     this.buddyListenerId = buddyService.addKernelBuddyListener(buddyListener)
     log('info', `native listener registered service=buddy id=${this.buddyListenerId || '<empty>'}`)
-    const groupListener = makeListener('NodeIKernelGroupListener', kernel.NodeIKernelGroupListener, {
+    const groupListener = markBridgeListener(makeListener('NodeIKernelGroupListener', kernel.NodeIKernelGroupListener, {
       onGroupListUpdate: (
         value: number | {
           groupList: Array<{
@@ -1161,11 +1159,11 @@ export class QQKernelBridge {
           finish: !info.hasNext,
         })
       },
-    })
+    }))
     this.groupListenerId = groupService.addKernelGroupListener(groupListener)
     log('info', `native listener registered service=group id=${this.groupListenerId || '<empty>'}`)
     if (recentService.addKernelRecentContactListener) {
-      const recentListener = makeListener('NodeIKernelRecentContactListener', kernel.NodeIKernelRecentContactListener, {
+      const recentListener = markBridgeListener(makeListener('NodeIKernelRecentContactListener', kernel.NodeIKernelRecentContactListener, {
         onRecentContactListChanged: (value: string[] | RecentContactInfo[] | {
           changedList: RecentContactInfo[]
         }, legacyChanged?: RecentContactInfo[]) => {
@@ -1179,12 +1177,13 @@ export class QQKernelBridge {
           changedRecentContactLists?: Array<{ changedList?: RecentContactInfo[] }>
         }) => {
           const lists = Array.isArray(value) ? value : value.changedRecentContactLists ?? []
-          log('info', `recent contact update received: version=2 lists=${lists.length} changed=${lists.reduce((sum, item) => sum + (item.changedList?.length ?? 0), 0)}`)
+          const changed = lists.flatMap((item) => item.changedList ?? [])
+          log('info', `recent contact update received: version=2 lists=${lists.length} changed=${changed.length} messages=${changed.map((item) => `${item.chatType}:${item.peerUid}:${item.msgSeq ?? ''}:${item.msgId || '<none>'}`).join(',') || '<none>'}`)
           for (const list of lists) {
             for (const item of list.changedList ?? []) this.upsertRecent(item)
           }
         },
-      })
+      }))
       this.recentListenerId = recentService.addKernelRecentContactListener(recentListener)
       log('info', `native listener registered service=recent id=${this.recentListenerId || '<empty>'}`)
     }
@@ -1361,6 +1360,9 @@ export class QQKernelBridge {
       }
       const conversation = this.conversationFromRecord(record)
       const message = this.mapMessage(record)
+      if (source === 'onRecvMsg' && !message.outgoing) {
+        log('info', receivedMessageSummary(conversation, message))
+      }
       const previous = (this.messages.get(message.conversationId) ?? []).find((item) => item.id === message.id)
       // Some info updates only mutate delivery/media metadata and omit the
       // reaction field altogether. Absence is not an authoritative clear.
@@ -2290,6 +2292,22 @@ function summarizeCallbackArgs(args: unknown[]): string {
     return `${typeof value}(${String(value).slice(0, 80)})`
   })
   return `argc=${args.length} args=[${summary.join(';')}]`
+}
+
+function receivedMessageSummary(conversation: QQConversation, message: QQMessage): string {
+  const sender = message.sender?.alias || message.sender?.name || message.sender?.numericId || message.senderId
+  const senderId = message.sender?.numericId || message.senderId
+  const content = message.parts.length
+    ? message.parts.map((part) => part.type === 'text'
+      ? JSON.stringify(truncateLogText(part.text))
+      : `[${part.media.kind === 'image' ? 'image' : 'file'} name=${JSON.stringify(part.media.name || '')} size=${part.media.size ?? '?'}]`)
+      .join(' ')
+    : '[empty]'
+  return `received message conversation=${JSON.stringify(conversation.title)}(${conversation.id}) sender=${JSON.stringify(sender)}(${senderId}) seq=${message.msgSeq ?? ''} id=${message.id} content=${content}`
+}
+
+function truncateLogText(value: string, limit = 500): string {
+  return value.length <= limit ? value : `${value.slice(0, limit)}…`
 }
 
 function summarizeNativeResult(value: unknown): string {

@@ -21,6 +21,7 @@ export interface RecentContactInfo {
   avatarUrl: string
   unreadCnt: string
   msgId: string
+  msgSeq?: string
   msgTime?: string
   senderUid?: string
   senderUin?: string

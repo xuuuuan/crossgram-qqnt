@@ -11,6 +11,16 @@ export const slowHttpLogPath = process.env.QQNT_BRIDGE_SLOW_HTTP_LOG
 
 const slowHttpKeys = new Map<string, Set<string>>()
 
+const ANSI = {
+  reset: '\u001b[0m',
+  bold: '\u001b[1m',
+  dim: '\u001b[2m',
+  red: '\u001b[31m',
+  yellow: '\u001b[33m',
+  cyan: '\u001b[36m',
+  brightCyan: '\u001b[96m',
+} as const
+
 export function log(level: 'info' | 'warn' | 'error', message: string, ...details: unknown[]): void {
   const rendered = [
     new Date().toISOString(),
@@ -24,10 +34,24 @@ export function log(level: 'info' | 'warn' | 'error', message: string, ...detail
   } catch {
     // QQ logging must never make the host process fail.
   }
-  const output = `[qqnt-bridge] ${message}`
+  const output = consoleOutput(level, message)
   if (level === 'error') console.error(output, ...details)
   else if (level === 'warn') console.warn(output, ...details)
   else console.log(output, ...details)
+}
+
+function consoleOutput(level: 'info' | 'warn' | 'error', message: string): string {
+  const plain = `[qqnt-bridge] ${level.toUpperCase()} ${message}`
+  if (!useConsoleColor()) return plain
+  const levelColor = level === 'error' ? ANSI.red : level === 'warn' ? ANSI.yellow : ANSI.cyan
+  const messageColor = message.startsWith('received message') ? `${ANSI.bold}${ANSI.brightCyan}` : ''
+  return `${ANSI.dim}[qqnt-bridge]${ANSI.reset} ${levelColor}${level.toUpperCase()}${ANSI.reset} ${messageColor}${message}${messageColor ? ANSI.reset : ''}`
+}
+
+function useConsoleColor(): boolean {
+  if (process.env.NO_COLOR !== undefined || process.env.QQNT_BRIDGE_COLOR === '0') return false
+  if (process.env.VITEST) return false
+  return true
 }
 
 export function recordSlowHttpRequest(entry: {
