@@ -110,6 +110,10 @@ function fixture() {
     })),
   }
   const richMedia = { downloadFile: vi.fn() }
+  const uix = {
+    getUid: vi.fn(async () => ({ uidInfo: new Map([['1715311957', 'uid-1715311957']]) })),
+    getUin: vi.fn(async () => ({ uinInfo: new Map([['uid-1715311957', '1715311957']]) })),
+  }
   class Listener {
     handlers: typeof msgHandlers
     constructor(handlers: typeof msgHandlers) { this.handlers = handlers }
@@ -131,13 +135,10 @@ function fixture() {
       getGroupAvatarPath: () => avatarPath, getConfGroupAvatarPath: () => '',
       forceDownloadGroupAvatar: async () => ({ result: 0, errMsg: '' }),
     }),
-    getUixConvertService: () => ({
-      getUid: async () => ({ uidInfo: new Map([['1715311957', 'uid-1715311957']]) }),
-      getUin: async () => ({ uinInfo: new Map([['uid-1715311957', '1715311957']]) }),
-    }),
+    getUixConvertService: () => uix,
   } as unknown as KernelSession
   return {
-    kernel, session, msg, recent, group, richMedia, message, sentBodies,
+    kernel, session, msg, recent, group, richMedia, uix, message, sentBodies,
     emitMessages(records: MsgRecord[]) {
       msgHandlers.onMsgInfoListUpdate?.(records)
     },
@@ -198,7 +199,11 @@ describe('QQKernelBridge', () => {
     const dialogs = await bridge.getDialogs()
     expect(dialogs.conversations[0]).toMatchObject({
       id: 'uid-1715311957', peerUin: '1715311957', title: 'xuuuuan',
-      lastMessage: { id: 'm1', parts: [{ type: 'text', text: 'hello preview' }] },
+      lastMessage: {
+        id: 'm1',
+        sender: { id: 'uid-1715311957', numericId: '1715311957', name: 'xuuuuan' },
+        parts: [{ type: 'text', text: 'hello preview' }],
+      },
     })
     const history = await bridge.getHistory(dialogs.conversations[0])
     expect(history.messages[0]).toMatchObject({ id: 'm1', parts: [{ type: 'text', text: 'hello' }] })
@@ -216,6 +221,40 @@ describe('QQKernelBridge', () => {
     expect(sent.sourceIds).toBeUndefined()
     expect(f.msg.getMsgUniqueId).toHaveBeenCalledWith(expect.stringMatching(/^\d{13}$/))
     expect(f.msg.sendMsg).toHaveBeenCalledOnce()
+  })
+
+  it('embeds a group recent sender and bounds a missing UID lookup', async () => {
+    const f = fixture()
+    f.recent.getRecentContactInfos.mockResolvedValue({
+      result: 0,
+      errMsg: '',
+      relation: [{
+        chatType: 2, peerUid: '1058754719', peerUin: '1058754719', peerName: 'Test Group',
+        remark: '', avatarUrl: '', unreadCnt: '0', msgId: 'group-preview', msgTime: '1800000000',
+        senderUid: 'u_group_member', senderUin: '42',
+        abstractContent: [{ elementType: 1, content: 'group preview' }],
+      }],
+    })
+    const bridge = new QQKernelBridge({ userResolveTimeoutMs: 20 })
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.getDialogs()).resolves.toMatchObject({
+      conversations: [{
+        lastMessage: {
+          senderId: 'u_group_member',
+          sender: {
+            id: 'u_group_member', numericId: '42', name: '42',
+            avatar: { locator: { avatarUin: '42' } },
+          },
+        },
+      }],
+    })
+    expect(f.uix.getUin).not.toHaveBeenCalled()
+
+    f.uix.getUin.mockImplementationOnce(() => new Promise(() => {}))
+    await expect(bridge.getUser('u_hung')).resolves.toMatchObject({
+      id: 'u_hung', name: 'u_hung', avatar: { id: 'avatar:user:u_hung' },
+    })
   })
 
   it('maps and sends native mention and reply elements without parsing opaque IDs', async () => {

@@ -44,6 +44,7 @@ export interface QQKernelOptions {
   tempPath?: string
   sendTimeoutMs?: number
   downloadTimeoutMs?: number
+  userResolveTimeoutMs?: number
 }
 
 export class QQKernelBridge {
@@ -111,11 +112,13 @@ export class QQKernelBridge {
   private readonly tempPath: string
   private readonly sendTimeoutMs: number
   private readonly downloadTimeoutMs: number
+  private readonly userResolveTimeoutMs: number
 
   constructor(options: QQKernelOptions = {}) {
     this.tempPath = options.tempPath ?? join(process.env.TMPDIR ?? '/tmp', 'qqnt-mtproto-bridge')
     this.sendTimeoutMs = options.sendTimeoutMs ?? 60_000
     this.downloadTimeoutMs = options.downloadTimeoutMs ?? 120_000
+    this.userResolveTimeoutMs = options.userResolveTimeoutMs ?? 2_000
     mkdirSync(this.tempPath, { recursive: true })
   }
 
@@ -995,14 +998,25 @@ export class QQKernelBridge {
   async getUser(uid: string) {
     const cached = this.seenUsers.get(uid) ?? this.users.get(uid)
     if (cached) return { ...cached, avatar: await this.userAvatar(uid, false) }
-    const numeric = await retryTransientInvalidArgument(
-      () => Promise.resolve().then(() => this.requireSession().getUixConvertService().getUin(new Set([uid]))),
-    )
-    const numericId = numeric.uinInfo.get(uid)
-    if (!numericId) return null
-    const user = { id: uid, numericId, name: numericId }
+    let numericId: string | undefined
+    try {
+      const numeric = await withTimeout(
+        retryTransientInvalidArgument(
+          () => Promise.resolve().then(() => this.requireSession().getUixConvertService().getUin(new Set([uid]))),
+        ),
+        this.userResolveTimeoutMs,
+        `QQ user resolve timed out: ${uid}`,
+      )
+      numericId = numeric.uinInfo.get(uid)
+    } catch (error) {
+      log('error', `QQ user resolve failed uid=${uid}; using opaque fallback`, error)
+    }
+    const user = { id: uid, numericId, name: numericId ?? uid }
     this.seenUsers.set(uid, user)
-    return { ...user, avatar: qlogoAvatarMedia(uid, numericId) }
+    return {
+      ...user,
+      avatar: numericId ? qlogoAvatarMedia(uid, numericId) : avatarMedia(`user:${uid}`),
+    }
   }
 
   async getReactionCatalog(): Promise<QQReactionContext> {
@@ -1828,6 +1842,13 @@ export class QQKernelBridge {
 
   private upsertRecent(item: RecentContactInfo): void {
     if (item.chatType !== CHAT_C2C && item.chatType !== CHAT_GROUP) return
+    if (item.senderUid) {
+      this.rememberSeenUser({
+        id: item.senderUid,
+        numericId: item.senderUin || undefined,
+        name: item.senderUin || item.senderUid,
+      })
+    }
     if (item.chatType === CHAT_C2C) {
       this.rememberSeenUser({
         id: item.peerUid,
@@ -1948,10 +1969,20 @@ export class QQKernelBridge {
     const text = (item.abstractContent ?? []).map((element) =>
       element.content || element.fileName || abstractCustomContent(element.custom_content))
       .filter(Boolean).join('')
+    const senderId = item.senderUid || item.senderUin || item.peerUid
+    const sender = this.seenUsers.get(senderId) ?? this.users.get(senderId)
     return {
       id: item.msgId,
       conversationId: conversationId(item.chatType as 1 | 2, item.peerUid),
-      senderId: item.senderUid || item.senderUin || item.peerUid,
+      senderId,
+      sender: sender ? {
+        id: sender.id,
+        numericId: sender.numericId,
+        name: sender.name,
+        avatar: sender.numericId && /^\d+$/.test(sender.numericId)
+          ? qlogoAvatarMedia(sender.id, sender.numericId)
+          : undefined,
+      } : undefined,
       timestamp: Number(item.msgTime) || Math.floor(Date.now() / 1000),
       outgoing: Boolean(item.senderUid && item.senderUid === this.config?.selfUid),
       parts: text ? [{ type: 'text', text }] : [],
