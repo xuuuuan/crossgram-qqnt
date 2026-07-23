@@ -1931,7 +1931,14 @@ export class QQKernelBridge {
           }] : undefined,
         })
       } else if (element.elementType === ELEMENT_FACE && element.faceElement) {
-        parts.push({ type: 'text', text: element.faceElement.faceText || `[QQ表情 ${element.faceElement.faceIndex}]` })
+        const text = element.faceElement.faceText || `[QQ表情 ${element.faceElement.faceIndex}]`
+        parts.push({
+          type: 'text', text,
+          entities: [{
+            type: 'qq-face', offset: 0, length: text.length,
+            faceId: String(element.faceElement.faceIndex), faceType: element.faceElement.faceType,
+          }],
+        })
       } else if (element.elementType === ELEMENT_REPLY && element.replyElement?.replayMsgId) {
         replyToId = element.replyElement.replayMsgId
       } else {
@@ -2432,7 +2439,7 @@ function textElement(text: string): MsgElement {
 
 function textPartElements(part: QQTextPart): MsgElement[] {
   const entities = (part.entities ?? [])
-    .filter((entity) => entity.type === 'mention' && entity.offset >= 0 && entity.length > 0
+    .filter((entity) => entity.offset >= 0 && entity.length > 0
       && entity.offset + entity.length <= part.text.length)
     .sort((left, right) => left.offset - right.offset)
   if (!entities.length) return part.text ? [textElement(part.text)] : []
@@ -2441,17 +2448,28 @@ function textPartElements(part: QQTextPart): MsgElement[] {
   for (const entity of entities) {
     if (entity.offset < offset) continue
     if (entity.offset > offset) elements.push(textElement(part.text.slice(offset, entity.offset)))
-    elements.push({
-      elementType: ELEMENT_TEXT,
-      elementId: '',
-      textElement: {
-        content: part.text.slice(entity.offset, entity.offset + entity.length),
-        atType: 2,
-        atUid: entity.numericId ?? '',
-        atTinyId: '',
-        atNtUid: entity.userId,
-      },
-    })
+    const content = part.text.slice(entity.offset, entity.offset + entity.length)
+    if (entity.type === 'mention') {
+      elements.push({
+        elementType: ELEMENT_TEXT,
+        elementId: '',
+        textElement: {
+          content,
+          atType: 2,
+          atUid: entity.numericId ?? '',
+          atTinyId: '',
+          atNtUid: entity.userId,
+        },
+      })
+    } else {
+      const faceIndex = Number(entity.faceId)
+      if (!Number.isInteger(faceIndex) || faceIndex < 0) elements.push(textElement(content))
+      else elements.push({
+        elementType: ELEMENT_FACE,
+        elementId: '',
+        faceElement: { faceIndex, faceText: content, faceType: entity.faceType || 1 },
+      })
+    }
     offset = entity.offset + entity.length
   }
   if (offset < part.text.length) elements.push(textElement(part.text.slice(offset)))

@@ -122,13 +122,22 @@ export interface QQMessage {
 export interface QQTextPart {
   type: 'text'
   text: string
-  entities?: Array<{
-    type: 'mention'
-    offset: number
-    length: number
-    userId: string
-    numericId?: string
-  }>
+  entities?: Array<
+    | {
+        type: 'mention'
+        offset: number
+        length: number
+        userId: string
+        numericId?: string
+      }
+    | {
+        type: 'qq-face'
+        offset: number
+        length: number
+        faceId: string
+        faceType: number
+      }
+  >
 }
 
 export interface QQConversation {

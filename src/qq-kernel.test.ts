@@ -224,7 +224,9 @@ describe('QQKernelBridge', () => {
       elementType: 1, elementId: 'mention', textElement: {
         content: '@Alice', atType: 2, atUid: '12345', atTinyId: '', atNtUid: 'u_opaque_alice',
       },
-    }, { elementType: 1, elementId: 'text', textElement: { content: ' hello' } }]
+    }, { elementType: 6, elementId: 'face', faceElement: {
+      faceIndex: 14, faceText: '[微笑]', faceType: 1,
+    } }, { elementType: 1, elementId: 'text', textElement: { content: ' hello' } }]
     const bridge = new QQKernelBridge()
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
 
@@ -234,6 +236,9 @@ describe('QQKernelBridge', () => {
       parts: [{
         type: 'text', text: '@Alice',
         entities: [{ type: 'mention', offset: 0, length: 6, userId: 'u_opaque_alice', numericId: '12345' }],
+      }, {
+        type: 'text', text: '[微笑]',
+        entities: [{ type: 'qq-face', offset: 0, length: 4, faceId: '14', faceType: 1 }],
       }, { type: 'text', text: ' hello' }],
     })
 
@@ -244,8 +249,11 @@ describe('QQKernelBridge', () => {
     await bridge.send({
       conversationId: 'uid-1715311957', replyToId: 'opaque-original',
       textParts: [{
-        type: 'text', text: 'hi @Alice!',
-        entities: [{ type: 'mention', offset: 3, length: 6, userId: 'u_opaque_alice', numericId: '12345' }],
+        type: 'text', text: 'hi @Alice[微笑]!',
+        entities: [
+          { type: 'mention', offset: 3, length: 6, userId: 'u_opaque_alice', numericId: '12345' },
+          { type: 'qq-face', offset: 9, length: 4, faceId: '14', faceType: 1 },
+        ],
       }],
     }, Readable.from([]))
     expect(f.msg.sendMsg).toHaveBeenCalledWith('m1', expect.anything(), [
@@ -254,6 +262,9 @@ describe('QQKernelBridge', () => {
       expect.objectContaining({
         elementType: 1,
         textElement: expect.objectContaining({ content: '@Alice', atType: 2, atUid: '12345', atNtUid: 'u_opaque_alice' }),
+      }),
+      expect.objectContaining({
+        elementType: 6, faceElement: expect.objectContaining({ faceIndex: 14, faceText: '[微笑]', faceType: 1 }),
       }),
       expect.objectContaining({ elementType: 1, textElement: expect.objectContaining({ content: '!', atType: 0 }) }),
     ], expect.any(Map))
