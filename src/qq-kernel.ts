@@ -68,10 +68,8 @@ export class QQKernelBridge {
   private readonly pendingReactions = new Map<string, ReturnType<typeof deferred<QQReactionContext>>>()
   private readonly pendingGroupProfiles = new Map<string, ReturnType<typeof deferred<void>>>()
   private readonly groupProfileAttempts = new Map<string, number>()
-  private readonly unreadMarkerLookups = new Map<string, {
-    state: string
-    promise: Promise<QQMessage | undefined>
-  }>()
+  private unreadBatchState = ''
+  private unreadBatchPromise?: Promise<void>
   private listenerId?: string
   private buddyListenerId?: string
   private groupListenerId?: string
@@ -107,7 +105,8 @@ export class QQKernelBridge {
     this.groups.clear()
     this.avatarCache.clear()
     this.groupProfileAttempts.clear()
-    this.unreadMarkerLookups.clear()
+    this.unreadBatchState = ''
+    this.unreadBatchPromise = undefined
     this.messages.clear()
     this.buddySnapshotLoaded = false
     this.kernel = kernel
@@ -212,14 +211,15 @@ export class QQKernelBridge {
     }
     const dialogs = [...this.contacts.values()]
     const offset = parseCursor(cursor)
-    const page = await mapConcurrent(dialogs.slice(offset, offset + clamp(limit, 1, 500)), 32, async (conversation) => {
+    const selected = dialogs.slice(offset, offset + clamp(limit, 1, 500))
+    await this.refreshUnreadMarkers(selected)
+    const page = await mapConcurrent(selected, 8, async (conversation) => {
       if (conversation.chatType === CHAT_GROUP && isFallbackTitle(conversation.title, conversation.peerUin || conversation.peerUid)) {
         await this.ensureGroupProfile(conversation.peerUin || conversation.peerUid).catch((error) =>
           log('error', `group profile fallback failed group=${conversation.peerUin || conversation.peerUid}`, error))
       }
       const current = this.contacts.get(conversation.id) ?? conversation
-      const withReadMarker = await this.withUnreadMarker(current)
-      return this.withConversationAvatar(withReadMarker, false)
+      return this.withConversationAvatar(current, false)
     })
     return {
       conversations: page,
@@ -309,25 +309,21 @@ export class QQKernelBridge {
     const anchor = query.beforeId ?? query.afterId ?? query.cursor ?? '0'
     const peer = contact(conversation)
     const initial = !query.beforeId && !query.afterId && !query.cursor
+    const unreadSeq = query.aroundUnreadSeq || (initial ? conversation.firstUnread?.msgSeq : undefined)
     let response: { result: number, errMsg: string, msgList: MsgRecord[] }
-    const primaryName = initial
+    const primaryName = unreadSeq && service.getMsgsBySeqAndCount
+      ? 'getMsgsBySeqAndCount(unread)'
+      : initial
       ? conversation.chatType === CHAT_GROUP && service.getAioFirstViewLatestMsgs
         ? 'getAioFirstViewLatestMsgs'
         : service.getMsgsIncludeSelf ? 'getMsgsIncludeSelf' : service.getLatestDbMsgs ? 'getLatestDbMsgs' : 'getMsgs'
       : service.getMsgsIncludeSelf ? 'getMsgsIncludeSelf' : 'getMsgs'
     log('info', `native API start name=${primaryName} conversation=${conversation.id} anchor=${anchor} limit=${limit} after=${Boolean(query.afterId)}`)
     try {
-      if (initial && conversation.chatType === CHAT_GROUP && service.getAioFirstViewLatestMsgs) {
-        const firstView = await withTimeout(
-          retryHistoryCall(() => service.getAioFirstViewLatestMsgs!(peer, limit)),
-          2_000,
-          'QQ first-view history request timed out',
-        )
-        if (firstView.result === 0 && !firstView.needContinueGetMsg) {
-          response = firstView
-        } else {
-          response = await this.latestHistoryFallback(service, peer, limit)
-        }
+      if (unreadSeq && service.getMsgsBySeqAndCount) {
+        response = await this.unreadHistory(service, conversation, unreadSeq, limit)
+      } else if (initial && conversation.chatType === CHAT_GROUP && service.getAioFirstViewLatestMsgs) {
+        response = await this.firstViewHistory(service, conversation, limit)
       } else if (initial) {
         response = await this.latestHistoryFallback(service, peer, limit)
       } else {
@@ -349,7 +345,7 @@ export class QQKernelBridge {
         log('info', `native API fallback name=getMsgs conversation=${conversation.id} previousResult=${response.result}`)
         response = await withTimeout(
           service.getMsgs(peer, '0', limit, true),
-          5_000,
+          450,
           'QQ history fallback request timed out',
         )
       }
@@ -387,6 +383,53 @@ export class QQKernelBridge {
         ? () => service.getLatestDbMsgs!(peer, limit)
         : () => service.getMsgs(peer, '0', limit, true)
     return withTimeout(retryHistoryCall(request), 2_000, 'QQ history request timed out')
+  }
+
+  private async firstViewHistory(
+    service: ReturnType<KernelSession['getMsgService']>,
+    conversation: QQConversation,
+    limit: number,
+  ): Promise<{ result: number, errMsg: string, msgList: MsgRecord[] }> {
+    const peer = contact(conversation)
+    const started = Date.now()
+    // QQ does not await getAioFirstViewLatestMsgs by itself. ChatStore starts
+    // the local-first-view and include-self paths together, races them, and
+    // keeps local data only when it is already a complete screen.
+    const local = retryHistoryCall(() => service.getAioFirstViewLatestMsgs!(peer, limit))
+    const remote = retryHistoryCall(() => service.getMsgsIncludeSelf
+      ? service.getMsgsIncludeSelf(peer, '0', limit, true)
+      : service.getMsgs(peer, '0', limit, true))
+    const settledLocal = local.then(
+      (value) => ({ source: 'local' as const, value }),
+      (error) => ({ source: 'local' as const, error }),
+    )
+    const settledRemote = remote.then(
+      (value) => ({ source: 'remote' as const, value }),
+      (error) => ({ source: 'remote' as const, error }),
+    )
+    const first = await withTimeout(
+      Promise.race([settledLocal, settledRemote]),
+      450,
+      'QQ first-screen history request timed out',
+    )
+    if (
+      first.source === 'local'
+      && 'value' in first
+      && first.value.result === 0
+      && first.value.msgList.length >= limit
+      && !first.value.needContinueGetMsg
+    ) {
+      log('info', `native API complete name=firstViewRace conversation=${conversation.id} source=local durationMs=${Date.now() - started} messages=${first.value.msgList.length}`)
+      return first.value
+    }
+    const remoteResult = first.source === 'remote' ? first : await withTimeout(
+      settledRemote,
+      Math.max(1, 450 - (Date.now() - started)),
+      'QQ first-screen remote history request timed out',
+    )
+    if ('error' in remoteResult) throw remoteResult.error
+    log('info', `native API complete name=firstViewRace conversation=${conversation.id} source=remote durationMs=${Date.now() - started} messages=${remoteResult.value.msgList.length}`)
+    return remoteResult.value
   }
 
   async getMessage(conversation: QQConversation, id: string): Promise<QQMessage | null> {
@@ -532,51 +575,119 @@ export class QQKernelBridge {
     }
   }
 
-  private async withUnreadMarker(conversation: QQConversation): Promise<QQConversation> {
-    if (!conversation.unreadCount || conversation.readInboxMaxMessage) return conversation
+  private async refreshUnreadMarkers(conversations: readonly QQConversation[]): Promise<void> {
     const service = this.requireMsgService()
-    if (!service.getFirstUnreadMsgSeq || !service.getMsgsBySeqAndCount) return conversation
-    const state = `${conversation.unreadCount}:${conversation.lastMessage?.id ?? ''}`
-    let lookup = this.unreadMarkerLookups.get(conversation.id)
-    if (!lookup || lookup.state !== state) {
-      lookup = { state, promise: this.lookupUnreadMarker(conversation, service) }
-      this.unreadMarkerLookups.set(conversation.id, lookup)
+    if (!service.getABatchOfContactMsgBoxInfo) return
+    if (!conversations.length) return
+    const state = conversations.map((conversation) =>
+      `${conversation.id}:${conversation.unreadCount}:${conversation.lastMessage?.id ?? ''}`).join('|')
+    if (state !== this.unreadBatchState) {
+      this.unreadBatchState = state
+      this.unreadBatchPromise = this.loadUnreadMarkers(service, conversations)
     }
-    const readInboxMaxMessage = await lookup.promise
-    return readInboxMaxMessage
-      ? this.mergeConversation({ ...conversation, readInboxMaxMessage })
-      : conversation
+    await this.unreadBatchPromise
   }
 
-  private async lookupUnreadMarker(
-    conversation: QQConversation,
+  private async loadUnreadMarkers(
     service: ReturnType<KernelSession['getMsgService']>,
-  ): Promise<QQMessage | undefined> {
-    const peer = contact(conversation)
+    conversations: readonly QQConversation[],
+  ): Promise<void> {
     try {
-      log('info', `native API start name=getFirstUnreadMsgSeq conversation=${conversation.id}`)
-      const unread = await withTimeout(
-        retryHistoryCall(() => service.getFirstUnreadMsgSeq!(peer)),
+      log('info', `native API start name=getABatchOfContactMsgBoxInfo contacts=${conversations.length}`)
+      const response = await withTimeout(
+        retryHistoryCall(() => service.getABatchOfContactMsgBoxInfo!(conversations.map(contact))),
         450,
-        'QQ first-unread request timed out',
+        'QQ batch unread request timed out',
       )
-      if (unread.result !== 0 || !unread.seq || unread.seq === '0') return undefined
-      const around = await withTimeout(
-        retryHistoryCall(() => service.getMsgsBySeqAndCount!(peer, unread.seq, 2, true, false)),
-        450,
-        'QQ read-marker history request timed out',
-      )
-      if (around.result !== 0) return undefined
-      const previous = around.msgList.find((record) => record.msgSeq !== unread.seq)
-      if (!previous) return undefined
+      if (response.result !== 0) throw new Error(`getABatchOfContactMsgBoxInfo: ${response.errMsg} (${response.result})`)
+      const infos = new Map(response.contactMsgBoxInfos.map((info) => [
+        `${info.contact.chatType}:${info.contact.peerUid}`,
+        info,
+      ]))
+      let found = 0
+      for (const conversation of conversations) {
+        const info = infos.get(`${conversation.chatType}:${conversation.peerUid}`)
+        if (!info) continue
+        const unreadCount = Number(info.unreadCnt) || 0
+        const marker = info.firstUnreadMsgInfo
+        const firstUnread = unreadCount > 0 && marker?.msgSeq && marker.msgSeq !== '0'
+          ? marker
+          : undefined
+        this.mergeConversation({
+          ...conversation,
+          unreadCount,
+          firstUnread,
+          readInboxMaxMessage: unreadCount > 0 ? conversation.readInboxMaxMessage : undefined,
+        })
+        if (firstUnread) found++
+      }
+      this.unreadBatchState = conversations.map((conversation) => {
+        const current = this.contacts.get(conversation.id) ?? conversation
+        return `${current.id}:${current.unreadCount}:${current.lastMessage?.id ?? ''}`
+      }).join('|')
+      log('info', `native API complete name=getABatchOfContactMsgBoxInfo contacts=${conversations.length} markers=${found}`)
+    } catch (error) {
+      // Allow the next request to retry instead of permanently caching a
+      // transient native failure.
+      this.unreadBatchState = ''
+      this.unreadBatchPromise = undefined
+      log('warn', 'QQ batch unread lookup failed', error)
+    }
+  }
+
+  private async unreadHistory(
+    service: ReturnType<KernelSession['getMsgService']>,
+    conversation: QQConversation,
+    unreadSeq: string,
+    limit: number,
+  ): Promise<{ result: number, errMsg: string, msgList: MsgRecord[] }> {
+    const peer = contact(conversation)
+    const count = Math.max(2, Math.ceil(limit / 2) + 1)
+    const call = async (queryOrder: boolean) => {
+      const started = Date.now()
+      try {
+        const result = await retryHistoryCall(
+          () => service.getMsgsBySeqAndCount!(peer, unreadSeq, count, queryOrder, false),
+        )
+        log('info', `native API complete name=getMsgsBySeqAndCount(unread) conversation=${conversation.id} direction=${queryOrder ? 'before' : 'after'} durationMs=${Date.now() - started} result=${result.result} messages=${result.msgList.length}`)
+        return result
+      } catch (error) {
+        log('warn', `QQ unread history direction failed conversation=${conversation.id} direction=${queryOrder ? 'before' : 'after'} durationMs=${Date.now() - started}`, error)
+        return undefined
+      }
+    }
+    // Match QQ's ChatMsgArea.getRangeMsgs: it fetches both sides of msgSeq
+    // concurrently. Waiting for them serially doubles cold roaming latency.
+    const [before, after] = await withTimeout(
+      Promise.all([call(true), call(false)]),
+      450,
+      'QQ unread history request timed out',
+    )
+    // QQ returns kNoMoreMsg (2004000) together with the final non-empty
+    // page. The official client consumes that page instead of discarding it.
+    const successful = [before, after].filter((item) => item && (item.result === 0 || item.msgList.length > 0))
+    if (!successful.length) {
+      return before ?? after ?? { result: -1, errMsg: 'unread history unavailable', msgList: [] }
+    }
+    const records = new Map<string, MsgRecord>()
+    for (const result of successful) {
+      for (const record of result!.msgList) records.set(record.msgId, record)
+    }
+    const msgList = [...records.values()]
+      .sort((left, right) => Number(right.msgTime) - Number(left.msgTime))
+      .slice(0, limit)
+    const previous = before?.result === 0
+      ? before.msgList
+        .filter((record) => record.msgSeq !== unreadSeq)
+        .sort((left, right) => Number(right.msgTime) - Number(left.msgTime))[0]
+      : undefined
+    if (previous) {
       const readInboxMaxMessage = this.mapMessage(previous)
       this.rememberMessage(readInboxMaxMessage)
-      log('info', `native API complete name=readMarker conversation=${conversation.id} firstUnreadSeq=${unread.seq} readMessage=${readInboxMaxMessage.id}`)
-      return readInboxMaxMessage
-    } catch (error) {
-      log('warn', `QQ unread marker lookup failed conversation=${conversation.id}`, error)
-      return undefined
+      this.mergeConversation({ ...conversation, readInboxMaxMessage })
+      log('info', `native API complete name=readMarker conversation=${conversation.id} firstUnreadSeq=${unreadSeq} readMessage=${readInboxMaxMessage.id}`)
     }
+    return { result: 0, errMsg: '', msgList }
   }
 
   async deleteMessages(conversation: QQConversation, ids: string[], forEveryone: boolean): Promise<void> {
@@ -1254,6 +1365,7 @@ export class QQKernelBridge {
       avatarUrl: user?.avatarUrl || group?.avatarUrl || item.avatarUrl,
       unreadCount: Number(item.unreadCnt) || 0,
       lastMessage: current?.lastMessage?.id === item.msgId ? current.lastMessage : summary,
+      firstUnread: Number(item.unreadCnt) > 0 ? current?.firstUnread : undefined,
       readInboxMaxMessage: Number(item.unreadCnt) > 0 ? current?.readInboxMaxMessage : undefined,
     }
     this.mergeConversation(conversation)

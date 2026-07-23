@@ -70,6 +70,8 @@ export interface QQConversation {
   avatar?: QQMedia
   unreadCount?: number
   lastMessage?: QQMessage
+  /** QQ's native cursor for the first unread message. */
+  firstUnread?: { msgSeq: string, msgTime: string }
   /** Last message read before QQ's first unread message. */
   readInboxMaxMessage?: QQMessage
 }
@@ -128,6 +130,8 @@ export interface HistoryQuery {
   limit?: number
   beforeId?: string
   afterId?: string
+  /** Native QQ sequence used only to open a chat around its unread boundary. */
+  aroundUnreadSeq?: string
 }
 
 export interface MemberPage {

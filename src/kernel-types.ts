@@ -106,6 +106,15 @@ export interface MsgRecord {
   }>
 }
 
+export interface ContactMsgBoxInfo {
+  contact: Contact
+  firstUnreadMsgInfo?: {
+    msgSeq: string
+    msgTime: string
+  }
+  unreadCnt?: string
+}
+
 export interface FileTransNotifyInfo {
   fileModelId: string
   msgElementId: string
@@ -142,6 +151,11 @@ export interface KernelMsgService {
   getMsgUniqueId?(time: string): string
   getLatestDbMsgs?(peer: Contact, count: number): Promise<{ result: number, errMsg: string, msgList: MsgRecord[] }>
   getFirstUnreadMsgSeq?(peer: Contact): Promise<{ result: number, errMsg: string, seq: string }>
+  getABatchOfContactMsgBoxInfo?(contacts: Contact[]): Promise<{
+    result: number
+    errMsg: string
+    contactMsgBoxInfos: ContactMsgBoxInfo[]
+  }>
   getEmojiResourcePath?(type: number): Promise<{ result: number, errMsg: string, resourcePath: string }>
   getRichMediaFilePath?(
     elementType: number, elementSubType: number, md5HexStr: string, fileName: string,
