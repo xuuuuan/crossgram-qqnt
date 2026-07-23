@@ -526,7 +526,7 @@ describe('QQKernelBridge', () => {
         },
       }],
     }])
-    expect(f.msg.getMultiMsg).toHaveBeenCalledWith(expect.anything(), 'merged-1', '')
+    expect(f.msg.getMultiMsg).toHaveBeenCalledWith(expect.anything(), 'merged-1', 'merged-1')
   })
 
   it('uses include-self for current QQ direct-chat history', async () => {

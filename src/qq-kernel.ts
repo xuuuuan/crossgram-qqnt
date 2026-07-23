@@ -492,11 +492,12 @@ export class QQKernelBridge {
     const service = this.requireMsgService()
     if (!service.getMultiMsg) throw new Error('getMultiMsg is unavailable in this QQNT build')
     const conversation = this.getConversation(locator.conversationId)
-    log('info', `native API start name=getMultiMsg conversation=${conversation.id} root=${locator.rootMessageId} parent=${locator.parentMessageId ?? ''}`)
+    const parentMessageId = locator.parentMessageId ?? locator.rootMessageId
+    log('info', `native API start name=getMultiMsg conversation=${conversation.id} root=${locator.rootMessageId} parent=${parentMessageId}`)
     const response = await retryTransientInvalidArgument(() => service.getMultiMsg!(
-      contact(conversation), locator.rootMessageId, locator.parentMessageId ?? '',
+      contact(conversation), locator.rootMessageId, parentMessageId,
     ))
-    log('info', `native API complete name=getMultiMsg conversation=${conversation.id} root=${locator.rootMessageId} parent=${locator.parentMessageId ?? ''} result=${response.result} err=${JSON.stringify(response.errMsg)} messages=${response.msgList.length}`)
+    log('info', `native API complete name=getMultiMsg conversation=${conversation.id} root=${locator.rootMessageId} parent=${parentMessageId} result=${response.result} err=${JSON.stringify(response.errMsg)} messages=${response.msgList.length}`)
     if (response.result !== 0) throw new Error(`getMultiMsg: ${response.errMsg} (${response.result})`)
     return response.msgList
       .filter((record) => !isRecalledRecord(record))
