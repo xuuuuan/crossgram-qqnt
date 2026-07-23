@@ -470,7 +470,15 @@ describe('QQKernelBridge', () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
-    const conversation = (await bridge.getDialogs()).conversations[0]
+    const conversation = await bridge.resolveConversation(2, '1058754719')
+    const groupMessage = {
+      ...f.message,
+      chatType: 2 as const,
+      peerUid: '1058754719',
+      peerUin: '1058754719',
+    }
+    f.msg.getMsgsByMsgId.mockResolvedValue({ result: 0, errMsg: '', msgList: [groupMessage] })
+    f.msg.getLatestDbMsgs.mockResolvedValue({ result: 0, errMsg: '', msgList: [groupMessage] })
     await bridge.getHistory(conversation)
     await expect(bridge.setMessageReactions(conversation, 'm1', ['2:128522', '1:14']))
       .resolves.toMatchObject({ reactions: [
@@ -478,18 +486,33 @@ describe('QQKernelBridge', () => {
         { key: '1:14', selected: true },
       ] })
     expect(f.msg.setMsgEmojiLikes.mock.calls).toEqual([
-      [expect.objectContaining({ peerUid: 'uid-1715311957' }), 'seq1', '128522', '2', true],
-      [expect.objectContaining({ peerUid: 'uid-1715311957' }), 'seq1', '14', '1', true],
+      [expect.objectContaining({ peerUid: '1058754719' }), 'seq1', '128522', '2', true],
+      [expect.objectContaining({ peerUid: '1058754719' }), 'seq1', '14', '1', true],
     ])
 
     const events = bridge.subscribe()[Symbol.asyncIterator]()
     f.emitMessages([{
-      ...f.message,
+      ...groupMessage,
       emojiLikesList: [{ emojiType: '2', emojiId: '128522', likesCnt: '3', isClicked: true }],
     }])
     await expect(events.next()).resolves.toMatchObject({
       value: { type: 'message-reactions', context: { reactions: [{ key: '2:128522', count: 3 }] } },
     })
+    const state = await bridge.getMessageReactions(conversation, 'm1')
+    expect(state).not.toHaveProperty('available')
+  })
+
+  it('does not expose or write reactions in direct conversations', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const conversation = (await bridge.getDialogs()).conversations[0]
+
+    await expect(bridge.getMessageReactions(conversation, 'm1'))
+      .resolves.toEqual({ reactions: [], maxSelected: 0 })
+    await expect(bridge.setMessageReactions(conversation, 'm1', ['1:14']))
+      .rejects.toThrow('unavailable in direct conversations')
+    expect(f.msg.setMsgEmojiLikes).not.toHaveBeenCalled()
   })
 
   it('uses the final group msgSeq and accepts an idempotent reaction add', async () => {
@@ -540,7 +563,7 @@ describe('QQBridgeServer', () => {
     const { port } = server.address()
     const base = `http://127.0.0.1:${port}/v1`
     await expect(fetch(`${base}/status`).then((response) => response.json())).resolves.toMatchObject({
-      protocolVersion: 1, ready: true, selfUin: '10000',
+      protocolVersion: 2, ready: true, selfUin: '10000',
     })
     await expect(fetch(`${base}/dialogs`).then((response) => response.json())).resolves.toMatchObject({
       conversations: [{ peerUin: '1715311957' }],

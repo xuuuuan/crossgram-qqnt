@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 1
+export const PROTOCOL_VERSION = 2
 
 export type QQChatType = 1 | 2
 
@@ -56,7 +56,8 @@ export interface QQMessage {
   }
   msgSeq?: string
   parts: Array<{ type: 'text', text: string } | { type: 'media', media: QQMedia }>
-  reactionContext?: QQReactionContext
+  /** Per-message state only. The shared definition catalog has its own endpoint. */
+  reactionContext?: QQReactionState
 }
 
 export interface QQConversation {
@@ -84,7 +85,7 @@ export type QQEvent =
       eventId: string
       conversation: QQConversation
       target: { conversationId: string, messageId: string, targetId: string }
-      context: QQReactionContext
+      context: QQReactionState
       timestamp: number
     }
 
@@ -110,6 +111,11 @@ export interface QQReactionDefinition {
 
 export interface QQReactionContext {
   available: QQReactionDefinition[]
+  reactions: Array<{ key: string, count: number, selected?: boolean }>
+  maxSelected: number
+}
+
+export interface QQReactionState {
   reactions: Array<{ key: string, count: number, selected?: boolean }>
   maxSelected: number
 }

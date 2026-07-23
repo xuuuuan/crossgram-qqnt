@@ -13,7 +13,8 @@ import type {
 } from './kernel-types.js'
 import {
   conversationId, parseConversationId, type HistoryQuery, type MemberPage, type QQConversation, type QQEvent,
-  type QQMedia, type QQMediaLocator, type QQMessage, type QQReactionContext, type QQReactionDefinition, type SendManifest,
+  type QQMedia, type QQMediaLocator, type QQMessage, type QQReactionContext, type QQReactionDefinition, type QQReactionState,
+  type SendManifest,
 } from './protocol.js'
 
 const CHAT_C2C = 1
@@ -65,7 +66,7 @@ export class QQKernelBridge {
     expectedMediaKind?: 'image' | 'file'
   }> = []
   private readonly pendingDownloads = new Map<string, ReturnType<typeof deferred<FileTransNotifyInfo>>>()
-  private readonly pendingReactions = new Map<string, ReturnType<typeof deferred<QQReactionContext>>>()
+  private readonly pendingReactions = new Map<string, ReturnType<typeof deferred<QQReactionState>>>()
   private readonly pendingGroupProfiles = new Map<string, ReturnType<typeof deferred<void>>>()
   private readonly groupProfileAttempts = new Map<string, number>()
   private unreadBatchState = ''
@@ -727,17 +728,19 @@ export class QQKernelBridge {
     return { available: this.reactionDefinitions, reactions: [], maxSelected: 20 }
   }
 
-  async getMessageReactions(conversation: QQConversation, messageId: string): Promise<QQReactionContext> {
+  async getMessageReactions(conversation: QQConversation, messageId: string): Promise<QQReactionState> {
+    if (conversation.chatType !== CHAT_GROUP) return { reactions: [], maxSelected: 0 }
     const message = (this.messages.get(conversation.id) ?? []).find((item) => item.id === messageId)
       ?? await withTimeout(this.getMessage(conversation, messageId), 5_000, 'QQ reaction lookup timed out')
-    return message?.reactionContext ?? this.getReactionCatalog()
+    return message?.reactionContext ?? { reactions: [], maxSelected: 20 }
   }
 
   async setMessageReactions(
     conversation: QQConversation,
     messageId: string,
     reactionKeys: readonly string[],
-  ): Promise<QQReactionContext> {
+  ): Promise<QQReactionState> {
+    if (conversation.chatType !== CHAT_GROUP) throw new Error('QQ reactions are unavailable in direct conversations')
     const service = this.requireMsgService()
     if (!service.setMsgEmojiLikes) throw new Error('QQ reactions are unavailable in this QQNT build')
     const cached = (this.messages.get(conversation.id) ?? []).find((item) => item.id === messageId)
@@ -766,7 +769,7 @@ export class QQKernelBridge {
       for (const key of new Set([...current, ...desired])) {
         if (current.has(key) === desired.has(key)) continue
         const [emojiType, emojiId] = splitReactionKey(key)
-        const event = deferred<QQReactionContext>()
+        const event = deferred<QQReactionState>()
         this.pendingReactions.set(pendingKey, event)
         let completed = false
         let lastError: unknown
@@ -804,7 +807,7 @@ export class QQKernelBridge {
         const count = Math.max(0, (item?.count ?? 0) + Number(selected) - Number(wasSelected))
         return count || selected ? [{ key, count, selected: selected || undefined }] : []
       })
-      message.reactionContext = { available: this.reactionDefinitions, reactions, maxSelected: 20 }
+      message.reactionContext = { reactions, maxSelected: 20 }
       this.rememberMessage(message)
       // Some QQNT builds apply setMsgEmojiLikes without emitting
       // onMsgInfoListUpdate. Publish the confirmed local state immediately;
@@ -1236,7 +1239,7 @@ export class QQKernelBridge {
         && JSON.stringify(previous?.reactionContext?.reactions) !== JSON.stringify(message.reactionContext?.reactions)
       if (source === 'onMsgInfoListUpdate' && record.emojiLikesList !== undefined) {
         this.pendingReactions.get(`${conversation.id}\u0000${message.id}`)?.resolve(
-          message.reactionContext ?? this.getReactionCatalog(),
+          message.reactionContext ?? { reactions: [], maxSelected: 20 },
         )
       }
       if (!previous) {
@@ -1247,7 +1250,7 @@ export class QQKernelBridge {
           eventId: `reaction:${message.id}:${record.msgSeq ?? Date.now()}`,
           conversation,
           target: { conversationId: conversation.id, messageId: message.id, targetId: message.id },
-          context: message.reactionContext ?? this.getReactionCatalog(),
+          context: message.reactionContext ?? { reactions: [], maxSelected: 20 },
           timestamp: message.timestamp,
         })
       } else {
@@ -1558,11 +1561,13 @@ export class QQKernelBridge {
       outgoing: SEND_FROM_SELF.has(record.sendType) || record.senderUid === this.config?.selfUid,
       msgSeq: record.msgSeq,
       parts,
-      reactionContext: this.mapReactionContext(record),
+      reactionContext: record.chatType === CHAT_GROUP && record.emojiLikesList?.length
+        ? this.mapReactionState(record)
+        : undefined,
     }
   }
 
-  private mapReactionContext(record: MsgRecord): QQReactionContext {
+  private mapReactionState(record: MsgRecord): QQReactionState {
     const reactions = (record.emojiLikesList ?? []).flatMap((item) => {
       const nativeKey = reactionKey(item.emojiType, item.emojiId)
       const key = this.reactionByKey.get(nativeKey)?.key ?? nativeKey
@@ -1570,7 +1575,7 @@ export class QQKernelBridge {
         ? [{ key, count: Number(item.likesCnt) || 0, selected: item.isClicked || undefined }]
         : []
     })
-    return { available: this.reactionDefinitions, reactions, maxSelected: 20 }
+    return { reactions, maxSelected: 20 }
   }
 
   private async loadReactionCatalog(): Promise<void> {
