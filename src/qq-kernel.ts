@@ -14,7 +14,7 @@ import type {
 import {
   conversationId, parseConversationId, type HistoryQuery, type MemberPage, type QQConversation, type QQEvent,
   type QQMedia, type QQMediaLocator, type QQMessage, type QQReactionContext, type QQReactionDefinition, type QQReactionState,
-  type QQSticker, type QQStickerPack, type QQStickerPackSummary, type QQStickerReference, type SendManifest,
+  type QQSticker, type QQStickerPack, type QQStickerPackSummary, type QQStickerReference, type QQTextPart, type SendManifest,
 } from './protocol.js'
 
 const CHAT_C2C = 1
@@ -22,6 +22,8 @@ const CHAT_GROUP = 2
 const ELEMENT_TEXT = 1
 const ELEMENT_IMAGE = 2
 const ELEMENT_FILE = 3
+const ELEMENT_FACE = 6
+const ELEMENT_REPLY = 7
 const ELEMENT_MARKET_FACE = 11
 const SEND_FROM_SELF = new Set([1, 2])
 const MEMBER_ADMIN = 3
@@ -663,7 +665,10 @@ export class QQKernelBridge {
   async send(manifest: SendManifest, body: Readable): Promise<QQMessage> {
     const conversation = this.getConversation(manifest.conversationId)
     const elements: MsgElement[] = []
-    if (manifest.text) elements.push(textElement(manifest.text))
+    if (manifest.replyToId) elements.push(replyElement(manifest.replyToId))
+    if (manifest.textParts?.length) {
+      for (const part of manifest.textParts) elements.push(...textPartElements(part))
+    } else if (manifest.text) elements.push(textElement(manifest.text))
     const cleanup: string[] = []
     let preserveUntil: number | undefined
     try {
@@ -734,7 +739,7 @@ export class QQKernelBridge {
         accepted,
         minimumStatus,
         startedAt,
-        expectedText: manifest.text,
+        expectedText: manifest.textParts?.map((part) => part.text).join('') || manifest.text,
         expectedMediaName: manifest.media?.[0]?.name,
         expectedMediaKind: manifest.sticker ? 'sticker' : manifest.media?.[0]?.kind,
         originRequestId: manifest.originRequestId,
@@ -772,7 +777,7 @@ export class QQKernelBridge {
       const pollController = new AbortController()
       const confirmationPoll = this.pollSentMessage(
         conversation,
-        manifest.text,
+        manifest.textParts?.map((part) => part.text).join('') || manifest.text,
         startedAt,
         manifest.sticker ? 'sticker' : manifest.media?.[0]?.kind,
         manifest.media?.[0]?.name,
@@ -1909,13 +1914,26 @@ export class QQKernelBridge {
 
   private mapMessage(record: MsgRecord): QQMessage {
     const parts: QQMessage['parts'] = []
+    let replyToId: string | undefined
     for (const element of record.elements ?? []) {
       const sticker = mapSticker(record, element)
       if (sticker) {
         this.stickers.set(sticker.stickerId, sticker)
         parts.push({ type: 'sticker', sticker })
       } else if (element.elementType === ELEMENT_TEXT && element.textElement?.content) {
-        parts.push({ type: 'text', text: element.textElement.content })
+        const text = element.textElement
+        const mentionedId = text.atNtUid || text.atUid
+        parts.push({
+          type: 'text', text: text.content,
+          entities: text.atType === 2 && mentionedId ? [{
+            type: 'mention', offset: 0, length: text.content.length,
+            userId: mentionedId, numericId: text.atUid || undefined,
+          }] : undefined,
+        })
+      } else if (element.elementType === ELEMENT_FACE && element.faceElement) {
+        parts.push({ type: 'text', text: element.faceElement.faceText || `[QQ表情 ${element.faceElement.faceIndex}]` })
+      } else if (element.elementType === ELEMENT_REPLY && element.replyElement?.replayMsgId) {
+        replyToId = element.replyElement.replayMsgId
       } else {
         const media = mapMedia(record, element)
         if (media) parts.push({ type: 'media', media })
@@ -1938,6 +1956,7 @@ export class QQKernelBridge {
       outgoing: SEND_FROM_SELF.has(record.sendType) || record.senderUid === this.config?.selfUid,
       msgSeq: record.msgSeq,
       originRequestId: this.messageOrigins.get(record.msgId),
+      replyToId,
       parts,
       reactionContext: record.chatType === CHAT_GROUP && record.emojiLikesList?.length
         ? this.mapReactionState(record)
@@ -2407,7 +2426,49 @@ function textElement(text: string): MsgElement {
   return {
     elementType: ELEMENT_TEXT,
     elementId: '',
-    textElement: { content: text, atType: 0, atUid: '', atTinyId: '', atNtUid: '' } as never,
+    textElement: { content: text, atType: 0, atUid: '', atTinyId: '', atNtUid: '' },
+  }
+}
+
+function textPartElements(part: QQTextPart): MsgElement[] {
+  const entities = (part.entities ?? [])
+    .filter((entity) => entity.type === 'mention' && entity.offset >= 0 && entity.length > 0
+      && entity.offset + entity.length <= part.text.length)
+    .sort((left, right) => left.offset - right.offset)
+  if (!entities.length) return part.text ? [textElement(part.text)] : []
+  const elements: MsgElement[] = []
+  let offset = 0
+  for (const entity of entities) {
+    if (entity.offset < offset) continue
+    if (entity.offset > offset) elements.push(textElement(part.text.slice(offset, entity.offset)))
+    elements.push({
+      elementType: ELEMENT_TEXT,
+      elementId: '',
+      textElement: {
+        content: part.text.slice(entity.offset, entity.offset + entity.length),
+        atType: 2,
+        atUid: entity.numericId ?? '',
+        atTinyId: '',
+        atNtUid: entity.userId,
+      },
+    })
+    offset = entity.offset + entity.length
+  }
+  if (offset < part.text.length) elements.push(textElement(part.text.slice(offset)))
+  return elements
+}
+
+function replyElement(messageId: string): MsgElement {
+  return {
+    elementType: ELEMENT_REPLY,
+    elementId: '',
+    replyElement: {
+      replayMsgId: messageId,
+      sourceMsgTextElems: [],
+      replyMsgRevokeType: 0,
+      sourceMsgIsIncPic: false,
+      sourceMsgExpired: false,
+    },
   }
 }
 

@@ -56,7 +56,33 @@ export interface GroupProfileInfo {
 export interface MsgElement {
   elementType: number
   elementId: string
-  textElement?: { content: string }
+  textElement?: {
+    content: string
+    atType?: number
+    atUid?: string
+    atTinyId?: string
+    atNtUid?: string
+  }
+  faceElement?: {
+    faceIndex: number
+    faceText?: string
+    faceType: number
+    packId?: string
+    stickerId?: string
+    sourceType?: number
+    stickerType?: number
+    resultId?: string
+    imageType?: number
+  }
+  replyElement?: {
+    replayMsgId: string
+    replayMsgSeq?: string
+    sourceMsgText?: string
+    sourceMsgTextElems: unknown[]
+    replyMsgRevokeType: number
+    sourceMsgIsIncPic: boolean
+    sourceMsgExpired: boolean
+  }
   picElement?: {
     fileName: string
     fileSize: string

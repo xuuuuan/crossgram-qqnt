@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 5
+export const PROTOCOL_VERSION = 6
 
 export type QQChatType = 1 | 2
 
@@ -108,13 +108,27 @@ export interface QQMessage {
   msgSeq?: string
   /** Adapter-generated correlation token used to suppress only its own listener echo. */
   originRequestId?: string
+  /** Opaque QQ msgId referenced by a native reply element. */
+  replyToId?: string
   parts: Array<
-    | { type: 'text', text: string }
+    | QQTextPart
     | { type: 'media', media: QQMedia }
     | { type: 'sticker', sticker: QQSticker }
   >
   /** Per-message state only. The shared definition catalog has its own endpoint. */
   reactionContext?: QQReactionState
+}
+
+export interface QQTextPart {
+  type: 'text'
+  text: string
+  entities?: Array<{
+    type: 'mention'
+    offset: number
+    length: number
+    userId: string
+    numericId?: string
+  }>
 }
 
 export interface QQConversation {
@@ -189,6 +203,8 @@ export interface QQReactionState {
 export interface SendManifest {
   conversationId: string
   text?: string
+  textParts?: QQTextPart[]
+  replyToId?: string
   originRequestId?: string
   sticker?: QQStickerReference
   media?: Array<{

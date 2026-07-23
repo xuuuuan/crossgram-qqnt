@@ -213,6 +213,52 @@ describe('QQKernelBridge', () => {
     expect(f.msg.sendMsg).toHaveBeenCalledOnce()
   })
 
+  it('maps and sends native mention and reply elements without parsing opaque IDs', async () => {
+    const f = fixture()
+    f.message.elements = [{
+      elementType: 7, elementId: 'reply', replyElement: {
+        replayMsgId: 'opaque-original', sourceMsgTextElems: [], replyMsgRevokeType: 0,
+        sourceMsgIsIncPic: false, sourceMsgExpired: false,
+      },
+    }, {
+      elementType: 1, elementId: 'mention', textElement: {
+        content: '@Alice', atType: 2, atUid: '12345', atTinyId: '', atNtUid: 'u_opaque_alice',
+      },
+    }, { elementType: 1, elementId: 'text', textElement: { content: ' hello' } }]
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    const history = await bridge.getHistory(bridge.getConversation('uid-1715311957'))
+    expect(history.messages[0]).toMatchObject({
+      replyToId: 'opaque-original',
+      parts: [{
+        type: 'text', text: '@Alice',
+        entities: [{ type: 'mention', offset: 0, length: 6, userId: 'u_opaque_alice', numericId: '12345' }],
+      }, { type: 'text', text: ' hello' }],
+    })
+
+    f.msg.sendMsg.mockImplementationOnce(async () => {
+      queueMicrotask(() => f.emitMessages([{ ...f.message, sendStatus: 2 }]))
+      return { result: 0, errMsg: '' }
+    })
+    await bridge.send({
+      conversationId: 'uid-1715311957', replyToId: 'opaque-original',
+      textParts: [{
+        type: 'text', text: 'hi @Alice!',
+        entities: [{ type: 'mention', offset: 3, length: 6, userId: 'u_opaque_alice', numericId: '12345' }],
+      }],
+    }, Readable.from([]))
+    expect(f.msg.sendMsg).toHaveBeenCalledWith('m1', expect.anything(), [
+      expect.objectContaining({ elementType: 7, replyElement: expect.objectContaining({ replayMsgId: 'opaque-original' }) }),
+      expect.objectContaining({ elementType: 1, textElement: expect.objectContaining({ content: 'hi ', atType: 0 }) }),
+      expect.objectContaining({
+        elementType: 1,
+        textElement: expect.objectContaining({ content: '@Alice', atType: 2, atUid: '12345', atNtUid: 'u_opaque_alice' }),
+      }),
+      expect.objectContaining({ elementType: 1, textElement: expect.objectContaining({ content: '!', atType: 0 }) }),
+    ], expect.any(Map))
+  })
+
   it('uses one batch unread lookup and loads only the opened chat around its unread boundary', async () => {
     const f = fixture()
     const previous = { ...f.message, msgId: 'm0', msgSeq: 'seq0', msgTime: '1799999999' }
@@ -949,7 +995,7 @@ describe('QQBridgeServer', () => {
     const { port } = server.address()
     const base = `http://127.0.0.1:${port}/v1`
     await expect(fetch(`${base}/status`).then((response) => response.json())).resolves.toMatchObject({
-      protocolVersion: 5, ready: true, selfUin: '10000',
+      protocolVersion: 6, ready: true, selfUin: '10000',
     })
     await expect(fetch(`${base}/dialogs`).then((response) => response.json())).resolves.toMatchObject({
       conversations: [{ peerUin: '1715311957' }],
