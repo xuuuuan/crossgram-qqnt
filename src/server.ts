@@ -250,6 +250,15 @@ export class QQBridgeServer {
       json(response, 200, { ok: true })
       return
     }
+    if (request.method === 'POST' && path === '/v1/messages/get') {
+      const body = await readJson<{ conversationId: string, messageId: string }>(request)
+      const message = await this.bridge.getMessage(
+        this.bridge.getConversation(body.conversationId), body.messageId,
+      )
+      if (message) json(response, 200, message)
+      else json(response, 404, { error: 'message not found' })
+      return
+    }
     if (request.method === 'GET' && path === '/v1/messages/reactions') {
       const conversation = this.bridge.getConversation(requiredParam(url, 'conversationId'))
       const messageId = requiredParam(url, 'messageId')
@@ -270,14 +279,15 @@ export class QQBridgeServer {
       return
     }
     if (request.method === 'POST' && path === '/v1/messages/forward') {
-      const body = await readJson<{ from: string, to: string, messageIds: string[] }>(request)
-      await this.bridge.forwardMessages(
+      const body = await readJson<{ from: string, to: string, messageIds: string[], merged?: boolean }>(request)
+      const messages = await this.bridge.forwardMessages(
         this.bridge.getConversation(body.from),
         body.messageIds,
         this.bridge.getConversation(body.to),
+        body.merged,
       )
-      log('info', `HTTP API forward messages id=${requestId} from=${body.from} to=${body.to} messages=${body.messageIds.join(',')}`)
-      json(response, 200, { ok: true })
+      log('info', `HTTP API forward messages id=${requestId} from=${body.from} to=${body.to} merged=${Boolean(body.merged)} messages=${body.messageIds.join(',')} outputs=${messages.map((item) => item.id).join(',')}`)
+      json(response, 200, { messages })
       return
     }
     if (request.method === 'GET' && path.startsWith('/v1/users/')) {

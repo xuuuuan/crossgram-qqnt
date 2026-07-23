@@ -25,6 +25,7 @@ const ELEMENT_FILE = 3
 const ELEMENT_FACE = 6
 const ELEMENT_REPLY = 7
 const ELEMENT_MARKET_FACE = 11
+const ELEMENT_MULTI_FORWARD = 16
 const SEND_FROM_SELF = new Set([1, 2])
 const MEMBER_ADMIN = 3
 const MEMBER_OWNER = 4
@@ -948,13 +949,42 @@ export class QQKernelBridge {
     log('info', `native API complete name=${forEveryone ? 'recallMsg' : 'deleteMsg'} conversation=${conversation.id} result=${result.result} err=${JSON.stringify(result.errMsg)}`)
   }
 
-  async forwardMessages(source: QQConversation, ids: string[], destination: QQConversation): Promise<void> {
-    log('info', `native API start name=forwardMsg from=${source.id} to=${destination.id} messages=${ids.join(',')}`)
-    const result = await this.requireMsgService().forwardMsg(
-      ids, contact(source), [contact(destination)], new Map(),
+  async forwardMessages(
+    source: QQConversation,
+    ids: string[],
+    destination: QQConversation,
+    merged = false,
+  ): Promise<QQMessage[]> {
+    if (!ids.length) return []
+    const service = this.requireMsgService()
+    const before = new Set((await this.latestRecords(destination, 50)).map((record) => record.msgId))
+    const startedAt = Math.floor(Date.now() / 1000)
+    const api = merged ? 'multiForwardMsg' : 'forwardMsg'
+    log('info', `native API start name=${api} from=${source.id} to=${destination.id} messages=${ids.join(',')}`)
+    let result: { result: number, errMsg: string }
+    if (merged) {
+      if (!service.multiForwardMsg) throw new Error('multiForwardMsg is unavailable in this QQNT build')
+      const records = await service.getMsgsByMsgId(contact(source), ids)
+      if (records.result !== 0) throw new Error(`getMsgsByMsgId: ${records.errMsg} (${records.result})`)
+      const byId = new Map(records.msgList.map((record) => [record.msgId, record]))
+      result = await service.multiForwardMsg(ids.map((msgId) => {
+        const record = byId.get(msgId)
+        return {
+          msgId,
+          senderShowName: record
+            ? record.sendRemarkName || record.sendMemberName || record.sendNickName || record.senderUin
+            : undefined,
+        }
+      }), contact(source), contact(destination))
+    } else {
+      result = await service.forwardMsg(ids, contact(source), [contact(destination)], new Map())
+    }
+    if (result.result !== 0) throw new Error(`${api}: ${result.errMsg} (${result.result})`)
+    const messages = await this.waitForForwardedMessages(
+      destination, before, merged ? 1 : ids.length, startedAt,
     )
-    if (result.result !== 0) throw new Error(`forwardMsg: ${result.errMsg} (${result.result})`)
-    log('info', `native API complete name=forwardMsg from=${source.id} to=${destination.id} result=${result.result} err=${JSON.stringify(result.errMsg)}`)
+    log('info', `native API complete name=${api} from=${source.id} to=${destination.id} result=${result.result} messages=${messages.map((item) => item.id).join(',')} err=${JSON.stringify(result.errMsg)}`)
+    return messages
   }
 
   async getUser(uid: string) {
@@ -1941,6 +1971,8 @@ export class QQKernelBridge {
         })
       } else if (element.elementType === ELEMENT_REPLY && element.replyElement?.replayMsgId) {
         replyToId = element.replyElement.replayMsgId
+      } else if (element.elementType === ELEMENT_MULTI_FORWARD && element.multiForwardMsgElement) {
+        parts.push({ type: 'text', text: element.multiForwardMsgElement.fileName || '[聊天记录]' })
       } else {
         const media = mapMedia(record, element)
         if (media) parts.push({ type: 'media', media })
@@ -2423,10 +2455,49 @@ export class QQKernelBridge {
       cursor = next
     }
   }
+
+  private async latestRecords(conversation: QQConversation, limit: number): Promise<MsgRecord[]> {
+    const service = this.requireMsgService()
+    if (service.getLatestDbMsgs) {
+      const result = await service.getLatestDbMsgs(contact(conversation), limit)
+      if (result.result === 0) return result.msgList
+    }
+    const result = await service.getMsgs(contact(conversation), '0', limit, true)
+    return result.result === 0 ? result.msgList : []
+  }
+
+  private async waitForForwardedMessages(
+    conversation: QQConversation,
+    before: Set<string>,
+    expected: number,
+    startedAt: number,
+  ): Promise<QQMessage[]> {
+    const deadline = Date.now() + Math.min(this.sendTimeoutMs, 20_000)
+    do {
+      const records = await this.latestRecords(conversation, Math.max(50, expected * 4))
+      const forwarded = records.filter((record) =>
+        !before.has(record.msgId)
+        && Number(record.msgTime) >= startedAt - 1
+        && (SEND_FROM_SELF.has(record.sendType) || record.senderUid === this.config?.selfUid))
+      if (forwarded.length >= expected) {
+        return forwarded.slice(0, expected).reverse().map((record) => {
+          const message = this.mapMessage(record)
+          this.rememberMessage(message)
+          return message
+        })
+      }
+      await delay(100)
+    } while (Date.now() < deadline)
+    throw new Error(`QQ did not expose ${expected} forwarded message(s) in ${conversation.id}`)
+  }
 }
 
 function contact(conversation: QQConversation) {
   return { chatType: conversation.chatType, peerUid: conversation.peerUid, guildId: '' }
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds))
 }
 
 function textElement(text: string): MsgElement {

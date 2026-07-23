@@ -83,6 +83,11 @@ export interface MsgElement {
     sourceMsgIsIncPic: boolean
     sourceMsgExpired: boolean
   }
+  multiForwardMsgElement?: {
+    xmlContent?: string
+    resId?: string
+    fileName?: string
+  }
   picElement?: {
     fileName: string
     fileSize: string
@@ -208,6 +213,11 @@ export interface KernelMsgService {
   recallMsg(peer: Contact, msgIds: string[]): Promise<{ result: number, errMsg: string }>
   deleteMsg(peer: Contact, msgIds: string[]): Promise<{ result: number, errMsg: string }>
   forwardMsg(msgIds: string[], source: Contact, destinations: Contact[], attrs: Map<number, unknown>): Promise<{ result: number, errMsg: string }>
+  multiForwardMsg?(
+    messages: Array<{ msgId: string, senderShowName?: string }>,
+    source: Contact,
+    destination: Contact,
+  ): Promise<{ result: number, errMsg: string }>
   getMsgs(peer: Contact, msgId: string, count: number, queryOrder: boolean): Promise<{ result: number, errMsg: string, msgList: MsgRecord[] }>
   getMsgsIncludeSelf?(peer: Contact, msgId: string, count: number, queryOrder: boolean): Promise<{ result: number, errMsg: string, msgList: MsgRecord[] }>
   getAioFirstViewLatestMsgs?(peer: Contact, count: number): Promise<{

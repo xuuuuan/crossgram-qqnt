@@ -39,6 +39,7 @@ function fixture() {
     recallMsg: vi.fn(async () => ({ result: 0, errMsg: '' })),
     deleteMsg: vi.fn(async () => ({ result: 0, errMsg: '' })),
     forwardMsg: vi.fn(async () => ({ result: 0, errMsg: '', detailErr: new Map() })),
+    multiForwardMsg: vi.fn(async () => ({ result: 0, errMsg: '' })),
     getMsgs: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [message] })),
     getMsgsIncludeSelf: undefined as import('./kernel-types.js').KernelMsgService['getMsgsIncludeSelf'],
     getLatestDbMsgs: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [message] })),
@@ -328,6 +329,46 @@ describe('QQKernelBridge', () => {
       readInboxMaxMessage: { id: 'm0', msgSeq: 'seq0' },
     })
     expect(f.msg.getABatchOfContactMsgBoxInfo).toHaveBeenCalledOnce()
+  })
+
+  it('uses single forward for one source message and merged forward for multiple messages', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    await bridge.getDialogs()
+    const conversation = bridge.getConversation('uid-1715311957')
+    const forwarded = {
+      ...f.message, msgId: 'forwarded-1', msgTime: String(Math.floor(Date.now() / 1000)),
+      elements: [{ elementType: 1, elementId: 'forwarded-text', textElement: { content: 'forwarded' } }],
+    }
+    f.msg.getLatestDbMsgs
+      .mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [f.message] })
+      .mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [forwarded, f.message] })
+    await expect(bridge.forwardMessages(conversation, ['m1'], conversation)).resolves.toMatchObject([
+      { id: 'forwarded-1', parts: [{ type: 'text', text: 'forwarded' }] },
+    ])
+    expect(f.msg.forwardMsg).toHaveBeenCalledWith(['m1'], expect.anything(), [expect.anything()], expect.any(Map))
+
+    const merged = {
+      ...forwarded, msgId: 'merged-1',
+      elements: [{
+        elementType: 16, elementId: 'merged',
+        multiForwardMsgElement: { fileName: 'Alice 和 Bob 的聊天记录', resId: 'opaque-res' },
+      }],
+    }
+    f.msg.getLatestDbMsgs
+      .mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [forwarded, f.message] })
+      .mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [merged, forwarded, f.message] })
+    f.msg.getMsgsByMsgId.mockResolvedValueOnce({
+      result: 0, errMsg: '', msgList: [f.message, { ...f.message, msgId: 'm2', sendNickName: 'Alice' }],
+    })
+    await expect(bridge.forwardMessages(conversation, ['m1', 'm2'], conversation, true)).resolves.toMatchObject([
+      { id: 'merged-1', parts: [{ type: 'text', text: 'Alice 和 Bob 的聊天记录' }] },
+    ])
+    expect(f.msg.multiForwardMsg).toHaveBeenCalledWith([
+      { msgId: 'm1', senderShowName: 'Self' },
+      { msgId: 'm2', senderShowName: 'Alice' },
+    ], expect.anything(), expect.anything())
   })
 
   it('uses include-self for current QQ direct-chat history', async () => {
