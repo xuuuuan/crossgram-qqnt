@@ -1168,9 +1168,14 @@ export class QQKernelBridge {
     }
     if (!path || !existsSync(path)) path = await this.downloadMedia(locator)
     const size = statSync(path).size
-    const end = limit === undefined ? size - 1 : Math.min(size - 1, offset + Math.max(0, limit) - 1)
-    log('info', `media stream open message=${locator.messageId} element=${locator.elementId} peer=${locator.peerUid} path=${JSON.stringify(path)} size=${size} start=${Math.max(0, offset)} end=${end}`)
-    return createReadStream(path, { start: Math.max(0, offset), end })
+    const start = Math.max(0, Math.trunc(offset))
+    if (!size || start >= size || (limit !== undefined && limit <= 0)) {
+      log('info', `media stream open empty message=${locator.messageId} element=${locator.elementId} peer=${locator.peerUid} path=${JSON.stringify(path)} size=${size} start=${start} limit=${limit ?? '<all>'}`)
+      return Readable.from([])
+    }
+    const end = limit === undefined ? size - 1 : Math.min(size - 1, start + Math.trunc(limit) - 1)
+    log('info', `media stream open message=${locator.messageId} element=${locator.elementId} peer=${locator.peerUid} path=${JSON.stringify(path)} size=${size} start=${start} end=${end}`)
+    return createReadStream(path, { start, end })
   }
 
   private async openQlogoAvatar(uin: string, offset = 0, limit?: number): Promise<Readable> {

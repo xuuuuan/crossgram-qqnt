@@ -1186,6 +1186,9 @@ describe('QQBridgeServer', () => {
 
     const cached = await open(2, 6)
     expect(Buffer.from(await cached.arrayBuffer()).toString()).toBe('cdefgh')
+    const pastEnd = await open(32, 4)
+    expect(pastEnd.status).toBe(200)
+    expect((await pastEnd.arrayBuffer()).byteLength).toBe(0)
     expect(f.richMedia.downloadFile).toHaveBeenCalledOnce()
   })
 
