@@ -46,7 +46,12 @@ export class QQKernelBridge {
   private readonly contacts = new Map<string, QQConversation>()
   private readonly users = new Map<string, { id: string, numericId?: string, name: string, avatarUrl?: string }>()
   private readonly seenUsers = new Map<string, { id: string, numericId?: string, name: string, avatarUrl?: string }>()
-  private readonly groups = new Map<string, { name: string, avatarUrl?: string }>()
+  private readonly groups = new Map<string, {
+    name: string
+    avatarUrl?: string
+    participantCount?: number
+    selfRole?: MemberPage['members'][number]['role']
+  }>()
   private readonly avatarCache = new Map<string, QQMedia>()
   private buddySnapshotLoaded = false
   private readonly messages = new Map<string, QQMessage[]>()
@@ -68,6 +73,11 @@ export class QQKernelBridge {
   private readonly pendingDownloads = new Map<string, ReturnType<typeof deferred<FileTransNotifyInfo>>>()
   private readonly pendingReactions = new Map<string, ReturnType<typeof deferred<QQReactionState>>>()
   private readonly pendingGroupProfiles = new Map<string, ReturnType<typeof deferred<void>>>()
+  private readonly pendingMemberPages = new Map<string, ReturnType<typeof deferred<{
+    ids: Array<{ uid: string, index: number }>
+    infos: Map<string, MemberInfo>
+    finish: boolean
+  }>>>()
   private readonly groupProfileAttempts = new Map<string, number>()
   private unreadBatchState = ''
   private unreadBatchPromise?: Promise<void>
@@ -168,6 +178,8 @@ export class QQKernelBridge {
     this.pendingReactions.clear()
     for (const pending of this.pendingGroupProfiles.values()) pending.reject(new Error('QQNT session detached'))
     this.pendingGroupProfiles.clear()
+    for (const pending of this.pendingMemberPages.values()) pending.reject(new Error('QQNT session detached'))
+    this.pendingMemberPages.clear()
   }
 
   subscribe(): AsyncQueue<QQEvent> {
@@ -830,25 +842,52 @@ export class QQKernelBridge {
     if (conversation.chatType !== CHAT_GROUP) return { members: [], total: 0 }
     const service = this.requireGroupService()
     const scene = service.createMemberListScene(conversation.peerUin || conversation.peerUid, `mtproto-${randomUUID()}`)
-    log('info', `native API start name=getNextMemberList conversation=${conversation.id} scene=${scene} cursor=${cursor ?? ''} limit=${limit}`)
+    const requested = clamp(limit, 1, 500)
+    // QQ's own member-list UI requests at least 30. Current native builds can
+    // return a false terminal empty page for smaller `num` values, so prefetch
+    // the native minimum and expose only the caller's requested window.
+    // Keep native work bounded even when Telegram asks for a 100-200 member
+    // window. Returning fewer rows than requested is valid for a cursor page,
+    // and lets the next Telegram offset advance from the emitted cursor.
+    const nativeLimit = 30
+    log('info', `native API start name=getNextMemberList conversation=${conversation.id} scene=${scene} cursor=${cursor ?? ''} limit=${requested} nativeLimit=${nativeLimit}`)
+    const listenerPage = deferred<{
+      ids: Array<{ uid: string, index: number }>
+      infos: Map<string, MemberInfo>
+      finish: boolean
+    }>()
+    this.pendingMemberPages.set(scene, listenerPage)
     try {
       const start = decodeMemberCursor(cursor)
-      const response = await service.getNextMemberList(scene, start, clamp(limit, 1, 500))
+      const response = await service.getNextMemberList(scene, start, nativeLimit)
       if (response.errCode !== 0) throw new Error(`getNextMemberList: ${response.errMsg} (${response.errCode})`)
-      log('info', `native API complete name=getNextMemberList conversation=${conversation.id} scene=${scene} result=${response.errCode} err=${JSON.stringify(response.errMsg)} ids=${response.result.ids.length} finish=${response.result.finish}`)
-      const members = response.result.ids.flatMap(({ uid }) => {
-        const info = response.result.infos.get(uid)
+      let result = response.result
+      if (!result.ids.length && (conversation.participantCount ?? 0) > 0) {
+        try {
+          result = await withTimeout(listenerPage.promise, 3_000, 'QQ member list listener timed out')
+          log('info', `native callback selected name=onMemberListChange conversation=${conversation.id} scene=${scene} ids=${result.ids.length} finish=${result.finish}`)
+        } catch (error) {
+          log('error', `native member list callback unavailable conversation=${conversation.id} scene=${scene}`, error)
+        }
+      }
+      log('info', `native API complete name=getNextMemberList conversation=${conversation.id} scene=${scene} result=${response.errCode} err=${JSON.stringify(response.errMsg)} ids=${result.ids.length} finish=${result.finish}`)
+      const selectedIds = result.ids.slice(0, requested)
+      const members = selectedIds.flatMap(({ uid }) => {
+        const info = result.infos.get(uid)
         if (!info) return []
         const member = mapMember(info)
         this.rememberSeenUser(member.user)
         return [member]
       })
+      const hasMore = selectedIds.length < result.ids.length || !result.finish
       return {
         members,
-        total: response.result.finish ? members.length : undefined,
-        nextCursor: response.result.finish ? undefined : encodeMemberCursor(response.result.ids.at(-1)),
+        total: conversation.participantCount
+          ?? (result.finish ? Math.max(0, start.index) + result.ids.length : undefined),
+        nextCursor: hasMore ? encodeMemberCursor(selectedIds.at(-1)) : undefined,
       }
     } finally {
+      this.pendingMemberPages.delete(scene)
       service.destroyMemberListScene(scene)
       log('info', `native API complete name=destroyMemberListScene conversation=${conversation.id} scene=${scene}`)
     }
@@ -1007,9 +1046,23 @@ export class QQKernelBridge {
     const groupListener = makeListener('NodeIKernelGroupListener', kernel.NodeIKernelGroupListener, {
       onGroupListUpdate: (
         value: number | {
-          groupList: Array<{ groupCode: string, groupName: string, remarkName?: string, avatarUrl?: string }>
+          groupList: Array<{
+            groupCode: string
+            groupName: string
+            remarkName?: string
+            avatarUrl?: string
+            memberCount?: number
+            memberRole?: number
+          }>
         },
-        legacyGroups?: Array<{ groupCode: string, groupName: string, remarkName?: string, avatarUrl?: string }>,
+        legacyGroups?: Array<{
+          groupCode: string
+          groupName: string
+          remarkName?: string
+          avatarUrl?: string
+          memberCount?: number
+          memberRole?: number
+        }>,
       ) => {
         const groups = typeof value === 'object' && value ? value.groupList ?? [] : legacyGroups ?? []
         log('info', `group list update received: type=${typeof value === 'number' ? value : 'object'} groups=${groups.length}`)
@@ -1030,6 +1083,18 @@ export class QQKernelBridge {
         log('info', `group all-info update received: group=${group.groupCode} name=${JSON.stringify(group.groupName || '')}`)
         this.upsertGroupProfile(group)
         this.pendingGroupProfiles.get(group.groupCode)?.resolve()
+      },
+      onMemberListChange: (info: {
+        sceneId: string
+        ids: Array<{ uid: string, index: number }>
+        infos: Map<string, MemberInfo>
+        hasNext: boolean
+      }) => {
+        this.pendingMemberPages.get(info.sceneId)?.resolve({
+          ids: info.ids,
+          infos: info.infos,
+          finish: !info.hasNext,
+        })
       },
     })
     this.groupListenerId = groupService.addKernelGroupListener(groupListener)
@@ -1402,6 +1467,8 @@ export class QQKernelBridge {
     this.groups.set(group.groupCode, {
       name: !isFallbackTitle(name, group.groupCode) ? name : previous?.name || name,
       avatarUrl: group.avatarUrl || previous?.avatarUrl,
+      participantCount: group.memberCount ?? group.memberNum ?? previous?.participantCount,
+      selfRole: mapMemberRole(group.memberRole ?? group.cmdUinPrivilege) ?? previous?.selfRole,
     })
     const id = conversationId(CHAT_GROUP, group.groupCode)
     if (!this.contacts.has(id)) return
@@ -1413,6 +1480,8 @@ export class QQKernelBridge {
       peerUin: group.groupCode,
       chatType: CHAT_GROUP,
       avatarUrl: group.avatarUrl,
+      participantCount: group.memberCount ?? group.memberNum,
+      selfRole: mapMemberRole(group.memberRole ?? group.cmdUinPrivilege),
     })
   }
 
@@ -1435,6 +1504,12 @@ export class QQKernelBridge {
       peerUin: next.peerUin || current?.peerUin || (next.chatType === CHAT_GROUP ? next.peerUid : ''),
       avatarUrl: next.avatarUrl || current?.avatarUrl,
       avatar,
+      participantCount: next.participantCount
+        ?? current?.participantCount
+        ?? (next.chatType === CHAT_GROUP ? this.groups.get(peerKey)?.participantCount : undefined),
+      selfRole: next.selfRole
+        ?? current?.selfRole
+        ?? (next.chatType === CHAT_GROUP ? this.groups.get(peerKey)?.selfRole : undefined),
       unreadCount: next.unreadCount ?? current?.unreadCount,
       lastMessage: next.lastMessage ?? current?.lastMessage,
     }
@@ -1972,6 +2047,13 @@ function mapMember(info: MemberInfo): MemberPage['members'][number] {
     },
     role: info.role === MEMBER_OWNER ? 'owner' : info.role === MEMBER_ADMIN ? 'administrator' : 'member',
   }
+}
+
+function mapMemberRole(role?: number): MemberPage['members'][number]['role'] | undefined {
+  if (role === MEMBER_OWNER) return 'owner'
+  if (role === MEMBER_ADMIN) return 'administrator'
+  if (role === 2) return 'member'
+  return undefined
 }
 
 function parseCursor(value?: string): number {

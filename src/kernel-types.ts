@@ -46,6 +46,10 @@ export interface GroupProfileInfo {
   groupCode: string
   groupName: string
   remarkName?: string
+  memberCount?: number
+  memberNum?: number
+  memberRole?: number
+  cmdUinPrivilege?: number
 }
 
 export interface MsgElement {

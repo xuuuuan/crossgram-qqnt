@@ -69,6 +69,10 @@ export interface QQConversation {
   chatType: QQChatType
   avatarUrl?: string
   avatar?: QQMedia
+  /** Native group size, when present in QQ's group profile snapshot. */
+  participantCount?: number
+  /** Current account's native group role (2 member, 3 admin, 4 owner). */
+  selfRole?: 'owner' | 'administrator' | 'member'
   unreadCount?: number
   lastMessage?: QQMessage
   /** QQ's native cursor for the first unread message. */

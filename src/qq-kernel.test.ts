@@ -115,7 +115,7 @@ function fixture() {
     }),
   } as unknown as KernelSession
   return {
-    kernel, session, msg, recent, message, sentBodies,
+    kernel, session, msg, recent, group, message, sentBodies,
     emitMessages(records: MsgRecord[]) {
       msgHandlers.onMsgInfoListUpdate?.(records)
     },
@@ -131,8 +131,22 @@ function fixture() {
     emitBuddyInfo(infos: Map<string, unknown>) {
       buddyHandlers.onBuddyInfoChange?.(infos)
     },
-    emitGroupList(groups: Array<{ groupCode: string, groupName: string, remarkName?: string }>) {
+    emitGroupList(groups: Array<{
+      groupCode: string
+      groupName: string
+      remarkName?: string
+      memberCount?: number
+      memberRole?: number
+    }>) {
       groupHandlers.onGroupListUpdate?.(1, groups)
+    },
+    emitMemberList(info: {
+      sceneId: string
+      ids: Array<{ uid: string, index: number }>
+      infos: Map<string, unknown>
+      hasNext: boolean
+    }) {
+      groupHandlers.onMemberListChange?.(info)
     },
     setAvatarPath(path: string) {
       avatarPath = path
@@ -392,6 +406,87 @@ describe('QQKernelBridge', () => {
       id: 'member',
       name: 'Personal Name',
       avatar: { locator: { avatarUin: '42' } },
+    })
+  })
+
+  it('keeps native member cursors opaque and reports the group profile total on every page', async () => {
+    const f = fixture()
+    f.group.getNextMemberList
+      .mockResolvedValueOnce({
+        errCode: 0, errMsg: '', result: {
+          ids: [{ uid: 'member-a', index: 1 }, { uid: 'member-b', index: 2 }],
+          infos: new Map([
+            ['member-a', {
+              uid: 'member-a', uin: '1', nick: 'A', remark: '', cardName: '', role: 2, avatarPath: '',
+            }],
+            ['member-b', {
+              uid: 'member-b', uin: '2', nick: 'B', remark: '', cardName: '', role: 2, avatarPath: '',
+            }],
+          ]),
+          finish: false,
+        },
+      })
+      .mockResolvedValueOnce({
+        errCode: 0, errMsg: '', result: {
+          ids: [{ uid: 'member-c', index: 3 }],
+          infos: new Map([['member-c', {
+            uid: 'member-c', uin: '3', nick: 'C', remark: '', cardName: '', role: 3, avatarPath: '',
+          }]]),
+          finish: true,
+        },
+      })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    await bridge.resolveConversation(2, '1058754719')
+    f.emitGroupList([{
+      groupCode: '1058754719', groupName: 'Bridge Test Group', memberCount: 3, memberRole: 4,
+    }])
+    expect(bridge.getConversation('1058754719')).toMatchObject({
+      participantCount: 3, selfRole: 'owner',
+    })
+
+    const first = await bridge.getMembers(bridge.getConversation('1058754719'), undefined, 2)
+    const second = await bridge.getMembers(bridge.getConversation('1058754719'), first.nextCursor, 2)
+    expect(first).toMatchObject({ total: 3, members: [{ user: { id: 'member-a' } }, { user: { id: 'member-b' } }] })
+    expect(second).toMatchObject({
+      total: 3, members: [{ user: { id: 'member-c' }, role: 'administrator' }],
+    })
+    expect(second.nextCursor).toBeUndefined()
+    expect(f.group.getNextMemberList).toHaveBeenNthCalledWith(1, 'scene', { uid: '', index: 0 }, 30)
+    expect(f.group.getNextMemberList).toHaveBeenNthCalledWith(
+      2, 'scene', { uid: 'member-b', index: 2 }, 30,
+    )
+  })
+
+  it('uses the member-list listener when a cold native request returns an empty snapshot', async () => {
+    const f = fixture()
+    f.group.getNextMemberList.mockResolvedValueOnce({
+      errCode: 0, errMsg: '', result: { ids: [], infos: new Map(), finish: true },
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    await bridge.resolveConversation(2, '1058754719')
+    f.emitGroupList([{
+      groupCode: '1058754719', groupName: 'Bridge Test Group', memberCount: 2, memberRole: 4,
+    }])
+    const page = bridge.getMembers(bridge.getConversation('1058754719'), undefined, 1)
+    f.emitMemberList({
+      sceneId: 'scene',
+      ids: [{ uid: 'member-a', index: 1 }, { uid: 'member-b', index: 2 }],
+      infos: new Map([
+        ['member-a', {
+          uid: 'member-a', uin: '1', nick: 'A', remark: '', cardName: '', role: 2, avatarPath: '',
+        }],
+        ['member-b', {
+          uid: 'member-b', uin: '2', nick: 'B', remark: '', cardName: '', role: 2, avatarPath: '',
+        }],
+      ]),
+      hasNext: false,
+    })
+    await expect(page).resolves.toMatchObject({
+      total: 2,
+      members: [{ user: { id: 'member-a' } }],
+      nextCursor: expect.any(String),
     })
   })
 
