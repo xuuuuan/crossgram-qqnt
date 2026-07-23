@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 2
+export const PROTOCOL_VERSION = 3
 
 export type QQChatType = 1 | 2
 
@@ -103,12 +103,17 @@ export interface QQReactionDefinition {
         alt: string
         resource: {
           version: number
-          format: 'static'
-          mimeType: 'image/png'
+          format: 'static' | 'video'
+          mimeType: 'image/png' | 'video/webm'
           width: number
           height: number
           size?: number
-          locator: { filePath: string }
+          locator: {
+            /** Static fallback or source file exposed by the injected bridge. */
+            filePath: string
+            /** Versioned adapter-owned WebM generated from QQ's APNG resource. */
+            assetKey?: string
+          }
         }
       }
 }

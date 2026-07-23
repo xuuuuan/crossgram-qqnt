@@ -1,5 +1,5 @@
 import { Readable } from 'node:stream'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -155,6 +155,11 @@ function fixture() {
 }
 
 describe('QQKernelBridge', () => {
+  const tempPaths: string[] = []
+  afterEach(async () => {
+    await Promise.all(tempPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })))
+  })
+
   it('maps dialogs/history and confirms sends from the native listener', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
@@ -597,6 +602,101 @@ describe('QQKernelBridge', () => {
     expect(state).not.toHaveProperty('available')
   })
 
+  it('preserves uncatalogued reactions and gives successive native updates unique event IDs', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const conversation = await bridge.resolveConversation(2, '1058754719')
+    const groupMessage = {
+      ...f.message,
+      chatType: 2 as const,
+      peerUid: '1058754719',
+      peerUin: '1058754719',
+    }
+    f.msg.getLatestDbMsgs.mockResolvedValue({ result: 0, errMsg: '', msgList: [groupMessage] })
+    await bridge.getHistory(conversation)
+    const events = bridge.subscribe()[Symbol.asyncIterator]()
+
+    f.emitMessages([{
+      ...groupMessage,
+      emojiLikesList: [{ emojiType: '2', emojiId: '999999', likesCnt: '1', isClicked: false }],
+    }])
+    const first = await events.next()
+    expect(first.value).toMatchObject({
+      type: 'message-reactions',
+      context: { reactions: [{ key: '2:999999', count: 1 }] },
+    })
+
+    f.emitMessages([{
+      ...groupMessage,
+      emojiLikesList: [{ emojiType: '2', emojiId: '999999', likesCnt: '2', isClicked: false }],
+    }])
+    const second = await events.next()
+    expect(second.value).toMatchObject({
+      type: 'message-reactions',
+      context: { reactions: [{ key: '2:999999', count: 2 }] },
+    })
+    expect(second.value && 'eventId' in second.value ? second.value.eventId : undefined)
+      .not.toBe(first.value && 'eventId' in first.value ? first.value.eventId : undefined)
+
+    f.emitMessages([{ ...groupMessage, sendStatus: 3 }])
+    await expect(bridge.getMessageReactions(conversation, groupMessage.msgId)).resolves.toMatchObject({
+      reactions: [{ key: '2:999999', count: 2 }],
+    })
+  })
+
+  it('loads animated sysfaces and non-Telegram QQ emoji as custom reaction resources', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'qqnt-reactions-'))
+    tempPaths.push(root)
+    const resourceRoot = join(root, 'global', 'nt_data', 'Emoji', 'emoji-resource')
+    const staticPath = join(resourceRoot, 'sysface_res', 'static')
+    const animatedPath = join(resourceRoot, 'sysface_res', 'apng')
+    const emojiPath = join(resourceRoot, 'emoji_res')
+    await Promise.all([
+      mkdir(staticPath, { recursive: true }),
+      mkdir(animatedPath, { recursive: true }),
+      mkdir(emojiPath, { recursive: true }),
+    ])
+    const png = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M/wHwAF/gL+X1n0WQAAAABJRU5ErkJggg==',
+      'base64',
+    )
+    await Promise.all([
+      writeFile(join(resourceRoot, 'face_config.json'), JSON.stringify({
+        emoji: [{ QSid: '😊', QCid: '128522', AQLid: '0', QDes: '/嘿嘿' }],
+        sysface: [{ QSid: '14', QDes: '/微笑' }],
+      })),
+      writeFile(join(staticPath, 's14.png'), png),
+      writeFile(join(animatedPath, 's14.png'), png),
+      writeFile(join(emojiPath, 'emoji_000.png'), png),
+    ])
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, {
+      selfUin: '10000', selfUid: 'self', userPath: join(root, 'account'),
+    })
+    await vi.waitFor(async () => expect((await bridge.getReactionCatalog()).available).toHaveLength(2))
+
+    expect((await bridge.getReactionCatalog()).available).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        key: '2:128522',
+        presentation: expect.objectContaining({
+          type: 'custom', alt: '😊',
+          resource: expect.objectContaining({ format: 'static', mimeType: 'image/png' }),
+        }),
+      }),
+      expect.objectContaining({
+        key: '1:14',
+        presentation: expect.objectContaining({
+          type: 'custom', alt: '🙂',
+          resource: expect.objectContaining({
+            format: 'video', mimeType: 'video/webm', locator: { filePath: join(staticPath, 's14.png'), assetKey: 'sysface/s14.webm' },
+          }),
+        }),
+      }),
+    ]))
+  })
+
   it('does not expose or write reactions in direct conversations', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
@@ -658,7 +758,7 @@ describe('QQBridgeServer', () => {
     const { port } = server.address()
     const base = `http://127.0.0.1:${port}/v1`
     await expect(fetch(`${base}/status`).then((response) => response.json())).resolves.toMatchObject({
-      protocolVersion: 2, ready: true, selfUin: '10000',
+      protocolVersion: 3, ready: true, selfUin: '10000',
     })
     await expect(fetch(`${base}/dialogs`).then((response) => response.json())).resolves.toMatchObject({
       conversations: [{ peerUin: '1715311957' }],

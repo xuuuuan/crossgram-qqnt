@@ -25,7 +25,15 @@ const ELEMENT_FILE = 3
 const SEND_FROM_SELF = new Set([1, 2])
 const MEMBER_ADMIN = 3
 const MEMBER_OWNER = 4
-const TELEGRAM_STANDARD_REACTIONS = new Set(['👍', '❤️', '😂', '😢', '🔥', '🎉', '👏', '🤔', '🤯'])
+// Keep this in sync with Telegram's account-level reaction catalog. QQ emoji
+// outside this set are exposed as custom reactions backed by QQ's own icon.
+const TELEGRAM_STANDARD_REACTIONS = new Set([
+  '❤', '👍', '👎', '🔥', '🥰', '👏', '😁', '🤔', '🤯', '😱', '🤬', '😢', '🎉', '🤩', '🤮', '💩',
+  '🙏', '👌', '🕊', '🤡', '🥱', '🥴', '😍', '🐳', '❤‍🔥', '🌚', '🌭', '💯', '🤣', '⚡', '🍌', '🏆',
+  '💔', '🤨', '😐', '🍓', '🍾', '💋', '🖕', '😈', '😴', '😭', '🤓', '👻', '👨‍💻', '👀', '🎃',
+  '🙈', '😇', '😨', '🤝', '✍', '🤗', '🫡', '🎅', '🎄', '☃', '💅', '🤪', '🗿', '🆒', '💘', '🙉',
+  '🦄', '😘', '💊', '🙊', '😎', '👾', '🤷‍♂', '🤷', '🤷‍♀', '😡', '😂',
+])
 
 export interface QQKernelOptions {
   tempPath?: string
@@ -57,6 +65,8 @@ export class QQKernelBridge {
   private readonly messages = new Map<string, QQMessage[]>()
   private reactionDefinitions: QQReactionDefinition[] = []
   private readonly reactionByKey = new Map<string, QQReactionDefinition>()
+  private reactionCatalogPromise?: Promise<void>
+  private reactionEventSequence = 0
   private readonly pendingMessages = new Map<string, ReturnType<typeof deferred<MsgRecord>>>()
   private readonly pendingAcceptances = new Map<string, ReturnType<typeof deferred<void>>>()
   private readonly pendingMinimumStatuses = new Map<string, number>()
@@ -119,6 +129,9 @@ export class QQKernelBridge {
     this.unreadBatchState = ''
     this.unreadBatchPromise = undefined
     this.messages.clear()
+    this.reactionDefinitions = []
+    this.reactionByKey.clear()
+    this.reactionCatalogPromise = undefined
     this.buddySnapshotLoaded = false
     this.kernel = kernel
     this.session = session
@@ -736,7 +749,10 @@ export class QQKernelBridge {
     return { ...user, avatar: qlogoAvatarMedia(uid, numericId) }
   }
 
-  getReactionCatalog(): QQReactionContext {
+  async getReactionCatalog(): Promise<QQReactionContext> {
+    if (!this.reactionDefinitions.length) {
+      await withTimeout(this.loadReactionCatalogOnce(), 5_000, 'QQ reaction catalog request timed out')
+    }
     return { available: this.reactionDefinitions, reactions: [], maxSelected: 20 }
   }
 
@@ -1171,12 +1187,24 @@ export class QQKernelBridge {
   private async ensureReactionCatalog(): Promise<void> {
     for (let attempt = 0; this.session && !this.reactionDefinitions.length; attempt++) {
       try {
-        await withTimeout(this.loadReactionCatalog(), 5_000, 'QQ reaction catalog request timed out')
+        await withTimeout(this.loadReactionCatalogOnce(), 5_000, 'QQ reaction catalog request timed out')
         if (this.reactionDefinitions.length) return
       } catch (error) {
         if (attempt % 6 === 0) log('error', 'reaction catalog load failed; retrying', error)
       }
       await new Promise((resolve) => setTimeout(resolve, 1_000))
+    }
+  }
+
+  private async loadReactionCatalogOnce(): Promise<void> {
+    if (this.reactionDefinitions.length) return
+    if (this.reactionCatalogPromise) return this.reactionCatalogPromise
+    const pending = this.loadReactionCatalog()
+    this.reactionCatalogPromise = pending
+    try {
+      await pending
+    } finally {
+      if (this.reactionCatalogPromise === pending) this.reactionCatalogPromise = undefined
     }
   }
 
@@ -1285,6 +1313,11 @@ export class QQKernelBridge {
       const conversation = this.conversationFromRecord(record)
       const message = this.mapMessage(record)
       const previous = (this.messages.get(message.conversationId) ?? []).find((item) => item.id === message.id)
+      // Some info updates only mutate delivery/media metadata and omit the
+      // reaction field altogether. Absence is not an authoritative clear.
+      if (record.emojiLikesList === undefined && previous?.reactionContext) {
+        message.reactionContext = previous.reactionContext
+      }
       if (record.sendStatus === 0) {
         if (previous) {
           this.forgetMessage(message)
@@ -1312,7 +1345,10 @@ export class QQKernelBridge {
       } else if (reactionsChanged) {
         this.dispatch({
           type: 'message-reactions',
-          eventId: `reaction:${message.id}:${record.msgSeq ?? Date.now()}`,
+          // msgSeq is immutable, so it cannot identify successive mutations.
+          // A process-local suffix keeps the delivery journal from suppressing
+          // the second reaction update on the same QQ message.
+          eventId: `reaction:${message.id}:${Date.now()}:${++this.reactionEventSequence}`,
           conversation,
           target: { conversationId: conversation.id, messageId: message.id, targetId: message.id },
           context: message.reactionContext ?? { reactions: [], maxSelected: 20 },
@@ -1646,9 +1682,10 @@ export class QQKernelBridge {
     const reactions = (record.emojiLikesList ?? []).flatMap((item) => {
       const nativeKey = reactionKey(item.emojiType, item.emojiId)
       const key = this.reactionByKey.get(nativeKey)?.key ?? nativeKey
-      return this.reactionByKey.has(nativeKey) || !this.reactionDefinitions.length
-        ? [{ key, count: Number(item.likesCnt) || 0, selected: item.isClicked || undefined }]
-        : []
+      // Cloud-control catalogs can lag behind the message payload. Never turn
+      // a real native reaction into an empty state merely because its visual
+      // definition is not present in this QQNT build.
+      return [{ key, count: Number(item.likesCnt) || 0, selected: item.isClicked || undefined }]
     })
     return { reactions, maxSelected: 20 }
   }
@@ -1658,17 +1695,20 @@ export class QQKernelBridge {
     const localRoot = this.findLocalReactionRoot()
     let configPath = localRoot ? join(localRoot, 'face_config.json') : ''
     let facePath = localRoot ? join(localRoot, 'sysface_res') : ''
-    if (!configPath || !existsSync(configPath) || !existsSync(facePath)) {
+    let emojiPath = localRoot ? join(localRoot, 'emoji_res') : ''
+    if (!configPath || !existsSync(configPath) || !existsSync(facePath) || !existsSync(emojiPath)) {
       if (!service.getEmojiResourcePath) return
-      const [configResult, faceResult] = await Promise.all([
+      const [configResult, faceResult, emojiResult] = await Promise.all([
         service.getEmojiResourcePath(0),
         service.getEmojiResourcePath(1),
+        service.getEmojiResourcePath(2),
       ])
-      if (configResult.result !== 0 || faceResult.result !== 0) {
-        throw new Error(`getEmojiResourcePath: ${configResult.errMsg || faceResult.errMsg}`)
+      if (configResult.result !== 0 || faceResult.result !== 0 || emojiResult.result !== 0) {
+        throw new Error(`getEmojiResourcePath: ${configResult.errMsg || faceResult.errMsg || emojiResult.errMsg}`)
       }
       configPath = configResult.resourcePath
       facePath = faceResult.resourcePath
+      emojiPath = emojiResult.resourcePath
     }
     const config = JSON.parse(await readFile(configPath, 'utf8')) as {
       sysface?: Array<{ QSid: string, QDes?: string, QHide?: string }>
@@ -1678,13 +1718,38 @@ export class QQKernelBridge {
     const aliases = new Map<string, QQReactionDefinition>()
     for (const item of config.emoji ?? []) {
       if (item.QHide === '1' || !item.QSid) continue
-      if (!TELEGRAM_STANDARD_REACTIONS.has(item.QSid)) continue
       const emojiId = item.QCid || item.AQLid
       if (!emojiId) continue
-      const definition: QQReactionDefinition = {
-        key: reactionKey('2', emojiId),
-        title: cleanFaceName(item.QDes),
-        presentation: { type: 'emoji', emoticon: item.QSid },
+      const nativeKey = reactionKey('2', emojiId)
+      let definition: QQReactionDefinition
+      if (TELEGRAM_STANDARD_REACTIONS.has(item.QSid)) {
+        definition = {
+          key: nativeKey,
+          title: cleanFaceName(item.QDes),
+          presentation: { type: 'emoji', emoticon: item.QSid },
+        }
+      } else {
+        const filePath = join(emojiPath, `emoji_${item.AQLid?.padStart(3, '0')}.png`)
+        if (!item.AQLid || !existsSync(filePath)) continue
+        const info = await stat(filePath)
+        const dimensions = pngDimensions(await readFile(filePath))
+        definition = {
+          key: nativeKey,
+          title: cleanFaceName(item.QDes),
+          presentation: {
+            type: 'custom',
+            alt: item.QSid,
+            resource: {
+              version: Math.trunc(info.mtimeMs),
+              format: 'static',
+              mimeType: 'image/png',
+              width: dimensions?.width ?? 56,
+              height: dimensions?.height ?? 56,
+              size: info.size,
+              locator: { filePath },
+            },
+          },
+        }
       }
       definitions.push(definition)
       if (item.QCid) aliases.set(reactionKey('2', item.QCid), definition)
@@ -1694,22 +1759,29 @@ export class QQKernelBridge {
       if (item.QHide === '1') continue
       const filePath = join(facePath, 'static', `s${item.QSid}.png`)
       if (!existsSync(filePath)) continue
-      const info = await stat(filePath)
+      const animatedPath = join(facePath, 'apng', `s${item.QSid}.png`)
+      const animated = existsSync(animatedPath)
+      const info = await stat(animated ? animatedPath : filePath)
       const dimensions = pngDimensions(await readFile(filePath))
       definitions.push({
         key: reactionKey('1', item.QSid),
         title: cleanFaceName(item.QDes),
         presentation: {
           type: 'custom',
-          alt: `[${cleanFaceName(item.QDes) || item.QSid}]`,
+          // Telegram expects CustomEmoji.alt to be a fallback emoji, not a
+          // localized label. The QQ title remains available separately.
+          alt: '🙂',
           resource: {
             version: Math.trunc(info.mtimeMs),
-            format: 'static',
-            mimeType: 'image/png',
+            format: animated ? 'video' : 'static',
+            mimeType: animated ? 'video/webm' : 'image/png',
             width: dimensions?.width ?? 128,
             height: dimensions?.height ?? 128,
-            size: info.size,
-            locator: { filePath },
+            size: animated ? undefined : info.size,
+            locator: {
+              filePath,
+              ...(animated ? { assetKey: `sysface/s${item.QSid}.webm` } : {}),
+            },
           },
         },
       })

@@ -133,7 +133,7 @@ export class QQBridgeServer {
       return
     }
     if (request.method === 'GET' && path === '/v1/reactions/catalog') {
-      const catalog = this.bridge.getReactionCatalog()
+      const catalog = await this.bridge.getReactionCatalog()
       log('info', `HTTP API reaction catalog id=${requestId} available=${catalog.available.length}`)
       json(response, 200, catalog)
       return
