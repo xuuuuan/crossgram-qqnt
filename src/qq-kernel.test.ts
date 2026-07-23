@@ -245,9 +245,23 @@ describe('QQKernelBridge', () => {
     })
 
     f.msg.sendMsg.mockImplementationOnce(async () => {
-      queueMicrotask(() => f.emitMessages([{ ...f.message, sendStatus: 2 }]))
+      queueMicrotask(() => f.emitMessages([{ ...f.message, sendStatus: 2, elements: [
+        { elementType: 7, elementId: 'reply', replyElement: {
+          replayMsgId: 'opaque-original', sourceMsgTextElems: [], replyMsgRevokeType: 0,
+          sourceMsgIsIncPic: false, sourceMsgExpired: false,
+        } },
+        { elementType: 1, elementId: 'prefix', textElement: { content: 'hi ' } },
+        { elementType: 1, elementId: 'mention', textElement: {
+          content: '@Alice', atType: 2, atUid: '12345', atTinyId: '', atNtUid: 'u_opaque_alice',
+        } },
+        { elementType: 6, elementId: 'face', faceElement: {
+          faceIndex: 14, faceText: '[微笑]', faceType: 1,
+        } },
+        { elementType: 1, elementId: 'suffix', textElement: { content: '!' } },
+      ] }]))
       return { result: 0, errMsg: '' }
     })
+    f.msg.getMsgUniqueId.mockReturnValueOnce('0')
     await bridge.send({
       conversationId: 'uid-1715311957', replyToId: 'opaque-original',
       textParts: [{
@@ -258,7 +272,7 @@ describe('QQKernelBridge', () => {
         ],
       }],
     }, Readable.from([]))
-    expect(f.msg.sendMsg).toHaveBeenCalledWith('m1', expect.anything(), [
+    expect(f.msg.sendMsg).toHaveBeenCalledWith('0', expect.anything(), [
       expect.objectContaining({ elementType: 7, replyElement: expect.objectContaining({ replayMsgId: 'opaque-original' }) }),
       expect.objectContaining({ elementType: 1, textElement: expect.objectContaining({ content: 'hi ', atType: 0 }) }),
       expect.objectContaining({

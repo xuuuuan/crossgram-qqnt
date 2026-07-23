@@ -1589,8 +1589,7 @@ export class QQKernelBridge {
         const index = this.pendingUnassigned.findIndex((item) =>
           item.conversationId === id
           && Number(record.msgTime) >= item.startedAt - 2
-          && (!item.expectedText || record.elements.some((element) =>
-            element.textElement?.content === item.expectedText))
+          && (!item.expectedText || recordTextContent(record) === item.expectedText)
           && (!item.expectedMediaKind || record.elements.some((element) =>
             matchesElementKind(element, item.expectedMediaKind!)))
           && (!item.expectedMediaName || record.elements.some((element) =>
@@ -1731,8 +1730,7 @@ export class QQKernelBridge {
       const found = response.msgList.find((record) =>
         Number(record.msgTime) >= startedAt - 2
         && (record.senderUid === this.config?.selfUid || SEND_FROM_SELF.has(record.sendType))
-        && (expectedText === undefined || record.elements.some((element) =>
-          element.textElement?.content === expectedText))
+        && (expectedText === undefined || recordTextContent(record) === expectedText)
         && (expectedMediaKind === undefined || record.elements.some((element) =>
           matchesElementKind(element, expectedMediaKind)))
         && (expectedMediaName === undefined || expectedMediaKind === 'image' || record.elements.some((element) =>
@@ -2946,6 +2944,13 @@ function normalizeSingleMessageRecord(value: MsgRecord | { msgRecord?: MsgRecord
   if (!value) return []
   if ('msgId' in value) return [value]
   return value.msgRecord ? [value.msgRecord] : []
+}
+
+function recordTextContent(record: MsgRecord): string {
+  return (record.elements ?? []).map((element) =>
+    element.textElement?.content
+    ?? element.faceElement?.faceText
+    ?? '').join('')
 }
 
 function summarizeCallbackArgs(args: unknown[]): string {
