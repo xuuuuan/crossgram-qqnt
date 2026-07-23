@@ -13,7 +13,7 @@ import type {
 } from './kernel-types.js'
 import {
   conversationId, parseConversationId, type HistoryQuery, type MemberPage, type QQConversation, type QQEvent,
-  type QQMedia, type QQMediaLocator, type QQMessage, type QQReactionContext, type QQReactionDefinition, type QQReactionState,
+  type QQMedia, type QQMediaLocator, type QQMessage, type QQMultiForwardLocator, type QQReactionContext, type QQReactionDefinition, type QQReactionState,
   type QQSticker, type QQStickerPack, type QQStickerPackSummary, type QQStickerReference, type QQTextPart, type SendManifest,
 } from './protocol.js'
 
@@ -486,6 +486,21 @@ export class QQKernelBridge {
     const message = this.mapMessage(record)
     this.rememberMessage(message)
     return message
+  }
+
+  async getMultiForwardMessages(locator: QQMultiForwardLocator): Promise<QQMessage[]> {
+    const service = this.requireMsgService()
+    if (!service.getMultiMsg) throw new Error('getMultiMsg is unavailable in this QQNT build')
+    const conversation = this.getConversation(locator.conversationId)
+    log('info', `native API start name=getMultiMsg conversation=${conversation.id} root=${locator.rootMessageId} parent=${locator.parentMessageId ?? ''}`)
+    const response = await retryTransientInvalidArgument(() => service.getMultiMsg!(
+      contact(conversation), locator.rootMessageId, locator.parentMessageId ?? '',
+    ))
+    log('info', `native API complete name=getMultiMsg conversation=${conversation.id} root=${locator.rootMessageId} parent=${locator.parentMessageId ?? ''} result=${response.result} err=${JSON.stringify(response.errMsg)} messages=${response.msgList.length}`)
+    if (response.result !== 0) throw new Error(`getMultiMsg: ${response.errMsg} (${response.result})`)
+    return response.msgList
+      .filter((record) => !isRecalledRecord(record))
+      .map((record) => this.mapMessage(record, locator.rootMessageId))
   }
 
   private async getMessageRecord(conversation: QQConversation, id: string): Promise<MsgRecord | null> {
@@ -2097,7 +2112,7 @@ export class QQKernelBridge {
     return this.mergeConversation(conversation)
   }
 
-  private mapMessage(record: MsgRecord): QQMessage {
+  private mapMessage(record: MsgRecord, multiForwardRootId?: string): QQMessage {
     const parts: QQMessage['parts'] = []
     let replyToId: string | undefined
     for (const element of record.elements ?? []) {
@@ -2127,7 +2142,15 @@ export class QQKernelBridge {
       } else if (element.elementType === ELEMENT_REPLY && element.replyElement?.replayMsgId) {
         replyToId = element.replyElement.replayMsgId
       } else if (element.elementType === ELEMENT_MULTI_FORWARD && element.multiForwardMsgElement) {
-        parts.push({ type: 'text', text: element.multiForwardMsgElement.fileName || '[聊天记录]' })
+        parts.push({
+          type: 'multi-forward',
+          title: element.multiForwardMsgElement.fileName || '聊天记录',
+          locator: {
+            conversationId: conversationId(record.chatType as 1 | 2, record.peerUid),
+            rootMessageId: multiForwardRootId ?? record.msgId,
+            ...(multiForwardRootId ? { parentMessageId: record.msgId } : {}),
+          },
+        })
       } else {
         const media = mapMedia(record, element)
         if (media) parts.push({ type: 'media', media })

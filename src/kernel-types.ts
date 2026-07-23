@@ -264,6 +264,11 @@ export interface KernelMsgService {
     source: Contact,
     destination: Contact,
   ): Promise<{ result: number, errMsg: string }>
+  getMultiMsg?(
+    peer: Contact,
+    rootMsgId: string,
+    parentMsgId: string,
+  ): Promise<{ result: number, errMsg: string, msgList: MsgRecord[] }>
   getMsgs(peer: Contact, msgId: string, count: number, queryOrder: boolean): Promise<{ result: number, errMsg: string, msgList: MsgRecord[] }>
   getMsgsIncludeSelf?(peer: Contact, msgId: string, count: number, queryOrder: boolean): Promise<{ result: number, errMsg: string, msgList: MsgRecord[] }>
   getAioFirstViewLatestMsgs?(peer: Contact, count: number): Promise<{

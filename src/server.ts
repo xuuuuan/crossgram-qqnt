@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { once } from 'node:events'
 import type { Readable } from 'node:stream'
 import {
-  PROTOCOL_VERSION, type QQMediaLocator, type QQStickerReference, type SendManifest,
+  PROTOCOL_VERSION, type QQMediaLocator, type QQMultiForwardLocator, type QQStickerReference, type SendManifest,
 } from './protocol.js'
 import { QQKernelBridge } from './qq-kernel.js'
 import { log, recordSlowHttpRequest, slowHttpLogPath } from './log.js'
@@ -257,6 +257,13 @@ export class QQBridgeServer {
       )
       if (message) json(response, 200, message)
       else json(response, 404, { error: 'message not found' })
+      return
+    }
+    if (request.method === 'POST' && path === '/v1/messages/multi-forward') {
+      const locator = await readJson<QQMultiForwardLocator>(request)
+      const messages = await this.bridge.getMultiForwardMessages(locator)
+      log('info', `HTTP API multi-forward id=${requestId} conversation=${locator.conversationId} root=${locator.rootMessageId} parent=${locator.parentMessageId ?? ''} messages=${messages.length}`)
+      json(response, 200, { messages })
       return
     }
     if (request.method === 'GET' && path === '/v1/messages/reactions') {

@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 6
+export const PROTOCOL_VERSION = 7
 
 export type QQChatType = 1 | 2
 
@@ -114,9 +114,19 @@ export interface QQMessage {
     | QQTextPart
     | { type: 'media', media: QQMedia }
     | { type: 'sticker', sticker: QQSticker }
+    | { type: 'multi-forward', title: string, locator: QQMultiForwardLocator }
   >
   /** Per-message state only. The shared definition catalog has its own endpoint. */
   reactionContext?: QQReactionState
+}
+
+export interface QQMultiForwardLocator {
+  /** Physical QQ conversation containing the outermost merged-forward message. */
+  conversationId: string
+  /** Outermost QQ message ID; unchanged while opening nested forwards. */
+  rootMessageId: string
+  /** Nested merged-forward message ID. Omitted for the outermost level. */
+  parentMessageId?: string
 }
 
 export interface QQTextPart {

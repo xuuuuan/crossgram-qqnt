@@ -40,6 +40,7 @@ function fixture() {
     deleteMsg: vi.fn(async () => ({ result: 0, errMsg: '' })),
     forwardMsg: vi.fn(async () => ({ result: 0, errMsg: '', detailErr: new Map() })),
     multiForwardMsg: vi.fn(async () => ({ result: 0, errMsg: '' })),
+    getMultiMsg: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [message] })),
     getMsgs: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [message] })),
     getMsgsIncludeSelf: undefined as import('./kernel-types.js').KernelMsgService['getMsgsIncludeSelf'],
     getLatestDbMsgs: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [message] })),
@@ -497,12 +498,35 @@ describe('QQKernelBridge', () => {
       result: 0, errMsg: '', msgList: [f.message, { ...f.message, msgId: 'm2', sendNickName: 'Alice' }],
     })
     await expect(bridge.forwardMessages(conversation, ['m1', 'm2'], conversation, true)).resolves.toMatchObject([
-      { id: 'merged-1', parts: [{ type: 'text', text: 'Alice 和 Bob 的聊天记录' }] },
+      { id: 'merged-1', parts: [{
+        type: 'multi-forward', title: 'Alice 和 Bob 的聊天记录',
+        locator: { conversationId: 'uid-1715311957', rootMessageId: 'merged-1' },
+      }] },
     ])
     expect(f.msg.multiForwardMsg).toHaveBeenCalledWith([
       { msgId: 'm1', senderShowName: 'Self' },
       { msgId: 'm2', senderShowName: 'Alice' },
     ], expect.anything(), expect.anything())
+
+    const nested = {
+      ...f.message, msgId: 'nested-1',
+      elements: [{
+        elementType: 16, elementId: 'nested',
+        multiForwardMsgElement: { fileName: '嵌套聊天记录', resId: 'nested-res' },
+      }],
+    }
+    f.msg.getMultiMsg.mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [nested] })
+    await expect(bridge.getMultiForwardMessages({
+      conversationId: 'uid-1715311957', rootMessageId: 'merged-1',
+    })).resolves.toMatchObject([{
+      id: 'nested-1', parts: [{
+        type: 'multi-forward', title: '嵌套聊天记录',
+        locator: {
+          conversationId: 'uid-1715311957', rootMessageId: 'merged-1', parentMessageId: 'nested-1',
+        },
+      }],
+    }])
+    expect(f.msg.getMultiMsg).toHaveBeenCalledWith(expect.anything(), 'merged-1', '')
   })
 
   it('uses include-self for current QQ direct-chat history', async () => {
@@ -1295,7 +1319,7 @@ describe('QQBridgeServer', () => {
     const { port } = server.address()
     const base = `http://127.0.0.1:${port}/v1`
     await expect(fetch(`${base}/status`).then((response) => response.json())).resolves.toMatchObject({
-      protocolVersion: 6, ready: true, selfUin: '10000',
+      protocolVersion: 7, ready: true, selfUin: '10000',
     })
     await expect(fetch(`${base}/dialogs`).then((response) => response.json())).resolves.toMatchObject({
       conversations: [{ peerUin: '1715311957' }],
