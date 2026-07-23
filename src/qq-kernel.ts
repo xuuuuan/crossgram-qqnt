@@ -25,6 +25,7 @@ const ELEMENT_FILE = 3
 const SEND_FROM_SELF = new Set([1, 2])
 const MEMBER_ADMIN = 3
 const MEMBER_OWNER = 4
+const MEDIA_PATH_CACHE_LIMIT = 1_024
 // Keep this in sync with Telegram's account-level reaction catalog. QQ emoji
 // outside this set are exposed as custom reactions backed by QQ's own icon.
 const TELEGRAM_STANDARD_REACTIONS = new Set([
@@ -81,6 +82,8 @@ export class QQKernelBridge {
     expectedMediaKind?: 'image' | 'file'
   }> = []
   private readonly pendingDownloads = new Map<string, ReturnType<typeof deferred<FileTransNotifyInfo>>>()
+  private readonly activeMediaDownloads = new Map<string, Promise<string>>()
+  private readonly downloadedMediaPaths = new Map<string, string>()
   private readonly pendingReactions = new Map<string, ReturnType<typeof deferred<QQReactionState>>>()
   private readonly pendingGroupProfiles = new Map<string, ReturnType<typeof deferred<void>>>()
   private readonly pendingMemberPages = new Map<string, ReturnType<typeof deferred<{
@@ -187,6 +190,8 @@ export class QQKernelBridge {
     this.pendingMinimumStatuses.clear()
     this.pendingUnassigned.splice(0)
     this.pendingDownloads.clear()
+    this.activeMediaDownloads.clear()
+    this.downloadedMediaPaths.clear()
     for (const pending of this.pendingReactions.values()) pending.reject(new Error('QQNT session detached'))
     this.pendingReactions.clear()
     for (const pending of this.pendingGroupProfiles.values()) pending.reject(new Error('QQNT session detached'))
@@ -940,36 +945,80 @@ export class QQKernelBridge {
   }
 
   private async downloadMedia(locator: QQMediaLocator): Promise<string> {
+    const identity = mediaDownloadIdentity(locator)
+    const cached = this.downloadedMediaPaths.get(identity)
+    if (cached) {
+      if (existsSync(cached)) {
+        this.downloadedMediaPaths.delete(identity)
+        this.downloadedMediaPaths.set(identity, cached)
+        return cached
+      }
+      this.downloadedMediaPaths.delete(identity)
+    }
+
+    const active = this.activeMediaDownloads.get(identity)
+    if (active) {
+      log('info', `native API join name=downloadFile message=${locator.messageId} element=${locator.elementId} identity=${identity}`)
+      return active
+    }
+
+    const download = this.startMediaDownload(locator)
+    this.activeMediaDownloads.set(identity, download)
+    try {
+      const path = await download
+      this.rememberDownloadedMediaPath(identity, path)
+      return path
+    } finally {
+      if (this.activeMediaDownloads.get(identity) === download) this.activeMediaDownloads.delete(identity)
+    }
+  }
+
+  private async startMediaDownload(locator: QQMediaLocator): Promise<string> {
     const key = `${locator.messageId}:${locator.elementId}`
     const pending = deferred<FileTransNotifyInfo>()
     this.pendingDownloads.set(key, pending)
     const directory = join(this.tempPath, 'downloads')
     mkdirSync(directory, { recursive: true })
     log('info', `native API start name=downloadFile message=${locator.messageId} element=${locator.elementId} peer=${locator.peerUid} kind=${locator.kind} directory=${JSON.stringify(directory)}`)
-    this.requireSession().getRichMediaService().downloadFile({
-      fileModelId: '',
-      msgId: locator.messageId,
-      elemId: locator.elementId,
-      uuid: locator.fileUuid ?? '',
-      subId: locator.fileSubId ?? '',
-      fileName: locator.fileName,
-      fileSize: locator.fileSize ?? '0',
-      msgTime: '0',
-      peerUid: locator.peerUid,
-      chatType: locator.chatType,
-      md5: locator.md5 ?? '',
-      md510m: '',
-      sha: locator.sha ?? '',
-      sha3: locator.sha3 ?? '',
-      bizType: locator.fileBizId,
-    }, 1, 0, directory)
-    const completed = await withTimeout(pending.promise, this.downloadTimeoutMs, `QQ media download timed out: ${key}`)
+    let completed: FileTransNotifyInfo
+    try {
+      this.requireSession().getRichMediaService().downloadFile({
+        fileModelId: '',
+        msgId: locator.messageId,
+        elemId: locator.elementId,
+        uuid: locator.fileUuid ?? '',
+        subId: locator.fileSubId ?? '',
+        fileName: locator.fileName,
+        fileSize: locator.fileSize ?? '0',
+        msgTime: '0',
+        peerUid: locator.peerUid,
+        chatType: locator.chatType,
+        md5: locator.md5 ?? '',
+        md510m: '',
+        sha: locator.sha ?? '',
+        sha3: locator.sha3 ?? '',
+        bizType: locator.fileBizId,
+      }, 1, 0, directory)
+      completed = await withTimeout(pending.promise, this.downloadTimeoutMs, `QQ media download timed out: ${key}`)
+    } finally {
+      if (this.pendingDownloads.get(key) === pending) this.pendingDownloads.delete(key)
+    }
     if (completed.fileErrCode !== '0' && completed.fileErrCode !== '') {
       throw new Error(`QQ media download failed: ${completed.fileErrMsg} (${completed.fileErrCode})`)
     }
     if (!completed.filePath || !existsSync(completed.filePath)) throw new Error('QQ media download completed without a file')
     log('info', `native API complete name=downloadFile message=${locator.messageId} element=${locator.elementId} status=${completed.trasferStatus} error=${completed.fileErrCode} path=${JSON.stringify(completed.filePath)} size=${completed.totalSize}`)
     return completed.filePath
+  }
+
+  private rememberDownloadedMediaPath(identity: string, path: string): void {
+    this.downloadedMediaPaths.delete(identity)
+    while (this.downloadedMediaPaths.size >= MEDIA_PATH_CACHE_LIMIT) {
+      const oldest = this.downloadedMediaPaths.keys().next().value as string | undefined
+      if (oldest === undefined) break
+      this.downloadedMediaPaths.delete(oldest)
+    }
+    this.downloadedMediaPaths.set(identity, path)
   }
 
   private registerListeners(): void {
@@ -2248,6 +2297,14 @@ function summarizeNativeResult(value: unknown): string {
   const object = value as { result?: unknown, errMsg?: unknown, data?: unknown }
   const data = Array.isArray(object.data) ? `array(${object.data.length})` : typeof object.data
   return `result=${String(object.result ?? '<none>')} err=${JSON.stringify(String(object.errMsg ?? ''))} data=${data}`
+}
+
+function mediaDownloadIdentity(locator: QQMediaLocator): string {
+  if (locator.md5) return `md5:${locator.md5.toLowerCase()}`
+  if (locator.sha3) return `sha3:${locator.sha3.toLowerCase()}`
+  if (locator.sha) return `sha:${locator.sha.toLowerCase()}`
+  if (locator.fileUuid) return `uuid:${locator.fileUuid}`
+  return `message:${locator.messageId}:element:${locator.elementId}`
 }
 
 function safeRemoveListener(service: string, id: string, remove: () => void): void {

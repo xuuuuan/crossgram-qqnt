@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { ContactMsgBoxInfo, KernelModule, KernelSession, MsgRecord } from './kernel-types.js'
+import type { ContactMsgBoxInfo, FileTransNotifyInfo, KernelModule, KernelSession, MsgRecord } from './kernel-types.js'
 import { QQKernelBridge } from './qq-kernel.js'
 import { QQBridgeServer } from './server.js'
 
@@ -88,6 +88,7 @@ function fixture() {
       },
     })),
   }
+  const richMedia = { downloadFile: vi.fn() }
   class Listener {
     handlers: typeof msgHandlers
     constructor(handlers: typeof msgHandlers) { this.handlers = handlers }
@@ -103,7 +104,7 @@ function fixture() {
     getRecentContactService: () => recent,
     getBuddyService: () => buddy,
     getGroupService: () => group,
-    getRichMediaService: () => ({ downloadFile: vi.fn() }),
+    getRichMediaService: () => richMedia,
     getAvatarService: () => ({
       getAvatarPath: () => avatarPath, forceDownloadAvatar: async () => ({ result: 0, errMsg: '' }),
       getGroupAvatarPath: () => avatarPath, getConfGroupAvatarPath: () => '',
@@ -115,7 +116,7 @@ function fixture() {
     }),
   } as unknown as KernelSession
   return {
-    kernel, session, msg, recent, group, message, sentBodies,
+    kernel, session, msg, recent, group, richMedia, message, sentBodies,
     emitMessages(records: MsgRecord[]) {
       msgHandlers.onMsgInfoListUpdate?.(records)
     },
@@ -124,6 +125,9 @@ function fixture() {
     },
     emitSent(record: MsgRecord) {
       msgHandlers.onAddSendMsg?.(record)
+    },
+    emitDownload(info: FileTransNotifyInfo) {
+      msgHandlers.onRichMediaDownloadComplete?.(info)
     },
     emitBuddyList(categories: Array<{ buddyList: unknown[] }>) {
       buddyHandlers.onBuddyListChange?.(categories)
@@ -152,6 +156,12 @@ function fixture() {
       avatarPath = path
     },
   }
+}
+
+async function readStream(stream: Readable): Promise<Buffer> {
+  const chunks: Buffer[] = []
+  for await (const chunk of stream) chunks.push(Buffer.from(chunk))
+  return Buffer.concat(chunks)
 }
 
 describe('QQKernelBridge', () => {
@@ -522,6 +532,43 @@ describe('QQKernelBridge', () => {
     }
   })
 
+  it('coalesces concurrent native media downloads and reuses the completed path', async () => {
+    const f = fixture()
+    const directory = await mkdtemp(join(tmpdir(), 'qqnt-media-singleflight-'))
+    tempPaths.push(directory)
+    const downloadedPath = join(directory, 'downloaded.bin')
+    await writeFile(downloadedPath, 'abcdefghijklmnop')
+    const bridge = new QQKernelBridge({ tempPath: directory })
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const locator = {
+      messageId: 'download-message', elementId: 'download-element', chatType: 2 as const,
+      peerUid: 'group', kind: 'file' as const, fileName: 'downloaded.bin', fileSize: '16',
+      filePath: join(directory, 'missing.bin'), fileUuid: 'download-uuid', md5: 'ABCDEF',
+    }
+
+    const pendingStreams = Promise.all([
+      bridge.openMedia(locator, 0, 4),
+      bridge.openMedia(locator, 4, 4),
+      bridge.openMedia(locator, 8, 4),
+      bridge.openMedia(locator, 12, 4),
+    ])
+    expect(f.richMedia.downloadFile).toHaveBeenCalledOnce()
+    f.emitDownload({
+      fileModelId: '', msgId: locator.messageId, msgElementId: locator.elementId,
+      fileErrCode: '0', fileErrMsg: '', filePath: downloadedPath, totalSize: '16', trasferStatus: 4,
+    })
+
+    const ranges = await Promise.all((await pendingStreams).map(readStream))
+    expect(ranges.map((bytes) => bytes.toString())).toEqual(['abcd', 'efgh', 'ijkl', 'mnop'])
+
+    const sameContent = await bridge.openMedia({
+      ...locator, messageId: 'another-message', elementId: 'another-element', fileUuid: 'another-uuid',
+      md5: 'abcdef',
+    }, 2, 6)
+    expect((await readStream(sameContent)).toString()).toBe('cdefgh')
+    expect(f.richMedia.downloadFile).toHaveBeenCalledOnce()
+  })
+
   it('publishes a first-seen info update as a message even with an empty reaction list', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
@@ -771,6 +818,48 @@ describe('QQBridgeServer', () => {
     })
     expect(response.status).toBe(200)
     expect(await response.json()).toMatchObject({ id: 'm1' })
+  })
+
+  it('serves concurrent media ranges through one native download', async () => {
+    const f = fixture()
+    const directory = await mkdtemp(join(tmpdir(), 'qqnt-media-http-singleflight-'))
+    tempPaths.push(directory)
+    const downloadedPath = join(directory, 'downloaded.bin')
+    await writeFile(downloadedPath, 'abcdefghijklmnop')
+    const bridge = new QQKernelBridge({ tempPath: directory })
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const base = `http://127.0.0.1:${server.address().port}/v1`
+    const locator = {
+      messageId: 'http-message', elementId: 'http-element', chatType: 2,
+      peerUid: 'group', kind: 'file', fileName: 'downloaded.bin', fileSize: '16',
+      filePath: join(directory, 'missing.bin'), fileUuid: 'http-uuid', md5: '1234abcd',
+    }
+    const open = (offset: number, limit: number) => fetch(`${base}/media/open`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-qqnt-offset': String(offset),
+        'x-qqnt-limit': String(limit),
+      },
+      body: JSON.stringify(locator),
+    })
+
+    const pendingResponses = [0, 4, 8, 12].map((offset) => open(offset, 4))
+    await vi.waitFor(() => expect(f.richMedia.downloadFile).toHaveBeenCalledOnce())
+    f.emitDownload({
+      fileModelId: '', msgId: locator.messageId, msgElementId: locator.elementId,
+      fileErrCode: '0', fileErrMsg: '', filePath: downloadedPath, totalSize: '16', trasferStatus: 4,
+    })
+    const responses = await Promise.all(pendingResponses)
+    expect(responses.map((response) => response.status)).toEqual([200, 200, 200, 200])
+    const ranges = await Promise.all(responses.map(async (response) => Buffer.from(await response.arrayBuffer()).toString()))
+    expect(ranges).toEqual(['abcd', 'efgh', 'ijkl', 'mnop'])
+
+    const cached = await open(2, 6)
+    expect(Buffer.from(await cached.arrayBuffer()).toString()).toBe('cdefgh')
+    expect(f.richMedia.downloadFile).toHaveBeenCalledOnce()
   })
 
   it('warns once per normalized slow HTTP route', async () => {
