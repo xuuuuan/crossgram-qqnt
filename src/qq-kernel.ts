@@ -1398,8 +1398,8 @@ export class QQKernelBridge {
         peerUid?: string,
         seq?: string,
       ) => typeof value === 'object'
-        ? this.onDelete(value.chatType, value.peerUid, [value.seq])
-        : this.onDelete(value, peerUid!, [seq!]),
+        ? this.onRecall(value.chatType, value.peerUid, value.seq)
+        : this.onRecall(value, peerUid!, seq!),
       onMsgDelete: (
         value: { chatType: number, peerUid: string } | {
           peer: { chatType: number, peerUid: string }
@@ -1673,6 +1673,10 @@ export class QQKernelBridge {
       this.rememberRecordSender(record)
       const outgoing = record.senderUid === this.config?.selfUid || SEND_FROM_SELF.has(record.sendType)
       log('info', `native message event source=${source} id=${record.msgId} seq=${record.msgSeq ?? ''} peer=${record.peerUid} chatType=${record.chatType} outgoing=${outgoing} status=${record.sendStatus} elements=${record.elements?.length ?? 0} reactions=${record.emojiLikesList?.length ?? 0}`)
+      if (record.elements?.some((element) => element.grayTipElement?.revokeElement)) {
+        this.onDelete(record.chatType, record.peerUid, [record.msgId])
+        continue
+      }
       const pending = this.pendingMessages.get(record.msgId)
       if (record.sendStatus >= 1) this.pendingAcceptances.get(record.msgId)?.resolve()
       if (pending && record.sendStatus === 0) {
@@ -1758,16 +1762,51 @@ export class QQKernelBridge {
 
   private onDelete(chatType: number, peerUid: string, ids: string[]): void {
     if (chatType !== CHAT_C2C && chatType !== CHAT_GROUP) return
+    const uniqueIds = [...new Set(ids.filter(Boolean))]
+    if (!uniqueIds.length) return
     log('info', `native message delete chatType=${chatType} peer=${peerUid} messages=${ids.join(',')}`)
     const id = conversationId(chatType, peerUid)
     const conversation = this.contacts.get(id) ?? this.getConversation(id)
+    const cached = this.messages.get(id)
+    if (cached) {
+      for (const messageId of uniqueIds) {
+        const message = cached.find((item) => item.id === messageId)
+        if (message) this.forgetMessage(message)
+      }
+    }
     this.dispatch({
       type: 'message-delete',
-      eventId: `delete:${chatType}:${peerUid}:${ids.join(',')}:${Date.now()}`,
+      eventId: `delete:${chatType}:${peerUid}:${uniqueIds.join(',')}:${Date.now()}`,
       conversation,
-      messageIds: ids,
+      messageIds: uniqueIds,
       timestamp: Math.floor(Date.now() / 1000),
     })
+  }
+
+  private onRecall(chatType: number, peerUid: string, msgSeq: string): void {
+    if (chatType !== CHAT_C2C && chatType !== CHAT_GROUP || !msgSeq) return
+    const id = conversationId(chatType, peerUid)
+    const cached = (this.messages.get(id) ?? []).find((message) => message.msgSeq === msgSeq)
+    if (cached) {
+      this.onDelete(chatType, peerUid, [cached.id])
+      return
+    }
+    const service = this.requireMsgService()
+    if (!service.getMsgsBySeqAndCount) {
+      log('warn', `native recall could not resolve msgSeq=${msgSeq} peer=${peerUid}: getMsgsBySeqAndCount unavailable`)
+      return
+    }
+    const peer = { chatType, peerUid, guildId: '' }
+    void retryHistoryCall(() => service.getMsgsBySeqAndCount!(peer, msgSeq, 1, true, true))
+      .then((result) => {
+        const record = result.msgList.find((item) => item.msgSeq === msgSeq) ?? result.msgList[0]
+        if (!record?.msgId) {
+          log('warn', `native recall could not resolve msgSeq=${msgSeq} peer=${peerUid}: result=${result.result}`)
+          return
+        }
+        this.onDelete(chatType, peerUid, [record.msgId])
+      })
+      .catch((error) => log('error', `native recall lookup failed msgSeq=${msgSeq} peer=${peerUid}`, error))
   }
 
   private onDownload(info: FileTransNotifyInfo): void {

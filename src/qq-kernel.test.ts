@@ -148,6 +148,9 @@ function fixture() {
     emitSent(record: MsgRecord) {
       msgHandlers.onAddSendMsg?.(record)
     },
+    emitRecall(chatType: number, peerUid: string, msgSeq: string) {
+      msgHandlers.onMsgRecall?.(chatType, peerUid, msgSeq)
+    },
     emitDownload(info: FileTransNotifyInfo) {
       msgHandlers.onRichMediaDownloadComplete?.(info)
     },
@@ -326,6 +329,47 @@ describe('QQKernelBridge', () => {
       }),
       expect.objectContaining({ elementType: 1, textElement: expect.objectContaining({ content: '!', atType: 0 }) }),
     ], expect.any(Map))
+  })
+
+  it('deletes recalled messages by msgId for both recall callback shapes', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    await bridge.getHistory(bridge.getConversation('uid-1715311957'))
+    const events = bridge.subscribe()[Symbol.asyncIterator]()
+
+    f.emitRecall(1, 'uid-1715311957', 'seq1')
+    await expect(events.next()).resolves.toMatchObject({
+      value: { type: 'message-delete', messageIds: ['m1'] },
+    })
+
+    f.msg.getMsgsBySeqAndCount.mockResolvedValueOnce({
+      result: 0, errMsg: '', msgList: [{ ...f.message, msgId: 'm2', msgSeq: 'seq2' }],
+    })
+    f.emitRecall(1, 'uid-1715311957', 'seq2')
+    await expect(events.next()).resolves.toMatchObject({
+      value: { type: 'message-delete', messageIds: ['m2'] },
+    })
+  })
+
+  it('turns recalled gray-tip replacements into message-delete events', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    await bridge.getHistory(bridge.getConversation('uid-1715311957'))
+    const events = bridge.subscribe()[Symbol.asyncIterator]()
+    f.emitMessages([{ ...f.message, elements: [{
+      elementType: 8,
+      elementId: 'revoke',
+      grayTipElement: {
+        revokeElement: {
+          operatorUid: 'self', origMsgSenderUid: 'self', isSelfOperate: true, wording: '',
+        },
+      },
+    }] }])
+    await expect(events.next()).resolves.toMatchObject({
+      value: { type: 'message-delete', messageIds: ['m1'] },
+    })
   })
 
   it('uses one batch unread lookup and loads only the opened chat around its unread boundary', async () => {

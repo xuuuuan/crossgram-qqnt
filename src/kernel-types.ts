@@ -88,6 +88,14 @@ export interface MsgElement {
     resId?: string
     fileName?: string
   }
+  grayTipElement?: {
+    revokeElement?: {
+      operatorUid: string
+      origMsgSenderUid: string
+      isSelfOperate: boolean
+      wording: string
+    }
+  }
   picElement?: {
     fileName: string
     fileSize: string
