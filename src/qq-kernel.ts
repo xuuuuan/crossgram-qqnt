@@ -5,6 +5,7 @@ import { basename, dirname, extname, join } from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { Readable } from 'node:stream'
 import { AsyncQueue, deferred } from './async.js'
+import { MULTIPLEXED_MSG_SERVICE } from './listener-multiplexer.js'
 import { log } from './log.js'
 import type {
   FileTransNotifyInfo, GroupProfileInfo, InitSessionConfig, KernelModule, KernelSession, MemberInfo, MsgElement, MsgRecord,
@@ -67,6 +68,10 @@ export class QQKernelBridge {
   private readonly pendingReactions = new Map<string, ReturnType<typeof deferred<QQReactionContext>>>()
   private readonly pendingGroupProfiles = new Map<string, ReturnType<typeof deferred<void>>>()
   private readonly groupProfileAttempts = new Map<string, number>()
+  private readonly unreadMarkerLookups = new Map<string, {
+    state: string
+    promise: Promise<QQMessage | undefined>
+  }>()
   private listenerId?: string
   private buddyListenerId?: string
   private groupListenerId?: string
@@ -102,6 +107,7 @@ export class QQKernelBridge {
     this.groups.clear()
     this.avatarCache.clear()
     this.groupProfileAttempts.clear()
+    this.unreadMarkerLookups.clear()
     this.messages.clear()
     this.buddySnapshotLoaded = false
     this.kernel = kernel
@@ -211,7 +217,9 @@ export class QQKernelBridge {
         await this.ensureGroupProfile(conversation.peerUin || conversation.peerUid).catch((error) =>
           log('error', `group profile fallback failed group=${conversation.peerUin || conversation.peerUid}`, error))
       }
-      return this.withConversationAvatar(this.contacts.get(conversation.id) ?? conversation, false)
+      const current = this.contacts.get(conversation.id) ?? conversation
+      const withReadMarker = await this.withUnreadMarker(current)
+      return this.withConversationAvatar(withReadMarker, false)
     })
     return {
       conversations: page,
@@ -297,17 +305,42 @@ export class QQKernelBridge {
 
   async getHistory(conversation: QQConversation, query: HistoryQuery = {}): Promise<{ messages: QQMessage[], nextCursor?: string }> {
     const service = this.requireMsgService()
-    const limit = clamp(query.limit ?? 50, 1, 100)
+    const limit = clamp(query.limit ?? 50, 1, 200)
     const anchor = query.beforeId ?? query.afterId ?? query.cursor ?? '0'
     const peer = contact(conversation)
     const initial = !query.beforeId && !query.afterId && !query.cursor
     let response: { result: number, errMsg: string, msgList: MsgRecord[] }
-    log('info', `native API start name=${initial && service.getLatestDbMsgs ? 'getLatestDbMsgs' : 'getMsgs'} conversation=${conversation.id} anchor=${anchor} limit=${limit} after=${Boolean(query.afterId)}`)
+    const primaryName = initial
+      ? service.getAioFirstViewLatestMsgs ? 'getAioFirstViewLatestMsgs' : service.getLatestDbMsgs ? 'getLatestDbMsgs' : 'getMsgs'
+      : service.getMsgsIncludeSelf ? 'getMsgsIncludeSelf' : 'getMsgs'
+    log('info', `native API start name=${primaryName} conversation=${conversation.id} anchor=${anchor} limit=${limit} after=${Boolean(query.afterId)}`)
     try {
-      const request = Promise.resolve().then(() => initial && service.getLatestDbMsgs
-        ? service.getLatestDbMsgs(peer, limit)
-        : service.getMsgs(peer, anchor, limit, !query.afterId))
-      response = await withTimeout(request, 5_000, 'QQ history request timed out')
+      if (initial && service.getAioFirstViewLatestMsgs) {
+        const firstView = await withTimeout(
+          retryHistoryCall(() => service.getAioFirstViewLatestMsgs!(peer, limit)),
+          2_000,
+          'QQ first-view history request timed out',
+        )
+        if (firstView.result === 0 && !firstView.needContinueGetMsg) {
+          response = firstView
+        } else {
+          response = await this.latestHistoryFallback(service, peer, limit)
+        }
+      } else if (initial) {
+        response = await this.latestHistoryFallback(service, peer, limit)
+      } else {
+        const count = service.getMsgsIncludeSelf ? Math.min(200, limit + 1) : limit
+        response = await withTimeout(
+          retryHistoryCall(() => service.getMsgsIncludeSelf
+            ? service.getMsgsIncludeSelf(peer, anchor, count, !query.afterId)
+            : service.getMsgs(peer, anchor, count, !query.afterId)),
+          5_000,
+          'QQ history request timed out',
+        )
+        if (service.getMsgsIncludeSelf) {
+          response = { ...response, msgList: response.msgList.filter((record) => record.msgId !== anchor).slice(0, limit) }
+        }
+      }
       // Some QQNT releases expose getLatestDbMsgs but return an initialization
       // error for it. getMsgs(peer, "0", ...) is the documented equivalent.
       if (initial && response.result !== 0) {
@@ -345,6 +378,19 @@ export class QQKernelBridge {
     }
     const last = response.msgList.at(-1)
     return { messages, nextCursor: messages.length === limit ? last?.msgId : undefined }
+  }
+
+  private async latestHistoryFallback(
+    service: ReturnType<KernelSession['getMsgService']>,
+    peer: ReturnType<typeof contact>,
+    limit: number,
+  ): Promise<{ result: number, errMsg: string, msgList: MsgRecord[] }> {
+    const request = service.getMsgsIncludeSelf
+      ? () => service.getMsgsIncludeSelf!(peer, '0', limit, true)
+      : service.getLatestDbMsgs
+        ? () => service.getLatestDbMsgs!(peer, limit)
+        : () => service.getMsgs(peer, '0', limit, true)
+    return withTimeout(retryHistoryCall(request), 5_000, 'QQ history request timed out')
   }
 
   async getMessage(conversation: QQConversation, id: string): Promise<QQMessage | null> {
@@ -487,6 +533,53 @@ export class QQKernelBridge {
       } else {
         await Promise.all(cleanup.map((path) => rm(path, { force: true }).catch(() => undefined)))
       }
+    }
+  }
+
+  private async withUnreadMarker(conversation: QQConversation): Promise<QQConversation> {
+    if (!conversation.unreadCount || conversation.readInboxMaxMessage) return conversation
+    const service = this.requireMsgService()
+    if (!service.getFirstUnreadMsgSeq || !service.getMsgsBySeqAndCount) return conversation
+    const state = `${conversation.unreadCount}:${conversation.lastMessage?.id ?? ''}`
+    let lookup = this.unreadMarkerLookups.get(conversation.id)
+    if (!lookup || lookup.state !== state) {
+      lookup = { state, promise: this.lookupUnreadMarker(conversation, service) }
+      this.unreadMarkerLookups.set(conversation.id, lookup)
+    }
+    const readInboxMaxMessage = await lookup.promise
+    return readInboxMaxMessage
+      ? this.mergeConversation({ ...conversation, readInboxMaxMessage })
+      : conversation
+  }
+
+  private async lookupUnreadMarker(
+    conversation: QQConversation,
+    service: ReturnType<KernelSession['getMsgService']>,
+  ): Promise<QQMessage | undefined> {
+    const peer = contact(conversation)
+    try {
+      log('info', `native API start name=getFirstUnreadMsgSeq conversation=${conversation.id}`)
+      const unread = await withTimeout(
+        retryHistoryCall(() => service.getFirstUnreadMsgSeq!(peer)),
+        2_000,
+        'QQ first-unread request timed out',
+      )
+      if (unread.result !== 0 || !unread.seq || unread.seq === '0') return undefined
+      const around = await withTimeout(
+        retryHistoryCall(() => service.getMsgsBySeqAndCount!(peer, unread.seq, 2, true, false)),
+        2_000,
+        'QQ read-marker history request timed out',
+      )
+      if (around.result !== 0) return undefined
+      const previous = around.msgList.find((record) => record.msgSeq !== unread.seq)
+      if (!previous) return undefined
+      const readInboxMaxMessage = this.mapMessage(previous)
+      this.rememberMessage(readInboxMaxMessage)
+      log('info', `native API complete name=readMarker conversation=${conversation.id} firstUnreadSeq=${unread.seq} readMessage=${readInboxMaxMessage.id}`)
+      return readInboxMaxMessage
+    } catch (error) {
+      log('warn', `QQ unread marker lookup failed conversation=${conversation.id}`, error)
+      return undefined
     }
   }
 
@@ -731,7 +824,12 @@ export class QQKernelBridge {
     } catch {
       this.avatarService = undefined
     }
-    const msgListener = makeListener('NodeIKernelMsgListener', kernel.NodeIKernelMsgListener, {
+    const msgListener = makeListener(
+      'NodeIKernelMsgListener',
+      (msgService as unknown as { [MULTIPLEXED_MSG_SERVICE]?: boolean })[MULTIPLEXED_MSG_SERVICE]
+        ? undefined
+        : kernel.NodeIKernelMsgListener,
+      {
       onRecvMsg: (value: MsgRecord[] | { msgList: MsgRecord[] }) =>
         this.onMessages(normalizeMessageRecords(value), 'onRecvMsg'),
       onAddSendMsg: (value: MsgRecord | { msgRecord: MsgRecord }) =>
@@ -765,7 +863,8 @@ export class QQKernelBridge {
           log('info', `QQ media upload completed ${details}`)
         }
       },
-    })
+      },
+    )
     this.listenerId = msgService.addKernelMsgListener(msgListener)
     log('info', `native listener registered service=message id=${this.listenerId || '<empty>'}`)
     const buddyListener = makeListener('NodeIKernelBuddyListener', kernel.NodeIKernelBuddyListener, {
@@ -1159,6 +1258,7 @@ export class QQKernelBridge {
       avatarUrl: user?.avatarUrl || group?.avatarUrl || item.avatarUrl,
       unreadCount: Number(item.unreadCnt) || 0,
       lastMessage: current?.lastMessage?.id === item.msgId ? current.lastMessage : summary,
+      readInboxMaxMessage: Number(item.unreadCnt) > 0 ? current?.readInboxMaxMessage : undefined,
     }
     this.mergeConversation(conversation)
   }
@@ -1935,6 +2035,20 @@ async function retryTransientInvalidArgument<T>(operation: () => Promise<T>): Pr
       lastError = error
       if (!isTransientNativeError(error) || attempt === 9) throw error
       await new Promise((resolve) => setTimeout(resolve, 200 * (attempt + 1)))
+    }
+  }
+  throw lastError
+}
+
+async function retryHistoryCall<T>(operation: () => Promise<T>): Promise<T> {
+  let lastError: unknown
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      return await operation()
+    } catch (error) {
+      lastError = error
+      if (!isTransientNativeError(error) || attempt === 2) throw error
+      await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)))
     }
   }
   throw lastError

@@ -3,12 +3,14 @@ import { once } from 'node:events'
 import type { Readable } from 'node:stream'
 import { PROTOCOL_VERSION, type QQMediaLocator, type SendManifest } from './protocol.js'
 import { QQKernelBridge } from './qq-kernel.js'
-import { log } from './log.js'
+import { log, recordSlowHttpRequest, slowHttpLogPath } from './log.js'
 
 export interface BridgeServerOptions {
   host?: string
   port?: number
   token?: string
+  slowRequestThresholdMs?: number
+  slowRequestPath?: string
 }
 
 export class QQBridgeServer {
@@ -17,11 +19,15 @@ export class QQBridgeServer {
   readonly host: string
   readonly port: number
   readonly token?: string
+  readonly slowRequestThresholdMs: number
+  readonly slowRequestPath: string
 
   constructor(readonly bridge: QQKernelBridge, options: BridgeServerOptions = {}) {
     this.host = options.host ?? '127.0.0.1'
     this.port = options.port ?? 18767
     this.token = options.token
+    this.slowRequestThresholdMs = options.slowRequestThresholdMs ?? 500
+    this.slowRequestPath = options.slowRequestPath ?? slowHttpLogPath
   }
 
   async start(): Promise<void> {
@@ -31,12 +37,26 @@ export class QQBridgeServer {
       const startedAt = Date.now()
       const method = request.method ?? '<unknown>'
       const target = request.url ?? '/'
+      const observe = (completed: boolean) => {
+        const durationMs = Date.now() - startedAt
+        if (durationMs <= this.slowRequestThresholdMs || isLongLivedRequest(target)) return
+        const message = `slow HTTP request method=${method} target=${JSON.stringify(target)} status=${response.statusCode} durationMs=${durationMs} completed=${completed}`
+        log('warn', message)
+        recordSlowHttpRequest({
+          method, target, status: response.statusCode, durationMs, completed,
+        }, this.slowRequestPath)
+      }
       log('info', `HTTP request start id=${requestId} method=${method} target=${JSON.stringify(target)} remote=${request.socket.remoteAddress ?? '<unknown>'}`)
       response.once('finish', () => {
-        log('info', `HTTP request complete id=${requestId} method=${method} target=${JSON.stringify(target)} status=${response.statusCode} durationMs=${Date.now() - startedAt} contentLength=${response.getHeader('content-length') ?? '<stream>'}`)
+        const durationMs = Date.now() - startedAt
+        log('info', `HTTP request complete id=${requestId} method=${method} target=${JSON.stringify(target)} status=${response.statusCode} durationMs=${durationMs} contentLength=${response.getHeader('content-length') ?? '<stream>'}`)
+        observe(true)
       })
       response.once('close', () => {
-        if (!response.writableEnded) log('info', `HTTP request closed id=${requestId} method=${method} target=${JSON.stringify(target)} status=${response.statusCode} durationMs=${Date.now() - startedAt}`)
+        if (!response.writableEnded) {
+          log('info', `HTTP request closed id=${requestId} method=${method} target=${JSON.stringify(target)} status=${response.statusCode} durationMs=${Date.now() - startedAt}`)
+          observe(false)
+        }
       })
       void this.route(request, response, requestId).catch((error) => {
         log('error', `HTTP request failed id=${requestId} method=${method} target=${JSON.stringify(target)}`, error)
@@ -261,6 +281,14 @@ export class QQBridgeServer {
   private authorize(request: IncomingMessage): boolean {
     if (!this.token) return true
     return request.headers.authorization === `Bearer ${this.token}`
+  }
+}
+
+function isLongLivedRequest(target: string): boolean {
+  try {
+    return new URL(target, 'http://localhost').pathname === '/v1/events'
+  } catch {
+    return false
   }
 }
 

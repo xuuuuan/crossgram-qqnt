@@ -1,5 +1,6 @@
 import Module from 'node:module'
 import type { InitSessionConfig, KernelModule, KernelSession } from './kernel-types.js'
+import { multiplexMsgService } from './listener-multiplexer.js'
 import { log, logPath } from './log.js'
 import { QQKernelBridge } from './qq-kernel.js'
 import { QQBridgeServer } from './server.js'
@@ -120,7 +121,8 @@ function wrapKernelModule(kernel: KernelModule): KernelModule {
 
 function wrapSession(kernel: KernelModule, nativeSession: KernelSession): KernelSession {
   let attached = false
-  return new Proxy(nativeSession, {
+  let facade: KernelSession
+  facade = new Proxy(nativeSession, {
     get(target, property) {
       const value = Reflect.get(target as object, property, target)
       if (property === 'init' && typeof value === 'function') {
@@ -130,7 +132,7 @@ function wrapSession(kernel: KernelModule, nativeSession: KernelSession): Kernel
           if (!attached) {
             attached = true
             try {
-              bridge.attach(kernel, target, config)
+              bridge.attach(kernel, facade, config)
               log('info', `attached QQ account ${config.selfUin}`)
             } catch (error) {
               attached = false
@@ -140,9 +142,13 @@ function wrapSession(kernel: KernelModule, nativeSession: KernelSession): Kernel
           return result
         }
       }
+      if (property === 'getMsgService' && typeof value === 'function') {
+        return () => multiplexMsgService(kernel, Reflect.apply(value, target, []))
+      }
       // Native methods reject a JS Proxy as their receiver. Always bind them
       // back to the real native instance.
       return typeof value === 'function' ? value.bind(target) : value
     },
   })
+  return facade
 }

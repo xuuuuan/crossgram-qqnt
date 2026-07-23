@@ -70,6 +70,8 @@ export interface QQConversation {
   avatar?: QQMedia
   unreadCount?: number
   lastMessage?: QQMessage
+  /** Last message read before QQ's first unread message. */
+  readInboxMaxMessage?: QQMessage
 }
 
 export type QQEvent =

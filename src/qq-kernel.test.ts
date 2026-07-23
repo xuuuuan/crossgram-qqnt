@@ -1,4 +1,7 @@
 import { Readable } from 'node:stream'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { KernelModule, KernelSession, MsgRecord } from './kernel-types.js'
 import { QQKernelBridge } from './qq-kernel.js'
@@ -38,6 +41,8 @@ function fixture() {
     forwardMsg: vi.fn(async () => ({ result: 0, errMsg: '', detailErr: new Map() })),
     getMsgs: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [message] })),
     getLatestDbMsgs: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [message] })),
+    getFirstUnreadMsgSeq: vi.fn(async () => ({ result: 4, errMsg: '', seq: '0' })),
+    getMsgsBySeqAndCount: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [message] })),
     getMsgsByMsgId: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [message] })),
     setMsgEmojiLikes: vi.fn(async () => ({ result: 0, errMsg: '' })),
   }
@@ -105,7 +110,7 @@ function fixture() {
     }),
   } as unknown as KernelSession
   return {
-    kernel, session, msg, message, sentBodies,
+    kernel, session, msg, recent, message, sentBodies,
     emitMessages(records: MsgRecord[]) {
       msgHandlers.onMsgInfoListUpdate?.(records)
     },
@@ -154,6 +159,60 @@ describe('QQKernelBridge', () => {
     }, Readable.from([]))
     expect(sent.id).toBe('m1')
     expect(f.msg.sendMsg).toHaveBeenCalledOnce()
+  })
+
+  it('uses the first unread seq to expose the exact last-read message', async () => {
+    const f = fixture()
+    const previous = { ...f.message, msgId: 'm0', msgSeq: 'seq0', msgTime: '1799999999' }
+    f.recent.getRecentContactInfos.mockResolvedValue({
+      result: 0,
+      errMsg: '',
+      relation: [{
+        chatType: 1, peerUid: 'uid-1715311957', peerUin: '1715311957', peerName: 'xuuuuan',
+        remark: '', avatarUrl: '', unreadCnt: '7', msgId: 'm1', msgTime: '1800000000',
+        senderUid: 'uid-1715311957', senderUin: '1715311957',
+        abstractContent: [{ elementType: 1, content: 'hello preview' }],
+      }],
+    })
+    f.msg.getFirstUnreadMsgSeq.mockResolvedValueOnce({ result: 0, errMsg: '', seq: 'seq1' })
+    f.msg.getMsgsBySeqAndCount.mockResolvedValueOnce({
+      result: 0, errMsg: '', msgList: [previous, f.message],
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    const dialogs = await bridge.getDialogs()
+
+    expect(dialogs.conversations[0]).toMatchObject({
+      unreadCount: 7,
+      readInboxMaxMessage: { id: 'm0', msgSeq: 'seq0' },
+    })
+    expect(f.msg.getMsgsBySeqAndCount).toHaveBeenCalledWith(
+      expect.objectContaining({ peerUid: 'uid-1715311957' }),
+      'seq1',
+      2,
+      true,
+      false,
+    )
+    await bridge.getDialogs()
+    expect(f.msg.getFirstUnreadMsgSeq).toHaveBeenCalledOnce()
+    expect(f.msg.getMsgsBySeqAndCount).toHaveBeenCalledOnce()
+  })
+
+  it('prefers the current QQ first-view history API', async () => {
+    const f = fixture()
+    f.msg.getAioFirstViewLatestMsgs = vi.fn(async () => ({
+      result: 0, errMsg: '', msgList: [f.message], needContinueGetMsg: false,
+    }))
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const [conversation] = (await bridge.getDialogs()).conversations
+
+    await expect(bridge.getHistory(conversation)).resolves.toMatchObject({
+      messages: [{ id: 'm1' }],
+    })
+    expect(f.msg.getAioFirstViewLatestMsgs).toHaveBeenCalledOnce()
+    expect(f.msg.getLatestDbMsgs).not.toHaveBeenCalled()
   })
 
   it('streams request bytes into QQ staging without collecting a body Buffer', async () => {
@@ -419,7 +478,11 @@ describe('QQKernelBridge', () => {
 
 describe('QQBridgeServer', () => {
   let server: QQBridgeServer | undefined
-  afterEach(async () => server?.stop())
+  const tempPaths: string[] = []
+  afterEach(async () => {
+    await server?.stop()
+    await Promise.all(tempPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })))
+  })
 
   it('serves status, dialogs, and a chunked send endpoint', async () => {
     const f = fixture()
@@ -443,5 +506,32 @@ describe('QQBridgeServer', () => {
     })
     expect(response.status).toBe(200)
     expect(await response.json()).toMatchObject({ id: 'm1' })
+  })
+
+  it('warns once per normalized slow HTTP route', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const directory = await mkdtemp(join(tmpdir(), 'qqnt-bridge-server-'))
+    tempPaths.push(directory)
+    const path = join(directory, 'slow.log')
+    server = new QQBridgeServer(bridge, {
+      port: 0,
+      slowRequestThresholdMs: -1,
+      slowRequestPath: path,
+    })
+    await server.start()
+    const { port } = server.address()
+    await fetch(`http://127.0.0.1:${port}/v1/status`)
+    await fetch(`http://127.0.0.1:${port}/v1/status`)
+
+    const lines = (await readFile(path, 'utf8')).trim().split('\n')
+    expect(lines).toHaveLength(1)
+    expect(JSON.parse(lines[0])).toMatchObject({
+      route: '/v1/status',
+      method: 'GET',
+      status: 200,
+      completed: true,
+    })
   })
 })

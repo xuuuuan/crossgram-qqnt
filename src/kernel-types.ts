@@ -128,9 +128,20 @@ export interface KernelMsgService {
   deleteMsg(peer: Contact, msgIds: string[]): Promise<{ result: number, errMsg: string }>
   forwardMsg(msgIds: string[], source: Contact, destinations: Contact[], attrs: Map<number, unknown>): Promise<{ result: number, errMsg: string }>
   getMsgs(peer: Contact, msgId: string, count: number, queryOrder: boolean): Promise<{ result: number, errMsg: string, msgList: MsgRecord[] }>
+  getMsgsIncludeSelf?(peer: Contact, msgId: string, count: number, queryOrder: boolean): Promise<{ result: number, errMsg: string, msgList: MsgRecord[] }>
+  getAioFirstViewLatestMsgs?(peer: Contact, count: number): Promise<{
+    result: number
+    errMsg: string
+    msgList: MsgRecord[]
+    needContinueGetMsg: boolean
+  }>
+  getMsgsBySeqAndCount?(
+    peer: Contact, msgSeq: string, count: number, queryOrder: boolean, includeDeleteMsg: boolean,
+  ): Promise<{ result: number, errMsg: string, msgList: MsgRecord[] }>
   getMsgsByMsgId(peer: Contact, msgIds: string[]): Promise<{ result: number, errMsg: string, msgList: MsgRecord[] }>
   getMsgUniqueId?(time: string): string
   getLatestDbMsgs?(peer: Contact, count: number): Promise<{ result: number, errMsg: string, msgList: MsgRecord[] }>
+  getFirstUnreadMsgSeq?(peer: Contact): Promise<{ result: number, errMsg: string, seq: string }>
   getEmojiResourcePath?(type: number): Promise<{ result: number, errMsg: string, resourcePath: string }>
   getRichMediaFilePath?(
     elementType: number, elementSubType: number, md5HexStr: string, fileName: string,
