@@ -311,11 +311,13 @@ export class QQKernelBridge {
     const initial = !query.beforeId && !query.afterId && !query.cursor
     let response: { result: number, errMsg: string, msgList: MsgRecord[] }
     const primaryName = initial
-      ? service.getAioFirstViewLatestMsgs ? 'getAioFirstViewLatestMsgs' : service.getLatestDbMsgs ? 'getLatestDbMsgs' : 'getMsgs'
+      ? conversation.chatType === CHAT_GROUP && service.getAioFirstViewLatestMsgs
+        ? 'getAioFirstViewLatestMsgs'
+        : service.getMsgsIncludeSelf ? 'getMsgsIncludeSelf' : service.getLatestDbMsgs ? 'getLatestDbMsgs' : 'getMsgs'
       : service.getMsgsIncludeSelf ? 'getMsgsIncludeSelf' : 'getMsgs'
     log('info', `native API start name=${primaryName} conversation=${conversation.id} anchor=${anchor} limit=${limit} after=${Boolean(query.afterId)}`)
     try {
-      if (initial && service.getAioFirstViewLatestMsgs) {
+      if (initial && conversation.chatType === CHAT_GROUP && service.getAioFirstViewLatestMsgs) {
         const firstView = await withTimeout(
           retryHistoryCall(() => service.getAioFirstViewLatestMsgs!(peer, limit)),
           2_000,
@@ -353,14 +355,8 @@ export class QQKernelBridge {
       }
     } catch (error) {
       if (!initial) throw error
-      response = await withTimeout(
-        service.getMsgs(peer, '0', limit, true),
-        5_000,
-        'QQ history fallback request timed out',
-      ).catch((fallbackError) => {
-        log('error', 'QQ history requests failed; using cache', error, fallbackError)
-        return { result: 0, errMsg: '', msgList: [] as MsgRecord[] }
-      })
+      log('error', `QQ history request failed; using cache conversation=${conversation.id}`, error)
+      response = { result: 0, errMsg: '', msgList: [] }
     }
     if (response.result !== 0) {
       if (!query.beforeId && !query.afterId && !query.cursor) {
@@ -390,7 +386,7 @@ export class QQKernelBridge {
       : service.getLatestDbMsgs
         ? () => service.getLatestDbMsgs!(peer, limit)
         : () => service.getMsgs(peer, '0', limit, true)
-    return withTimeout(retryHistoryCall(request), 5_000, 'QQ history request timed out')
+    return withTimeout(retryHistoryCall(request), 2_000, 'QQ history request timed out')
   }
 
   async getMessage(conversation: QQConversation, id: string): Promise<QQMessage | null> {

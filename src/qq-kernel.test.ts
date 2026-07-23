@@ -199,8 +199,11 @@ describe('QQKernelBridge', () => {
     expect(f.msg.getMsgsBySeqAndCount).toHaveBeenCalledOnce()
   })
 
-  it('prefers the current QQ first-view history API', async () => {
+  it('uses include-self for current QQ direct-chat history', async () => {
     const f = fixture()
+    f.msg.getMsgsIncludeSelf = vi.fn(async () => ({
+      result: 0, errMsg: '', msgList: [f.message],
+    }))
     f.msg.getAioFirstViewLatestMsgs = vi.fn(async () => ({
       result: 0, errMsg: '', msgList: [f.message], needContinueGetMsg: false,
     }))
@@ -211,7 +214,8 @@ describe('QQKernelBridge', () => {
     await expect(bridge.getHistory(conversation)).resolves.toMatchObject({
       messages: [{ id: 'm1' }],
     })
-    expect(f.msg.getAioFirstViewLatestMsgs).toHaveBeenCalledOnce()
+    expect(f.msg.getMsgsIncludeSelf).toHaveBeenCalledOnce()
+    expect(f.msg.getAioFirstViewLatestMsgs).not.toHaveBeenCalled()
     expect(f.msg.getLatestDbMsgs).not.toHaveBeenCalled()
   })
 
