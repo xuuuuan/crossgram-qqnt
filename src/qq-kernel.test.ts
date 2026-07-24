@@ -1055,16 +1055,16 @@ describe('QQKernelBridge', () => {
     })
   })
 
-  it('streams a ranged qlogo avatar from the fixed QQ endpoint', async () => {
+  it('streams a complete qlogo avatar from the fixed QQ endpoint', async () => {
     const requested = vi.fn(async (input: URL | RequestInfo, init?: RequestInit) => {
       expect(String(input)).toBe('https://q1.qlogo.cn/g?b=qq&nk=42&s=640')
-      expect(init?.headers).toEqual({ range: 'bytes=10-11' })
-      return new Response(Uint8Array.from([1, 2]), { status: 206 })
+      expect(init?.headers).toBeUndefined()
+      return new Response(Uint8Array.from([1, 2]), { status: 200 })
     })
     vi.stubGlobal('fetch', requested)
     try {
       const bridge = new QQKernelBridge()
-      const stream = await bridge.openMedia({
+      const stream = await bridge.downloadFile({
         messageId: 'avatar:user:member',
         elementId: 'avatar:user:member',
         chatType: 1,
@@ -1072,7 +1072,7 @@ describe('QQKernelBridge', () => {
         kind: 'image',
         fileName: '42.jpg',
         avatarUin: '42',
-      }, 10, 2)
+      })
       const chunks: Buffer[] = []
       for await (const chunk of stream) chunks.push(Buffer.from(chunk))
       expect(Buffer.concat(chunks)).toEqual(Buffer.from([1, 2]))
@@ -1097,10 +1097,10 @@ describe('QQKernelBridge', () => {
     }
 
     const pendingStreams = Promise.all([
-      bridge.openMedia(locator, 0, 4),
-      bridge.openMedia(locator, 4, 4),
-      bridge.openMedia(locator, 8, 4),
-      bridge.openMedia(locator, 12, 4),
+      bridge.downloadFile(locator),
+      bridge.downloadFile(locator),
+      bridge.downloadFile(locator),
+      bridge.downloadFile(locator),
     ])
     expect(f.richMedia.downloadFile).toHaveBeenCalledOnce()
     f.emitDownload({
@@ -1108,14 +1108,14 @@ describe('QQKernelBridge', () => {
       fileErrCode: '0', fileErrMsg: '', filePath: downloadedPath, totalSize: '16', trasferStatus: 4,
     })
 
-    const ranges = await Promise.all((await pendingStreams).map(readStream))
-    expect(ranges.map((bytes) => bytes.toString())).toEqual(['abcd', 'efgh', 'ijkl', 'mnop'])
+    const files = await Promise.all((await pendingStreams).map(readStream))
+    expect(files.map((bytes) => bytes.toString())).toEqual(Array(4).fill('abcdefghijklmnop'))
 
-    const sameContent = await bridge.openMedia({
+    const sameContent = await bridge.downloadFile({
       ...locator, messageId: 'another-message', elementId: 'another-element', fileUuid: 'another-uuid',
       md5: 'abcdef',
-    }, 2, 6)
-    expect((await readStream(sameContent)).toString()).toBe('cdefgh')
+    })
+    expect((await readStream(sameContent)).toString()).toBe('abcdefghijklmnop')
     expect(f.richMedia.downloadFile).toHaveBeenCalledOnce()
   })
 
@@ -1429,7 +1429,7 @@ describe('QQBridgeServer', () => {
     const { port } = server.address()
     const base = `http://127.0.0.1:${port}/v1`
     await expect(fetch(`${base}/status`).then((response) => response.json())).resolves.toMatchObject({
-      protocolVersion: 7, ready: true, selfUin: '10000',
+      protocolVersion: 8, ready: true, selfUin: '10000',
     })
     await expect(fetch(`${base}/dialogs`).then((response) => response.json())).resolves.toMatchObject({
       conversations: [{ peerUin: '1715311957' }],
@@ -1444,7 +1444,7 @@ describe('QQBridgeServer', () => {
     expect(await response.json()).toMatchObject({ id: 'm1' })
   })
 
-  it('serves concurrent media ranges through one native download', async () => {
+  it('serves complete files and coalesces concurrent native downloads', async () => {
     const f = fixture()
     const directory = await mkdtemp(join(tmpdir(), 'qqnt-media-http-singleflight-'))
     tempPaths.push(directory)
@@ -1460,17 +1460,13 @@ describe('QQBridgeServer', () => {
       peerUid: 'group', kind: 'file', fileName: 'downloaded.bin', fileSize: '16',
       filePath: join(directory, 'missing.bin'), fileUuid: 'http-uuid', md5: '1234abcd',
     }
-    const open = (offset: number, limit: number) => fetch(`${base}/media/open`, {
+    const download = () => fetch(`${base}/files/download`, {
       method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-qqnt-offset': String(offset),
-        'x-qqnt-limit': String(limit),
-      },
+      headers: { 'content-type': 'application/json' },
       body: JSON.stringify(locator),
     })
 
-    const pendingResponses = [0, 4, 8, 12].map((offset) => open(offset, 4))
+    const pendingResponses = Array.from({ length: 4 }, download)
     await vi.waitFor(() => expect(f.richMedia.downloadFile).toHaveBeenCalledOnce())
     f.emitDownload({
       fileModelId: '', msgId: locator.messageId, msgElementId: locator.elementId,
@@ -1478,14 +1474,12 @@ describe('QQBridgeServer', () => {
     })
     const responses = await Promise.all(pendingResponses)
     expect(responses.map((response) => response.status)).toEqual([200, 200, 200, 200])
-    const ranges = await Promise.all(responses.map(async (response) => Buffer.from(await response.arrayBuffer()).toString()))
-    expect(ranges).toEqual(['abcd', 'efgh', 'ijkl', 'mnop'])
+    const files = await Promise.all(responses.map(async (response) => Buffer.from(await response.arrayBuffer()).toString()))
+    expect(files).toEqual(Array(4).fill('abcdefghijklmnop'))
 
-    const cached = await open(2, 6)
-    expect(Buffer.from(await cached.arrayBuffer()).toString()).toBe('cdefgh')
-    const pastEnd = await open(32, 4)
-    expect(pastEnd.status).toBe(200)
-    expect((await pastEnd.arrayBuffer()).byteLength).toBe(0)
+    const cached = await download()
+    expect(Buffer.from(await cached.arrayBuffer()).toString()).toBe('abcdefghijklmnop')
+    expect((await fetch(`${base}/media/open`, { method: 'POST' })).status).toBe(404)
     expect(f.richMedia.downloadFile).toHaveBeenCalledOnce()
   })
 

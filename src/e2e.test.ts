@@ -38,9 +38,9 @@ describe.skipIf(!enabled)('live QQNT bridge E2E', () => {
       avatar: { locator: { avatarUin: status.selfUin } },
     })
     expect(user.name).not.toBe(status.selfUin)
-    const avatarResponse = await fetch(`${base}/media/open`, {
+    const avatarResponse = await fetch(`${base}/files/download`, {
       method: 'POST',
-      headers: headers({ 'content-type': 'application/json', 'x-qqnt-offset': '0', 'x-qqnt-limit': '16' }),
+      headers: headers({ 'content-type': 'application/json' }),
       body: JSON.stringify(user.avatar!.locator),
     })
     expect(avatarResponse.status).toBe(200)
@@ -151,7 +151,7 @@ describe.skipIf(!enabled)('live QQNT bridge E2E', () => {
     expect(await history.text()).toContain(message.id)
   }, 180_000)
 
-  it.runIf(Boolean(process.env.QQNT_BRIDGE_E2E_FILE))('streams a file to xuuuuan and downloads it by range', async () => {
+  it.runIf(Boolean(process.env.QQNT_BRIDGE_E2E_FILE))('streams a file to xuuuuan and downloads the complete file', async () => {
     const path = process.env.QQNT_BRIDGE_E2E_FILE!
     const info = await stat(path)
     const conversation = await resolve('direct', allowedDirect)
@@ -171,11 +171,11 @@ describe.skipIf(!enabled)('live QQNT bridge E2E', () => {
     const message = JSON.parse(body) as { parts: Array<{ type: string, media?: { locator: unknown } }> }
     const locator = message.parts.find((part) => part.type === 'media')?.media?.locator
     expect(locator).toBeTruthy()
-    const downloaded = await fetch(`${base}/media/open`, {
-      method: 'POST', headers: headers({ 'content-type': 'application/json', 'x-qqnt-offset': '0', 'x-qqnt-limit': '4096' }),
+    const downloaded = await fetch(`${base}/files/download`, {
+      method: 'POST', headers: headers({ 'content-type': 'application/json' }),
       body: JSON.stringify(locator),
     })
     expect(downloaded.status).toBe(200)
-    expect((await downloaded.arrayBuffer()).byteLength).toBe(Math.min(4096, info.size))
+    expect((await downloaded.arrayBuffer()).byteLength).toBe(info.size)
   }, 180_000)
 })

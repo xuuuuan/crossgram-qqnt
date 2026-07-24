@@ -176,11 +176,7 @@ export class QQBridgeServer {
     }
     if (request.method === 'POST' && path === '/v1/stickers/asset') {
       const reference = await readJson<QQStickerReference>(request)
-      const asset = await this.bridge.openSticker(
-        reference,
-        numberHeader(request, 'x-qqnt-offset', 0),
-        optionalNumberHeader(request, 'x-qqnt-limit'),
-      )
+      const asset = await this.bridge.openSticker(reference)
       response.writeHead(200, {
         'content-type': asset.mimeType,
         'x-qqnt-size': String(asset.size ?? ''),
@@ -304,12 +300,10 @@ export class QQBridgeServer {
       else json(response, 200, user)
       return
     }
-    if (request.method === 'POST' && path === '/v1/media/open') {
+    if (request.method === 'POST' && path === '/v1/files/download') {
       const locator = await readJson<QQMediaLocator>(request)
-      const offset = numberHeader(request, 'x-qqnt-offset', 0)
-      const limit = optionalNumberHeader(request, 'x-qqnt-limit')
-      log('info', `HTTP API media open id=${requestId} kind=${locator.kind} message=${locator.messageId} element=${locator.elementId} peer=${locator.peerUid} offset=${offset} limit=${limit ?? '<all>'} pathPresent=${Boolean(locator.filePath)}`)
-      const stream = await this.bridge.openMedia(locator, offset, limit)
+      log('info', `HTTP API file download id=${requestId} kind=${locator.kind} message=${locator.messageId} element=${locator.elementId} peer=${locator.peerUid} pathPresent=${Boolean(locator.filePath)}`)
+      const stream = await this.bridge.downloadFile(locator)
       response.writeHead(200, {
         'content-type': 'application/octet-stream',
         'cache-control': 'no-store',
@@ -413,18 +407,6 @@ function numberParam(url: URL, name: string, fallback: number): number {
   const value = Number(url.searchParams.get(name) ?? fallback)
   if (!Number.isFinite(value)) throw new Error(`query parameter ${name} must be numeric`)
   return value
-}
-
-function numberHeader(request: IncomingMessage, name: string, fallback: number): number {
-  const value = request.headers[name]
-  if (value === undefined) return fallback
-  const parsed = Number(value)
-  if (!Number.isSafeInteger(parsed) || parsed < 0) throw new Error(`header ${name} must be a non-negative integer`)
-  return parsed
-}
-
-function optionalNumberHeader(request: IncomingMessage, name: string): number | undefined {
-  return request.headers[name] === undefined ? undefined : numberHeader(request, name, 0)
 }
 
 async function pipe(source: Readable, destination: ServerResponse): Promise<void> {

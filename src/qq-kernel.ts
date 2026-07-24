@@ -663,7 +663,7 @@ export class QQKernelBridge {
     }
   }
 
-  async openSticker(reference: QQStickerReference, offset = 0, limit?: number): Promise<{
+  async openSticker(reference: QQStickerReference): Promise<{
     stream: Readable
     mimeType: string
     size?: number
@@ -671,14 +671,14 @@ export class QQKernelBridge {
     if (reference.kind === 'favorite') {
       if (reference.path && existsSync(reference.path)) {
         return {
-          stream: rangedFileStream(reference.path, false, offset, limit),
+          stream: fileStream(reference.path, false),
           mimeType: imageMimeType(reference.path, reference.animated),
           size: statSync(reference.path).size,
         }
       }
       if (reference.locator) {
         return {
-          stream: await this.openMedia(reference.locator, offset, limit),
+          stream: await this.downloadFile(reference.locator),
           mimeType: imageMimeType(reference.name, reference.animated),
           size: reference.size,
         }
@@ -687,7 +687,7 @@ export class QQKernelBridge {
     }
     const resolved = await this.resolveMarketStickerPath(reference)
     return {
-      stream: rangedFileStream(resolved.path, resolved.encrypted, offset, limit),
+      stream: fileStream(resolved.path, resolved.encrypted),
       mimeType: resolved.animated ? 'image/gif' : imageMimeType(resolved.path, false),
       size: statSync(resolved.path).size,
     }
@@ -1352,38 +1352,27 @@ export class QQKernelBridge {
     }
   }
 
-  async openMedia(locator: QQMediaLocator, offset = 0, limit?: number): Promise<Readable> {
-    if (locator.avatarUin) return this.openQlogoAvatar(locator.avatarUin, offset, limit)
+  async downloadFile(locator: QQMediaLocator): Promise<Readable> {
+    if (locator.avatarUin) return this.downloadQlogoAvatar(locator.avatarUin)
     let path = locator.filePath
     if ((!path || !existsSync(path)) && locator.messageId.startsWith('avatar:')) {
       path = await this.refreshAvatarFile(locator)
     }
     if (!path || !existsSync(path)) path = await this.downloadMedia(locator)
     const size = statSync(path).size
-    const start = Math.max(0, Math.trunc(offset))
-    if (!size || start >= size || (limit !== undefined && limit <= 0)) {
-      log('info', `media stream open empty message=${locator.messageId} element=${locator.elementId} peer=${locator.peerUid} path=${JSON.stringify(path)} size=${size} start=${start} limit=${limit ?? '<all>'}`)
-      return Readable.from([])
-    }
-    const end = limit === undefined ? size - 1 : Math.min(size - 1, start + Math.trunc(limit) - 1)
-    log('info', `media stream open message=${locator.messageId} element=${locator.elementId} peer=${locator.peerUid} path=${JSON.stringify(path)} size=${size} start=${start} end=${end}`)
-    return createReadStream(path, { start, end })
+    log('info', `file stream open message=${locator.messageId} element=${locator.elementId} peer=${locator.peerUid} path=${JSON.stringify(path)} size=${size}`)
+    return size ? createReadStream(path) : Readable.from([])
   }
 
-  private async openQlogoAvatar(uin: string, offset = 0, limit?: number): Promise<Readable> {
+  private async downloadQlogoAvatar(uin: string): Promise<Readable> {
     if (!/^\d+$/.test(uin)) throw new Error(`invalid QQ avatar UIN: ${uin}`)
-    if (limit !== undefined && limit <= 0) return Readable.from([])
-    const start = Math.max(0, Math.trunc(offset))
-    const end = limit === undefined ? undefined : start + Math.max(0, Math.trunc(limit)) - 1
     const url = new URL('https://q1.qlogo.cn/g')
     url.search = new URLSearchParams({ b: 'qq', nk: uin, s: '640' }).toString()
-    const response = await withTimeout(fetch(url, {
-      headers: start || end !== undefined ? { range: `bytes=${start}-${end ?? ''}` } : undefined,
-    }), 10_000, `QQ qlogo request timed out: ${uin}`)
+    const response = await withTimeout(fetch(url), 10_000, `QQ qlogo request timed out: ${uin}`)
     if (!response.ok || !response.body) {
       throw new Error(`QQ qlogo request failed: ${uin} (${response.status})`)
     }
-    log('info', `qlogo avatar stream open uin=${uin} start=${start} end=${end ?? '<all>'} status=${response.status}`)
+    log('info', `qlogo avatar stream open uin=${uin} status=${response.status}`)
     return Readable.fromWeb(response.body)
   }
 
@@ -3163,16 +3152,11 @@ function imageMimeType(path: string, animated: boolean): string {
   return animated ? 'image/png' : 'image/png'
 }
 
-function rangedFileStream(path: string, encrypted: boolean, offset: number, limit?: number): Readable {
-  const size = statSync(path).size
-  const start = Math.min(size, Math.max(0, Math.trunc(offset)))
-  const requested = limit === undefined ? size - start : Math.max(0, Math.trunc(limit))
-  if (!requested || start >= size) return Readable.from([])
-  const end = Math.min(size - 1, start + requested - 1)
-  if (!encrypted) return createReadStream(path, { start, end })
+function fileStream(path: string, encrypted: boolean): Readable {
+  if (!encrypted) return createReadStream(path)
   return Readable.from((async function* () {
-    let position = start
-    for await (const source of createReadStream(path, { start, end })) {
+    let position = 0
+    for await (const source of createReadStream(path)) {
       const chunk = Buffer.from(source)
       for (let index = 0; index < chunk.length; index++, position++) {
         if (position % 50 < 20) chunk[index] = ~chunk[index]!
