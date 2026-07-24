@@ -687,11 +687,12 @@ describe('QQKernelBridge', () => {
         magicTabinfoList: [], smallTabinfoList: [], epIds: [42],
       } },
     })
-    f.msg.getMarketEmoticonPath.mockImplementation((epId, ids, serviceType) => {
-      if (serviceType === 1) return new Map([[String(epId), { isExist: true, path: detailPath }]])
-      if (serviceType === 3) return new Map(ids.map((id: string) => [id, { isExist: true, path: staticPath }]))
-      if (serviceType === 5) return new Map(ids.map((id: string) => [id, { isExist: true, path: dynamicPath }]))
-      return new Map()
+    f.msg.getMarketEmoticonPath.mockImplementation(async (epId, ids, serviceType) => {
+      let pathMap = new Map<string, { isExist: boolean, path: string }>()
+      if (serviceType === 1) pathMap = new Map([[String(epId), { isExist: true, path: detailPath }]])
+      if (serviceType === 3) pathMap = new Map(ids.map((id: string) => [id, { isExist: true, path: staticPath }]))
+      if (serviceType === 5) pathMap = new Map(ids.map((id: string) => [id, { isExist: true, path: dynamicPath }]))
+      return { result: 0, errMsg: '', pathMap }
     })
     f.msg.getMarketEmoticonEncryptKeys.mockResolvedValue({
       result: 0, errMsg: '', encryptKeyMap: new Map([['emoji-a', 'secret']]),

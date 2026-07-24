@@ -581,7 +581,7 @@ export class QQKernelBridge {
     if (downloaded.result !== 0) {
       throw new Error(`fetchMarketEmoticonShowImage: ${downloaded.errMsg} (${downloaded.result})`)
     }
-    const jsonPath = service.getMarketEmoticonPath(info.epId, [], 1).get(packId)?.path
+    const jsonPath = (await this.getMarketEmoticonPaths(info.epId, [], 1)).get(packId)?.path
     if (!jsonPath || !existsSync(jsonPath)) throw new Error(`QQ sticker pack ${packId} has no detail JSON`)
     const detail = JSON.parse(await readFile(jsonPath, 'utf8')) as {
       isApng?: number
@@ -592,8 +592,8 @@ export class QQKernelBridge {
     } => Boolean(item.id))
     const ids = rows.map((item) => item.id)
     const [staticPaths, dynamicPaths, keys] = await Promise.all([
-      Promise.resolve(service.getMarketEmoticonPath(info.epId, ids, 3)),
-      Promise.resolve(service.getMarketEmoticonPath(info.epId, ids, 5)),
+      this.getMarketEmoticonPaths(info.epId, ids, 3),
+      this.getMarketEmoticonPaths(info.epId, ids, 5),
       service.getMarketEmoticonEncryptKeys?.(info.epId, ids),
     ])
     const keyMap = keys?.result === 0 ? keys.encryptKeyMap : new Map<string, string>()
@@ -2762,7 +2762,9 @@ export class QQKernelBridge {
     }
     const service = this.requireMsgService()
     const epId = Number(reference.packageId)
-    const dynamic = service.getMarketEmoticonPath?.(epId, [reference.stickerId], 5).get(reference.stickerId)
+    const dynamic = service.getMarketEmoticonPath
+      ? (await this.getMarketEmoticonPaths(epId, [reference.stickerId], 5)).get(reference.stickerId)
+      : undefined
     if (reference.animated && dynamic?.isExist && dynamic.path && existsSync(dynamic.path)) {
       reference.dynamicPath = dynamic.path
       return { path: dynamic.path, encrypted: true, animated: true }
@@ -2773,20 +2775,41 @@ export class QQKernelBridge {
         width: reference.width, height: reference.height, jobType: reference.animated ? 1 : 0,
       })
       if (result.result !== 0) throw new Error(`fetchMarketEmoticonAioImage: ${result.errMsg} (${result.result})`)
-      const downloaded = service.getMarketEmoticonPath?.(epId, [reference.stickerId], 5).get(reference.stickerId)
+      const downloaded = service.getMarketEmoticonPath
+        ? (await this.getMarketEmoticonPaths(epId, [reference.stickerId], 5)).get(reference.stickerId)
+        : undefined
       if (reference.animated && downloaded?.path && existsSync(downloaded.path)) {
         reference.dynamicPath = downloaded.path
         return { path: downloaded.path, encrypted: true, animated: true }
       }
     }
-    const staticPath = reference.staticPath
-      || service.getMarketEmoticonPath?.(epId, [reference.stickerId], 4).get(reference.stickerId)?.path
-      || service.getMarketEmoticonPath?.(epId, [reference.stickerId], 3).get(reference.stickerId)?.path
+    let staticPath = reference.staticPath
+    if (!staticPath && service.getMarketEmoticonPath) {
+      staticPath = (await this.getMarketEmoticonPaths(epId, [reference.stickerId], 4))
+        .get(reference.stickerId)?.path
+        || (await this.getMarketEmoticonPaths(epId, [reference.stickerId], 3))
+          .get(reference.stickerId)?.path
+    }
     if (!staticPath || !existsSync(staticPath)) {
       throw new Error(`QQ market sticker file is missing: ${reference.packageId}/${reference.stickerId}`)
     }
     reference.staticPath = staticPath
     return { path: staticPath, encrypted: false, animated: false }
+  }
+
+  private async getMarketEmoticonPaths(
+    epId: number,
+    eIds: string[],
+    serviceType: number,
+  ): Promise<Map<string, { isExist: boolean, path: string }>> {
+    const method = this.requireMsgService().getMarketEmoticonPath
+    if (!method) return new Map()
+    const response = await method(epId, eIds, serviceType)
+    if (response instanceof Map) return response
+    if (response.result !== 0) {
+      throw new Error(`getMarketEmoticonPath: ${response.errMsg} (${response.result})`)
+    }
+    return response.pathMap
   }
 
   private async findFavoriteResId(

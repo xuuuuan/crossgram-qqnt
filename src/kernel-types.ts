@@ -394,7 +394,11 @@ export interface KernelMsgService {
   }): Promise<{ result: number, errMsg: string }>
   getMarketEmoticonPath?(
     epId: number, eIds: string[], serviceType: number,
-  ): Map<string, { isExist: boolean, path: string }>
+  ): Map<string, { isExist: boolean, path: string }> | Promise<{
+    result: number
+    errMsg: string
+    pathMap: Map<string, { isExist: boolean, path: string }>
+  }>
   getMarketEmoticonEncryptKeys?(
     epId: number, eIds: string[],
   ): Promise<{ result: number, errMsg: string, encryptKeyMap: Map<string, string> }>
