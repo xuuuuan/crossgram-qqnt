@@ -1,5 +1,5 @@
 import type {
-  KernelBuddyService, KernelGroupService, KernelMsgService, KernelRecentService,
+  KernelBuddyService, KernelGroupService, KernelMsgService, KernelProfileService, KernelRecentService,
 } from './kernel-types.js'
 import { log } from './log.js'
 
@@ -29,6 +29,10 @@ export function teeMsgService(nativeService: KernelMsgService): KernelMsgService
 
 export function teeBuddyService(nativeService: KernelBuddyService): KernelBuddyService {
   return teeListenerService(nativeService, 'buddy', 'addKernelBuddyListener', 'removeKernelBuddyListener')
+}
+
+export function teeProfileService(nativeService: KernelProfileService): KernelProfileService {
+  return teeListenerService(nativeService, 'profile', 'addKernelProfileListener', 'removeKernelProfileListener')
 }
 
 export function teeGroupService(nativeService: KernelGroupService): KernelGroupService {

@@ -22,6 +22,31 @@ async function resolve(kind: 'direct' | 'group', id: string) {
 }
 
 describe.skipIf(!enabled)('live QQNT bridge E2E', () => {
+  it('exposes the current QQ nickname and a streamable qlogo avatar', async () => {
+    const statusResponse = await fetch(`${base}/status`, { headers: headers() })
+    expect(statusResponse.status, await statusResponse.clone().text()).toBe(200)
+    const status = await statusResponse.json() as { selfUid: string, selfUin: string }
+    const userResponse = await fetch(`${base}/users/${encodeURIComponent(status.selfUid)}`, { headers: headers() })
+    expect(userResponse.status, await userResponse.clone().text()).toBe(200)
+    const user = await userResponse.json() as {
+      id: string, numericId?: string, name: string
+      avatar?: { locator: { avatarUin?: string } }
+    }
+    expect(user).toMatchObject({
+      id: status.selfUid,
+      numericId: status.selfUin,
+      avatar: { locator: { avatarUin: status.selfUin } },
+    })
+    expect(user.name).not.toBe(status.selfUin)
+    const avatarResponse = await fetch(`${base}/media/open`, {
+      method: 'POST',
+      headers: headers({ 'content-type': 'application/json', 'x-qqnt-offset': '0', 'x-qqnt-limit': '16' }),
+      body: JSON.stringify(user.avatar!.locator),
+    })
+    expect(avatarResponse.status).toBe(200)
+    expect(new Uint8Array(await avatarResponse.arrayBuffer()).slice(0, 3)).toEqual(new Uint8Array([0xff, 0xd8, 0xff]))
+  })
+
   it('sends and reads back private and group text messages only in the approved chats', async () => {
     for (const [kind, numericId] of [
       ['direct', allowedDirect],
@@ -86,7 +111,16 @@ describe.skipIf(!enabled)('live QQNT bridge E2E', () => {
     expect(actorId).toBeTruthy()
     const userResponse = await fetch(`${base}/users/${encodeURIComponent(actorId!)}`, { headers: headers() })
     expect(userResponse.status, await userResponse.clone().text()).toBe(200)
-    await expect(userResponse.json()).resolves.toMatchObject({ id: actorId, name: expect.any(String) })
+    const actor = await userResponse.json() as {
+      id: string, numericId?: string, name: string
+      avatar?: { locator: { avatarUin?: string } }
+    }
+    expect(actor).toMatchObject({
+      id: actorId,
+      numericId: expect.any(String),
+      avatar: { locator: { avatarUin: expect.any(String) } },
+    })
+    expect(actor.name).not.toBe(actor.numericId)
   }, 180_000)
 
   it('streams a PNG image to xuuuuan and returns a confirmed image element', async () => {

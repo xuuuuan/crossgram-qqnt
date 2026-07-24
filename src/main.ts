@@ -1,9 +1,9 @@
 import Module from 'node:module'
 import type {
   InitSessionConfig, KernelBuddyService, KernelGroupService, KernelModule, KernelMsgService,
-  KernelRecentService, KernelSession,
+  KernelProfileService, KernelRecentService, KernelSession,
 } from './kernel-types.js'
-import { teeBuddyService, teeGroupService, teeMsgService, teeRecentService } from './listener-tee.js'
+import { teeBuddyService, teeGroupService, teeMsgService, teeProfileService, teeRecentService } from './listener-tee.js'
 import { log, logPath } from './log.js'
 import { QQKernelBridge } from './qq-kernel.js'
 import { QQBridgeServer } from './server.js'
@@ -126,6 +126,7 @@ function wrapSession(kernel: KernelModule, nativeSession: KernelSession): Kernel
   let attached = false
   let msgServiceFacade: KernelMsgService | undefined
   let buddyServiceFacade: KernelBuddyService | undefined
+  let profileServiceFacade: KernelProfileService | undefined
   let groupServiceFacade: KernelGroupService | undefined
   let recentServiceFacade: KernelRecentService | undefined
   let facade: KernelSession
@@ -163,6 +164,14 @@ function wrapSession(kernel: KernelModule, nativeSession: KernelSession): Kernel
           const nativeService = Reflect.apply(value, target, []) as KernelBuddyService | undefined
           if (!nativeService) return nativeService
           return buddyServiceFacade = teeBuddyService(nativeService)
+        }
+      }
+      if (property === 'getProfileService' && typeof value === 'function') {
+        return () => {
+          if (profileServiceFacade) return profileServiceFacade
+          const nativeService = Reflect.apply(value, target, []) as KernelProfileService | undefined
+          if (!nativeService) return nativeService
+          return profileServiceFacade = teeProfileService(nativeService)
         }
       }
       if (property === 'getGroupService' && typeof value === 'function') {

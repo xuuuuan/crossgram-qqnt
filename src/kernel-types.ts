@@ -10,6 +10,11 @@ export interface ProfileSimpleInfo {
   nick: string
   remark: string
   avatarUrl: string
+  /** QQNT 6.9.99 moved global profile fields under coreInfo. */
+  coreInfo?: {
+    nick?: string
+    avatarUrl?: string
+  }
 }
 
 export interface RecentContactInfo {
@@ -417,6 +422,12 @@ export interface KernelBuddyService {
   getBuddyRemark?(uids: string[]): Map<string, string>
 }
 
+export interface KernelProfileService {
+  addKernelProfileListener(listener: unknown): string
+  removeKernelProfileListener(listenerId: string): void
+  getUserSimpleInfo(force: boolean, uids: string[]): Promise<{ result: number, errMsg: string }>
+}
+
 export interface KernelGroupService {
   addKernelGroupListener(listener: unknown): string
   removeKernelGroupListener(listenerId: string): void
@@ -456,6 +467,7 @@ export interface KernelSession {
   getMsgService(): KernelMsgService
   getRecentContactService(): KernelRecentService
   getBuddyService(): KernelBuddyService
+  getProfileService?(): KernelProfileService
   getGroupService(): KernelGroupService
   getRichMediaService(): KernelRichMediaService
   getAvatarService?(): {
@@ -475,6 +487,7 @@ export interface KernelModule {
   NodeIQQNTWrapperSession: { prototype: { init(config: InitSessionConfig, ...args: unknown[]): unknown } }
   NodeIKernelMsgListener?: new (handlers: Record<string, (...args: never[]) => unknown>) => unknown
   NodeIKernelBuddyListener?: new (handlers: Record<string, (...args: never[]) => unknown>) => unknown
+  NodeIKernelProfileListener?: new (handlers: Record<string, (...args: never[]) => unknown>) => unknown
   NodeIKernelGroupListener?: new (handlers: Record<string, (...args: never[]) => unknown>) => unknown
   NodeIKernelRecentContactListener?: new (handlers: Record<string, (...args: never[]) => unknown>) => unknown
 }

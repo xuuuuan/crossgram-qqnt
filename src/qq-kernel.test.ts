@@ -10,7 +10,12 @@ import { QQBridgeServer } from './server.js'
 function fixture() {
   let msgHandlers: Record<string, (...args: unknown[]) => unknown> = {}
   let buddyHandlers: Record<string, (...args: unknown[]) => unknown> = {}
+  let profileHandlers: Record<string, (...args: unknown[]) => unknown> = {}
   let groupHandlers: Record<string, (...args: unknown[]) => unknown> = {}
+  const profileInfos = new Map<string, {
+    uid: string, uin: string, nick: string, remark: string, avatarUrl: string
+    coreInfo?: { nick?: string, avatarUrl?: string }
+  }>([['self', { uid: 'self', uin: '10000', nick: 'Self', remark: '', avatarUrl: '' }]])
   let avatarPath = '/dev/null'
   const sentBodies: Buffer[] = []
   const message: MsgRecord = {
@@ -92,6 +97,20 @@ function fixture() {
     getBuddyNick: vi.fn((uids: string[]) => new Map(uids.map((uid) => [uid, `nick-${uid}`]))),
     getBuddyRemark: vi.fn(() => new Map<string, string>()),
   }
+  const profile = {
+    addKernelProfileListener: vi.fn((listener: { handlers?: typeof profileHandlers }) => {
+      profileHandlers = listener.handlers ?? listener as unknown as typeof profileHandlers
+      return 'profile-listener'
+    }),
+    removeKernelProfileListener: vi.fn(),
+    getUserSimpleInfo: vi.fn(async (_force: boolean, uids: string[]) => {
+      queueMicrotask(() => profileHandlers.onProfileSimpleChanged?.(new Map(uids.map((uid) => [
+        uid,
+        profileInfos.get(uid) ?? { uid, uin: '', nick: '', remark: '', avatarUrl: '' },
+      ]))))
+      return { result: 0, errMsg: '' }
+    }),
+  }
   const group = {
     addKernelGroupListener: vi.fn((listener: { handlers?: typeof groupHandlers }) => {
       groupHandlers = listener.handlers ?? listener as unknown as typeof groupHandlers
@@ -112,7 +131,11 @@ function fixture() {
   }
   const richMedia = { downloadFile: vi.fn() }
   const uix = {
-    getUid: vi.fn(async () => ({ uidInfo: new Map([['1715311957', 'uid-1715311957']]) })),
+    getUid: vi.fn(async (uins: Set<string>) => ({ uidInfo: new Map([...uins].flatMap((uin) => {
+      if (uin === '1715311957') return [[uin, 'uid-1715311957']]
+      if (uin === '3998401572') return [[uin, 'actor-uid']]
+      return []
+    })) })),
     getUin: vi.fn(async () => ({ uinInfo: new Map([['uid-1715311957', '1715311957']]) })),
   }
   class Listener {
@@ -123,12 +146,14 @@ function fixture() {
     NodeIQQNTWrapperSession: { prototype: { init() {} } },
     NodeIKernelMsgListener: Listener,
     NodeIKernelBuddyListener: Listener,
+    NodeIKernelProfileListener: Listener,
     NodeIKernelGroupListener: Listener,
   } as unknown as KernelModule
   const session = {
     getMsgService: () => msg,
     getRecentContactService: () => recent,
     getBuddyService: () => buddy,
+    getProfileService: () => profile,
     getGroupService: () => group,
     getRichMediaService: () => richMedia,
     getAvatarService: () => ({
@@ -139,7 +164,7 @@ function fixture() {
     getUixConvertService: () => uix,
   } as unknown as KernelSession
   return {
-    kernel, session, msg, recent, group, richMedia, uix, message, sentBodies,
+    kernel, session, msg, recent, profile, group, richMedia, uix, message, sentBodies,
     emitMessages(records: MsgRecord[]) {
       msgHandlers.onMsgInfoListUpdate?.(records)
     },
@@ -160,6 +185,12 @@ function fixture() {
     },
     emitBuddyInfo(infos: Map<string, unknown>) {
       buddyHandlers.onBuddyInfoChange?.(infos)
+    },
+    setProfile(info: {
+      uid: string, uin: string, nick: string, remark: string, avatarUrl: string
+      coreInfo?: { nick?: string, avatarUrl?: string }
+    }) {
+      profileInfos.set(info.uid, info)
     },
     emitGroupList(groups: Array<{
       groupCode: string
@@ -223,7 +254,24 @@ describe('QQKernelBridge', () => {
     expect(f.msg.sendMsg).toHaveBeenCalledOnce()
   })
 
-  it('embeds a group recent sender and bounds a missing UID lookup', async () => {
+  it('loads the authoritative self profile before exposing the account and keeps it stable', async () => {
+    const f = fixture()
+    f.setProfile({
+      uid: 'self', uin: '10000', nick: '', remark: '', avatarUrl: '',
+      coreInfo: { nick: 'Canonical Self' },
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.getUser('self')).resolves.toMatchObject({
+      id: 'self', numericId: '10000', name: 'Canonical Self',
+      avatar: { locator: { avatarUin: '10000' } },
+    })
+    f.emitMessages([{ ...f.message, sendNickName: 'A transient message name' }])
+    await expect(bridge.getUser('self')).resolves.toMatchObject({ name: 'Canonical Self' })
+  })
+
+  it('keeps recent contacts message-free and bounds a missing UID lookup', async () => {
     const f = fixture()
     f.recent.getRecentContactInfos.mockResolvedValue({
       result: 0,
@@ -1192,6 +1240,36 @@ describe('QQKernelBridge', () => {
     ])
     await expect(bridge.getUser('actor-a')).resolves.toMatchObject({
       id: 'actor-a', name: 'Alice', avatarUrl: 'https://example.com/a.jpg',
+    })
+  })
+
+  it('normalizes numeric reaction actors to QQ UIDs and exposes profile names and qlogo avatars', async () => {
+    const f = fixture()
+    f.setProfile({
+      uid: 'actor-uid', uin: '3998401572', nick: '', remark: '', avatarUrl: '', coreInfo: { nick: 'Alice' },
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const conversation = await bridge.resolveConversation(2, '1058754719')
+    const groupMessage = {
+      ...f.message,
+      chatType: 2 as const,
+      peerUid: '1058754719',
+      peerUin: '1058754719',
+      emojiLikesList: [{ emojiType: '2', emojiId: '128522', likesCnt: '1', isClicked: false }],
+    }
+    f.msg.getMsgsByMsgId.mockResolvedValue({ result: 0, errMsg: '', msgList: [groupMessage] })
+    f.msg.getMsgEmojiLikesList.mockResolvedValue({
+      result: 0, errMsg: '', cookie: '', isFirstPage: true, isLastPage: true,
+      emojiLikesList: [{ tinyId: '3998401572', nickName: '3998401572', headUrl: '' }],
+    })
+
+    await expect(bridge.getMessageReactions(conversation, 'm1')).resolves.toMatchObject({
+      reactions: [{ recentActors: [{ userId: 'actor-uid' }] }],
+    })
+    await expect(bridge.getUser('actor-uid')).resolves.toMatchObject({
+      id: 'actor-uid', numericId: '3998401572', name: 'Alice',
+      avatar: { locator: { avatarUin: '3998401572' } },
     })
   })
 

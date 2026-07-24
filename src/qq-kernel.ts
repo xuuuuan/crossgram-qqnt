@@ -58,6 +58,7 @@ export class QQKernelBridge {
   private config?: InitSessionConfig
   private msgService?: ReturnType<KernelSession['getMsgService']>
   private buddyService?: ReturnType<KernelSession['getBuddyService']>
+  private profileService?: NonNullable<ReturnType<NonNullable<KernelSession['getProfileService']>>>
   private groupService?: ReturnType<KernelSession['getGroupService']>
   private recentService?: ReturnType<KernelSession['getRecentContactService']>
   private avatarService?: NonNullable<ReturnType<NonNullable<KernelSession['getAvatarService']>>>
@@ -100,6 +101,7 @@ export class QQKernelBridge {
   private readonly downloadedMediaPaths = new Map<string, string>()
   private readonly pendingReactions = new Map<string, ReturnType<typeof deferred<QQReactionState>>>()
   private readonly pendingGroupProfiles = new Map<string, ReturnType<typeof deferred<void>>>()
+  private readonly pendingUserProfiles = new Map<string, ReturnType<typeof deferred<void>>>()
   private readonly pendingMemberPages = new Map<string, ReturnType<typeof deferred<{
     ids: Array<{ uid: string, index: number }>
     infos: Map<string, MemberInfo>
@@ -110,6 +112,7 @@ export class QQKernelBridge {
   private unreadBatchPromise?: Promise<void>
   private listenerId?: string
   private buddyListenerId?: string
+  private profileListenerId?: string
   private groupListenerId?: string
   private recentListenerId?: string
   private listenerRetry?: NodeJS.Timeout
@@ -165,6 +168,11 @@ export class QQKernelBridge {
       numericId: config.selfUin,
       name: config.selfUin,
     })
+    this.seenUsers.set(config.selfUid, {
+      id: config.selfUid,
+      numericId: config.selfUin,
+      name: config.selfUin,
+    })
     try {
       this.registerListeners()
       log('info', `bridge attach complete selfUin=${config.selfUin}`)
@@ -180,20 +188,23 @@ export class QQKernelBridge {
     this.listenerRetry = undefined
     const msgService = this.msgService
     const buddyService = this.buddyService
+    const profileService = this.profileService
     const groupService = this.groupService
     const recentService = this.recentService
-    if (this.listenerId || this.buddyListenerId || this.groupListenerId || this.recentListenerId) {
-      log('info', `bridge detach listeners msg=${this.listenerId ?? ''} buddy=${this.buddyListenerId ?? ''} group=${this.groupListenerId ?? ''} recent=${this.recentListenerId ?? ''}`)
+    if (this.listenerId || this.buddyListenerId || this.profileListenerId || this.groupListenerId || this.recentListenerId) {
+      log('info', `bridge detach listeners msg=${this.listenerId ?? ''} buddy=${this.buddyListenerId ?? ''} profile=${this.profileListenerId ?? ''} group=${this.groupListenerId ?? ''} recent=${this.recentListenerId ?? ''}`)
     }
     if (msgService && this.listenerId) safeRemoveListener('message', this.listenerId, () => msgService.removeKernelMsgListener(this.listenerId!))
     if (buddyService && this.buddyListenerId) safeRemoveListener('buddy', this.buddyListenerId, () => buddyService.removeKernelBuddyListener(this.buddyListenerId!))
+    if (profileService && this.profileListenerId) safeRemoveListener('profile', this.profileListenerId, () => profileService.removeKernelProfileListener(this.profileListenerId!))
     if (groupService && this.groupListenerId) safeRemoveListener('group', this.groupListenerId, () => groupService.removeKernelGroupListener(this.groupListenerId!))
     if (recentService?.removeKernelRecentContactListener && this.recentListenerId) {
       safeRemoveListener('recent', this.recentListenerId, () => recentService.removeKernelRecentContactListener!(this.recentListenerId!))
     }
-    this.listenerId = this.buddyListenerId = this.groupListenerId = undefined
+    this.listenerId = this.buddyListenerId = this.profileListenerId = this.groupListenerId = undefined
     this.msgService = undefined
     this.buddyService = undefined
+    this.profileService = undefined
     this.groupService = undefined
     this.recentService = undefined
     this.avatarService = undefined
@@ -217,6 +228,8 @@ export class QQKernelBridge {
     this.pendingReactions.clear()
     for (const pending of this.pendingGroupProfiles.values()) pending.reject(new Error('QQNT session detached'))
     this.pendingGroupProfiles.clear()
+    for (const pending of this.pendingUserProfiles.values()) pending.reject(new Error('QQNT session detached'))
+    this.pendingUserProfiles.clear()
     for (const pending of this.pendingMemberPages.values()) pending.reject(new Error('QQNT session detached'))
     this.pendingMemberPages.clear()
   }
@@ -304,7 +317,11 @@ export class QQKernelBridge {
       if (!this.buddySnapshotLoaded) await new Promise((resolve) => setTimeout(resolve, 250))
     }
     this.enrichBuddyNames()
-    const all = [...this.users.values()].sort((left, right) => left.name.localeCompare(right.name))
+    const all = [...this.users.values()].sort((left, right) => {
+      if (left.id === this.config?.selfUid) return -1
+      if (right.id === this.config?.selfUid) return 1
+      return left.name.localeCompare(right.name)
+    })
     const offset = parseCursor(cursor)
     const selected = all.slice(offset, offset + clamp(limit, 1, 1_000))
     // Bounded concurrency avoids a native thundering herd while ensuring a
@@ -1029,7 +1046,12 @@ export class QQKernelBridge {
   }
 
   async getUser(uid: string) {
-    const cached = this.seenUsers.get(uid) ?? this.users.get(uid)
+    let cached = this.seenUsers.get(uid) ?? this.users.get(uid)
+    if (cached && isFallbackUserName(cached)) {
+      await this.ensureUserProfiles([uid]).catch((error) =>
+        log('error', `QQ profile resolve failed uid=${uid}; using cached fallback`, error))
+      cached = this.seenUsers.get(uid) ?? this.users.get(uid)
+    }
     if (cached) return { ...cached, avatar: await this.userAvatar(uid, false) }
     let numericId: string | undefined
     try {
@@ -1045,10 +1067,13 @@ export class QQKernelBridge {
       log('error', `QQ user resolve failed uid=${uid}; using opaque fallback`, error)
     }
     const user = { id: uid, numericId, name: numericId ?? uid }
-    this.seenUsers.set(uid, user)
+    this.rememberSeenUser(user)
+    await this.ensureUserProfiles([uid]).catch((error) =>
+      log('error', `QQ profile resolve failed uid=${uid}; using opaque fallback`, error))
+    const resolved = this.seenUsers.get(uid) ?? user
     return {
-      ...user,
-      avatar: numericId ? qlogoAvatarMedia(uid, numericId) : avatarMedia(`user:${uid}`),
+      ...resolved,
+      avatar: await this.userAvatar(uid, false),
     }
   }
 
@@ -1127,18 +1152,51 @@ export class QQKernelBridge {
       for (const actor of result.emojiLikesList) {
         if (!actor.tinyId || actors.has(actor.tinyId)) continue
         actors.set(actor.tinyId, actor)
-        const previous = this.seenUsers.get(actor.tinyId) ?? this.users.get(actor.tinyId)
-        this.seenUsers.set(actor.tinyId, {
-          ...previous,
-          id: actor.tinyId,
-          name: actor.nickName || previous?.name || actor.tinyId,
-          avatarUrl: actor.headUrl || previous?.avatarUrl,
-        })
       }
       if (result.isLastPage || result.emojiLikesList.length === 0 || result.cookie === cookie) break
       cookie = result.cookie
     }
-    return [...actors.values()].slice(0, 100)
+    return this.normalizeReactionActors([...actors.values()].slice(0, 100))
+  }
+
+  private async normalizeReactionActors(actors: EmojiLikesUserInfo[]): Promise<EmojiLikesUserInfo[]> {
+    const numericIds = [...new Set(actors.map((actor) => actor.tinyId).filter((id) => /^\d+$/.test(id)))]
+    const opaqueIds = [...new Set(actors.map((actor) => actor.tinyId).filter((id) => !/^\d+$/.test(id)))]
+    const [uidInfo, uinInfo] = await Promise.all([
+      numericIds.length
+        ? retryTransientInvalidArgument(() => this.requireSession().getUixConvertService().getUid(new Set(numericIds)))
+          .then((value) => value.uidInfo)
+          .catch((error) => {
+            log('error', `reaction actor UID conversion failed uins=${numericIds.join(',')}`, error)
+            return new Map<string, string>()
+          })
+        : new Map<string, string>(),
+      opaqueIds.length
+        ? retryTransientInvalidArgument(() => this.requireSession().getUixConvertService().getUin(new Set(opaqueIds)))
+          .then((value) => value.uinInfo)
+          .catch((error) => {
+            log('error', `reaction actor UIN conversion failed uids=${opaqueIds.join(',')}`, error)
+            return new Map<string, string>()
+          })
+        : new Map<string, string>(),
+    ])
+    const normalized = new Map<string, EmojiLikesUserInfo>()
+    for (const actor of actors) {
+      const numericId = /^\d+$/.test(actor.tinyId) ? actor.tinyId : uinInfo.get(actor.tinyId)
+      const id = numericId ? uidInfo.get(numericId) ?? actor.tinyId : actor.tinyId
+      if (normalized.has(id)) continue
+      const previous = this.seenUsers.get(id) ?? this.users.get(id)
+      this.rememberSeenUser({
+        id,
+        numericId,
+        name: actor.nickName || previous?.name || numericId || id,
+        avatarUrl: actor.headUrl || previous?.avatarUrl,
+      })
+      normalized.set(id, { ...actor, tinyId: id })
+    }
+    await this.ensureUserProfiles([...normalized.keys()]).catch((error) =>
+      log('error', `reaction actor profile resolve failed users=${[...normalized.keys()].join(',')}`, error))
+    return [...normalized.values()]
   }
 
   async setMessageReactions(
@@ -1153,18 +1211,25 @@ export class QQKernelBridge {
     // onAddSendMsg may expose a temporary group msgSeq at sendStatus=1. The
     // stable msgId can already be returned to callers, but reaction writes must
     // refresh the record and use QQ's final msgSeq.
-    let message = await withTimeout(
-      this.getMessage(conversation, messageId),
+    let record = await withTimeout(
+      this.getMessageRecord(conversation, messageId),
       5_000,
       'QQ reaction target refresh timed out',
-    ).catch(() => cached ?? null)
-    // getMsgsByMsgId can keep returning the optimistic sendStatus=1 record for
-    // a newly sent group message. Its msgSeq points at the previous database
-    // row; the latest-history view contains the final server msgSeq.
-    if (conversation.chatType === CHAT_GROUP) {
-      const history = await this.getHistory(conversation, { limit: 20 }).catch(() => null)
-      message = history?.messages.find((item) => item.id === messageId) ?? message
+    ).catch(() => null)
+    // Both getMsgsByMsgId and the first-view cache can briefly retain the
+    // optimistic record. Poll the database view until QQ publishes the final
+    // sendStatus/msgSeq, bounded to keep older builds responsive.
+    for (let attempt = 0; record?.sendStatus === 1 && attempt < 8; attempt++) {
+      const latest = await this.latestRecords(conversation, 20).catch(() => [])
+      const candidate = latest.find((item) => item.msgId === messageId)
+      if (candidate && candidate.sendStatus >= 2) {
+        record = candidate
+        break
+      }
+      await delay(200)
+      record = await this.getMessageRecord(conversation, messageId).catch(() => record)
     }
+    const message = record ? this.mapMessage(record) : cached ?? null
     if (!message) throw new Error(`QQ reaction target not found: ${messageId}`)
     const current = new Set((message.reactionContext?.reactions ?? []).filter((item) => item.selected)
       .map((item) => item.key))
@@ -1412,6 +1477,11 @@ export class QQKernelBridge {
     this.groupService = groupService
     this.recentService = recentService
     try {
+      this.profileService = session.getProfileService?.()
+    } catch {
+      this.profileService = undefined
+    }
+    try {
       this.avatarService = session.getAvatarService?.()
     } catch {
       this.avatarService = undefined
@@ -1484,6 +1554,23 @@ export class QQKernelBridge {
     }))
     this.buddyListenerId = buddyService.addKernelBuddyListener(buddyListener)
     log('info', `native listener registered service=buddy id=${this.buddyListenerId || '<empty>'}`)
+    if (this.profileService) {
+      const profileListener = markBridgeListener(makeListener(
+        'NodeIKernelProfileListener',
+        kernel.NodeIKernelProfileListener,
+        {
+          onProfileSimpleChanged: (value: Map<string, ProfileSimpleInfo> | {
+            profiles: Map<string, ProfileSimpleInfo>
+          }) => {
+            const profiles = value instanceof Map ? value : value.profiles
+            log('info', `profile update received: ${profiles.size} users`)
+            for (const profile of profiles.values()) this.upsertProfile(profile)
+          },
+        },
+      ))
+      this.profileListenerId = this.profileService.addKernelProfileListener(profileListener)
+      log('info', `native listener registered service=profile id=${this.profileListenerId || '<empty>'}`)
+    }
     const groupListener = markBridgeListener(makeListener('NodeIKernelGroupListener', kernel.NodeIKernelGroupListener, {
       onGroupListUpdate: (
         value: number | {
@@ -1607,7 +1694,42 @@ export class QQKernelBridge {
 
   private async initializePlatformData(): Promise<void> {
     void this.ensureReactionCatalog()
+    if (this.config?.selfUid) {
+      await this.ensureUserProfiles([this.config.selfUid]).catch((error) =>
+        log('error', 'initial self profile refresh failed', error))
+    }
     await this.refreshContacts().catch((error) => log('error', 'initial contact refresh failed', error))
+  }
+
+  private async ensureUserProfiles(uids: string[]): Promise<void> {
+    const service = this.profileService
+    if (!service) return
+    const unique = [...new Set(uids.filter((uid) => uid && !/^\d+$/.test(uid)))]
+    if (!unique.length) return
+    const created: string[] = []
+    for (const uid of unique) {
+      if (this.pendingUserProfiles.has(uid)) continue
+      this.pendingUserProfiles.set(uid, deferred<void>())
+      created.push(uid)
+    }
+    const waits = unique.flatMap((uid) => {
+      const pending = this.pendingUserProfiles.get(uid)
+      return pending ? [pending.promise] : []
+    })
+    try {
+      if (created.length) {
+        log('info', `native API start name=getUserSimpleInfo force=false users=${created.join(',')}`)
+        const result = await service.getUserSimpleInfo(false, created)
+        log('info', `native API complete name=getUserSimpleInfo result=${result.result} err=${JSON.stringify(result.errMsg)} users=${created.join(',')}`)
+        if (result.result !== 0) {
+          const error = new Error(`getUserSimpleInfo: ${result.errMsg} (${result.result})`)
+          for (const uid of created) this.pendingUserProfiles.get(uid)?.reject(error)
+        }
+      }
+      await withTimeout(Promise.all(waits).then(() => undefined), 1_500, 'QQ user profile listener timed out')
+    } finally {
+      for (const uid of created) this.pendingUserProfiles.delete(uid)
+    }
   }
 
   private async ensureReactionCatalog(): Promise<void> {
@@ -1970,6 +2092,34 @@ export class QQKernelBridge {
     })
   }
 
+  private upsertProfile(profile: ProfileSimpleInfo): void {
+    if (!profile.uid) return
+    const previous = this.seenUsers.get(profile.uid) ?? this.users.get(profile.uid)
+    const profileName = profile.coreInfo?.nick || profile.nick
+    const profileAvatarUrl = profile.coreInfo?.avatarUrl || profile.avatarUrl
+    const user = {
+      ...previous,
+      id: profile.uid,
+      numericId: profile.uin || previous?.numericId,
+      name: profileName || previous?.name || profile.uin || profile.uid,
+      avatarUrl: profileAvatarUrl || previous?.avatarUrl,
+    }
+    // ProfileService is authoritative for the global QQ nickname. Message
+    // records and buddy remarks must not make the same user oscillate between
+    // account number, contact remark, and nickname.
+    this.seenUsers.set(profile.uid, user)
+    if (profile.uid === this.config?.selfUid || this.users.has(profile.uid)) {
+      const contact = this.users.get(profile.uid)
+      this.users.set(profile.uid, {
+        ...user,
+        name: profile.uid === this.config?.selfUid
+          ? user.name
+          : contact?.name || profile.remark || user.name,
+      })
+    }
+    this.pendingUserProfiles.get(profile.uid)?.resolve()
+  }
+
   private upsertGroupProfile(group: GroupProfileInfo & { avatarUrl?: string }): void {
     const name = group.remarkName || group.groupName || group.groupCode
     const previous = this.groups.get(group.groupCode)
@@ -2075,11 +2225,14 @@ export class QQKernelBridge {
     const current = this.seenUsers.get(candidate.id)
     const currentFallback = !current?.name || current.name === current.id || current.name === current.numericId
     const candidateFallback = !candidate.name || candidate.name === candidate.id || candidate.name === candidate.numericId
+    const keepStableSelfName = candidate.id === this.config?.selfUid && current && !currentFallback
     this.seenUsers.set(candidate.id, {
       ...current,
       ...candidate,
       numericId: candidate.numericId || current?.numericId,
-      name: !candidateFallback || currentFallback ? candidate.name : current!.name,
+      name: keepStableSelfName
+        ? current.name
+        : !candidateFallback || currentFallback ? candidate.name : current!.name,
       avatarUrl: candidate.avatarUrl || current?.avatarUrl,
     })
   }
@@ -2103,6 +2256,9 @@ export class QQKernelBridge {
   }
 
   private mapMessage(record: MsgRecord, multiForwardRootId?: string): QQMessage {
+    this.rememberRecordSender(record)
+    const senderId = record.senderUid || record.senderUin
+    const sender = this.seenUsers.get(senderId) ?? this.users.get(senderId)
     const parts: QQMessage['parts'] = []
     let replyToId: string | undefined
     for (const element of record.elements ?? []) {
@@ -2153,14 +2309,14 @@ export class QQKernelBridge {
     return {
       id: record.msgId,
       conversationId: conversationId(record.chatType as 1 | 2, record.peerUid),
-      senderId: record.senderUid || record.senderUin,
+      senderId,
       sender: {
-        id: record.senderUid || record.senderUin,
-        numericId: record.senderUin || undefined,
-        name: record.sendNickName || record.sendRemarkName || record.senderUin || record.senderUid,
+        id: senderId,
+        numericId: sender?.numericId || record.senderUin || undefined,
+        name: sender?.name || record.sendNickName || record.sendRemarkName || record.senderUin || record.senderUid,
         alias: record.chatType === CHAT_GROUP ? record.sendMemberName || undefined : undefined,
-        avatar: /^\d+$/.test(record.senderUin)
-          ? qlogoAvatarMedia(record.senderUid || record.senderUin, record.senderUin)
+        avatar: /^\d+$/.test(sender?.numericId || record.senderUin)
+          ? qlogoAvatarMedia(senderId, sender?.numericId || record.senderUin)
           : undefined,
       },
       timestamp: Number(record.msgTime) || Math.floor(Date.now() / 1000),
@@ -3321,6 +3477,10 @@ function hasAvatarFile(avatar: QQMedia): boolean {
 
 function isFallbackTitle(title: string | undefined, peerKey: string): boolean {
   return !title?.trim() || title.trim() === peerKey
+}
+
+function isFallbackUserName(user: { id: string, numericId?: string, name: string }): boolean {
+  return !user.name || user.name === user.id || user.name === user.numericId
 }
 
 function firstUsefulTitle(peerKey: string, ...candidates: Array<string | undefined>): string {
