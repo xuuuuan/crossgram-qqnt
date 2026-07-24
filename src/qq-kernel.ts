@@ -261,6 +261,18 @@ export class QQKernelBridge {
     const session = this.requireSession()
     const recentService = session.getRecentContactService()
     let recentError: unknown
+    if (recentService.getRecentContactList) {
+      log('info', 'native API start name=getRecentContactList')
+      try {
+        const loaded = await recentService.getRecentContactList()
+        log('info', `native API complete name=getRecentContactList result=${loaded.result} err=${JSON.stringify(loaded.errMsg)}`)
+        if (loaded.result !== 0) log('warn', `getRecentContactList did not load the full dialog list: ${loaded.errMsg} (${loaded.result})`)
+      } catch (error) {
+        // Older kernels may expose a stub with an incompatible implementation.
+        // getRecentContactInfos below remains a useful cache fallback.
+        log('error', 'full recent contact refresh failed; using cached infos', error)
+      }
+    }
     log('info', 'native API start name=getRecentContactInfos')
     try {
       const recent = await recentService.getRecentContactInfos()
@@ -279,7 +291,7 @@ export class QQKernelBridge {
     if (recentError) throw recentError
   }
 
-  async getDialogs(cursor?: string, limit = 100): Promise<{ conversations: QQConversation[], nextCursor?: string }> {
+  async getDialogs(cursor?: string, limit = 100, afterId?: string): Promise<{ conversations: QQConversation[], nextCursor?: string }> {
     // A refresh failure must not erase/block the already subscribed recent
     // contact snapshot (QQ can transiently reject this call during startup).
     if (!this.contacts.size) {
@@ -287,7 +299,8 @@ export class QQKernelBridge {
         .catch((error) => log('error', 'dialog refresh failed; using cache', error))
     }
     const dialogs = [...this.contacts.values()]
-    const offset = parseCursor(cursor)
+    const afterIndex = afterId ? dialogs.findIndex((dialog) => dialog.id === afterId) : -1
+    const offset = afterId ? (afterIndex < 0 ? 0 : afterIndex + 1) : parseCursor(cursor)
     const selected = dialogs.slice(offset, offset + clamp(limit, 1, 500))
     await this.refreshUnreadMarkers(selected)
     const page = await mapConcurrent(selected, 8, async (conversation) => {
@@ -445,6 +458,7 @@ export class QQKernelBridge {
     log('info', `native API complete name=history conversation=${conversation.id} result=${response.result} err=${JSON.stringify(response.errMsg)} messages=${response.msgList.length}`)
     const visibleRecords = response.msgList.filter((record) => !isRecalledRecord(record))
     await this.resolveReplyTargets(visibleRecords)
+    await this.resolveGrayTipUsers(visibleRecords)
     const messages = visibleRecords.map((record) => this.mapMessage(record))
     for (const message of messages) this.rememberMessage(message)
     if (!messages.length && !query.beforeId && !query.afterId && !query.cursor) {
@@ -519,6 +533,7 @@ export class QQKernelBridge {
     const record = await this.getMessageRecord(conversation, id)
     if (!record) return null
     await this.resolveReplyTargets([record])
+    await this.resolveGrayTipUsers([record])
     const message = this.mapMessage(record)
     this.rememberMessage(message)
     return message
@@ -1884,6 +1899,7 @@ export class QQKernelBridge {
   ): Promise<void> {
     log('info', `native message batch source=${source} count=${records.length}`)
     await this.resolveReplyTargets(records)
+    await this.resolveGrayTipUsers(records)
     for (const record of records) {
       if (record.chatType !== CHAT_C2C && record.chatType !== CHAT_GROUP) continue
       this.rememberRecordSender(record)
@@ -2325,8 +2341,7 @@ export class QQKernelBridge {
 
   private mapMessage(record: MsgRecord, multiForwardRootId?: string): QQMessage {
     this.rememberRecordSender(record)
-    const senderId = record.senderUid || record.senderUin
-    const sender = this.seenUsers.get(senderId) ?? this.users.get(senderId)
+    let senderId = record.senderUid || record.senderUin
     const parts: QQMessage['parts'] = []
     let replyToId: string | undefined
     let serviceAction: QQMessage['serviceAction']
@@ -2387,7 +2402,13 @@ export class QQKernelBridge {
         })
       } else {
         if (element.grayTipElement) {
-          serviceAction = { type: 'custom', text: grayTipText(element.grayTipElement, this.config?.selfUid) }
+          const action = grayTipAction(
+            element.grayTipElement,
+            this.config?.selfUid,
+            (uid) => this.seenUsers.get(uid)?.name ?? this.users.get(uid)?.name,
+          )
+          serviceAction = { type: 'custom', text: action.text }
+          if ((!senderId || senderId === '0') && action.actorId) senderId = action.actorId
           continue
         }
         const media = mapMedia(record, element)
@@ -2398,6 +2419,7 @@ export class QQKernelBridge {
         }
       }
     }
+    const sender = this.seenUsers.get(senderId) ?? this.users.get(senderId)
     return {
       id: record.msgId,
       conversationId: conversationId(record.chatType as 1 | 2, record.peerUid),
@@ -2422,6 +2444,30 @@ export class QQKernelBridge {
         ? this.mapReactionState(record)
         : undefined,
     }
+  }
+
+  private async resolveGrayTipUsers(records: readonly MsgRecord[]): Promise<void> {
+    const users = new Set<string>()
+    for (const record of records) {
+      for (const element of record.elements ?? []) {
+        const json = element.grayTipElement?.jsonGrayTipElement?.jsonStr
+        if (!json) continue
+        try {
+          const parsed = JSON.parse(json) as { items?: Array<{ type?: unknown, uid?: unknown, nm?: unknown }> }
+          for (const item of parsed.items ?? []) {
+            if (item.type !== 'qq' || typeof item.uid !== 'string' || !item.uid) continue
+            if (item.uid === this.config?.selfUid || this.seenUsers.has(item.uid) || this.users.has(item.uid)) continue
+            if (typeof item.nm === 'string' && item.nm) {
+              this.rememberSeenUser({ id: item.uid, name: item.nm })
+            } else {
+              users.add(item.uid)
+            }
+          }
+        } catch {}
+      }
+    }
+    if (users.size) await this.ensureUserProfiles([...users]).catch((error) =>
+      log('error', `gray-tip user profile resolve failed users=${[...users].join(',')}`, error))
   }
 
   private async resolveReplyTargets(records: MsgRecord[]): Promise<void> {
@@ -3665,10 +3711,16 @@ function fallbackElementText(element: MsgElement, selfUid?: string): string {
   return `[暂不支持的消息 ${element.elementType}]`
 }
 
-function grayTipText(gray: NonNullable<MsgElement['grayTipElement']>, selfUid?: string): string {
-  return groupGrayTipText(gray.groupElement, selfUid)
+function grayTipAction(
+  gray: NonNullable<MsgElement['grayTipElement']>,
+  selfUid?: string,
+  resolveUser: (uid: string) => string | undefined = () => undefined,
+): { text: string, actorId?: string } {
+  const json = jsonGrayTipText(gray.jsonGrayTipElement, selfUid, resolveUser)
+  return {
+    text: groupGrayTipText(gray.groupElement, selfUid)
     || (gray.buddyElement?.type === 1 ? '你们已成功添加为好友，现在可以开始聊天了。' : '')
-    || jsonGrayTipText(gray.jsonGrayTipElement)
+    || json.text
     || xmlGrayTipText(gray.xmlElement)
     || gray.feedMsgElement?.content
     || (gray.proclamationElement
@@ -3677,19 +3729,32 @@ function grayTipText(gray: NonNullable<MsgElement['grayTipElement']>, selfUid?: 
       ? gray.essenceElement.isSetEssence ? '消息已设为精华' : '消息已移出精华' : '')
     || (gray.fileReceiptElement?.fileName ? `[文件回执] ${gray.fileReceiptElement.fileName}` : '')
     || genericGrayTipText(gray)
-    || '[系统消息]'
+    || '[系统消息]',
+    actorId: json.actorId,
+  }
 }
 
-function jsonGrayTipText(gray?: { recentAbstract: string, jsonStr: string }): string {
-  if (!gray) return ''
+function jsonGrayTipText(
+  gray: { recentAbstract: string, jsonStr: string } | undefined,
+  selfUid?: string,
+  resolveUser: (uid: string) => string | undefined = () => undefined,
+): { text: string, actorId?: string } {
+  if (!gray) return { text: '' }
   try {
-    const parsed = JSON.parse(gray.jsonStr) as { items?: Array<{ txt?: unknown, nm?: unknown }> }
-    const text = parsed.items?.map((item) =>
-      typeof item.txt === 'string' ? item.txt : typeof item.nm === 'string' ? item.nm : '')
+    const parsed = JSON.parse(gray.jsonStr) as {
+      items?: Array<{ type?: unknown, uid?: unknown, txt?: unknown, nm?: unknown }>
+    }
+    const actorId = parsed.items?.find((item) => item.type === 'qq' && typeof item.uid === 'string')?.uid as string | undefined
+    const text = parsed.items?.map((item) => {
+      if (item.type === 'qq' && typeof item.uid === 'string') {
+        return item.uid === selfUid ? '你' : resolveUser(item.uid) || (typeof item.nm === 'string' ? item.nm : '') || item.uid
+      }
+      return typeof item.txt === 'string' ? item.txt : typeof item.nm === 'string' ? item.nm : ''
+    })
       .join('').trim()
-    return text || gray.recentAbstract || structuredContentSummary(gray.jsonStr)
+    return { text: text || gray.recentAbstract || structuredContentSummary(gray.jsonStr), actorId }
   } catch {
-    return gray.recentAbstract || structuredContentSummary(gray.jsonStr)
+    return { text: gray.recentAbstract || structuredContentSummary(gray.jsonStr) }
   }
 }
 

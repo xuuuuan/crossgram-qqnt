@@ -109,7 +109,7 @@ export interface MsgElement {
       isSelfOperate: boolean
       wording: string
     }
-    jsonGrayTipElement?: { recentAbstract: string, jsonStr: string }
+    jsonGrayTipElement?: { busiId?: string, recentAbstract: string, jsonStr: string }
     xmlElement?: { content: string, members?: Map<string, string> }
     fileReceiptElement?: { fileName: string }
     feedMsgElement?: { content: string }
@@ -473,6 +473,7 @@ export interface KernelMsgService {
 export interface KernelRecentService {
   addKernelRecentContactListener?(listener: unknown): string
   removeKernelRecentContactListener?(listenerId: string): void
+  getRecentContactList?(): Promise<{ result: number, errMsg: string }>
   getRecentContactInfos(): Promise<{ result: number, errMsg: string, relation: RecentContactInfo[] }>
 }
 

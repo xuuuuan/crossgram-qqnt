@@ -86,6 +86,7 @@ function fixture() {
     })),
   }
   const recent = {
+    getRecentContactList: vi.fn(async () => ({ result: 0, errMsg: '' })),
     getRecentContactInfos: vi.fn(async () => ({
       result: 0, errMsg: '', relation: [{
         chatType: 1, peerUid: 'uid-1715311957', peerUin: '1715311957', peerName: 'xuuuuan',
@@ -304,6 +305,30 @@ describe('QQKernelBridge', () => {
     })
   })
 
+  it('loads the full recent-contact list and paginates dialogs after an opaque ID', async () => {
+    const f = fixture()
+    f.recent.getRecentContactInfos.mockResolvedValue({
+      result: 0,
+      errMsg: '',
+      relation: [
+        { chatType: 2, peerUid: 'group-a', peerUin: 'group-a', peerName: 'A' },
+        { chatType: 2, peerUid: 'group-b', peerUin: 'group-b', peerName: 'B' },
+        { chatType: 2, peerUid: 'group-c', peerUin: 'group-c', peerName: 'C' },
+      ],
+    } as Awaited<ReturnType<typeof f.recent.getRecentContactInfos>>)
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    const first = await bridge.getDialogs(undefined, 1)
+    const second = await bridge.getDialogs(undefined, 1, first.conversations[0].id)
+
+    expect(f.recent.getRecentContactList).toHaveBeenCalled()
+    expect(first.conversations.map((item) => item.id)).toEqual(['group-a'])
+    expect(first.nextCursor).toBe('1')
+    expect(second.conversations.map((item) => item.id)).toEqual(['group-b'])
+    expect(second.nextCursor).toBe('2')
+  })
+
   it('maps and sends native mention and reply elements without parsing opaque IDs', async () => {
     const f = fixture()
     f.message.elements = [{
@@ -446,6 +471,18 @@ describe('QQKernelBridge', () => {
       record('poke', { elementType: 6, elementId: 'poke', faceElement: {
         faceIndex: 0, faceType: 5, spokeSummary: 'Alice戳了戳你',
       } }),
+      record('json-poke', { elementType: 8, elementId: 'json-poke', grayTipElement: {
+        jsonGrayTipElement: {
+          busiId: '1061', recentAbstract: '',
+          jsonStr: JSON.stringify({ items: [
+            { type: 'qq', uid: 'self', nm: '' },
+            { type: 'img' },
+            { type: 'nor', txt: '戳了戳' },
+            { type: 'qq', uid: 'bob', nm: 'Bob' },
+            { type: 'nor', txt: '的猫耳' },
+          ] }),
+        },
+      } }),
       record('join', { elementType: 8, elementId: 'join', grayTipElement: {
         groupElement: {
           type: 1, role: 0, groupName: '', memberUid: '', memberNick: '', memberRemark: '',
@@ -490,6 +527,7 @@ describe('QQKernelBridge', () => {
     const messages = (await bridge.getHistory(bridge.getConversation('1058754719'))).messages
     expect(messages.map((message) => ({ parts: message.parts, serviceAction: message.serviceAction }))).toMatchObject([
       { parts: [], serviceAction: { type: 'custom', text: 'Alice戳了戳你' } },
+      { parts: [], serviceAction: { type: 'custom', text: '你戳了戳Bob的猫耳' } },
       { parts: [], serviceAction: { type: 'custom', text: 'Alice邀请Bob加入了群聊。' } },
       { parts: [], serviceAction: { type: 'custom', text: '你被管理员禁言1小时1分钟1秒' } },
       { parts: [], serviceAction: { type: 'custom', text: '安全提醒：请修改密码' } },
