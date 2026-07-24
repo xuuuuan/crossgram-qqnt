@@ -1,4 +1,5 @@
 import { createReadStream } from 'node:fs'
+import { Readable } from 'node:stream'
 import { stat } from 'node:fs/promises'
 import { basename } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -149,6 +150,39 @@ describe.skipIf(!enabled)('live QQNT bridge E2E', () => {
       headers: headers(),
     })
     expect(await history.text()).toContain(message.id)
+  }, 180_000)
+
+  it('streams two PNG images to xuuuuan as one QQ message', async () => {
+    const imagePath = new URL('../../mtproto-relay-cordis/packages/platform-static/src/test-image.png', import.meta.url)
+    const image = await stat(imagePath)
+    const conversation = await resolve('direct', allowedDirect)
+    const name = basename(imagePath.pathname)
+    const manifest = Buffer.from(JSON.stringify({
+      conversationId: conversation.id,
+      mediaFraming: 'length-prefixed-v1',
+      media: [
+        { kind: 'image', name: `first-${name}`, size: image.size, mimeType: 'image/png' },
+        { kind: 'image', name: `second-${name}`, size: image.size, mimeType: 'image/png' },
+      ],
+    })).toString('base64url')
+    const body = Readable.from((async function* () {
+      for (let index = 0; index < 2; index++) {
+        for await (const chunk of createReadStream(imagePath)) {
+          const header = Buffer.allocUnsafe(4)
+          header.writeUInt32BE(chunk.length)
+          yield header
+          yield chunk
+        }
+        yield Buffer.alloc(4)
+      }
+    })())
+    const sent = await fetch(`${base}/messages`, {
+      method: 'POST', headers: headers({ 'x-qqnt-manifest': manifest }), body: body as never, duplex: 'half',
+    } as RequestInit)
+    const responseBody = await sent.text()
+    expect(sent.status, responseBody).toBe(200)
+    const message = JSON.parse(responseBody) as { parts: Array<{ type: string }> }
+    expect(message.parts.filter((part) => part.type === 'media')).toHaveLength(2)
   }, 180_000)
 
   it.runIf(Boolean(process.env.QQNT_BRIDGE_E2E_FILE))('streams a file to xuuuuan and downloads the complete file', async () => {
