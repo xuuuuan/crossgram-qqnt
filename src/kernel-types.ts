@@ -110,7 +110,7 @@ export interface MsgElement {
       wording: string
     }
     jsonGrayTipElement?: { recentAbstract: string, jsonStr: string }
-    xmlElement?: { content: string }
+    xmlElement?: { content: string, members?: Map<string, string> }
     fileReceiptElement?: { fileName: string }
     feedMsgElement?: { content: string }
     proclamationElement?: { isSetProclamation: number }

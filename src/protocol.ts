@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 9
+export const PROTOCOL_VERSION = 10
 
 export type QQChatType = 1 | 2
 
@@ -110,6 +110,8 @@ export interface QQMessage {
   originRequestId?: string
   /** Opaque QQ msgId referenced by a native reply element. */
   replyToId?: string
+  /** QQ gray-tip/poke projected as a Telegram service message by the relay. */
+  serviceAction?: { type: 'custom', text: string }
   parts: Array<
     | QQTextPart
     | { type: 'media', media: QQMedia }

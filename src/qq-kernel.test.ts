@@ -436,7 +436,7 @@ describe('QQKernelBridge', () => {
     })
   })
 
-  it('renders poke, member changes, mute notices, and generic JSON gray tips as text', async () => {
+  it('maps poke, member changes, mute notices, and generic gray tips to service actions', async () => {
     const f = fixture()
     const record = (msgId: string, element: MsgRecord['elements'][number]): MsgRecord => ({
       ...f.message, msgId, msgSeq: `${msgId}-seq`, chatType: 2,
@@ -477,17 +477,24 @@ describe('QQKernelBridge', () => {
       record('generic', { elementType: 8, elementId: 'generic', grayTipElement: {
         walletGrayTipElement: { receiverRichContent: '你领取了红包' },
       } as unknown as NonNullable<MsgRecord['elements'][number]['grayTipElement']> }),
+      record('xml', { elementType: 8, elementId: 'xml', grayTipElement: {
+        xmlElement: {
+          content: '<gtip><qq uin="alice" jp="123"/><nor txt="邀请"/><qq uin="bob" jp="456"/><nor txt="加入了群聊。"/></gtip>',
+          members: new Map([['alice', 'Alice'], ['bob', 'Bob']]),
+        },
+      } }),
     ] })
     const bridge = new QQKernelBridge()
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
 
     const messages = (await bridge.getHistory(bridge.getConversation('1058754719'))).messages
-    expect(messages.map((message) => message.parts)).toMatchObject([
-      [{ type: 'text', text: 'Alice戳了戳你' }],
-      [{ type: 'text', text: 'Alice邀请Bob加入了群聊。' }],
-      [{ type: 'text', text: '你被管理员禁言1小时1分钟1秒' }],
-      [{ type: 'text', text: '安全提醒：请修改密码' }],
-      [{ type: 'text', text: '你领取了红包' }],
+    expect(messages.map((message) => ({ parts: message.parts, serviceAction: message.serviceAction }))).toMatchObject([
+      { parts: [], serviceAction: { type: 'custom', text: 'Alice戳了戳你' } },
+      { parts: [], serviceAction: { type: 'custom', text: 'Alice邀请Bob加入了群聊。' } },
+      { parts: [], serviceAction: { type: 'custom', text: '你被管理员禁言1小时1分钟1秒' } },
+      { parts: [], serviceAction: { type: 'custom', text: '安全提醒：请修改密码' } },
+      { parts: [], serviceAction: { type: 'custom', text: '你领取了红包' } },
+      { parts: [], serviceAction: { type: 'custom', text: 'Alice邀请Bob加入了群聊。' } },
     ])
   })
 
@@ -1774,7 +1781,7 @@ describe('QQBridgeServer', () => {
     const { port } = server.address()
     const base = `http://127.0.0.1:${port}/v1`
     await expect(fetch(`${base}/status`).then((response) => response.json())).resolves.toMatchObject({
-      protocolVersion: 9, ready: true, selfUin: '10000',
+      protocolVersion: 10, ready: true, selfUin: '10000',
     })
     await expect(fetch(`${base}/dialogs`).then((response) => response.json())).resolves.toMatchObject({
       conversations: [{ peerUin: '1715311957' }],

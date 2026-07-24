@@ -2329,6 +2329,7 @@ export class QQKernelBridge {
     const sender = this.seenUsers.get(senderId) ?? this.users.get(senderId)
     const parts: QQMessage['parts'] = []
     let replyToId: string | undefined
+    let serviceAction: QQMessage['serviceAction']
     for (const element of record.elements ?? []) {
       const sticker = mapSticker(record, element)
       if (sticker) {
@@ -2349,13 +2350,17 @@ export class QQKernelBridge {
           ? element.faceElement.spokeSummary || element.faceElement.vaspokeName
             || element.faceElement.faceText || '[戳一戳]'
           : element.faceElement.faceText || `[QQ表情 ${element.faceElement.faceIndex}]`
-        parts.push({
-          type: 'text', text,
-          entities: [{
-            type: 'qq-face', offset: 0, length: text.length,
-            faceId: String(element.faceElement.faceIndex), faceType: element.faceElement.faceType,
-          }],
-        })
+        if (element.faceElement.faceType === 5) {
+          serviceAction = { type: 'custom', text }
+        } else {
+          parts.push({
+            type: 'text', text,
+            entities: [{
+              type: 'qq-face', offset: 0, length: text.length,
+              faceId: String(element.faceElement.faceIndex), faceType: element.faceElement.faceType,
+            }],
+          })
+        }
       } else if (element.elementType === ELEMENT_REPLY && element.replyElement) {
         replyToId = this.resolvedReplyTargets.get(record.msgId)
           ?? replyTargetId(record, element.replyElement)
@@ -2381,6 +2386,10 @@ export class QQKernelBridge {
           },
         })
       } else {
+        if (element.grayTipElement) {
+          serviceAction = { type: 'custom', text: grayTipText(element.grayTipElement, this.config?.selfUid) }
+          continue
+        }
         const media = mapMedia(record, element)
         if (media) parts.push({ type: 'media', media })
         else {
@@ -2407,6 +2416,7 @@ export class QQKernelBridge {
       msgSeq: record.msgSeq,
       originRequestId: this.messageOrigins.get(record.msgId),
       replyToId,
+      serviceAction,
       parts,
       reactionContext: record.chatType === CHAT_GROUP && record.emojiLikesList?.length
         ? this.mapReactionState(record)
@@ -3621,22 +3631,6 @@ function fallbackElementText(element: MsgElement, selfUid?: string): string {
     const summary = structuredContentSummary(element.arkElement.bytesData)
     return summary || '[卡片消息]'
   }
-  if (element.grayTipElement) {
-    return groupGrayTipText(element.grayTipElement.groupElement, selfUid)
-      || (element.grayTipElement.buddyElement?.type === 1
-        ? '你们已成功添加为好友，现在可以开始聊天了。' : '')
-      || jsonGrayTipText(element.grayTipElement.jsonGrayTipElement)
-      || xmlText(element.grayTipElement.xmlElement?.content)
-      || element.grayTipElement.feedMsgElement?.content
-      || (element.grayTipElement.proclamationElement
-        ? element.grayTipElement.proclamationElement.isSetProclamation ? '群公告已更新' : '群公告已取消' : '')
-      || (element.grayTipElement.essenceElement
-        ? element.grayTipElement.essenceElement.isSetEssence ? '消息已设为精华' : '消息已移出精华' : '')
-      || (element.grayTipElement.fileReceiptElement?.fileName
-        ? `[文件回执] ${element.grayTipElement.fileReceiptElement.fileName}` : '')
-      || genericGrayTipText(element.grayTipElement)
-      || '[系统消息]'
-  }
   const xml = element.structLongMsgElement?.xmlContent || element.structMsgElement?.xmlContent
   if (xml) return xmlText(xml) || '[结构化消息]'
   if (element.giphyElement) return '[GIF]'
@@ -3671,6 +3665,21 @@ function fallbackElementText(element: MsgElement, selfUid?: string): string {
   return `[暂不支持的消息 ${element.elementType}]`
 }
 
+function grayTipText(gray: NonNullable<MsgElement['grayTipElement']>, selfUid?: string): string {
+  return groupGrayTipText(gray.groupElement, selfUid)
+    || (gray.buddyElement?.type === 1 ? '你们已成功添加为好友，现在可以开始聊天了。' : '')
+    || jsonGrayTipText(gray.jsonGrayTipElement)
+    || xmlGrayTipText(gray.xmlElement)
+    || gray.feedMsgElement?.content
+    || (gray.proclamationElement
+      ? gray.proclamationElement.isSetProclamation ? '群公告已更新' : '群公告已取消' : '')
+    || (gray.essenceElement
+      ? gray.essenceElement.isSetEssence ? '消息已设为精华' : '消息已移出精华' : '')
+    || (gray.fileReceiptElement?.fileName ? `[文件回执] ${gray.fileReceiptElement.fileName}` : '')
+    || genericGrayTipText(gray)
+    || '[系统消息]'
+}
+
 function jsonGrayTipText(gray?: { recentAbstract: string, jsonStr: string }): string {
   if (!gray) return ''
   try {
@@ -3689,6 +3698,29 @@ function genericGrayTipText(gray: NonNullable<MsgElement['grayTipElement']>): st
     'wording', 'content', 'text', 'summary', 'recentabstract', 'tips', 'warningtips', 'message',
     'richcontent', 'senderrichcontent', 'receiverrichcontent', 'postscript', 'friendnick', 'txt', 'nm',
   ]))
+}
+
+function xmlGrayTipText(xml?: { content: string, members?: Map<string, string> }): string {
+  if (!xml?.content) return ''
+  const parts: string[] = []
+  for (const match of xml.content.matchAll(/<(qq|nor)\b([^>]*)\/?\s*>/gi)) {
+    const attributes = match[2] ?? ''
+    if (match[1]?.toLowerCase() === 'qq') {
+      const uid = xmlAttribute(attributes, 'uin')
+      const display = xml.members?.get(uid) || xmlAttribute(attributes, 'name')
+        || xmlAttribute(attributes, 'nick') || xmlAttribute(attributes, 'jp')
+      if (display) parts.push(display)
+    } else {
+      const text = xmlAttribute(attributes, 'txt')
+      if (text) parts.push(text)
+    }
+  }
+  return parts.join('').trim() || xmlText(xml.content)
+}
+
+function xmlAttribute(attributes: string, name: string): string {
+  const match = new RegExp(`\\b${name}=(?:"([^"]*)"|'([^']*)')`, 'i').exec(attributes)
+  return decodeXmlText(match?.[1] ?? match?.[2] ?? '')
 }
 
 function groupGrayTipText(
