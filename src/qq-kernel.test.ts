@@ -416,6 +416,24 @@ describe('QQKernelBridge', () => {
     )
   })
 
+  it('prefers the real replay message ID over QQNT records snapshot IDs', async () => {
+    const f = fixture()
+    f.message.elements = [{
+      elementType: 7, elementId: 'reply', replyElement: {
+        replayMsgId: 'real-source', sourceMsgIdInRecords: 'nested-copy',
+        sourceMsgTextElems: [], replyMsgRevokeType: 0,
+        sourceMsgIsIncPic: false, sourceMsgExpired: false,
+      },
+    }]
+    f.message.records = [{ ...f.message, msgId: 'nested-copy', msgSeq: 'source-seq', records: [] }]
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.getHistory(bridge.getConversation('uid-1715311957'))).resolves.toMatchObject({
+      messages: [{ replyToId: 'real-source' }],
+    })
+  })
+
   it('renders poke, member changes, mute notices, and generic JSON gray tips as text', async () => {
     const f = fixture()
     const record = (msgId: string, element: MsgRecord['elements'][number]): MsgRecord => ({

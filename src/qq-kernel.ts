@@ -4022,8 +4022,15 @@ function replyTargetId(
   record: MsgRecord,
   reply: NonNullable<MsgElement['replyElement']>,
 ): string | undefined {
-  for (const id of [reply.sourceMsgIdInRecords, reply.replayMsgId, reply.replayMsgRootMsgId]) {
+  for (const id of [reply.replayMsgId, reply.replayMsgRootMsgId]) {
     if (id && id !== '0') return id
+  }
+  // sourceMsgIdInRecords identifies QQNT's nested snapshot, which can have a
+  // different msgId from the real top-level source. Keep it only as a legacy
+  // fallback when the corresponding nested record was not actually supplied.
+  if (reply.sourceMsgIdInRecords && reply.sourceMsgIdInRecords !== '0'
+    && !record.records?.some((item) => item.msgId === reply.sourceMsgIdInRecords)) {
+    return reply.sourceMsgIdInRecords
   }
   if (!reply.replayMsgSeq || reply.replayMsgSeq === '0') return
   return record.records?.find((item) => item.msgSeq === reply.replayMsgSeq)?.msgId
