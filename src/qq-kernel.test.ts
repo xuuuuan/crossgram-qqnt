@@ -416,6 +416,61 @@ describe('QQKernelBridge', () => {
     )
   })
 
+  it('renders poke, member changes, mute notices, and generic JSON gray tips as text', async () => {
+    const f = fixture()
+    const record = (msgId: string, element: MsgRecord['elements'][number]): MsgRecord => ({
+      ...f.message, msgId, msgSeq: `${msgId}-seq`, chatType: 2,
+      peerUid: '1058754719', peerUin: '1058754719', peerName: 'Test Group', elements: [element],
+    })
+    f.msg.getLatestDbMsgs.mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [
+      record('poke', { elementType: 6, elementId: 'poke', faceElement: {
+        faceIndex: 0, faceType: 5, spokeSummary: 'Alice戳了戳你',
+      } }),
+      record('join', { elementType: 8, elementId: 'join', grayTipElement: {
+        groupElement: {
+          type: 1, role: 0, groupName: '', memberUid: '', memberNick: '', memberRemark: '',
+          adminUid: '', adminNick: '', adminRemark: '', memberAdd: {
+            showType: 5,
+            otherInviteOther: {
+              inviter: { uid: 'alice', name: 'Alice' },
+              invited: { uid: 'bob', name: 'Bob' },
+            },
+          },
+        },
+      } }),
+      record('mute', { elementType: 8, elementId: 'mute', grayTipElement: {
+        groupElement: {
+          type: 8, role: 0, groupName: '', memberUid: '', memberNick: '', memberRemark: '',
+          adminUid: '', adminNick: '', adminRemark: '', shutUp: {
+            duration: '3661',
+            admin: { uid: 'admin', card: '管理员', name: 'Admin', role: 3 },
+            member: { uid: 'self', card: 'Self', name: 'Self', role: 2 },
+          },
+        },
+      } }),
+      record('json', { elementType: 8, elementId: 'json', grayTipElement: {
+        jsonGrayTipElement: {
+          recentAbstract: 'fallback',
+          jsonStr: JSON.stringify({ items: [{ txt: '安全提醒：' }, { nm: '请修改密码' }] }),
+        },
+      } }),
+      record('generic', { elementType: 8, elementId: 'generic', grayTipElement: {
+        walletGrayTipElement: { receiverRichContent: '你领取了红包' },
+      } as unknown as NonNullable<MsgRecord['elements'][number]['grayTipElement']> }),
+    ] })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    const messages = (await bridge.getHistory(bridge.getConversation('1058754719'))).messages
+    expect(messages.map((message) => message.parts)).toMatchObject([
+      [{ type: 'text', text: 'Alice戳了戳你' }],
+      [{ type: 'text', text: 'Alice邀请Bob加入了群聊。' }],
+      [{ type: 'text', text: '你被管理员禁言1小时1分钟1秒' }],
+      [{ type: 'text', text: '安全提醒：请修改密码' }],
+      [{ type: 'text', text: '你领取了红包' }],
+    ])
+  })
+
   it('deletes recalled messages by msgId for both recall callback shapes', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()

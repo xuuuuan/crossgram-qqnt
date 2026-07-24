@@ -2337,7 +2337,10 @@ export class QQKernelBridge {
           }] : undefined,
         })
       } else if (element.elementType === ELEMENT_FACE && element.faceElement) {
-        const text = element.faceElement.faceText || `[QQ表情 ${element.faceElement.faceIndex}]`
+        const text = element.faceElement.faceType === 5
+          ? element.faceElement.spokeSummary || element.faceElement.vaspokeName
+            || element.faceElement.faceText || '[戳一戳]'
+          : element.faceElement.faceText || `[QQ表情 ${element.faceElement.faceIndex}]`
         parts.push({
           type: 'text', text,
           entities: [{
@@ -2363,7 +2366,7 @@ export class QQKernelBridge {
         const media = mapMedia(record, element)
         if (media) parts.push({ type: 'media', media })
         else {
-          const fallback = fallbackElementText(element)
+          const fallback = fallbackElementText(element, this.config?.selfUid)
           if (fallback) parts.push({ type: 'text', text: fallback })
         }
       }
@@ -3575,7 +3578,7 @@ function decodeXmlText(text: string): string {
   })
 }
 
-function fallbackElementText(element: MsgElement): string {
+function fallbackElementText(element: MsgElement, selfUid?: string): string {
   if (element.pttElement) {
     const transcript = element.pttElement.text?.trim()
     return transcript ? `[语音] ${transcript}` : element.pttElement.duration > 0
@@ -3591,12 +3594,19 @@ function fallbackElementText(element: MsgElement): string {
     return summary || '[卡片消息]'
   }
   if (element.grayTipElement) {
-    return element.grayTipElement.jsonGrayTipElement?.recentAbstract
-      || structuredContentSummary(element.grayTipElement.jsonGrayTipElement?.jsonStr)
+    return groupGrayTipText(element.grayTipElement.groupElement, selfUid)
+      || (element.grayTipElement.buddyElement?.type === 1
+        ? '你们已成功添加为好友，现在可以开始聊天了。' : '')
+      || jsonGrayTipText(element.grayTipElement.jsonGrayTipElement)
       || xmlText(element.grayTipElement.xmlElement?.content)
       || element.grayTipElement.feedMsgElement?.content
+      || (element.grayTipElement.proclamationElement
+        ? element.grayTipElement.proclamationElement.isSetProclamation ? '群公告已更新' : '群公告已取消' : '')
+      || (element.grayTipElement.essenceElement
+        ? element.grayTipElement.essenceElement.isSetEssence ? '消息已设为精华' : '消息已移出精华' : '')
       || (element.grayTipElement.fileReceiptElement?.fileName
         ? `[文件回执] ${element.grayTipElement.fileReceiptElement.fileName}` : '')
+      || genericGrayTipText(element.grayTipElement)
       || '[系统消息]'
   }
   const xml = element.structLongMsgElement?.xmlContent || element.structMsgElement?.xmlContent
@@ -3631,6 +3641,94 @@ function fallbackElementText(element: MsgElement): string {
     return labels.length ? `[按钮] ${labels.join(' / ')}` : '[交互按钮]'
   }
   return `[暂不支持的消息 ${element.elementType}]`
+}
+
+function jsonGrayTipText(gray?: { recentAbstract: string, jsonStr: string }): string {
+  if (!gray) return ''
+  try {
+    const parsed = JSON.parse(gray.jsonStr) as { items?: Array<{ txt?: unknown, nm?: unknown }> }
+    const text = parsed.items?.map((item) =>
+      typeof item.txt === 'string' ? item.txt : typeof item.nm === 'string' ? item.nm : '')
+      .join('').trim()
+    return text || gray.recentAbstract || structuredContentSummary(gray.jsonStr)
+  } catch {
+    return gray.recentAbstract || structuredContentSummary(gray.jsonStr)
+  }
+}
+
+function genericGrayTipText(gray: NonNullable<MsgElement['grayTipElement']>): string {
+  return findStructuredString(gray, new Set([
+    'wording', 'content', 'text', 'summary', 'recentabstract', 'tips', 'warningtips', 'message',
+    'richcontent', 'senderrichcontent', 'receiverrichcontent', 'postscript', 'friendnick', 'txt', 'nm',
+  ]))
+}
+
+function groupGrayTipText(
+  group: NonNullable<MsgElement['grayTipElement']>['groupElement'],
+  selfUid?: string,
+): string {
+  if (!group) return ''
+  const name = (member?: { uid: string, name: string }) =>
+    member?.uid === selfUid ? '你' : member?.name || member?.uid || ''
+  const roleName = (uid: string, remark: string, nick: string) =>
+    uid === selfUid ? '你' : remark || nick || uid
+  if (group.type === 1) {
+    const add = group.memberAdd
+    if (!add) return '有新成员加入了群聊'
+    if (add.showType === 1) return '你已经是群成员了。'
+    if (add.showType === 2 && add.otherAddByOtherQRCode) {
+      return `${name(add.otherAddByOtherQRCode.invited)}通过扫描${name(add.otherAddByOtherQRCode.inviter)}分享的二维码加入了群聊。`
+    }
+    if (add.showType === 3) return `${name(add.otherAddByYourQRCode)}通过扫描你分享的二维码加入了群聊。`
+    if (add.showType === 4) return `你通过扫描${name(add.youAddByOtherQRCode)}分享的二维码加入了群聊。`
+    if (add.showType === 5 && add.otherInviteOther) {
+      return `${name(add.otherInviteOther.inviter)}邀请${name(add.otherInviteOther.invited)}加入了群聊。`
+    }
+    if (add.showType === 6) return `${name(add.otherInviteYou)}邀请你加入了群聊。`
+    if (add.showType === 7) return `你邀请${name(add.youInviteOther)}加入了群聊。`
+    return `${name(add.otherAdd) || '有新成员'}加入了群聊。`
+  }
+  if (group.type === 2) return '该群已被群主解散'
+  if (group.type === 3) return '你已被移出群聊'
+  if (group.type === 4) {
+    const members = group.createGroup?.memberInfo.map(name).filter(Boolean).join('、')
+    return members ? `你邀请了${members}加入群聊。` : '群聊已创建'
+  }
+  if (group.type === 5) {
+    const operator = roleName(group.memberUid, group.memberRemark, group.memberNick)
+    return `${operator || '管理员'}修改了群名称为“${group.groupName}”`
+  }
+  if (group.type === 6) return '你已屏蔽该群聊消息'
+  if (group.type === 7) return '你已取消屏蔽该群聊消息'
+  if (group.type === 8 && group.shutUp) return groupShutUpText(group.shutUp, selfUid)
+  if (group.type === 9) return '由于该群长时间未活跃，已被系统自动回收'
+  if (group.type === 10) return '该群已被群主解散或被删除'
+  return ''
+}
+
+function groupShutUpText(
+  shutUp: NonNullable<NonNullable<NonNullable<MsgElement['grayTipElement']>['groupElement']>['shutUp']>,
+  selfUid?: string,
+): string {
+  const display = (member: { uid: string, card: string, name: string }) =>
+    member.uid === selfUid ? '你' : member.card || member.name || member.uid
+  if (!shutUp.member.uid) return `${display(shutUp.admin)}${shutUp.duration === '0' ? '关闭' : '开启'}了全员禁言`
+  if (shutUp.duration === '0') return `${display(shutUp.member)}被${display(shutUp.admin)}解除禁言`
+  return `${display(shutUp.member)}被${display(shutUp.admin)}禁言${formatDuration(Number(shutUp.duration))}`
+}
+
+function formatDuration(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return ''
+  const parts: string[] = []
+  const days = Math.floor(seconds / 86_400)
+  const hours = Math.floor(seconds % 86_400 / 3_600)
+  const minutes = Math.floor(seconds % 3_600 / 60)
+  const remaining = seconds % 60
+  if (days) parts.push(`${days}天`)
+  if (hours) parts.push(`${hours}小时`)
+  if (minutes) parts.push(`${minutes}分钟`)
+  if (remaining) parts.push(`${remaining}秒`)
+  return parts.join('')
 }
 
 function structuredContentSummary(value: string | undefined): string {

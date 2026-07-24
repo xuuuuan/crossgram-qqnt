@@ -78,6 +78,9 @@ export interface MsgElement {
     stickerType?: number
     resultId?: string
     imageType?: number
+    pokeType?: number
+    spokeSummary?: string
+    vaspokeName?: string
   }
   replyElement?: {
     replayMsgId: string
@@ -99,6 +102,7 @@ export interface MsgElement {
     fileName?: string
   }
   grayTipElement?: {
+    subElementType?: number
     revokeElement?: {
       operatorUid: string
       origMsgSenderUid: string
@@ -109,6 +113,42 @@ export interface MsgElement {
     xmlElement?: { content: string }
     fileReceiptElement?: { fileName: string }
     feedMsgElement?: { content: string }
+    proclamationElement?: { isSetProclamation: number }
+    essenceElement?: { isSetEssence: number }
+    buddyElement?: { type: number, elem?: { friendNick: string } }
+    groupElement?: {
+      type: number
+      role: number
+      groupName: string
+      memberUid: string
+      memberNick: string
+      memberRemark: string
+      adminUid: string
+      adminNick: string
+      adminRemark: string
+      createGroup?: { memberInfo: Array<{ uid: string, name: string }> }
+      memberAdd?: {
+        showType: number
+        otherAdd?: { uid: string, name: string }
+        otherAddByOtherQRCode?: {
+          inviter: { uid: string, name: string }
+          invited: { uid: string, name: string }
+        }
+        otherAddByYourQRCode?: { uid: string, name: string }
+        youAddByOtherQRCode?: { uid: string, name: string }
+        otherInviteOther?: {
+          inviter: { uid: string, name: string }
+          invited: { uid: string, name: string }
+        }
+        otherInviteYou?: { uid: string, name: string }
+        youInviteOther?: { uid: string, name: string }
+      }
+      shutUp?: {
+        duration: string
+        admin: { uid: string, card: string, name: string, role: number }
+        member: { uid: string, card: string, name: string, role: number }
+      }
+    }
   }
   pttElement?: { duration: number, text?: string }
   videoElement?: { fileName: string, fileTime: number }
