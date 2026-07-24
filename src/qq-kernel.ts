@@ -121,6 +121,7 @@ export class QQKernelBridge {
   private profileListenerId?: string
   private groupListenerId?: string
   private recentListenerId?: string
+  private readonly pendingRecentListUpdates = new Set<() => void>()
   private listenerRetry?: NodeJS.Timeout
   private readonly tempPath: string
   private readonly sendTimeoutMs: number
@@ -193,6 +194,7 @@ export class QQKernelBridge {
   detach(): void {
     if (this.listenerRetry) clearTimeout(this.listenerRetry)
     this.listenerRetry = undefined
+    this.resolveRecentListUpdates()
     const msgService = this.msgService
     const buddyService = this.buddyService
     const profileService = this.profileService
@@ -272,11 +274,21 @@ export class QQKernelBridge {
     let recentError: unknown
     if (recentService.getRecentContactList) {
       log('info', 'native API start name=getRecentContactList')
+      // QQNT returns only an acknowledgement here. The refreshed rows arrive
+      // asynchronously through the recent-contact listener, so do not read
+      // the small startup cache (often eight rows) before that callback lands.
+      const recentListUpdate = this.waitForRecentListUpdate(1_500)
       try {
         const loaded = await recentService.getRecentContactList()
         log('info', `native API complete name=getRecentContactList result=${loaded.result} err=${JSON.stringify(loaded.errMsg)}`)
-        if (loaded.result !== 0) log('warn', `getRecentContactList did not load the full dialog list: ${loaded.errMsg} (${loaded.result})`)
+        if (loaded.result !== 0) {
+          recentListUpdate.cancel()
+          log('warn', `getRecentContactList did not load the full dialog list: ${loaded.errMsg} (${loaded.result})`)
+        } else {
+          await recentListUpdate.promise
+        }
       } catch (error) {
+        recentListUpdate.cancel()
         // Older kernels may expose a stub with an incompatible implementation.
         // getRecentContactInfos below remains a useful cache fallback.
         log('error', 'full recent contact refresh failed; using cached infos', error)
@@ -546,6 +558,41 @@ export class QQKernelBridge {
     const message = this.mapMessage(record)
     this.rememberMessage(message)
     return message
+  }
+
+  async getRawMessageRecord(conversation: QQConversation, id: string): Promise<MsgRecord | null> {
+    const service = this.requireMsgService()
+    const response = await retryTransientInvalidArgument(
+      () => service.getMsgsByMsgId(contact(conversation), [id]),
+    )
+    if (response.result !== 0) throw new Error(`getMsgsByMsgId: ${response.errMsg} (${response.result})`)
+    return response.msgList[0] ?? null
+  }
+
+  async getRawMessagesAroundSeq(conversation: QQConversation, seq: string, count = 20): Promise<{
+    before: { result: number, errMsg: string, count: number }
+    after: { result: number, errMsg: string, count: number }
+    messages: MsgRecord[]
+  }> {
+    const service = this.requireMsgService()
+    if (!service.getMsgsBySeqAndCount) throw new Error('getMsgsBySeqAndCount is unavailable in this QQNT build')
+    const peer = contact(conversation)
+    const selectedCount = clamp(count, 1, 200)
+    const [before, after] = await Promise.all([
+      retryHistoryCall(() => service.getMsgsBySeqAndCount!(peer, seq, selectedCount, true, true)),
+      retryHistoryCall(() => service.getMsgsBySeqAndCount!(peer, seq, selectedCount, false, true)),
+    ])
+    const records = new Map<string, MsgRecord>()
+    for (const record of [...before.msgList, ...after.msgList]) records.set(record.msgId, record)
+    return {
+      before: { result: before.result, errMsg: before.errMsg, count: before.msgList.length },
+      after: { result: after.result, errMsg: after.errMsg, count: after.msgList.length },
+      messages: [...records.values()].sort((left, right) => {
+        const seqOrder = BigInt(left.msgSeq || '0') - BigInt(right.msgSeq || '0')
+        if (seqOrder) return seqOrder < 0n ? -1 : 1
+        return Number(left.msgTime) - Number(right.msgTime)
+      }),
+    }
   }
 
   async getMultiForwardMessages(locator: QQMultiForwardLocator): Promise<QQMessage[]> {
@@ -1762,6 +1809,7 @@ export class QQKernelBridge {
             : value.changedList ?? legacyChanged ?? []
           log('info', `recent contact update received: version=1 changed=${changed.length}`)
           for (const item of changed) this.upsertRecent(item)
+          this.resolveRecentListUpdates()
         },
         onRecentContactListChangedVer2: (value: Array<{ changedList?: RecentContactInfo[] }> | {
           changedRecentContactLists?: Array<{ changedList?: RecentContactInfo[] }>
@@ -1772,6 +1820,7 @@ export class QQKernelBridge {
           for (const list of lists) {
             for (const item of list.changedList ?? []) this.upsertRecent(item)
           }
+          this.resolveRecentListUpdates()
         },
       }))
       this.recentListenerId = recentService.addKernelRecentContactListener(recentListener)
@@ -1795,6 +1844,24 @@ export class QQKernelBridge {
         this.scheduleListenerRegistration(attempt + 1)
       }
     }, attempt === 1 ? 0 : 250)
+  }
+
+  private waitForRecentListUpdate(timeoutMs: number): { promise: Promise<void>, cancel: () => void } {
+    if (!this.recentListenerId) return { promise: Promise.resolve(), cancel() {} }
+    let finish!: () => void
+    const promise = new Promise<void>((resolve) => { finish = resolve })
+    const timer = setTimeout(finish, timeoutMs)
+    const waiter = () => {
+      clearTimeout(timer)
+      this.pendingRecentListUpdates.delete(waiter)
+      finish()
+    }
+    this.pendingRecentListUpdates.add(waiter)
+    return { promise, cancel: waiter }
+  }
+
+  private resolveRecentListUpdates(): void {
+    for (const resolve of [...this.pendingRecentListUpdates]) resolve()
   }
 
   private async requestBuddyList(): Promise<void> {

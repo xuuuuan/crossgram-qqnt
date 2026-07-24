@@ -332,6 +332,45 @@ describe('QQKernelBridge', () => {
     expect(second.nextCursor).toBe('2')
   })
 
+  it('waits for the asynchronous full recent-contact callback before returning dialogs', async () => {
+    const f = fixture()
+    let recentHandlers: Record<string, (...args: unknown[]) => unknown> = {}
+    class RecentListener {
+      handlers: typeof recentHandlers
+      constructor(handlers: typeof recentHandlers) { this.handlers = handlers }
+    }
+    Object.assign(f.kernel, { NodeIKernelRecentContactListener: RecentListener })
+    Object.assign(f.recent, {
+      addKernelRecentContactListener(listener: { handlers?: typeof recentHandlers }) {
+        recentHandlers = listener.handlers ?? listener as unknown as typeof recentHandlers
+        return 'recent-listener'
+      },
+      removeKernelRecentContactListener() {},
+    })
+    const full = Array.from({ length: 12 }, (_, index) => ({
+      chatType: 2 as const,
+      peerUid: `group-${index}`,
+      peerUin: `group-${index}`,
+      peerName: `Group ${index}`,
+    }))
+    f.recent.getRecentContactInfos.mockResolvedValue({
+      result: 0, errMsg: '', relation: full.slice(0, 8),
+    } as Awaited<ReturnType<typeof f.recent.getRecentContactInfos>>)
+    const recentTimers: NodeJS.Timeout[] = []
+    f.recent.getRecentContactList.mockImplementation(async () => {
+      recentTimers.push(setTimeout(() => recentHandlers.onRecentContactListChanged?.(full), 10))
+      return { result: 0, errMsg: '' }
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    const dialogs = await bridge.getDialogs()
+
+    expect(dialogs.conversations).toHaveLength(12)
+    for (const timer of recentTimers) clearTimeout(timer)
+    bridge.detach()
+  })
+
   it('maps and sends native mention and reply elements without parsing opaque IDs', async () => {
     const f = fixture()
     f.message.elements = [{
@@ -2020,6 +2059,27 @@ describe('QQBridgeServer', () => {
     expect(second).toMatchObject({ id: '2', event: { type: 'message', message: { id: 'ws-second' } } })
     resumedSocket.close()
     await once(resumedSocket, 'close')
+    await vi.waitFor(() => expect(bridge.events.size).toBe(0))
+  })
+
+  it('can listen for WebSocket events on a separately configured address', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    server = new QQBridgeServer(bridge, { port: 0, webSocketPort: 0 })
+    await server.start()
+
+    const httpAddress = server.address()
+    const webSocketAddress = server.webSocketAddress()
+    expect(webSocketAddress.port).not.toBe(httpAddress.port)
+    await expect(fetch(`http://127.0.0.1:${webSocketAddress.port}/v1/events/ws`))
+      .resolves.toMatchObject({ status: 426 })
+
+    const socket = new WebSocket(`ws://127.0.0.1:${webSocketAddress.port}/v1/events/ws`)
+    await once(socket, 'open')
+    expect(bridge.events.size).toBe(1)
+    socket.close()
+    await once(socket, 'close')
     await vi.waitFor(() => expect(bridge.events.size).toBe(0))
   })
 
