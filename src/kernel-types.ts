@@ -77,6 +77,9 @@ export interface MsgElement {
   replyElement?: {
     replayMsgId: string
     replayMsgSeq?: string
+    sourceMsgIdInRecords?: string
+    replyMsgClientSeq?: string
+    replyMsgTime?: string
     sourceMsgText?: string
     sourceMsgTextElems: unknown[]
     replyMsgRevokeType: number
@@ -214,6 +217,7 @@ export interface MsgRecord {
   sendMemberName: string
   sendNickName: string
   elements: MsgElement[]
+  records?: MsgRecord[]
   emojiLikesList?: Array<{
     emojiId: string
     emojiType: string

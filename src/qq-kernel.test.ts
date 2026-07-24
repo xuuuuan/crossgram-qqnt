@@ -203,12 +203,8 @@ describe('QQKernelBridge', () => {
     const dialogs = await bridge.getDialogs()
     expect(dialogs.conversations[0]).toMatchObject({
       id: 'uid-1715311957', peerUin: '1715311957', title: 'xuuuuan',
-      lastMessage: {
-        id: 'm1',
-        sender: { id: 'uid-1715311957', numericId: '1715311957', name: 'xuuuuan' },
-        parts: [{ type: 'text', text: 'hello preview' }],
-      },
     })
+    expect(dialogs.conversations[0].lastMessage).toBeUndefined()
     const history = await bridge.getHistory(dialogs.conversations[0])
     expect(history.messages[0]).toMatchObject({ id: 'm1', parts: [{ type: 'text', text: 'hello' }] })
     expect(f.msg.getLatestDbMsgs).toHaveBeenCalledWith(expect.objectContaining({
@@ -242,17 +238,9 @@ describe('QQKernelBridge', () => {
     const bridge = new QQKernelBridge({ userResolveTimeoutMs: 20 })
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
 
-    await expect(bridge.getDialogs()).resolves.toMatchObject({
-      conversations: [{
-        lastMessage: {
-          senderId: 'u_group_member',
-          sender: {
-            id: 'u_group_member', numericId: '42', name: '42',
-            avatar: { locator: { avatarUin: '42' } },
-          },
-        },
-      }],
-    })
+    const dialogs = await bridge.getDialogs()
+    expect(dialogs.conversations).toMatchObject([{ id: '1058754719', title: 'Test Group' }])
+    expect(dialogs.conversations[0].lastMessage).toBeUndefined()
     expect(f.uix.getUin).not.toHaveBeenCalled()
 
     f.uix.getUin.mockImplementationOnce(() => new Promise(() => {}))
@@ -265,7 +253,8 @@ describe('QQKernelBridge', () => {
     const f = fixture()
     f.message.elements = [{
       elementType: 7, elementId: 'reply', replyElement: {
-        replayMsgId: 'opaque-original', sourceMsgTextElems: [], replyMsgRevokeType: 0,
+        replayMsgId: '0', sourceMsgIdInRecords: 'opaque-original',
+        sourceMsgTextElems: [], replyMsgRevokeType: 0,
         sourceMsgIsIncPic: false, sourceMsgExpired: false,
       },
     }, {
@@ -698,6 +687,25 @@ describe('QQKernelBridge', () => {
       })], expect.any(Map),
     )
     expect(sent.parts).toMatchObject([{ type: 'sticker', sticker: { stickerId: 'market:42:emoji-a' } }])
+  })
+
+  it('maps every QQ expression picture subtype as a sticker and keeps normal pictures as media', async () => {
+    const f = fixture()
+    f.message.elements = [0, 1, 2, 3, 4, 7, 8, 9, 10, 12, 13].map((picSubType) => ({
+      elementType: 2,
+      elementId: `picture-${picSubType}`,
+      picElement: {
+        fileName: `${picSubType}.png`, fileSize: '4', picWidth: 32, picHeight: 32,
+        md5HexStr: `md5-${picSubType}`, fileUuid: `uuid-${picSubType}`, fileSubId: '', picSubType,
+      },
+    }))
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    const [message] = (await bridge.getHistory(bridge.getConversation('uid-1715311957'))).messages
+    expect(message.parts[0]).toMatchObject({ type: 'media', media: { name: '0.png' } })
+    expect(message.parts.slice(1)).toHaveLength(10)
+    expect(message.parts.slice(1).every((part) => part.type === 'sticker')).toBe(true)
   })
 
   it('accepts repeated sticker catalog segment markers like the QQ client', async () => {
@@ -1275,7 +1283,7 @@ describe('QQKernelBridge', () => {
         presentation: expect.objectContaining({
           type: 'custom', alt: '🙂',
           resource: expect.objectContaining({
-            format: 'video', mimeType: 'video/webm', locator: { filePath: join(staticPath, 's14.png'), assetKey: 'sysface/s14.webm' },
+            format: 'video', mimeType: 'video/webm', locator: { filePath: join(animatedPath, 's14.png') },
           }),
         }),
       }),

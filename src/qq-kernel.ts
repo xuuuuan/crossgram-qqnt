@@ -26,6 +26,7 @@ const ELEMENT_FACE = 6
 const ELEMENT_REPLY = 7
 const ELEMENT_MARKET_FACE = 11
 const ELEMENT_MULTI_FORWARD = 16
+const STICKER_PIC_SUBTYPES = new Set([1, 2, 3, 4, 7, 8, 9, 10, 12, 13])
 const SEND_FROM_SELF = new Set([1, 2])
 const MEMBER_ADMIN = 3
 const MEMBER_OWNER = 4
@@ -1917,13 +1918,6 @@ export class QQKernelBridge {
 
   private upsertRecent(item: RecentContactInfo): void {
     if (item.chatType !== CHAT_C2C && item.chatType !== CHAT_GROUP) return
-    if (item.senderUid) {
-      this.rememberSeenUser({
-        id: item.senderUid,
-        numericId: item.senderUin || undefined,
-        name: item.senderUin || item.senderUid,
-      })
-    }
     if (item.chatType === CHAT_C2C) {
       this.rememberSeenUser({
         id: item.peerUid,
@@ -1935,7 +1929,6 @@ export class QQKernelBridge {
     const user = item.chatType === CHAT_C2C ? this.users.get(item.peerUid) : undefined
     const group = item.chatType === CHAT_GROUP ? this.groups.get(item.peerUin || item.peerUid) : undefined
     const current = this.contacts.get(conversationId(item.chatType, item.peerUid))
-    const summary = this.messageFromRecent(item)
     const conversation: QQConversation = {
       id: conversationId(item.chatType, item.peerUid),
       kind: item.chatType === CHAT_GROUP ? 'group' : 'direct',
@@ -1945,7 +1938,10 @@ export class QQKernelBridge {
       chatType: item.chatType,
       avatarUrl: user?.avatarUrl || group?.avatarUrl || item.avatarUrl,
       unreadCount: Number(item.unreadCnt) || 0,
-      lastMessage: current?.lastMessage?.id === item.msgId ? current.lastMessage : summary,
+      // RecentContact is a dialog/contact index, not a message source. Its
+      // abstractContent frequently contains lossy placeholders such as
+      // "[图片]". Only message listeners and history populate lastMessage.
+      lastMessage: current?.lastMessage,
       firstUnread: Number(item.unreadCnt) > 0 ? current?.firstUnread : undefined,
       readInboxMaxMessage: Number(item.unreadCnt) > 0 ? current?.readInboxMaxMessage : undefined,
     }
@@ -2037,31 +2033,6 @@ export class QQKernelBridge {
     for (const uid of this.users.keys()) if (!keep.has(uid)) this.users.delete(uid)
     for (const buddy of buddies) this.upsertBuddy(buddy)
     this.buddySnapshotLoaded = true
-  }
-
-  private messageFromRecent(item: RecentContactInfo): QQMessage | undefined {
-    if (!item.msgId) return
-    const text = (item.abstractContent ?? []).map((element) =>
-      element.content || element.fileName || abstractCustomContent(element.custom_content))
-      .filter(Boolean).join('')
-    const senderId = item.senderUid || item.senderUin || item.peerUid
-    const sender = this.seenUsers.get(senderId) ?? this.users.get(senderId)
-    return {
-      id: item.msgId,
-      conversationId: conversationId(item.chatType as 1 | 2, item.peerUid),
-      senderId,
-      sender: sender ? {
-        id: sender.id,
-        numericId: sender.numericId,
-        name: sender.name,
-        avatar: sender.numericId && /^\d+$/.test(sender.numericId)
-          ? qlogoAvatarMedia(sender.id, sender.numericId)
-          : undefined,
-      } : undefined,
-      timestamp: Number(item.msgTime) || Math.floor(Date.now() / 1000),
-      outgoing: Boolean(item.senderUid && item.senderUid === this.config?.selfUid),
-      parts: text ? [{ type: 'text', text }] : [],
-    }
   }
 
   private enrichBuddyNames(): void {
@@ -2158,8 +2129,8 @@ export class QQKernelBridge {
             faceId: String(element.faceElement.faceIndex), faceType: element.faceElement.faceType,
           }],
         })
-      } else if (element.elementType === ELEMENT_REPLY && element.replyElement?.replayMsgId) {
-        replyToId = element.replyElement.replayMsgId
+      } else if (element.elementType === ELEMENT_REPLY && element.replyElement) {
+        replyToId = replyTargetId(record, element.replyElement) ?? replyToId
       } else if (element.elementType === ELEMENT_MULTI_FORWARD && element.multiForwardMsgElement) {
         parts.push({
           type: 'multi-forward',
@@ -2304,10 +2275,7 @@ export class QQKernelBridge {
             width: dimensions?.width ?? 128,
             height: dimensions?.height ?? 128,
             size: animated ? undefined : info.size,
-            locator: {
-              filePath,
-              ...(animated ? { assetKey: `sysface/s${item.QSid}.webm` } : {}),
-            },
+            locator: { filePath: animated ? animatedPath : filePath },
           },
         },
       })
@@ -2947,7 +2915,7 @@ function mapSticker(record: MsgRecord, element: MsgElement): QQSticker | undefin
     }
   }
   const picture = element.picElement
-  if (!picture || ![1, 2, 13].includes(picture.picSubType ?? 0)) return
+  if (!picture || !STICKER_PIC_SUBTYPES.has(picture.picSubType ?? 0)) return
   const media = mapMedia(record, element)
   if (!media) return
   const animated = [2000, 2001].includes(picture.picType ?? 0) || /\.(?:gif|apng)$/i.test(picture.fileName)
@@ -3024,7 +2992,7 @@ function matchesElementKind(element: MsgElement, kind: 'image' | 'file' | 'stick
   if (kind === 'file') return Boolean(element.fileElement)
   if (kind === 'sticker') {
     return Boolean(element.marketFaceElement) || Boolean(
-      element.picElement && [1, 2, 13].includes(element.picElement.picSubType ?? 0),
+      element.picElement && STICKER_PIC_SUBTYPES.has(element.picElement.picSubType ?? 0),
     )
   }
   return Boolean(element.picElement)
@@ -3479,17 +3447,15 @@ function cleanFaceName(value?: string): string | undefined {
   return name || undefined
 }
 
-function abstractCustomContent(value?: string): string {
-  if (!value) return ''
-  try {
-    const parsed = JSON.parse(value) as { prompt?: unknown, desc?: unknown }
-    if (typeof parsed.prompt === 'string') return parsed.prompt
-    if (typeof parsed.desc === 'string') return parsed.desc
-  } catch {
-    // Recent-contact custom content is often JSON, but plain text is also a
-    // valid fallback in older QQNT builds.
+function replyTargetId(
+  record: MsgRecord,
+  reply: NonNullable<MsgElement['replyElement']>,
+): string | undefined {
+  for (const id of [reply.sourceMsgIdInRecords, reply.replayMsgId]) {
+    if (id && id !== '0') return id
   }
-  return value
+  if (!reply.replayMsgSeq || reply.replayMsgSeq === '0') return
+  return record.records?.find((item) => item.msgSeq === reply.replayMsgSeq)?.msgId
 }
 
 function pngDimensions(bytes: Uint8Array): { width: number, height: number } | undefined {

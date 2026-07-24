@@ -199,10 +199,8 @@ export interface QQReactionDefinition {
           height: number
           size?: number
           locator: {
-            /** Static fallback or source file exposed by the injected bridge. */
+            /** PNG/APNG source file exposed by the injected bridge. */
             filePath: string
-            /** Versioned adapter-owned WebM generated from QQ's APNG resource. */
-            assetKey?: string
           }
         }
       }
