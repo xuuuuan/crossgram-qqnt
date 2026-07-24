@@ -590,6 +590,7 @@ export class QQKernelBridge {
     const jsonPath = (await this.getMarketEmoticonPaths(epId, [], 1)).get(packId)?.path
     if (!jsonPath || !existsSync(jsonPath)) throw new Error(`QQ sticker pack ${packId} has no detail JSON`)
     const detail = JSON.parse(await readFile(jsonPath, 'utf8')) as {
+      name?: string
       isApng?: number
       imgs?: Array<{
         id?: string
@@ -636,7 +637,7 @@ export class QQKernelBridge {
       return sticker
     })
     const pack: QQStickerPack = {
-      packId, title: info?.tabName || packId, version: 1, count: stickers.length, stickers,
+      packId, title: info?.tabName || detail.name || packId, version: 1, count: stickers.length, stickers,
     }
     this.stickerPacks.set(packId, pack)
     return pack

@@ -675,6 +675,7 @@ describe('QQKernelBridge', () => {
     const staticPath = join(directory, 'sticker.png')
     const dynamicPath = join(directory, 'sticker.gif.encrypt')
     await writeFile(detailPath, JSON.stringify({
+      name: 'Downloaded QQ Waves',
       isApng: 0,
       imgs: [{ id: 'emoji-a', name: 'Wave', wWidthInPhone: 320, wHeightInPhone: 180, isApng: 1 }],
     }))
@@ -751,7 +752,8 @@ describe('QQKernelBridge', () => {
     // its opaque package ID through the current QQ API.
     f.msg.fetchMarketEmotionJsonFile = vi.fn(async () => ({ result: 0, errMsg: '' }))
     await expect(bridge.getStickerPack('43')).resolves.toMatchObject({
-      packId: '43', title: '43', stickers: [{ packId: '43', stickerId: 'market:43:emoji-a' }],
+      packId: '43', title: 'Downloaded QQ Waves',
+      stickers: [{ packId: '43', stickerId: 'market:43:emoji-a' }],
     })
     expect(f.msg.fetchMarketEmotionJsonFile).toHaveBeenCalledWith(43)
   })
