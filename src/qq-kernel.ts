@@ -764,6 +764,7 @@ export class QQKernelBridge {
       for (const part of manifest.textParts) elements.push(...textPartElements(part))
     } else if (manifest.text) elements.push(textElement(manifest.text))
     const cleanup: string[] = []
+    const sentMediaPaths: string[] = []
     let preserveUntil: number | undefined
     try {
       if (manifest.sticker && manifest.media?.length) throw new Error('a message cannot contain both sticker and media')
@@ -786,30 +787,37 @@ export class QQKernelBridge {
         elements.push(prepared.element)
       }
       if (manifest.media?.length) {
-        if (manifest.media.length !== 1) throw new Error('the streaming endpoint accepts exactly one media item per request')
-        const spec = manifest.media[0]
-        const stagingRoot = this.stagingPath(spec.kind)
-        mkdirSync(stagingRoot, { recursive: true })
-        const path = join(stagingRoot, `${randomUUID()}${safeExtension(spec.name)}`)
-        cleanup.push(path)
-        await pipeline(body, createWriteStream(path, { flags: 'wx' }))
-        const size = statSync(path).size
-        if (spec.size !== undefined && size !== spec.size) {
-          throw new Error(`incomplete upload: expected ${spec.size} bytes, received ${size}`)
+        if (manifest.media.length > 1 && manifest.mediaFraming !== 'length-prefixed-v1') {
+          throw new Error('multiple media items require length-prefixed-v1 framing')
         }
-        if (spec.kind === 'image') {
-          const prepared = await this.prepareImageElement(path, spec.name, size, {
-            width: spec.width,
-            height: spec.height,
-          })
-          if (prepared.path !== path) {
-            cleanup.splice(cleanup.indexOf(path), 1)
-            if (prepared.owned) cleanup.push(prepared.path)
+        const reader = manifest.mediaFraming === 'length-prefixed-v1' ? new FramedUploadReader(body) : undefined
+        for (const [index, spec] of manifest.media.entries()) {
+          const stagingRoot = this.stagingPath(spec.kind)
+          mkdirSync(stagingRoot, { recursive: true })
+          const path = join(stagingRoot, `${randomUUID()}${safeExtension(spec.name)}`)
+          cleanup.push(path)
+          await pipeline(reader ? reader.media(index) : body, createWriteStream(path, { flags: 'wx' }))
+          const size = statSync(path).size
+          if (spec.size !== undefined && size !== spec.size) {
+            throw new Error(`incomplete upload ${index}: expected ${spec.size} bytes, received ${size}`)
           }
-          elements.push(prepared.element)
-        } else {
-          elements.push(await fileElement(path, spec.name, size))
+          if (spec.kind === 'image') {
+            const prepared = await this.prepareImageElement(path, spec.name, size, {
+              width: spec.width,
+              height: spec.height,
+            })
+            if (prepared.path !== path) {
+              cleanup.splice(cleanup.indexOf(path), 1)
+              if (prepared.owned) cleanup.push(prepared.path)
+            }
+            sentMediaPaths.push(prepared.path)
+            elements.push(prepared.element)
+          } else {
+            sentMediaPaths.push(path)
+            elements.push(await fileElement(path, spec.name, size))
+          }
         }
+        await reader?.finish()
       } else {
         body.resume()
       }
@@ -892,15 +900,18 @@ export class QQKernelBridge {
       this.rememberMessageOrigin(record.msgId, manifest.originRequestId)
       const message = this.mapMessage(record)
       log('info', `native API confirmed name=sendMsg conversation=${conversation.id} requestedMessage=${id} confirmedMessage=${message.id} status=${record.sendStatus}`)
-      if (manifest.media?.length && cleanup[0]) {
-        const media = message.parts.find((part) => part.type === 'media')
-        if (media?.type === 'media') {
-          media.media.locator.filePath = cleanup[0]
-          media.media.size ??= manifest.media[0].size
-          media.media.width ??= manifest.media[0].width
-          media.media.height ??= manifest.media[0].height
-          preserveUntil = Date.now() + 10 * 60_000
+      if (manifest.media?.length && sentMediaPaths.length) {
+        const mediaParts = message.parts.filter((part) => part.type === 'media')
+        for (const [index, media] of mediaParts.entries()) {
+          const spec = manifest.media[index]
+          const path = sentMediaPaths[index]
+          if (!spec || !path || media.type !== 'media') continue
+          media.media.locator.filePath = path
+          media.media.size ??= spec.size
+          media.media.width ??= spec.width
+          media.media.height ??= spec.height
         }
+        preserveUntil = Date.now() + 10 * 60_000
       }
       return message
     } finally {
@@ -2999,6 +3010,54 @@ function contact(conversation: QQConversation) {
 
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds))
+}
+
+class FramedUploadReader {
+  private readonly iterator: AsyncIterator<unknown>
+  private buffered = Buffer.alloc(0)
+  private ended = false
+
+  constructor(body: Readable) {
+    this.iterator = body[Symbol.asyncIterator]()
+  }
+
+  async *media(index: number): AsyncIterable<Buffer> {
+    while (true) {
+      const header = await this.readExactly(4, `media ${index} frame header`)
+      const length = header.readUInt32BE(0)
+      if (length === 0) return
+      if (length > 1024 * 1024) throw new Error(`media ${index} frame is too large: ${length}`)
+      yield await this.readExactly(length, `media ${index} frame body`)
+    }
+  }
+
+  async finish(): Promise<void> {
+    if (this.buffered.length) throw new Error(`framed upload has ${this.buffered.length} trailing bytes`)
+    const next = await this.iterator.next()
+    if (!next.done && Buffer.byteLength(next.value as Uint8Array)) {
+      throw new Error('framed upload has trailing data')
+    }
+    this.ended = true
+  }
+
+  private async readExactly(length: number, description: string): Promise<Buffer> {
+    while (this.buffered.length < length && !this.ended) {
+      const next = await this.iterator.next()
+      if (next.done) {
+        this.ended = true
+        break
+      }
+      const chunk = Buffer.isBuffer(next.value) ? next.value : Buffer.from(next.value as Uint8Array)
+      if (!chunk.length) continue
+      this.buffered = this.buffered.length ? Buffer.concat([this.buffered, chunk]) : chunk
+    }
+    if (this.buffered.length < length) {
+      throw new Error(`incomplete framed upload while reading ${description}`)
+    }
+    const output = this.buffered.subarray(0, length)
+    this.buffered = this.buffered.subarray(length)
+    return output
+  }
 }
 
 async function isCompleteMediaFile(path: string, locator: QQMediaLocator): Promise<boolean> {

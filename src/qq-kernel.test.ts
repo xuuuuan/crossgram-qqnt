@@ -32,9 +32,9 @@ function fixture() {
     removeKernelMsgListener: vi.fn(),
     getMsgUniqueId: vi.fn(() => 'm1'),
     sendMsg: vi.fn(async (_id, _peer, elements) => {
-      const file = elements.find((element: { fileElement?: { filePath: string }, picElement?: { sourcePath?: string } }) =>
+      const files = elements.filter((element: { fileElement?: { filePath: string }, picElement?: { sourcePath?: string } }) =>
         element.fileElement || element.picElement)
-      if (file) {
+      for (const file of files) {
         const { readFile } = await import('node:fs/promises')
         sentBodies.push(await readFile(file.fileElement?.filePath ?? file.picElement.sourcePath))
       }
@@ -768,6 +768,41 @@ describe('QQKernelBridge', () => {
         picElement: expect.objectContaining({ picWidth: 1096, picHeight: 892, picType: 1000 }),
       })], expect.any(Map),
     )
+  })
+
+  it('streams multiple framed images into one native message without joining their buffers', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const first = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+      'base64',
+    )
+    const second = Buffer.from(first)
+    second[second.length - 1] ^= 1
+    const frame = (bytes: Buffer) => [
+      Buffer.from([0, 0, 0, bytes.length]), bytes, Buffer.alloc(4),
+    ]
+    f.msg.sendMsg.mockImplementationOnce(async (_id, _peer, elements) => {
+      queueMicrotask(() => f.emitMessages([{ ...f.message, sendStatus: 2, elements }]))
+      return { result: 0, errMsg: '' }
+    })
+
+    const sent = await bridge.send({
+      conversationId: 'uid-1715311957', mediaFraming: 'length-prefixed-v1',
+      media: [
+        { kind: 'image', name: 'first.png', size: first.length },
+        { kind: 'image', name: 'second.png', size: second.length },
+      ],
+    }, Readable.from([...frame(first), ...frame(second)]))
+
+    expect(f.msg.sendMsg).toHaveBeenCalledWith(
+      'm1', expect.anything(), [
+        expect.objectContaining({ picElement: expect.objectContaining({ md5HexStr: 'e44e7ecfec99356632c13cd3eaa3e250' }) }),
+        expect.objectContaining({ picElement: expect.objectContaining({ md5HexStr: '5b118909b999cf913eb2ab9e8972fbe0' }) }),
+      ], expect.any(Map),
+    )
+    expect(sent.parts.filter((part) => part.type === 'media')).toHaveLength(2)
   })
 
   it('lists, decrypts, sends, and maps QQ market stickers', async () => {
@@ -1621,7 +1656,7 @@ describe('QQBridgeServer', () => {
     const { port } = server.address()
     const base = `http://127.0.0.1:${port}/v1`
     await expect(fetch(`${base}/status`).then((response) => response.json())).resolves.toMatchObject({
-      protocolVersion: 8, ready: true, selfUin: '10000',
+      protocolVersion: 9, ready: true, selfUin: '10000',
     })
     await expect(fetch(`${base}/dialogs`).then((response) => response.json())).resolves.toMatchObject({
       conversations: [{ peerUin: '1715311957' }],

@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 8
+export const PROTOCOL_VERSION = 9
 
 export type QQChatType = 1 | 2
 
@@ -232,6 +232,8 @@ export interface SendManifest {
   replyToId?: string
   originRequestId?: string
   sticker?: QQStickerReference
+  /** Length-prefixed chunks terminated by a zero-length frame for each media item. */
+  mediaFraming?: 'length-prefixed-v1'
   media?: Array<{
     kind: 'image' | 'file'
     name: string
