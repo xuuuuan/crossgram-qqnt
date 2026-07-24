@@ -413,15 +413,15 @@ describe('QQKernelBridge', () => {
     }, { elementType: 1, elementId: 'text', textElement: { content: 'group reply' } }],
     } satisfies MsgRecord
     f.msg.getLatestDbMsgs.mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [reply] })
-    f.msg.getSourceOfReplyMsg.mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [original] })
+    f.msg.getMsgsBySeqAndCount.mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [original] })
     const bridge = new QQKernelBridge()
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
 
     await expect(bridge.getHistory(bridge.getConversation('uid-1715311957'))).resolves.toMatchObject({
       messages: [{ id: 'reply', replyToId: 'opaque-source' }],
     })
-    expect(f.msg.getSourceOfReplyMsg).toHaveBeenCalledWith(
-      expect.objectContaining({ peerUid: 'uid-1715311957' }), 'reply', 'source-seq',
+    expect(f.msg.getMsgsBySeqAndCount).toHaveBeenCalledWith(
+      expect.objectContaining({ peerUid: 'uid-1715311957' }), 'source-seq', 1, true, true,
     )
 
     const c2cReply = { ...reply, msgId: 'c2c-reply', elements: [{
@@ -441,6 +441,55 @@ describe('QQKernelBridge', () => {
     expect(f.msg.getSourceOfReplyMsgByClientSeqAndTime).toHaveBeenCalledWith(
       expect.objectContaining({ peerUid: 'uid-1715311957' }), 'c2c-reply', 'client-seq', '1700000000',
     )
+  })
+
+  it('maps group message and reply sequences directly to Telegram IDs without loading the target', async () => {
+    const f = fixture()
+    const original = {
+      ...f.message, chatType: 2, peerUid: '1058754719', peerUin: '1058754719',
+      msgId: 'real-source', msgSeq: '5850632',
+    } satisfies MsgRecord
+    const nested = { ...original, msgId: 'nested-copy', records: [] }
+    const reply = { ...original, msgId: 'reply', msgSeq: '5850634', records: [nested], elements: [{
+      elementType: 7, elementId: 'reply-element', replyElement: {
+        replayMsgId: '0', replayMsgSeq: '5850632', sourceMsgIdInRecords: 'nested-copy',
+        sourceMsgTextElems: [], replyMsgRevokeType: 0,
+        sourceMsgIsIncPic: false, sourceMsgExpired: false,
+      },
+    }] } satisfies MsgRecord
+    f.msg.getLatestDbMsgs.mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [reply, original] })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.getHistory(bridge.getConversation('1058754719'))).resolves.toMatchObject({
+      messages: [
+        { id: 'reply', telegramMessageId: 5850634, telegramReplyToMessageId: 5850632 },
+        { id: 'real-source', telegramMessageId: 5850632 },
+      ],
+    })
+    expect(f.msg.getMsgsBySeqAndCount).not.toHaveBeenCalled()
+    expect(f.msg.getSourceOfReplyMsg).not.toHaveBeenCalled()
+  })
+
+  it('resolves an adjacent direct reply from the same batch without loading its target', async () => {
+    const f = fixture()
+    const original = { ...f.message, msgId: 'direct-source', msgSeq: '101' } satisfies MsgRecord
+    const reply = { ...f.message, msgId: 'direct-reply', msgSeq: '102', elements: [{
+      elementType: 7, elementId: 'reply-element', replyElement: {
+        replayMsgId: '0', replayMsgSeq: '101', sourceMsgIdInRecords: 'nested-copy',
+        sourceMsgTextElems: [], replyMsgRevokeType: 0,
+        sourceMsgIsIncPic: false, sourceMsgExpired: false,
+      },
+    }] } satisfies MsgRecord
+    f.msg.getLatestDbMsgs.mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [reply, original] })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.getHistory(bridge.getConversation('uid-1715311957'))).resolves.toMatchObject({
+      messages: [{ id: 'direct-reply', replyToId: 'direct-source' }, { id: 'direct-source' }],
+    })
+    expect(f.msg.getMsgsBySeqAndCount).not.toHaveBeenCalled()
+    expect(f.msg.getSourceOfReplyMsgByClientSeqAndTime).not.toHaveBeenCalled()
   })
 
   it('prefers the real replay message ID over QQNT records snapshot IDs', async () => {

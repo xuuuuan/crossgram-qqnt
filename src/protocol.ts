@@ -106,6 +106,10 @@ export interface QQMessage {
     avatar?: QQMedia
   }
   msgSeq?: string
+  /** Telegram megagroup message ID; QQ group msgSeq is conversation-scoped and monotonic. */
+  telegramMessageId?: number
+  /** Telegram megagroup reply target taken directly from QQ replayMsgSeq. */
+  telegramReplyToMessageId?: number
   /** Adapter-generated correlation token used to suppress only its own listener echo. */
   originRequestId?: string
   /** Opaque QQ msgId referenced by a native reply element. */

@@ -2421,6 +2421,7 @@ export class QQKernelBridge {
       }
     }
     const sender = this.seenUsers.get(senderId) ?? this.users.get(senderId)
+    const nativeReply = record.elements?.find((element) => element.replyElement)?.replyElement
     return {
       id: record.msgId,
       conversationId: conversationId(record.chatType as 1 | 2, record.peerUid),
@@ -2437,6 +2438,10 @@ export class QQKernelBridge {
       timestamp: Number(record.msgTime) || Math.floor(Date.now() / 1000),
       outgoing: SEND_FROM_SELF.has(record.sendType) || record.senderUid === this.config?.selfUid,
       msgSeq: record.msgSeq,
+      telegramMessageId: record.chatType === CHAT_GROUP ? telegramMessageId(record.msgSeq) : undefined,
+      telegramReplyToMessageId: record.chatType === CHAT_GROUP
+        ? telegramMessageId(nativeReply?.replayMsgSeq)
+        : undefined,
       originRequestId: this.messageOrigins.get(record.msgId),
       replyToId,
       serviceAction,
@@ -2472,37 +2477,44 @@ export class QQKernelBridge {
   }
 
   private async resolveReplyTargets(records: MsgRecord[]): Promise<void> {
-    const batchBySeq = new Map(records.flatMap((record) => record.msgSeq ? [[record.msgSeq, record]] : []))
+    const batchBySeq = new Map(records.flatMap((record) => {
+      if (!record.msgSeq) return []
+      const conversation = conversationId(record.chatType as 1 | 2, record.peerUid)
+      return [[`${conversation}\u0000${record.msgSeq}`, record.msgId] as const]
+    }))
     const cachedBySeq = new Map(records.flatMap((record) => {
       const conversation = conversationId(record.chatType as 1 | 2, record.peerUid)
       return (this.messages.get(conversation) ?? []).flatMap((message) =>
         message.msgSeq ? [[`${conversation}\u0000${message.msgSeq}`, message.id] as const] : [])
     }))
     await Promise.all(records.map(async (record) => {
+      // QQ group msgSeq is the Telegram megagroup message ID, so group replies
+      // never need a target msgId lookup.
+      if (record.chatType === CHAT_GROUP) return
       if (this.resolvedReplyTargets.has(record.msgId)) return
       const reply = record.elements?.find((element) => element.replyElement)?.replyElement
       if (!reply) return
-      const direct = replyTargetId(record, reply)
-      if (direct) {
-        this.resolvedReplyTargets.set(record.msgId, direct)
-        return
-      }
       const conversation = conversationId(record.chatType as 1 | 2, record.peerUid)
       const local = reply.replayMsgSeq
-        ? batchBySeq.get(reply.replayMsgSeq)?.msgId
+        ? batchBySeq.get(`${conversation}\u0000${reply.replayMsgSeq}`)
           ?? cachedBySeq.get(`${conversation}\u0000${reply.replayMsgSeq}`)
         : undefined
       if (local) {
         this.resolvedReplyTargets.set(record.msgId, local)
         return
       }
+      const direct = replyTargetId(record, reply)
+      if (direct) {
+        this.resolvedReplyTargets.set(record.msgId, direct)
+        return
+      }
       if (reply.sourceMsgExpired) return
       const service = this.requireMsgService()
       const peer = contact(this.getConversation(conversation))
       try {
-        const response = reply.replayMsgSeq && reply.replayMsgSeq !== '0' && service.getSourceOfReplyMsg
+        const response = reply.replayMsgSeq && reply.replayMsgSeq !== '0' && service.getMsgsBySeqAndCount
           ? await withTimeout(
-            service.getSourceOfReplyMsg(peer, record.msgId, reply.replayMsgSeq),
+            retryHistoryCall(() => service.getMsgsBySeqAndCount!(peer, reply.replayMsgSeq!, 1, true, true)),
             2_000,
             'QQ reply source request timed out',
           )
@@ -2516,8 +2528,7 @@ export class QQKernelBridge {
             )
             : undefined
         const target = response?.result === 0
-          ? response.msgList.find((item) => item.msgSeq === reply.replayMsgSeq)?.msgId
-            ?? response.msgList[0]?.msgId
+          ? response.msgList.find((item) => !reply.replayMsgSeq || item.msgSeq === reply.replayMsgSeq)?.msgId
           : undefined
         if (target && target !== '0') this.resolvedReplyTargets.set(record.msgId, target)
       } catch (error) {
@@ -4094,8 +4105,13 @@ function replyTargetId(
     && !record.records?.some((item) => item.msgId === reply.sourceMsgIdInRecords)) {
     return reply.sourceMsgIdInRecords
   }
-  if (!reply.replayMsgSeq || reply.replayMsgSeq === '0') return
-  return record.records?.find((item) => item.msgSeq === reply.replayMsgSeq)?.msgId
+  return undefined
+}
+
+function telegramMessageId(value?: string): number | undefined {
+  if (!value || !/^\d+$/.test(value)) return
+  const id = Number(value)
+  return Number.isSafeInteger(id) && id > 0 && id <= 0x7fffffff ? id : undefined
 }
 
 function isMultiForwardRecord(record: MsgRecord): boolean {
