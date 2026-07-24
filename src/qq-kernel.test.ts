@@ -1479,27 +1479,25 @@ describe('QQKernelBridge', () => {
     expect(f.richMedia.downloadFile).toHaveBeenCalledOnce()
   })
 
-  it('redownloads an incomplete local image instead of streaming it at EOF', async () => {
+  it('uses QQ download completion for images without parsing the completed file', async () => {
     const f = fixture()
-    const directory = await mkdtemp(join(tmpdir(), 'qqnt-media-incomplete-'))
+    const directory = await mkdtemp(join(tmpdir(), 'qqnt-media-native-complete-'))
     tempPaths.push(directory)
-    const downloadedPath = join(directory, 'downloaded.png')
-    const complete = Buffer.from([
-      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
-      0, 0, 0, 0, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
-    ])
-    await writeFile(downloadedPath, complete.subarray(0, 10))
+    const downloadedPath = join(directory, 'downloaded.jpg')
+    // QQ is authoritative here: valid QQ image payloads are not required to
+    // satisfy a bridge-side JPEG/PNG parser after the native success event.
+    const complete = Buffer.alloc(173_994, 0x61)
+    await writeFile(downloadedPath, complete)
     const bridge = new QQKernelBridge({ tempPath: directory })
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
     const locator = {
       messageId: 'incomplete-message', elementId: 'incomplete-element', chatType: 2 as const,
-      peerUid: 'group', kind: 'image' as const, fileName: 'downloaded.png',
+      peerUid: 'group', kind: 'image' as const, fileName: 'downloaded.jpg',
       fileSize: String(complete.length), filePath: downloadedPath, fileUuid: 'incomplete-uuid',
     }
 
     const pending = bridge.downloadFile(locator)
     await vi.waitFor(() => expect(f.richMedia.downloadFile).toHaveBeenCalledOnce())
-    await writeFile(downloadedPath, complete)
     f.emitDownload({
       fileModelId: '', msgId: locator.messageId, msgElementId: locator.elementId,
       fileErrCode: '0', fileErrMsg: '', filePath: downloadedPath,

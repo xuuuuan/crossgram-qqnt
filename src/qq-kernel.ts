@@ -1433,14 +1433,16 @@ export class QQKernelBridge {
   async downloadFile(locator: QQMediaLocator): Promise<Readable> {
     if (locator.avatarUin) return this.downloadQlogoAvatar(locator.avatarUin)
     let path = locator.filePath
-    if ((!path || !existsSync(path)) && locator.messageId.startsWith('avatar:')) {
-      path = await this.refreshAvatarFile(locator)
+    if (locator.messageId.startsWith('avatar:')) {
+      if (!path || !existsSync(path)) path = await this.refreshAvatarFile(locator)
+    } else if (locator.kind === 'image') {
+      // QQ can publish sourcePath before it has finished writing the file.
+      // Always ask the native transfer service for images and trust its
+      // onRichMediaDownloadComplete success notification as the boundary.
+      path = await this.downloadMedia(locator)
+    } else if (!path || !existsSync(path)) {
+      path = await this.downloadMedia(locator)
     }
-    if (path && !await isCompleteMediaFile(path, locator)) {
-      log('warn', `local media is incomplete; downloading original message=${locator.messageId} element=${locator.elementId} path=${JSON.stringify(path)} actual=${existsSync(path) ? statSync(path).size : 0} expected=${locator.fileSize ?? 'unknown'}`)
-      path = undefined
-    }
-    if (!path) path = await this.downloadMedia(locator)
     const size = statSync(path).size
     log('info', `file stream open message=${locator.messageId} element=${locator.elementId} peer=${locator.peerUid} path=${JSON.stringify(path)} size=${size}`)
     return size ? createReadStream(path) : Readable.from([])
@@ -1462,7 +1464,7 @@ export class QQKernelBridge {
     const identity = mediaDownloadIdentity(locator)
     const cached = this.downloadedMediaPaths.get(identity)
     if (cached) {
-      if (await isCompleteMediaFile(cached, locator)) {
+      if (existsSync(cached)) {
         this.downloadedMediaPaths.delete(identity)
         this.downloadedMediaPaths.set(identity, cached)
         return cached
@@ -1524,7 +1526,6 @@ export class QQKernelBridge {
       throw new Error(`QQ media download completed with unexpected status: ${completed.trasferStatus}`)
     }
     if (!completed.filePath || !existsSync(completed.filePath)) throw new Error('QQ media download completed without a file')
-    await waitForCompleteMediaFile(completed.filePath, locator)
     log('info', `native API complete name=downloadFile message=${locator.messageId} element=${locator.elementId} status=${completed.trasferStatus} error=${completed.fileErrCode} path=${JSON.stringify(completed.filePath)} size=${completed.totalSize}`)
     return completed.filePath
   }
@@ -3144,70 +3145,6 @@ class FramedUploadReader {
     this.buffered = this.buffered.subarray(length)
     return output
   }
-}
-
-async function isCompleteMediaFile(path: string, locator: QQMediaLocator): Promise<boolean> {
-  let info: Awaited<ReturnType<typeof stat>>
-  try {
-    info = await stat(path)
-  } catch {
-    return false
-  }
-  if (!info.isFile() || info.size === 0) return false
-
-  const expected = positiveFileSize(locator.fileSize)
-  if (expected !== undefined && info.size < expected) return false
-  if (locator.kind !== 'image') return true
-
-  const extension = extname(locator.fileName || path).toLowerCase()
-  const handle = await openFile(path, 'r')
-  try {
-    if (extension === '.jpg' || extension === '.jpeg') {
-      const length = Math.min(info.size, 4_096)
-      const tail = Buffer.alloc(length)
-      await handle.read(tail, 0, length, info.size - length)
-      return tail.lastIndexOf(Buffer.from([0xff, 0xd9])) >= 0
-    }
-    if (extension === '.png' || extension === '.apng') {
-      if (info.size < 12) return false
-      const tail = Buffer.alloc(12)
-      await handle.read(tail, 0, tail.length, info.size - tail.length)
-      return tail.equals(Buffer.from([0, 0, 0, 0, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82]))
-    }
-    if (extension === '.gif') {
-      const tail = Buffer.alloc(1)
-      await handle.read(tail, 0, 1, info.size - 1)
-      return tail[0] === 0x3b
-    }
-    if (extension === '.webp') {
-      if (info.size < 12) return false
-      const header = Buffer.alloc(12)
-      await handle.read(header, 0, header.length, 0)
-      return header.toString('ascii', 0, 4) === 'RIFF'
-        && header.toString('ascii', 8, 12) === 'WEBP'
-        && header.readUInt32LE(4) + 8 <= info.size
-    }
-    return true
-  } finally {
-    await handle.close()
-  }
-}
-
-async function waitForCompleteMediaFile(path: string, locator: QQMediaLocator, timeoutMs = 3_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs
-  do {
-    if (await isCompleteMediaFile(path, locator)) return
-    await delay(50)
-  } while (Date.now() < deadline)
-
-  const actual = await stat(path).then((info) => info.size, () => 0)
-  throw new Error(`QQ media download produced an incomplete file: ${actual}/${locator.fileSize ?? 'unknown'} bytes`)
-}
-
-function positiveFileSize(value?: string): number | undefined {
-  if (!value || !/^\d+$/.test(value)) return
-  const size = Number(value)
-  return Number.isSafeInteger(size) && size > 0 ? size : undefined
 }
 
 function textElement(text: string): MsgElement {
