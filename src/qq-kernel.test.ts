@@ -71,6 +71,7 @@ function fixture() {
     })),
     fetchBottomEmojiTableList: undefined as import('./kernel-types.js').KernelMsgService['fetchBottomEmojiTableList'],
     fetchMarketEmoticonShowImage: vi.fn(async () => ({ result: 0, errMsg: '' })),
+    fetchMarketEmotionJsonFile: undefined,
     fetchMarketEmoticonAioImage: vi.fn(async () => ({ result: 0, errMsg: '' })),
     getMarketEmoticonPath: vi.fn(() => new Map()),
     getMarketEmoticonEncryptKeys: vi.fn(async () => ({ result: 0, errMsg: '', encryptKeyMap: new Map() })),
@@ -736,6 +737,15 @@ describe('QQKernelBridge', () => {
       })], expect.any(Map),
     )
     expect(sent.parts).toMatchObject([{ type: 'sticker', sticker: { stickerId: 'market:42:emoji-a' } }])
+
+    // A received market sticker can belong to a pack that is not installed and
+    // therefore absent from the bottom emoji catalog. Resolve it directly by
+    // its opaque package ID through the current QQ API.
+    f.msg.fetchMarketEmotionJsonFile = vi.fn(async () => ({ result: 0, errMsg: '' }))
+    await expect(bridge.getStickerPack('43')).resolves.toMatchObject({
+      packId: '43', title: '43', stickers: [{ packId: '43', stickerId: 'market:43:emoji-a' }],
+    })
+    expect(f.msg.fetchMarketEmotionJsonFile).toHaveBeenCalledWith(43)
   })
 
   it('maps every QQ expression picture subtype as a sticker and keeps only normal/QZone pictures as media', async () => {

@@ -568,20 +568,26 @@ export class QQKernelBridge {
     if (cached) return cached
     await this.loadStickerPackCatalog()
     const info = this.stickerPackInfo.get(packId)
-    if (!info) return null
     const service = this.requireMsgService()
-    if (!service.fetchMarketEmoticonShowImage || !service.getMarketEmoticonPath) return null
-    const downloaded = await service.fetchMarketEmoticonShowImage({
-      epId: info.epId,
-      wordingId: String(info.wordingId),
-      type: info.tabType,
-      name: info.tabName,
-      valid: true,
-    })
+    if (!service.getMarketEmoticonPath) return null
+    const epId = info?.epId ?? Number(packId)
+    if (!Number.isSafeInteger(epId) || epId <= 0) return null
+    const downloaded = service.fetchMarketEmotionJsonFile
+      ? await service.fetchMarketEmotionJsonFile(epId)
+      : info && service.fetchMarketEmoticonShowImage
+        ? await service.fetchMarketEmoticonShowImage({
+            epId,
+            wordingId: String(info.wordingId),
+            type: info.tabType,
+            name: info.tabName,
+            valid: true,
+          })
+        : null
+    if (!downloaded) return null
     if (downloaded.result !== 0) {
-      throw new Error(`fetchMarketEmoticonShowImage: ${downloaded.errMsg} (${downloaded.result})`)
+      throw new Error(`fetchMarketEmotionJsonFile: ${downloaded.errMsg} (${downloaded.result})`)
     }
-    const jsonPath = (await this.getMarketEmoticonPaths(info.epId, [], 1)).get(packId)?.path
+    const jsonPath = (await this.getMarketEmoticonPaths(epId, [], 1)).get(packId)?.path
     if (!jsonPath || !existsSync(jsonPath)) throw new Error(`QQ sticker pack ${packId} has no detail JSON`)
     const detail = JSON.parse(await readFile(jsonPath, 'utf8')) as {
       isApng?: number
@@ -592,16 +598,16 @@ export class QQKernelBridge {
     } => Boolean(item.id))
     const ids = rows.map((item) => item.id)
     const [staticPaths, dynamicPaths, keys] = await Promise.all([
-      this.getMarketEmoticonPaths(info.epId, ids, 3),
-      this.getMarketEmoticonPaths(info.epId, ids, 5),
-      service.getMarketEmoticonEncryptKeys?.(info.epId, ids),
+      this.getMarketEmoticonPaths(epId, ids, 3),
+      this.getMarketEmoticonPaths(epId, ids, 5),
+      service.getMarketEmoticonEncryptKeys?.(epId, ids),
     ])
     const keyMap = keys?.result === 0 ? keys.encryptKeyMap : new Map<string, string>()
-    const animated = detail.isApng === 1 || info.tabType === 3
+    const animated = detail.isApng === 1 || info?.tabType === 3
     const stickers = rows.map((item): QQSticker => {
       const reference: QQStickerReference = {
         kind: 'market', packageId: packId, stickerId: item.id,
-        name: item.name || info.tabName || '[表情]', key: keyMap.get(item.id) ?? '',
+        name: item.name || info?.tabName || '[表情]', key: keyMap.get(item.id) ?? '',
         width: positiveInteger(item.wWidthInPhone, 240),
         height: positiveInteger(item.wHeightInPhone, 240),
         animated,
@@ -618,7 +624,7 @@ export class QQKernelBridge {
       return sticker
     })
     const pack: QQStickerPack = {
-      packId, title: info.tabName || packId, version: 1, count: stickers.length, stickers,
+      packId, title: info?.tabName || packId, version: 1, count: stickers.length, stickers,
     }
     this.stickerPacks.set(packId, pack)
     return pack

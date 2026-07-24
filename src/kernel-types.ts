@@ -383,6 +383,7 @@ export interface KernelMsgService {
     name: string
     valid: boolean
   }): Promise<{ result: number, errMsg: string }>
+  fetchMarketEmotionJsonFile?(epId: number): Promise<{ result: number, errMsg: string }>
   fetchMarketEmoticonAioImage?(request: {
     epId: number
     eId: string
