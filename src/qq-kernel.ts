@@ -85,6 +85,7 @@ export class QQKernelBridge {
   private readonly pendingMinimumStatuses = new Map<string, number>()
   private readonly messageOrigins = new Map<string, string>()
   private readonly resolvedReplyTargets = new Map<string, string>()
+  private readonly pendingMergedForwards: Array<{ conversationId: string, startedAt: number }> = []
   private readonly pendingUnassigned: Array<{
     conversationId: string
     pending: ReturnType<typeof deferred<MsgRecord>>
@@ -529,10 +530,22 @@ export class QQKernelBridge {
     const conversation = this.getConversation(locator.conversationId)
     const parentMessageId = locator.parentMessageId ?? locator.rootMessageId
     log('info', `native API start name=getMultiMsg conversation=${conversation.id} root=${locator.rootMessageId} parent=${parentMessageId}`)
-    const response = await retryTransientInvalidArgument(() => service.getMultiMsg!(
+    let response = await retryTransientInvalidArgument(() => service.getMultiMsg!(
       contact(conversation), locator.rootMessageId, parentMessageId,
     ))
     log('info', `native API complete name=getMultiMsg conversation=${conversation.id} root=${locator.rootMessageId} parent=${parentMessageId} result=${response.result} err=${JSON.stringify(response.errMsg)} messages=${response.msgList.length}`)
+    // QQ normally indexes nested bundles by (outer root, nested record). Some
+    // forwarded bundles keep the nested resource attached to its original
+    // message instead, in which case QQ's normal lookup reports Data Not
+    // Existed even though (nested record, nested record) is still readable.
+    if (response.result !== 0 && parentMessageId !== locator.rootMessageId) {
+      log('info', `native API retry name=getMultiMsg conversation=${conversation.id} root=${parentMessageId} parent=${parentMessageId} reason=nested-resource-fallback`)
+      const fallback = await retryTransientInvalidArgument(() => service.getMultiMsg!(
+        contact(conversation), parentMessageId, parentMessageId,
+      ))
+      log('info', `native API complete name=getMultiMsg conversation=${conversation.id} root=${parentMessageId} parent=${parentMessageId} result=${fallback.result} err=${JSON.stringify(fallback.errMsg)} messages=${fallback.msgList.length} fallback=true`)
+      if (fallback.result === 0) response = fallback
+    }
     if (response.result !== 0) throw new Error(`getMultiMsg: ${response.errMsg} (${response.result})`)
     return response.msgList
       .filter((record) => !isRecalledRecord(record))
@@ -1041,30 +1054,39 @@ export class QQKernelBridge {
     const startedAt = Math.floor(Date.now() / 1000)
     const api = merged ? 'multiForwardMsg' : 'forwardMsg'
     log('info', `native API start name=${api} from=${source.id} to=${destination.id} messages=${ids.join(',')}`)
-    let result: { result: number, errMsg: string }
-    if (merged) {
-      if (!service.multiForwardMsg) throw new Error('multiForwardMsg is unavailable in this QQNT build')
-      const records = await service.getMsgsByMsgId(contact(source), ids)
-      if (records.result !== 0) throw new Error(`getMsgsByMsgId: ${records.errMsg} (${records.result})`)
-      const byId = new Map(records.msgList.map((record) => [record.msgId, record]))
-      result = await service.multiForwardMsg(ids.map((msgId) => {
-        const record = byId.get(msgId)
-        return {
-          msgId,
-          senderShowName: record
-            ? record.sendRemarkName || record.sendMemberName || record.sendNickName || record.senderUin
-            : undefined,
-        }
-      }), contact(source), contact(destination))
-    } else {
-      result = await service.forwardMsg(ids, contact(source), [contact(destination)], new Map())
+    const pendingMerged = merged ? { conversationId: destination.id, startedAt } : undefined
+    if (pendingMerged) this.pendingMergedForwards.push(pendingMerged)
+    try {
+      let result: { result: number, errMsg: string }
+      if (merged) {
+        if (!service.multiForwardMsg) throw new Error('multiForwardMsg is unavailable in this QQNT build')
+        const records = await service.getMsgsByMsgId(contact(source), ids)
+        if (records.result !== 0) throw new Error(`getMsgsByMsgId: ${records.errMsg} (${records.result})`)
+        const byId = new Map(records.msgList.map((record) => [record.msgId, record]))
+        result = await service.multiForwardMsg(ids.map((msgId) => {
+          const record = byId.get(msgId)
+          return {
+            msgId,
+            senderShowName: record
+              ? record.sendRemarkName || record.sendMemberName || record.sendNickName || record.senderUin
+              : undefined,
+          }
+        }), contact(source), contact(destination))
+      } else {
+        result = await service.forwardMsg(ids, contact(source), [contact(destination)], new Map())
+      }
+      if (result.result !== 0) throw new Error(`${api}: ${result.errMsg} (${result.result})`)
+      const messages = await this.waitForForwardedMessages(
+        destination, before, merged ? 1 : ids.length, startedAt, merged,
+      )
+      log('info', `native API complete name=${api} from=${source.id} to=${destination.id} result=${result.result} messages=${messages.map((item) => item.id).join(',')} err=${JSON.stringify(result.errMsg)}`)
+      return messages
+    } finally {
+      if (pendingMerged) {
+        const index = this.pendingMergedForwards.indexOf(pendingMerged)
+        if (index >= 0) this.pendingMergedForwards.splice(index, 1)
+      }
     }
-    if (result.result !== 0) throw new Error(`${api}: ${result.errMsg} (${result.result})`)
-    const messages = await this.waitForForwardedMessages(
-      destination, before, merged ? 1 : ids.length, startedAt,
-    )
-    log('info', `native API complete name=${api} from=${source.id} to=${destination.id} result=${result.result} messages=${messages.map((item) => item.id).join(',')} err=${JSON.stringify(result.errMsg)}`)
-    return messages
   }
 
   async getUser(uid: string) {
@@ -1884,6 +1906,13 @@ export class QQKernelBridge {
       }
       const conversation = this.conversationFromRecord(record)
       const message = this.mapMessage(record)
+      const pendingMerged = outgoing && this.pendingMergedForwards.some((item) =>
+        item.conversationId === conversation.id
+        && Number(record.msgTime) >= item.startedAt - 1)
+      if (pendingMerged && !record.elements.some(isMultiForwardElement)) {
+        log('info', `native merged-forward placeholder deferred source=${source} id=${record.msgId} peer=${record.peerUid} status=${record.sendStatus}`)
+        continue
+      }
       if (source === 'onRecvMsg' && !message.outgoing) {
         log('info', receivedMessageSummary(conversation, message))
       }
@@ -2941,6 +2970,7 @@ export class QQKernelBridge {
     before: Set<string>,
     expected: number,
     startedAt: number,
+    requireMergedCard = false,
   ): Promise<QQMessage[]> {
     const deadline = Date.now() + Math.min(this.sendTimeoutMs, 20_000)
     do {
@@ -2948,7 +2978,8 @@ export class QQKernelBridge {
       const forwarded = records.filter((record) =>
         !before.has(record.msgId)
         && Number(record.msgTime) >= startedAt - 1
-        && (SEND_FROM_SELF.has(record.sendType) || record.senderUid === this.config?.selfUid))
+        && (SEND_FROM_SELF.has(record.sendType) || record.senderUid === this.config?.selfUid)
+        && (!requireMergedCard || record.elements.some(isMultiForwardElement)))
       if (forwarded.length >= expected) {
         return forwarded.slice(0, expected).reverse().map((record) => {
           const message = this.mapMessage(record)
@@ -2958,7 +2989,7 @@ export class QQKernelBridge {
       }
       await delay(100)
     } while (Date.now() < deadline)
-    throw new Error(`QQ did not expose ${expected} forwarded message(s) in ${conversation.id}`)
+    throw new Error(`QQ did not expose ${expected} ${requireMergedCard ? 'merged-forward card' : 'forwarded message'}(s) in ${conversation.id}`)
   }
 }
 
@@ -3839,6 +3870,10 @@ function replyTargetId(
   }
   if (!reply.replayMsgSeq || reply.replayMsgSeq === '0') return
   return record.records?.find((item) => item.msgSeq === reply.replayMsgSeq)?.msgId
+}
+
+function isMultiForwardElement(element: MsgElement): boolean {
+  return element.elementType === ELEMENT_MULTI_FORWARD && Boolean(element.multiForwardMsgElement)
 }
 
 function pngDimensions(bytes: Uint8Array): { width: number, height: number } | undefined {

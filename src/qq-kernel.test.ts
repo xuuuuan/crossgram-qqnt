@@ -610,11 +610,24 @@ describe('QQKernelBridge', () => {
         },
       }],
     }
+    const placeholder = {
+      ...merged,
+      elements: [{
+        elementType: 1, elementId: 'merged-placeholder', textElement: { content: '[聊天记录]' },
+      }],
+    }
+    const events = bridge.subscribe()[Symbol.asyncIterator]()
     f.msg.getLatestDbMsgs
       .mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [forwarded, f.message] })
+      .mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [placeholder, forwarded, f.message] })
       .mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [merged, forwarded, f.message] })
     f.msg.getMsgsByMsgId.mockResolvedValueOnce({
       result: 0, errMsg: '', msgList: [f.message, { ...f.message, msgId: 'm2', sendNickName: 'Alice' }],
+    })
+    f.msg.multiForwardMsg.mockImplementationOnce(async () => {
+      f.emitSent(placeholder)
+      queueMicrotask(() => f.emitMessages([merged]))
+      return { result: 0, errMsg: '' }
     })
     await expect(bridge.forwardMessages(conversation, ['m1', 'm2'], conversation, true)).resolves.toMatchObject([
       { id: 'merged-1', parts: [{
@@ -622,6 +635,9 @@ describe('QQKernelBridge', () => {
         locator: { conversationId: 'uid-1715311957', rootMessageId: 'merged-1' },
       }] },
     ])
+    await expect(events.next()).resolves.toMatchObject({ value: {
+      type: 'message', message: { id: 'merged-1', parts: [{ type: 'multi-forward' }] },
+    } })
     expect(f.msg.multiForwardMsg).toHaveBeenCalledWith([
       { msgId: 'm1', senderShowName: 'Self' },
       { msgId: 'm2', senderShowName: 'Alice' },
@@ -646,6 +662,15 @@ describe('QQKernelBridge', () => {
       }],
     }])
     expect(f.msg.getMultiMsg).toHaveBeenCalledWith(expect.anything(), 'merged-1', 'merged-1')
+
+    f.msg.getMultiMsg
+      .mockResolvedValueOnce({ result: 4, errMsg: 'Data Not Existed!', msgList: [] })
+      .mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [nested] })
+    await expect(bridge.getMultiForwardMessages({
+      conversationId: 'uid-1715311957', rootMessageId: 'merged-1', parentMessageId: 'nested-1',
+    })).resolves.toMatchObject([{ id: 'nested-1' }])
+    expect(f.msg.getMultiMsg).toHaveBeenNthCalledWith(2, expect.anything(), 'merged-1', 'nested-1')
+    expect(f.msg.getMultiMsg).toHaveBeenNthCalledWith(3, expect.anything(), 'nested-1', 'nested-1')
   })
 
   it('uses include-self for current QQ direct-chat history', async () => {
