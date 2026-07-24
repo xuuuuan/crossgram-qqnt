@@ -1,8 +1,10 @@
 import { Readable } from 'node:stream'
+import { once } from 'node:events'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import WebSocket from 'ws'
 import type { ContactMsgBoxInfo, FileTransNotifyInfo, KernelModule, KernelSession, MsgRecord } from './kernel-types.js'
 import { QQKernelBridge } from './qq-kernel.js'
 import { QQBridgeServer } from './server.js'
@@ -1338,7 +1340,7 @@ describe('QQKernelBridge', () => {
     })
   })
 
-  it('replays events emitted after the last acknowledged SSE event', async () => {
+  it('replays events emitted after the last acknowledged stream event', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
@@ -1964,7 +1966,7 @@ describe('QQBridgeServer', () => {
     const { port } = server.address()
     const base = `http://127.0.0.1:${port}/v1`
     await expect(fetch(`${base}/status`).then((response) => response.json())).resolves.toMatchObject({
-      protocolVersion: 10, ready: true, selfUin: '10000',
+      protocolVersion: 11, ready: true, selfUin: '10000',
     })
     await expect(fetch(`${base}/dialogs`).then((response) => response.json())).resolves.toMatchObject({
       conversations: [{ peerUin: '1715311957' }],
@@ -1977,6 +1979,47 @@ describe('QQBridgeServer', () => {
     })
     expect(response.status).toBe(200)
     expect(await response.json()).toMatchObject({ id: 'm1' })
+  })
+
+  it('streams events over WebSocket, resumes by event id, and removes closed subscribers', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const base = `http://127.0.0.1:${server.address().port}/v1`
+    await expect(fetch(`${base}/events`)).resolves.toMatchObject({ status: 404 })
+
+    const firstSocket = new WebSocket(base.replace('http:', 'ws:') + '/events/ws')
+    await once(firstSocket, 'open')
+    expect(bridge.events.size).toBe(1)
+    const firstFrame = once(firstSocket, 'message')
+    f.emitReceived([{
+      ...f.message, msgId: 'ws-first', msgSeq: '100', sendType: 0,
+      senderUid: 'friend', senderUin: '42', sendNickName: 'Friend',
+    }])
+    const [firstRaw] = await firstFrame
+    const first = JSON.parse(firstRaw.toString())
+    expect(first).toMatchObject({ id: '1', event: { type: 'message', message: { id: 'ws-first' } } })
+    firstSocket.close()
+    await once(firstSocket, 'close')
+    await vi.waitFor(() => expect(bridge.events.size).toBe(0))
+
+    const observation = bridge.subscribe()
+    const observed = observation[Symbol.asyncIterator]().next()
+    f.emitReceived([{
+      ...f.message, msgId: 'ws-second', msgSeq: '101', sendType: 0,
+      senderUid: 'friend', senderUin: '42', sendNickName: 'Friend',
+    }])
+    await observed
+    bridge.unsubscribe(observation)
+    const resumedSocket = new WebSocket(base.replace('http:', 'ws:') + '/events/ws?lastEventId=1')
+    const [secondRaw] = await once(resumedSocket, 'message')
+    const second = JSON.parse(secondRaw.toString())
+    expect(second).toMatchObject({ id: '2', event: { type: 'message', message: { id: 'ws-second' } } })
+    resumedSocket.close()
+    await once(resumedSocket, 'close')
+    await vi.waitFor(() => expect(bridge.events.size).toBe(0))
   })
 
   it('serves complete files and coalesces concurrent native downloads', async () => {

@@ -1,6 +1,8 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { once } from 'node:events'
+import type { Duplex } from 'node:stream'
 import type { Readable } from 'node:stream'
+import WebSocket, { WebSocketServer } from 'ws'
 import {
   PROTOCOL_VERSION, type QQMediaLocator, type QQMultiForwardLocator, type QQStickerReference, type SendManifest,
 } from './protocol.js'
@@ -17,6 +19,7 @@ export interface BridgeServerOptions {
 
 export class QQBridgeServer {
   private server?: Server
+  private webSocketServer?: WebSocketServer
   private requestSequence = 0
   readonly host: string
   readonly port: number
@@ -41,7 +44,7 @@ export class QQBridgeServer {
       const target = request.url ?? '/'
       const observe = (completed: boolean) => {
         const durationMs = Date.now() - startedAt
-        if (durationMs <= this.slowRequestThresholdMs || isLongLivedRequest(target)) return
+        if (durationMs <= this.slowRequestThresholdMs) return
         const message = `slow HTTP request method=${method} target=${JSON.stringify(target)} status=${response.statusCode} durationMs=${durationMs} completed=${completed}`
         log('warn', message)
         recordSlowHttpRequest({
@@ -66,6 +69,32 @@ export class QQBridgeServer {
         else response.destroy(error instanceof Error ? error : new Error(String(error)))
       })
     })
+    this.webSocketServer = new WebSocketServer({ noServer: true })
+    this.server.on('upgrade', (request, socket, head) => {
+      const requestId = ++this.requestSequence
+      const target = request.url ?? '/'
+      if (!isWebSocketEventsRequest(target)) {
+        rejectUpgrade(socket, 404, 'Not Found')
+        return
+      }
+      if (!this.authorize(request)) {
+        rejectUpgrade(socket, 401, 'Unauthorized')
+        return
+      }
+      if (!this.bridge.status.ready) {
+        rejectUpgrade(socket, 503, 'Service Unavailable')
+        return
+      }
+      const lastEventId = new URL(target, `http://${request.headers.host ?? 'localhost'}`)
+        .searchParams.get('lastEventId') ?? undefined
+      log('info', `WebSocket upgrade request=${requestId} target=${JSON.stringify(target)} remote=${request.socket.remoteAddress ?? '<unknown>'}`)
+      this.webSocketServer?.handleUpgrade(request, socket, head, (webSocket) => {
+        void this.eventsWebSocket(webSocket, requestId, lastEventId).catch((error) => {
+          log('error', `WebSocket event stream failed request=${requestId}`, error)
+          webSocket.terminate()
+        })
+      })
+    })
     this.server.keepAliveTimeout = 65_000
     this.server.headersTimeout = 70_000
     this.server.requestTimeout = 0
@@ -84,6 +113,10 @@ export class QQBridgeServer {
     const server = this.server
     if (!server) return
     this.server = undefined
+    const webSocketServer = this.webSocketServer
+    this.webSocketServer = undefined
+    for (const client of webSocketServer?.clients ?? []) client.terminate()
+    webSocketServer?.close()
     server.close()
     await once(server, 'close')
   }
@@ -112,8 +145,8 @@ export class QQBridgeServer {
       json(response, 503, { error: 'QQNT kernel is not ready' })
       return
     }
-    if (request.method === 'GET' && path === '/v1/events') {
-      await this.events(request, response, requestId)
+    if (request.method === 'GET' && path === '/v1/events/ws') {
+      json(response, 426, { error: 'WebSocket upgrade required' })
       return
     }
     if (request.method === 'GET' && path === '/v1/dialogs') {
@@ -316,33 +349,29 @@ export class QQBridgeServer {
     json(response, 404, { error: 'not found' })
   }
 
-  private async events(request: IncomingMessage, response: ServerResponse, requestId: number): Promise<void> {
-    response.writeHead(200, {
-      'content-type': 'text/event-stream',
-      'cache-control': 'no-cache, no-transform',
-      connection: 'keep-alive',
-      'x-accel-buffering': 'no',
-    })
-    response.flushHeaders()
-    const lastEventId = stringHeader(request, 'last-event-id')
+  private async eventsWebSocket(webSocket: WebSocket, requestId: number, lastEventId?: string): Promise<void> {
     const queue = this.bridge.subscribe(lastEventId)
-    log('info', `SSE subscriber connected request=${requestId} lastEventId=${JSON.stringify(lastEventId ?? '')} subscribers=${this.bridge.events.size}`)
-    const heartbeat = setInterval(() => response.write(': heartbeat\n\n'), 15_000)
+    log('info', `WebSocket subscriber connected request=${requestId} lastEventId=${JSON.stringify(lastEventId ?? '')} subscribers=${this.bridge.events.size}`)
+    const heartbeat = setInterval(() => {
+      if (webSocket.readyState === WebSocket.OPEN) webSocket.ping()
+    }, 15_000)
     const close = () => this.bridge.unsubscribe(queue)
-    request.once('close', close)
+    webSocket.once('close', close)
+    webSocket.once('error', close)
     try {
       for await (const event of queue) {
+        if (webSocket.readyState !== WebSocket.OPEN) break
         const eventId = this.bridge.eventId(event)
-        log('info', `SSE event write request=${requestId} ${wireEventSummary(event)} streamEventId=${eventId ?? ''}`)
-        const frame = `${eventId ? `id: ${eventId}\n` : ''}data: ${JSON.stringify(event)}\n\n`
-        if (!response.write(frame)) await once(response, 'drain')
+        log('info', `WebSocket event write request=${requestId} ${wireEventSummary(event)} streamEventId=${eventId ?? ''}`)
+        await sendWebSocket(webSocket, JSON.stringify({ id: eventId, event }))
       }
     } finally {
       clearInterval(heartbeat)
-      request.off('close', close)
+      webSocket.off('close', close)
+      webSocket.off('error', close)
       this.bridge.unsubscribe(queue)
-      log('info', `SSE subscriber disconnected request=${requestId} subscribers=${this.bridge.events.size}`)
-      response.end()
+      log('info', `WebSocket subscriber disconnected request=${requestId} subscribers=${this.bridge.events.size}`)
+      if (webSocket.readyState === WebSocket.OPEN) webSocket.close()
     }
   }
 
@@ -352,21 +381,26 @@ export class QQBridgeServer {
   }
 }
 
-function isLongLivedRequest(target: string): boolean {
+function isWebSocketEventsRequest(target: string): boolean {
   try {
-    return new URL(target, 'http://localhost').pathname === '/v1/events'
+    return new URL(target, 'http://localhost').pathname === '/v1/events/ws'
   } catch {
     return false
   }
 }
 
-function wireEventSummary(event: { type: string, conversation?: { id?: string }, message?: { id?: string }, eventId?: string }): string {
-  return `type=${event.type} conversation=${event.conversation?.id ?? ''} message=${event.message?.id ?? ''} eventId=${event.eventId ?? ''}`
+function rejectUpgrade(socket: Duplex, status: number, reason: string): void {
+  socket.end(`HTTP/1.1 ${status} ${reason}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`)
 }
 
-function stringHeader(request: IncomingMessage, name: string): string | undefined {
-  const value = request.headers[name]
-  return typeof value === 'string' && value ? value : undefined
+function sendWebSocket(webSocket: WebSocket, data: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    webSocket.send(data, (error) => error ? reject(error) : resolve())
+  })
+}
+
+function wireEventSummary(event: { type: string, conversation?: { id?: string }, message?: { id?: string }, eventId?: string }): string {
+  return `type=${event.type} conversation=${event.conversation?.id ?? ''} message=${event.message?.id ?? ''} eventId=${event.eventId ?? ''}`
 }
 
 function json(response: ServerResponse, status: number, value: unknown): void {

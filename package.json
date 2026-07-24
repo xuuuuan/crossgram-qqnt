@@ -11,8 +11,12 @@
   },
   "devDependencies": {
     "@types/node": "^26.1.1",
+    "@types/ws": "^8.18.1",
     "esbuild": "^0.28.1",
     "typescript": "^5.9.3",
     "vitest": "^2.1.9"
+  },
+  "dependencies": {
+    "ws": "^8.21.1"
   }
 }

@@ -251,7 +251,7 @@ export class QQKernelBridge {
     if (lastEventId) {
       const cursor = this.recentEvents.findIndex((item) => item.id === lastEventId)
       const replay = cursor >= 0 ? this.recentEvents.slice(cursor + 1) : this.recentEvents
-      log(cursor >= 0 ? 'info' : 'warn', `SSE replay requested lastEventId=${JSON.stringify(lastEventId)} cursorFound=${cursor >= 0} replay=${replay.length} buffered=${this.recentEvents.length}`)
+      log(cursor >= 0 ? 'info' : 'warn', `event replay requested lastEventId=${JSON.stringify(lastEventId)} cursorFound=${cursor >= 0} replay=${replay.length} buffered=${this.recentEvents.length}`)
       for (const item of replay) queue.push(item.event)
     }
     return queue

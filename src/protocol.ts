@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 10
+export const PROTOCOL_VERSION = 11
 
 export type QQChatType = 1 | 2
 
