@@ -120,6 +120,7 @@ export class QQBridgeServer {
       const page = await this.bridge.getDialogs(
         url.searchParams.get('cursor') ?? undefined,
         numberParam(url, 'limit', 100),
+        url.searchParams.get('afterId') ?? undefined,
       )
       log('info', `HTTP API dialogs id=${requestId} count=${page.conversations.length} next=${page.nextCursor ?? ''}`)
       json(response, 200, page)
