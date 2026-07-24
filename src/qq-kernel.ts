@@ -84,6 +84,7 @@ export class QQKernelBridge {
   private readonly pendingAcceptances = new Map<string, ReturnType<typeof deferred<void>>>()
   private readonly pendingMinimumStatuses = new Map<string, number>()
   private readonly messageOrigins = new Map<string, string>()
+  private readonly resolvedReplyTargets = new Map<string, string>()
   private readonly pendingUnassigned: Array<{
     conversationId: string
     pending: ReturnType<typeof deferred<MsgRecord>>
@@ -146,6 +147,7 @@ export class QQKernelBridge {
     this.seenUsers.clear()
     this.groups.clear()
     this.avatarCache.clear()
+    this.resolvedReplyTargets.clear()
     this.groupProfileAttempts.clear()
     this.unreadBatchState = ''
     this.unreadBatchPromise = undefined
@@ -441,6 +443,7 @@ export class QQKernelBridge {
     }
     log('info', `native API complete name=history conversation=${conversation.id} result=${response.result} err=${JSON.stringify(response.errMsg)} messages=${response.msgList.length}`)
     const visibleRecords = response.msgList.filter((record) => !isRecalledRecord(record))
+    await this.resolveReplyTargets(visibleRecords)
     const messages = visibleRecords.map((record) => this.mapMessage(record))
     for (const message of messages) this.rememberMessage(message)
     if (!messages.length && !query.beforeId && !query.afterId && !query.cursor) {
@@ -514,6 +517,7 @@ export class QQKernelBridge {
   async getMessage(conversation: QQConversation, id: string): Promise<QQMessage | null> {
     const record = await this.getMessageRecord(conversation, id)
     if (!record) return null
+    await this.resolveReplyTargets([record])
     const message = this.mapMessage(record)
     this.rememberMessage(message)
     return message
@@ -1498,11 +1502,11 @@ export class QQKernelBridge {
       kernel.NodeIKernelMsgListener,
       {
       onRecvMsg: (value: MsgRecord[] | { msgList: MsgRecord[] }) =>
-        this.onMessages(normalizeMessageRecords(value), 'onRecvMsg'),
+        void this.onMessages(normalizeMessageRecords(value), 'onRecvMsg'),
       onAddSendMsg: (value: MsgRecord | { msgRecord: MsgRecord }) =>
-        this.onMessages(normalizeSingleMessageRecord(value), 'onAddSendMsg'),
+        void this.onMessages(normalizeSingleMessageRecord(value), 'onAddSendMsg'),
       onMsgInfoListUpdate: (value: MsgRecord[] | { msgList: MsgRecord[] }) =>
-        this.onMessages(normalizeMessageRecords(value), 'onMsgInfoListUpdate'),
+        void this.onMessages(normalizeMessageRecords(value), 'onMsgInfoListUpdate'),
       onMsgRecall: (
         value: number | { chatType: number, peerUid: string, seq: string },
         peerUid?: string,
@@ -1825,11 +1829,12 @@ export class QQKernelBridge {
     }
   }
 
-  private onMessages(
+  private async onMessages(
     records: MsgRecord[],
     source: 'onRecvMsg' | 'onAddSendMsg' | 'onMsgInfoListUpdate',
-  ): void {
+  ): Promise<void> {
     log('info', `native message batch source=${source} count=${records.length}`)
+    await this.resolveReplyTargets(records)
     for (const record of records) {
       if (record.chatType !== CHAT_C2C && record.chatType !== CHAT_GROUP) continue
       this.rememberRecordSender(record)
@@ -2293,7 +2298,9 @@ export class QQKernelBridge {
           }],
         })
       } else if (element.elementType === ELEMENT_REPLY && element.replyElement) {
-        replyToId = replyTargetId(record, element.replyElement) ?? replyToId
+        replyToId = this.resolvedReplyTargets.get(record.msgId)
+          ?? replyTargetId(record, element.replyElement)
+          ?? replyToId
       } else if (element.elementType === ELEMENT_MULTI_FORWARD && element.multiForwardMsgElement) {
         parts.push({
           type: 'multi-forward',
@@ -2336,6 +2343,61 @@ export class QQKernelBridge {
         ? this.mapReactionState(record)
         : undefined,
     }
+  }
+
+  private async resolveReplyTargets(records: MsgRecord[]): Promise<void> {
+    const batchBySeq = new Map(records.flatMap((record) => record.msgSeq ? [[record.msgSeq, record]] : []))
+    const cachedBySeq = new Map(records.flatMap((record) => {
+      const conversation = conversationId(record.chatType as 1 | 2, record.peerUid)
+      return (this.messages.get(conversation) ?? []).flatMap((message) =>
+        message.msgSeq ? [[`${conversation}\u0000${message.msgSeq}`, message.id] as const] : [])
+    }))
+    await Promise.all(records.map(async (record) => {
+      if (this.resolvedReplyTargets.has(record.msgId)) return
+      const reply = record.elements?.find((element) => element.replyElement)?.replyElement
+      if (!reply) return
+      const direct = replyTargetId(record, reply)
+      if (direct) {
+        this.resolvedReplyTargets.set(record.msgId, direct)
+        return
+      }
+      const conversation = conversationId(record.chatType as 1 | 2, record.peerUid)
+      const local = reply.replayMsgSeq
+        ? batchBySeq.get(reply.replayMsgSeq)?.msgId
+          ?? cachedBySeq.get(`${conversation}\u0000${reply.replayMsgSeq}`)
+        : undefined
+      if (local) {
+        this.resolvedReplyTargets.set(record.msgId, local)
+        return
+      }
+      if (reply.sourceMsgExpired) return
+      const service = this.requireMsgService()
+      const peer = contact(this.getConversation(conversation))
+      try {
+        const response = reply.replayMsgSeq && reply.replayMsgSeq !== '0' && service.getSourceOfReplyMsg
+          ? await withTimeout(
+            service.getSourceOfReplyMsg(peer, record.msgId, reply.replayMsgSeq),
+            2_000,
+            'QQ reply source request timed out',
+          )
+          : reply.replyMsgClientSeq && reply.replyMsgTime && service.getSourceOfReplyMsgByClientSeqAndTime
+            ? await withTimeout(
+              service.getSourceOfReplyMsgByClientSeqAndTime(
+                peer, record.msgId, reply.replyMsgClientSeq, reply.replyMsgTime,
+              ),
+              2_000,
+              'QQ C2C reply source request timed out',
+            )
+            : undefined
+        const target = response?.result === 0
+          ? response.msgList.find((item) => item.msgSeq === reply.replayMsgSeq)?.msgId
+            ?? response.msgList[0]?.msgId
+          : undefined
+        if (target && target !== '0') this.resolvedReplyTargets.set(record.msgId, target)
+      } catch (error) {
+        log('error', `QQ reply source resolve failed message=${record.msgId} peer=${record.peerUid}`, error)
+      }
+    }))
   }
 
   private mapReactionState(record: MsgRecord): QQReactionState {
@@ -3656,7 +3718,7 @@ function replyTargetId(
   record: MsgRecord,
   reply: NonNullable<MsgElement['replyElement']>,
 ): string | undefined {
-  for (const id of [reply.sourceMsgIdInRecords, reply.replayMsgId]) {
+  for (const id of [reply.sourceMsgIdInRecords, reply.replayMsgId, reply.replayMsgRootMsgId]) {
     if (id && id !== '0') return id
   }
   if (!reply.replayMsgSeq || reply.replayMsgSeq === '0') return

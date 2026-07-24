@@ -82,6 +82,8 @@ export interface MsgElement {
   replyElement?: {
     replayMsgId: string
     replayMsgSeq?: string
+    replayMsgRootSeq?: string
+    replayMsgRootMsgId?: string
     sourceMsgIdInRecords?: string
     replyMsgClientSeq?: string
     replyMsgTime?: string
@@ -290,6 +292,12 @@ export interface KernelMsgService {
     peer: Contact, msgSeq: string, count: number, queryOrder: boolean, includeDeleteMsg: boolean,
   ): Promise<{ result: number, errMsg: string, msgList: MsgRecord[] }>
   getMsgsByMsgId(peer: Contact, msgIds: string[]): Promise<{ result: number, errMsg: string, msgList: MsgRecord[] }>
+  getSourceOfReplyMsg?(
+    peer: Contact, msgId: string, sourceMsgSeq: string,
+  ): Promise<{ result: number, errMsg: string, msgList: MsgRecord[] }>
+  getSourceOfReplyMsgByClientSeqAndTime?(
+    peer: Contact, msgId: string, msgClientSeq: string, msgTime: string,
+  ): Promise<{ result: number, errMsg: string, msgList: MsgRecord[] }>
   getMsgUniqueId?(time: string): string
   getLatestDbMsgs?(peer: Contact, count: number): Promise<{ result: number, errMsg: string, msgList: MsgRecord[] }>
   getFirstUnreadMsgSeq?(peer: Contact): Promise<{ result: number, errMsg: string, seq: string }>

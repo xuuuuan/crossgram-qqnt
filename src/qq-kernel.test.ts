@@ -56,6 +56,10 @@ function fixture() {
     })),
     getMsgsBySeqAndCount: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [message] })),
     getMsgsByMsgId: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [message] })),
+    getSourceOfReplyMsg: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [] as MsgRecord[] })),
+    getSourceOfReplyMsgByClientSeqAndTime: vi.fn(async () => ({
+      result: 0, errMsg: '', msgList: [] as MsgRecord[],
+    })),
     setMsgEmojiLikes: vi.fn(async () => ({ result: 0, errMsg: '' })),
     getMsgEmojiLikesList: vi.fn(async () => ({
       result: 0, errMsg: '', emojiLikesList: [], cookie: '', isLastPage: true, isFirstPage: true,
@@ -368,6 +372,48 @@ describe('QQKernelBridge', () => {
       }),
       expect.objectContaining({ elementType: 1, textElement: expect.objectContaining({ content: '!', atType: 0 }) }),
     ], expect.any(Map))
+  })
+
+  it('resolves received group and C2C reply targets when QQNT only exposes sequence metadata', async () => {
+    const f = fixture()
+    const original = { ...f.message, msgId: 'opaque-source', msgSeq: 'source-seq' }
+    const reply = { ...f.message, msgId: 'reply', msgSeq: 'reply-seq', elements: [{
+      elementType: 7, elementId: 'reply-element', replyElement: {
+        replayMsgId: '0', replayMsgSeq: 'source-seq', sourceMsgIdInRecords: '0',
+        sourceMsgTextElems: [], replyMsgRevokeType: 0,
+        sourceMsgIsIncPic: false, sourceMsgExpired: false,
+      },
+    }, { elementType: 1, elementId: 'text', textElement: { content: 'group reply' } }],
+    } satisfies MsgRecord
+    f.msg.getLatestDbMsgs.mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [reply] })
+    f.msg.getSourceOfReplyMsg.mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [original] })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.getHistory(bridge.getConversation('uid-1715311957'))).resolves.toMatchObject({
+      messages: [{ id: 'reply', replyToId: 'opaque-source' }],
+    })
+    expect(f.msg.getSourceOfReplyMsg).toHaveBeenCalledWith(
+      expect.objectContaining({ peerUid: 'uid-1715311957' }), 'reply', 'source-seq',
+    )
+
+    const c2cReply = { ...reply, msgId: 'c2c-reply', elements: [{
+      elementType: 7, elementId: 'reply-element', replyElement: {
+        replayMsgId: '0', sourceMsgIdInRecords: '0', replyMsgClientSeq: 'client-seq', replyMsgTime: '1700000000',
+        sourceMsgTextElems: [], replyMsgRevokeType: 0,
+        sourceMsgIsIncPic: false, sourceMsgExpired: false,
+      },
+    }] } satisfies MsgRecord
+    f.msg.getSourceOfReplyMsgByClientSeqAndTime.mockResolvedValueOnce({
+      result: 0, errMsg: '', msgList: [original],
+    })
+    f.msg.getMsgsByMsgId.mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [c2cReply] })
+    await expect(bridge.getMessage(bridge.getConversation('uid-1715311957'), 'c2c-reply')).resolves.toMatchObject({
+      id: 'c2c-reply', replyToId: 'opaque-source',
+    })
+    expect(f.msg.getSourceOfReplyMsgByClientSeqAndTime).toHaveBeenCalledWith(
+      expect.objectContaining({ peerUid: 'uid-1715311957' }), 'c2c-reply', 'client-seq', '1700000000',
+    )
   })
 
   it('deletes recalled messages by msgId for both recall callback shapes', async () => {
