@@ -675,8 +675,8 @@ describe('QQKernelBridge', () => {
     const staticPath = join(directory, 'sticker.png')
     const dynamicPath = join(directory, 'sticker.gif.encrypt')
     await writeFile(detailPath, JSON.stringify({
-      isApng: 1,
-      imgs: [{ id: 'emoji-a', name: 'Wave', wWidthInPhone: 320, wHeightInPhone: 180 }],
+      isApng: 0,
+      imgs: [{ id: 'emoji-a', name: 'Wave', wWidthInPhone: 320, wHeightInPhone: 180, isApng: 1 }],
     }))
     await writeFile(staticPath, Buffer.from('static'))
     const gif = Buffer.from('GIF89a-decrypted-sticker')

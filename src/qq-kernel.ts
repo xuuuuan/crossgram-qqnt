@@ -591,10 +591,20 @@ export class QQKernelBridge {
     if (!jsonPath || !existsSync(jsonPath)) throw new Error(`QQ sticker pack ${packId} has no detail JSON`)
     const detail = JSON.parse(await readFile(jsonPath, 'utf8')) as {
       isApng?: number
-      imgs?: Array<{ id?: string, name?: string, wWidthInPhone?: number, wHeightInPhone?: number }>
+      imgs?: Array<{
+        id?: string
+        name?: string
+        wWidthInPhone?: number
+        wHeightInPhone?: number
+        isApng?: number | boolean
+      }>
     }
     const rows = (detail.imgs ?? []).filter((item): item is {
-      id: string, name?: string, wWidthInPhone?: number, wHeightInPhone?: number
+      id: string
+      name?: string
+      wWidthInPhone?: number
+      wHeightInPhone?: number
+      isApng?: number | boolean
     } => Boolean(item.id))
     const ids = rows.map((item) => item.id)
     const [staticPaths, dynamicPaths, keys] = await Promise.all([
@@ -603,16 +613,18 @@ export class QQKernelBridge {
       service.getMarketEmoticonEncryptKeys?.(epId, ids),
     ])
     const keyMap = keys?.result === 0 ? keys.encryptKeyMap : new Map<string, string>()
-    const animated = detail.isApng === 1 || info?.tabType === 3
     const stickers = rows.map((item): QQSticker => {
+      const staticPath = staticPaths.get(item.id)?.path || undefined
+      const dynamicPath = dynamicPaths.get(item.id)?.path || undefined
+      const animated = detail.isApng === 1 || Boolean(item.isApng) || info?.tabType === 3 || Boolean(dynamicPath)
       const reference: QQStickerReference = {
         kind: 'market', packageId: packId, stickerId: item.id,
         name: item.name || info?.tabName || '[表情]', key: keyMap.get(item.id) ?? '',
         width: positiveInteger(item.wWidthInPhone, 240),
         height: positiveInteger(item.wHeightInPhone, 240),
         animated,
-        staticPath: staticPaths.get(item.id)?.path || undefined,
-        dynamicPath: dynamicPaths.get(item.id)?.path || undefined,
+        staticPath,
+        dynamicPath,
       }
       const sticker: QQSticker = {
         stickerId: marketStickerId(packId, item.id), packId, title: item.name || info.tabName,
