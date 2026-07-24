@@ -3145,10 +3145,11 @@ function matchesElementKind(element: MsgElement, kind: 'image' | 'file' | 'stick
 function imageMimeType(path: string, animated: boolean): string {
   const extension = extname(path).toLowerCase()
   if (extension === '.gif') return 'image/gif'
+  if (animated) return 'image/apng'
   if (extension === '.webp') return 'image/webp'
   if (extension === '.jpg' || extension === '.jpeg') return 'image/jpeg'
   if (extension === '.bmp') return 'image/bmp'
-  return animated ? 'image/apng' : 'image/png'
+  return 'image/png'
 }
 
 function isAnimatedPicture(picture: NonNullable<MsgElement['picElement']>): boolean {

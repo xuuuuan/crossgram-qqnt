@@ -762,7 +762,7 @@ describe('QQKernelBridge', () => {
     f.message.elements = [{
       elementType: 2, elementId: 'animated-picture',
       picElement: {
-        fileName: 'expression.gif', fileSize: '4', picWidth: 32, picHeight: 32,
+        fileName: 'expression.jpg', fileSize: '4', picWidth: 32, picHeight: 32,
         md5HexStr: 'animated-md5', fileUuid: 'animated-uuid', fileSubId: '', picSubType: 0, picType: 2000,
       },
     }]
@@ -771,7 +771,7 @@ describe('QQKernelBridge', () => {
 
     const [message] = (await bridge.getHistory(bridge.getConversation('uid-1715311957'))).messages
     expect(message.parts).toMatchObject([{
-      type: 'sticker', sticker: { format: 'animated', mimeType: 'image/gif' },
+      type: 'sticker', sticker: { format: 'animated', mimeType: 'image/apng' },
     }])
   })
 
