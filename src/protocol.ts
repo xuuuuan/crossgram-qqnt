@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 11
+export const PROTOCOL_VERSION = 12
 
 export type QQChatType = 1 | 2
 
@@ -257,6 +257,21 @@ export interface HistoryQuery {
   afterId?: string
   /** Native QQ sequence used only to open a chat around its unread boundary. */
   aroundUnreadSeq?: string
+}
+
+export interface SearchQuery {
+  query: string
+  cursor?: string
+  limit?: number
+  fromUserId?: string
+  minTimestamp?: number
+  maxTimestamp?: number
+  mediaKind?: 'image' | 'file'
+}
+
+export interface SearchPage {
+  messages: QQMessage[]
+  nextCursor?: string
 }
 
 export interface MemberPage {

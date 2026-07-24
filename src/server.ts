@@ -229,7 +229,7 @@ export class QQBridgeServer {
       return
     }
 
-    const conversationMatch = /^\/v1\/conversations\/([^/]+)(?:\/(history|members))?$/.exec(path)
+    const conversationMatch = /^\/v1\/conversations\/([^/]+)(?:\/(history|members|search))?$/.exec(path)
     if (request.method === 'GET' && conversationMatch) {
       const conversation = this.bridge.getConversation(decodeURIComponent(conversationMatch[1]))
       if (!conversationMatch[2]) {
@@ -245,6 +245,23 @@ export class QQBridgeServer {
           limit: numberParam(url, 'limit', 50),
         })
         log('info', `HTTP API history id=${requestId} conversation=${conversation.id} count=${page.messages.length} next=${page.nextCursor ?? ''}`)
+        json(response, 200, page)
+      } else if (conversationMatch[2] === 'search') {
+        const requestedKind = url.searchParams.get('mediaKind')
+        if (requestedKind && requestedKind !== 'image' && requestedKind !== 'file') {
+          json(response, 400, { error: 'invalid mediaKind' })
+          return
+        }
+        const page = await this.bridge.searchMessages(conversation, {
+          query: url.searchParams.get('q') ?? '',
+          cursor: url.searchParams.get('cursor') ?? undefined,
+          limit: numberParam(url, 'limit', 50),
+          fromUserId: url.searchParams.get('fromUserId') ?? undefined,
+          minTimestamp: optionalNumberParam(url, 'minTimestamp'),
+          maxTimestamp: optionalNumberParam(url, 'maxTimestamp'),
+          mediaKind: (requestedKind as 'image' | 'file' | null) ?? undefined,
+        })
+        log('info', `HTTP API search id=${requestId} conversation=${conversation.id} query=${JSON.stringify(url.searchParams.get('q') ?? '')} count=${page.messages.length} next=${page.nextCursor ?? ''}`)
         json(response, 200, page)
       } else {
         const page = await this.bridge.getMembers(
@@ -441,6 +458,14 @@ function requiredParam(url: URL, name: string): string {
 function numberParam(url: URL, name: string, fallback: number): number {
   const value = Number(url.searchParams.get(name) ?? fallback)
   if (!Number.isFinite(value)) throw new Error(`query parameter ${name} must be numeric`)
+  return value
+}
+
+function optionalNumberParam(url: URL, name: string): number | undefined {
+  const raw = url.searchParams.get(name)
+  if (raw === null || raw === '') return
+  const value = Number(raw)
+  if (!Number.isFinite(value)) throw new Error(`invalid ${name}`)
   return value
 }
 

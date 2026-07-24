@@ -493,6 +493,40 @@ export interface KernelRecentService {
   getRecentContactInfos(): Promise<{ result: number, errMsg: string, relation: RecentContactInfo[] }>
 }
 
+export interface SearchChatMsgsParams {
+  chatInfo: { chatType: number, peerUid: string }
+  searchFields: number
+  filterMsgType: Array<{ type: number, subType: number[] }>
+  filterSendersUid: string[]
+  filterMsgFromTime: string
+  filterMsgToTime: string
+  pageLimit: number
+}
+
+export interface SearchMsgItem {
+  msgId: string
+  msgSeq: string
+  msgTime: string
+  senderUid: string
+  senderUin: string
+  senderNick: string
+  msgRecord?: MsgRecord
+}
+
+export interface SearchMsgKeywordsResult {
+  searchId: number
+  hasMore: boolean
+  resultItems: SearchMsgItem[]
+}
+
+export interface KernelSearchService {
+  addKernelSearchListener(listener: unknown): string
+  removeKernelSearchListener(listenerId: string): void
+  searchChatMsgs(keywords: string[], params: SearchChatMsgsParams): number
+  searchMoreChatMsgs(searchId: number): void
+  cancelSearchChatMsgs(searchId: number, code: number, reason: string): void
+}
+
 export interface KernelBuddyService {
   addKernelBuddyListener(listener: unknown): string
   removeKernelBuddyListener(listenerId: string): void
@@ -531,6 +565,7 @@ export interface KernelSession {
   getBuddyService(): KernelBuddyService
   getProfileService?(): KernelProfileService
   getGroupService(): KernelGroupService
+  getSearchService?(): KernelSearchService
   getRichMediaService(): KernelRichMediaService
   getAvatarService?(): {
     getAvatarPath(uid: string, size: number): string
@@ -552,6 +587,7 @@ export interface KernelModule {
   NodeIKernelProfileListener?: new (handlers: Record<string, (...args: never[]) => unknown>) => unknown
   NodeIKernelGroupListener?: new (handlers: Record<string, (...args: never[]) => unknown>) => unknown
   NodeIKernelRecentContactListener?: new (handlers: Record<string, (...args: never[]) => unknown>) => unknown
+  NodeIKernelSearchListener?: new (handlers: Record<string, (...args: never[]) => unknown>) => unknown
 }
 
 export interface InitSessionConfig {
