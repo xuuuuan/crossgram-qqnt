@@ -8,18 +8,27 @@ import { log, logPath } from './log.js'
 import { QQKernelBridge } from './qq-kernel.js'
 import { QQBridgeServer } from './server.js'
 
-const bridge = new QQKernelBridge()
-const server = new QQBridgeServer(bridge, {
-  host: process.env.QQNT_BRIDGE_HOST ?? '127.0.0.1',
-  port: Number(process.env.QQNT_BRIDGE_PORT ?? 18767),
-  token: process.env.QQNT_BRIDGE_TOKEN,
-})
+const processType = (process as NodeJS.Process & { type?: string }).type
+const bootstrapKey = Symbol.for('qqnt-bridge.bootstrap')
+const bootstrapState = globalThis as typeof globalThis & { [bootstrapKey]?: boolean }
 
-installKernelRequireHook()
-void startServer()
-log('info', `injected; log file: ${logPath}`)
+// NODE_OPTIONS is inherited by Electron child processes. Only initialize in
+// Electron's browser (main) process; plain Node remains useful for diagnostics.
+if ((processType === undefined || processType === 'browser') && !bootstrapState[bootstrapKey]) {
+  bootstrapState[bootstrapKey] = true
+  const bridge = new QQKernelBridge()
+  const server = new QQBridgeServer(bridge, {
+    host: process.env.QQNT_BRIDGE_HOST ?? '127.0.0.1',
+    port: Number(process.env.QQNT_BRIDGE_PORT ?? 18767),
+    token: process.env.QQNT_BRIDGE_TOKEN,
+  })
 
-async function startServer(): Promise<void> {
+  installKernelRequireHook(bridge)
+  void startServer(server)
+  log('info', `injected processType=${processType ?? 'node'} pid=${process.pid}; log file: ${logPath}`)
+}
+
+async function startServer(server: QQBridgeServer): Promise<void> {
   while (true) {
     try {
       await server.start()
@@ -38,7 +47,7 @@ async function startServer(): Promise<void> {
  * session constructor is a construct proxy. The proxy wraps each new session
  * instance and observes init() without mutating the native object.
  */
-function installKernelRequireHook(): void {
+function installKernelRequireHook(bridge: QQKernelBridge): void {
   type Loader = (request: string, parent: NodeModule | null, isMain: boolean) => unknown
   const moduleWithLoad = Module as unknown as { _load: Loader }
   const originalLoad = moduleWithLoad._load
@@ -50,7 +59,7 @@ function installKernelRequireHook(): void {
     if (!isKernelModule(loaded)) return loaded
     const cached = wrappedModules.get(loaded)
     if (cached) return cached
-    const wrapped = wrapKernelModule(loaded)
+    const wrapped = wrapKernelModule(loaded, bridge)
     wrappedModules.set(loaded, wrapped)
     log('info', `wrapped QQNT kernel module requested as ${request}`)
     return wrapped
@@ -66,7 +75,7 @@ function installKernelRequireHook(): void {
       const raw = nativeModule.exports
       let wrapped = wrappedModules.get(raw)
       if (!wrapped) {
-        wrapped = wrapKernelModule(raw)
+        wrapped = wrapKernelModule(raw, bridge)
         wrappedModules.set(raw, wrapped)
       }
       nativeModule.exports = wrapped
@@ -82,14 +91,14 @@ function isKernelModule(value: unknown): value is KernelModule & object {
   return typeof candidate.NodeIQQNTWrapperSession === 'function'
 }
 
-function wrapKernelModule(kernel: KernelModule): KernelModule {
+function wrapKernelModule(kernel: KernelModule, bridge: QQKernelBridge): KernelModule {
   const NativeSession = kernel.NodeIQQNTWrapperSession as unknown as new (...args: unknown[]) => KernelSession
   const wrappedSessions = new WeakMap<object, KernelSession>()
   const wrapOnce = (session: KernelSession): KernelSession => {
     const object = session as object
     const cached = wrappedSessions.get(object)
     if (cached) return cached
-    const wrapped = wrapSession(kernel, session)
+    const wrapped = wrapSession(kernel, session, bridge)
     wrappedSessions.set(object, wrapped)
     return wrapped
   }
@@ -122,7 +131,7 @@ function wrapKernelModule(kernel: KernelModule): KernelModule {
   return Object.defineProperties({}, descriptors) as KernelModule
 }
 
-function wrapSession(kernel: KernelModule, nativeSession: KernelSession): KernelSession {
+function wrapSession(kernel: KernelModule, nativeSession: KernelSession, bridge: QQKernelBridge): KernelSession {
   let attached = false
   let msgServiceFacade: KernelMsgService | undefined
   let buddyServiceFacade: KernelBuddyService | undefined

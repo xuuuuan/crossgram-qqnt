@@ -4,7 +4,9 @@ import { dirname, join } from 'node:path'
 import { inspect } from 'node:util'
 
 export const logPath = process.env.QQNT_BRIDGE_LOG
-  ?? join(homedir(), 'Library', 'Logs', 'qqnt-bridge.log')
+  ?? (process.platform === 'win32'
+    ? join(process.env.LOCALAPPDATA ?? homedir(), 'qqnt-bridge', 'qqnt-bridge.log')
+    : join(homedir(), 'Library', 'Logs', 'qqnt-bridge.log'))
 
 export const slowHttpLogPath = process.env.QQNT_BRIDGE_SLOW_HTTP_LOG
   ?? join(dirname(logPath), 'qqnt-bridge-slow-http.log')
