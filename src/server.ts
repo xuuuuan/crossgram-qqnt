@@ -329,15 +329,18 @@ export class QQBridgeServer {
       'x-accel-buffering': 'no',
     })
     response.flushHeaders()
-    const queue = this.bridge.subscribe()
-    log('info', `SSE subscriber connected request=${requestId} subscribers=${this.bridge.events.size}`)
+    const lastEventId = stringHeader(request, 'last-event-id')
+    const queue = this.bridge.subscribe(lastEventId)
+    log('info', `SSE subscriber connected request=${requestId} lastEventId=${JSON.stringify(lastEventId ?? '')} subscribers=${this.bridge.events.size}`)
     const heartbeat = setInterval(() => response.write(': heartbeat\n\n'), 15_000)
     const close = () => this.bridge.unsubscribe(queue)
     request.once('close', close)
     try {
       for await (const event of queue) {
-        log('info', `SSE event write request=${requestId} ${wireEventSummary(event)}`)
-        if (!response.write(`data: ${JSON.stringify(event)}\n\n`)) await once(response, 'drain')
+        const eventId = this.bridge.eventId(event)
+        log('info', `SSE event write request=${requestId} ${wireEventSummary(event)} streamEventId=${eventId ?? ''}`)
+        const frame = `${eventId ? `id: ${eventId}\n` : ''}data: ${JSON.stringify(event)}\n\n`
+        if (!response.write(frame)) await once(response, 'drain')
       }
     } finally {
       clearInterval(heartbeat)
@@ -364,6 +367,11 @@ function isLongLivedRequest(target: string): boolean {
 
 function wireEventSummary(event: { type: string, conversation?: { id?: string }, message?: { id?: string }, eventId?: string }): string {
   return `type=${event.type} conversation=${event.conversation?.id ?? ''} message=${event.message?.id ?? ''} eventId=${event.eventId ?? ''}`
+}
+
+function stringHeader(request: IncomingMessage, name: string): string | undefined {
+  const value = request.headers[name]
+  return typeof value === 'string' && value ? value : undefined
 }
 
 function json(response: ServerResponse, status: number, value: unknown): void {

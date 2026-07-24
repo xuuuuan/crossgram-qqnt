@@ -49,6 +49,9 @@ export interface QQKernelOptions {
 
 export class QQKernelBridge {
   readonly events = new Set<AsyncQueue<QQEvent>>()
+  private readonly recentEvents: Array<{ id: string, event: QQEvent }> = []
+  private readonly eventIds = new WeakMap<object, string>()
+  private eventSequence = 0
   private session?: KernelSession
   private kernel?: KernelModule
   private config?: InitSessionConfig
@@ -194,6 +197,7 @@ export class QQKernelBridge {
     this.recentService = undefined
     this.avatarService = undefined
     this.session = undefined
+    this.recentEvents.splice(0)
     for (const pending of this.pendingMessages.values()) pending.reject(new Error('QQNT session detached'))
     for (const accepted of this.pendingAcceptances.values()) accepted.resolve()
     for (const item of this.pendingUnassigned) {
@@ -216,10 +220,20 @@ export class QQKernelBridge {
     this.pendingMemberPages.clear()
   }
 
-  subscribe(): AsyncQueue<QQEvent> {
+  subscribe(lastEventId?: string): AsyncQueue<QQEvent> {
     const queue = new AsyncQueue<QQEvent>()
     this.events.add(queue)
+    if (lastEventId) {
+      const cursor = this.recentEvents.findIndex((item) => item.id === lastEventId)
+      const replay = cursor >= 0 ? this.recentEvents.slice(cursor + 1) : this.recentEvents
+      log(cursor >= 0 ? 'info' : 'warn', `SSE replay requested lastEventId=${JSON.stringify(lastEventId)} cursorFound=${cursor >= 0} replay=${replay.length} buffered=${this.recentEvents.length}`)
+      for (const item of replay) queue.push(item.event)
+    }
     return queue
+  }
+
+  eventId(event: QQEvent): string | undefined {
+    return this.eventIds.get(event)
   }
 
   unsubscribe(queue: AsyncQueue<QQEvent>): void {
@@ -1836,7 +1850,11 @@ export class QQKernelBridge {
   }
 
   private dispatch(event: QQEvent): void {
-    log('info', `bridge event dispatch ${eventSummary(event)} subscribers=${this.events.size}`)
+    const eventId = String(++this.eventSequence)
+    this.eventIds.set(event, eventId)
+    this.recentEvents.push({ id: eventId, event })
+    if (this.recentEvents.length > 2_048) this.recentEvents.splice(0, this.recentEvents.length - 2_048)
+    log('info', `bridge event dispatch ${eventSummary(event)} eventId=${eventId} subscribers=${this.events.size}`)
     for (const queue of this.events) queue.push(event)
   }
 

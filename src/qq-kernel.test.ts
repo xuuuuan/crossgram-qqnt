@@ -872,6 +872,27 @@ describe('QQKernelBridge', () => {
     })
   })
 
+  it('replays events emitted after the last acknowledged SSE event', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const firstQueue = bridge.subscribe()
+    const firstEvents = firstQueue[Symbol.asyncIterator]()
+
+    f.emitReceived([{ ...f.message, msgId: 'replay-1', msgSeq: '101' }])
+    const first = await firstEvents.next()
+    expect(first.done).toBe(false)
+    const lastEventId = bridge.eventId(first.value!)
+    expect(lastEventId).toBeTruthy()
+    bridge.unsubscribe(firstQueue)
+
+    f.emitReceived([{ ...f.message, msgId: 'replay-2', msgSeq: '102' }])
+    const replayed = bridge.subscribe(lastEventId)[Symbol.asyncIterator]()
+    await expect(replayed.next()).resolves.toMatchObject({
+      value: { type: 'message', message: { id: 'replay-2', msgSeq: '102' } },
+    })
+  })
+
   it('keeps a group member personal name and alias separate and adds a qlogo avatar', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
