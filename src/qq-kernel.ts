@@ -2790,15 +2790,22 @@ export class QQKernelBridge {
     if (service.fetchMarketEmoticonAioImage) {
       const result = await service.fetchMarketEmoticonAioImage({
         epId, eId: reference.stickerId, name: reference.name, encryptKey: reference.key,
-        width: reference.width, height: reference.height, jobType: reference.animated ? 1 : 0,
+        width: reference.width, height: reference.height, jobType: 0,
       })
       if (result.result !== 0) throw new Error(`fetchMarketEmoticonAioImage: ${result.errMsg} (${result.result})`)
-      const downloaded = service.getMarketEmoticonPath
-        ? (await this.getMarketEmoticonPaths(epId, [reference.stickerId], 5)).get(reference.stickerId)
-        : undefined
-      if (reference.animated && downloaded?.path && existsSync(downloaded.path)) {
-        reference.dynamicPath = downloaded.path
-        return { path: downloaded.path, encrypted: true, animated: true }
+      if (service.getMarketEmoticonPath) {
+        // Telegram Desktop commonly prefetches every document in a set at
+        // once. QQ serializes those downloads internally, so a later item can
+        // finish well after fetchMarketEmoticonAioImage has accepted it.
+        for (let attempt = 0; attempt < 300; attempt++) {
+          const downloaded = (await this.getMarketEmoticonPaths(epId, [reference.stickerId], 5))
+            .get(reference.stickerId)
+          if (reference.animated && downloaded?.path && existsSync(downloaded.path)) {
+            reference.dynamicPath = downloaded.path
+            return { path: downloaded.path, encrypted: true, animated: true }
+          }
+          if (attempt < 299) await delay(100)
+        }
       }
     }
     let staticPath = reference.staticPath

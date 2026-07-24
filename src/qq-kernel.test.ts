@@ -738,6 +738,14 @@ describe('QQKernelBridge', () => {
     )
     expect(sent.parts).toMatchObject([{ type: 'sticker', sticker: { stickerId: 'market:42:emoji-a' } }])
 
+    await rm(dynamicPath)
+    f.msg.fetchMarketEmoticonAioImage.mockImplementation(async () => {
+      await writeFile(dynamicPath, gif.map((byte, index) => index % 50 < 20 ? ~byte : byte))
+      return { result: 0, errMsg: '' }
+    })
+    expect(await readStream((await bridge.openSticker(pack!.stickers[0].reference)).stream)).toEqual(gif)
+    expect(f.msg.fetchMarketEmoticonAioImage).toHaveBeenCalledWith(expect.objectContaining({ jobType: 0 }))
+
     // A received market sticker can belong to a pack that is not installed and
     // therefore absent from the bottom emoji catalog. Resolve it directly by
     // its opaque package ID through the current QQ API.
