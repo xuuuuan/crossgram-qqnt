@@ -300,6 +300,8 @@ export interface FileTransNotifyInfo {
   fileSrvErrCode?: string
   clientMsg?: string
   step?: number
+  fileDownType: number
+  thumbSize: number
   filePath: string
   totalSize: string
   trasferStatus: number
@@ -370,6 +372,20 @@ export interface KernelMsgService {
     file_uuid: string
     needCreate: boolean
   }): string
+  downloadRichMedia(request: {
+    fileModelId: string
+    downSourceType: number
+    /** Older QQNT builds used this spelling alongside downSourceType. */
+    downloadSourceType?: number
+    triggerType: number
+    msgId: string
+    chatType: number
+    peerUid: string
+    elementId: string
+    thumbSize: number
+    downloadType: number
+    filePath: string
+  }): void
   setMsgEmojiLikes?(
     peer: Contact,
     msgSeq: string,
@@ -507,23 +523,6 @@ export interface KernelGroupService {
 
 export interface KernelRichMediaService {
   getRichMediaFileDir?(elementType: number, downType: number, isTemp: boolean): string
-  downloadFile(fileInfo: {
-    fileModelId: string
-    msgId: string
-    elemId: string
-    uuid: string
-    subId: string
-    fileName: string
-    fileSize: string
-    msgTime: string
-    peerUid: string
-    chatType: number
-    md5: string
-    md510m: string
-    sha: string
-    sha3: string
-    bizType?: number
-  }, downloadType: number, thumbSize: number, savePath: string): void
 }
 
 export interface KernelSession {

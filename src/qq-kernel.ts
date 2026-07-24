@@ -30,6 +30,8 @@ const SEND_FROM_SELF = new Set([1, 2])
 const MEMBER_ADMIN = 3
 const MEMBER_OWNER = 4
 const MEDIA_PATH_CACHE_LIMIT = 1_024
+const MEDIA_DOWNLOAD_ORIGINAL = 1
+const MEDIA_THUMB_SIZE_ORIGINAL = 0
 // Keep this in sync with Telegram's account-level reaction catalog. QQ emoji
 // outside this set are exposed as custom reactions backed by QQ's own icon.
 const TELEGRAM_STANDARD_REACTIONS = new Set([
@@ -1433,14 +1435,14 @@ export class QQKernelBridge {
   async downloadFile(locator: QQMediaLocator): Promise<Readable> {
     if (locator.avatarUin) return this.downloadQlogoAvatar(locator.avatarUin)
     let path = locator.filePath
-    if (locator.messageId.startsWith('avatar:')) {
+    if (locator.messageId.startsWith('reaction:')) {
+      if (!path || !existsSync(path)) throw new Error(`QQ reaction resource is unavailable: ${locator.fileName}`)
+    } else if (locator.messageId.startsWith('avatar:')) {
       if (!path || !existsSync(path)) path = await this.refreshAvatarFile(locator)
-    } else if (locator.kind === 'image') {
-      // QQ can publish sourcePath before it has finished writing the file.
-      // Always ask the native transfer service for images and trust its
-      // onRichMediaDownloadComplete success notification as the boundary.
-      path = await this.downloadMedia(locator)
-    } else if (!path || !existsSync(path)) {
+    } else if (locator.kind === 'image' || !path || !existsSync(path)) {
+      // A message sourcePath can be published while QQ is still writing it.
+      // Ask the message service for the original and use its precisely matched
+      // completion event as the only readiness boundary.
       path = await this.downloadMedia(locator)
     }
     const size = statSync(path).size
@@ -1472,49 +1474,46 @@ export class QQKernelBridge {
       this.downloadedMediaPaths.delete(identity)
     }
 
-    const active = this.activeMediaDownloads.get(identity)
+    const transferKey = mediaDownloadKey(locator)
+    const active = this.activeMediaDownloads.get(transferKey)
     if (active) {
-      log('info', `native API join name=downloadFile message=${locator.messageId} element=${locator.elementId} identity=${identity}`)
+      log('info', `native API join name=downloadRichMedia message=${locator.messageId} element=${locator.elementId} transfer=${transferKey} identity=${identity}`)
       return active
     }
 
     const download = this.startMediaDownload(locator)
-    this.activeMediaDownloads.set(identity, download)
+    this.activeMediaDownloads.set(transferKey, download)
     try {
       const path = await download
       this.rememberDownloadedMediaPath(identity, path)
       return path
     } finally {
-      if (this.activeMediaDownloads.get(identity) === download) this.activeMediaDownloads.delete(identity)
+      if (this.activeMediaDownloads.get(transferKey) === download) this.activeMediaDownloads.delete(transferKey)
     }
   }
 
   private async startMediaDownload(locator: QQMediaLocator): Promise<string> {
-    const key = `${locator.messageId}:${locator.elementId}`
+    const key = mediaDownloadKey(locator)
     const pending = deferred<FileTransNotifyInfo>()
     this.pendingDownloads.set(key, pending)
-    const directory = join(this.tempPath, 'downloads')
-    mkdirSync(directory, { recursive: true })
-    log('info', `native API start name=downloadFile message=${locator.messageId} element=${locator.elementId} peer=${locator.peerUid} kind=${locator.kind} directory=${JSON.stringify(directory)}`)
+    log('info', `native API start name=downloadRichMedia message=${locator.messageId} element=${locator.elementId} peer=${locator.peerUid} kind=${locator.kind} downloadType=${MEDIA_DOWNLOAD_ORIGINAL} thumbSize=${MEDIA_THUMB_SIZE_ORIGINAL}`)
     let completed: FileTransNotifyInfo
     try {
-      this.requireSession().getRichMediaService().downloadFile({
-        fileModelId: '',
+      this.requireSession().getMsgService().downloadRichMedia({
+        fileModelId: '0',
+        downSourceType: 0,
+        // NapCat passes both names so the same request works across the
+        // transition that renamed this field in QQNT.
+        downloadSourceType: 0,
+        triggerType: 1,
         msgId: locator.messageId,
-        elemId: locator.elementId,
-        uuid: locator.fileUuid ?? '',
-        subId: locator.fileSubId ?? '',
-        fileName: locator.fileName,
-        fileSize: locator.fileSize ?? '0',
-        msgTime: '0',
-        peerUid: locator.peerUid,
         chatType: locator.chatType,
-        md5: locator.md5 ?? '',
-        md510m: '',
-        sha: locator.sha ?? '',
-        sha3: locator.sha3 ?? '',
-        bizType: locator.fileBizId,
-      }, 1, 0, directory)
+        peerUid: locator.peerUid,
+        elementId: locator.elementId,
+        thumbSize: MEDIA_THUMB_SIZE_ORIGINAL,
+        downloadType: MEDIA_DOWNLOAD_ORIGINAL,
+        filePath: '',
+      })
       completed = await withTimeout(pending.promise, this.downloadTimeoutMs, `QQ media download timed out: ${key}`)
     } finally {
       if (this.pendingDownloads.get(key) === pending) this.pendingDownloads.delete(key)
@@ -1526,7 +1525,7 @@ export class QQKernelBridge {
       throw new Error(`QQ media download completed with unexpected status: ${completed.trasferStatus}`)
     }
     if (!completed.filePath || !existsSync(completed.filePath)) throw new Error('QQ media download completed without a file')
-    log('info', `native API complete name=downloadFile message=${locator.messageId} element=${locator.elementId} status=${completed.trasferStatus} error=${completed.fileErrCode} path=${JSON.stringify(completed.filePath)} size=${completed.totalSize}`)
+    log('info', `native API complete name=downloadRichMedia message=${locator.messageId} element=${locator.elementId} status=${completed.trasferStatus} error=${completed.fileErrCode} path=${JSON.stringify(completed.filePath)} size=${completed.totalSize}`)
     return completed.filePath
   }
 
@@ -2050,10 +2049,11 @@ export class QQKernelBridge {
   }
 
   private onDownload(info: FileTransNotifyInfo): void {
-    log('info', `native media download event message=${info.msgId} element=${info.msgElementId} status=${info.trasferStatus} error=${info.fileErrCode} server=${info.fileSrvErrCode ?? ''} path=${JSON.stringify(info.filePath || '')} size=${info.totalSize}`)
-    const pending = this.pendingDownloads.get(`${info.msgId}:${info.msgElementId}`)
+    const key = mediaDownloadEventKey(info)
+    log('info', `native media download event message=${info.msgId} element=${info.msgElementId} downloadType=${info.fileDownType} thumbSize=${info.thumbSize} status=${info.trasferStatus} error=${info.fileErrCode} server=${info.fileSrvErrCode ?? ''} path=${JSON.stringify(info.filePath || '')} size=${info.totalSize}`)
+    const pending = this.pendingDownloads.get(key)
     if (!pending) return
-    this.pendingDownloads.delete(`${info.msgId}:${info.msgElementId}`)
+    this.pendingDownloads.delete(key)
     pending.resolve(info)
   }
 
@@ -3934,6 +3934,16 @@ function mediaDownloadIdentity(locator: QQMediaLocator): string {
   if (locator.sha) return `sha:${locator.sha.toLowerCase()}`
   if (locator.fileUuid) return `uuid:${locator.fileUuid}`
   return `message:${locator.messageId}:element:${locator.elementId}`
+}
+
+function mediaDownloadKey(locator: QQMediaLocator): string {
+  return JSON.stringify([
+    locator.messageId, locator.elementId, MEDIA_DOWNLOAD_ORIGINAL, MEDIA_THUMB_SIZE_ORIGINAL,
+  ])
+}
+
+function mediaDownloadEventKey(info: FileTransNotifyInfo): string {
+  return JSON.stringify([info.msgId, info.msgElementId, info.fileDownType, info.thumbSize])
 }
 
 function safeRemoveListener(service: string, id: string, remove: () => void): void {

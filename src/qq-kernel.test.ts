@@ -56,6 +56,7 @@ function fixture() {
       result: 0, errMsg: '', contactMsgBoxInfos: [] as ContactMsgBoxInfo[],
     })),
     getRichMediaFilePath: vi.fn(() => ''),
+    downloadRichMedia: vi.fn(),
     getMsgsBySeqAndCount: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [message] })),
     getMsgsByMsgId: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [message] })),
     getSourceOfReplyMsg: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [] as MsgRecord[] })),
@@ -137,7 +138,7 @@ function fixture() {
       },
     })),
   }
-  const richMedia = { downloadFile: vi.fn() }
+  const richMedia = {}
   const uix = {
     getUid: vi.fn(async (uins: Set<string>) => ({ uidInfo: new Map([...uins].flatMap((uin) => {
       if (uin === '1715311957') return [[uin, 'uid-1715311957']]
@@ -1491,6 +1492,25 @@ describe('QQKernelBridge', () => {
     }
   })
 
+  it('streams local reaction resources without enqueueing a native message download', async () => {
+    const f = fixture()
+    const directory = await mkdtemp(join(tmpdir(), 'qqnt-reaction-resource-'))
+    tempPaths.push(directory)
+    const resourcePath = join(directory, 'reaction.png')
+    await writeFile(resourcePath, 'local-reaction')
+    const bridge = new QQKernelBridge({ tempPath: directory })
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    const stream = await bridge.downloadFile({
+      messageId: `reaction:${resourcePath}`, elementId: `reaction:${resourcePath}`,
+      chatType: 1, peerUid: '', kind: 'image', fileName: 'reaction.png',
+      filePath: resourcePath, fileSize: '14',
+    })
+
+    expect((await readStream(stream)).toString()).toBe('local-reaction')
+    expect(f.msg.downloadRichMedia).not.toHaveBeenCalled()
+  })
+
   it('coalesces concurrent native media downloads and reuses the completed path', async () => {
     const f = fixture()
     const directory = await mkdtemp(join(tmpdir(), 'qqnt-media-singleflight-'))
@@ -1507,14 +1527,20 @@ describe('QQKernelBridge', () => {
 
     const pendingStreams = Promise.all([
       bridge.downloadFile(locator),
-      bridge.downloadFile(locator),
+      bridge.downloadFile({ ...locator, md5: 'different-locator-snapshot' }),
       bridge.downloadFile(locator),
       bridge.downloadFile(locator),
     ])
-    await vi.waitFor(() => expect(f.richMedia.downloadFile).toHaveBeenCalledOnce())
+    await vi.waitFor(() => expect(f.msg.downloadRichMedia).toHaveBeenCalledOnce())
+    expect(f.msg.downloadRichMedia).toHaveBeenCalledWith({
+      fileModelId: '0', downSourceType: 0, downloadSourceType: 0, triggerType: 1,
+      msgId: locator.messageId, chatType: locator.chatType, peerUid: locator.peerUid,
+      elementId: locator.elementId, thumbSize: 0, downloadType: 1, filePath: '',
+    })
     f.emitDownload({
       fileModelId: '', msgId: locator.messageId, msgElementId: locator.elementId,
-      fileErrCode: '0', fileErrMsg: '', filePath: downloadedPath, totalSize: '16', trasferStatus: 4,
+      fileErrCode: '0', fileErrMsg: '', fileDownType: 1, thumbSize: 0,
+      filePath: downloadedPath, totalSize: '16', trasferStatus: 4,
     })
 
     const files = await Promise.all((await pendingStreams).map(readStream))
@@ -1525,7 +1551,45 @@ describe('QQKernelBridge', () => {
       md5: 'abcdef',
     })
     expect((await readStream(sameContent)).toString()).toBe('abcdefghijklmnop')
-    expect(f.richMedia.downloadFile).toHaveBeenCalledOnce()
+    expect(f.msg.downloadRichMedia).toHaveBeenCalledOnce()
+  })
+
+  it('does not resolve an original download with a concurrent thumbnail callback', async () => {
+    const f = fixture()
+    const directory = await mkdtemp(join(tmpdir(), 'qqnt-media-callback-match-'))
+    tempPaths.push(directory)
+    const thumbnailPath = join(directory, 'thumbnail.jpg')
+    const originalPath = join(directory, 'original.jpg')
+    await writeFile(thumbnailPath, 'thumb')
+    await writeFile(originalPath, 'original')
+    const bridge = new QQKernelBridge({ tempPath: directory })
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const locator = {
+      messageId: 'parallel-message', elementId: 'parallel-element', chatType: 2 as const,
+      peerUid: 'group', kind: 'image' as const, fileName: 'original.jpg',
+      filePath: thumbnailPath, fileUuid: 'parallel-uuid',
+    }
+
+    let settled = false
+    const pending = bridge.downloadFile(locator).then((stream) => {
+      settled = true
+      return stream
+    })
+    await vi.waitFor(() => expect(f.msg.downloadRichMedia).toHaveBeenCalledOnce())
+    f.emitDownload({
+      fileModelId: '', msgId: locator.messageId, msgElementId: locator.elementId,
+      fileErrCode: '0', fileErrMsg: '', fileDownType: 2, thumbSize: 720,
+      filePath: thumbnailPath, totalSize: '5', trasferStatus: 4,
+    })
+    await Promise.resolve()
+    expect(settled).toBe(false)
+
+    f.emitDownload({
+      fileModelId: '', msgId: locator.messageId, msgElementId: locator.elementId,
+      fileErrCode: '0', fileErrMsg: '', fileDownType: 1, thumbSize: 0,
+      filePath: originalPath, totalSize: '8', trasferStatus: 4,
+    })
+    expect((await readStream(await pending)).toString()).toBe('original')
   })
 
   it('uses QQ download completion for images without parsing the completed file', async () => {
@@ -1546,10 +1610,10 @@ describe('QQKernelBridge', () => {
     }
 
     const pending = bridge.downloadFile(locator)
-    await vi.waitFor(() => expect(f.richMedia.downloadFile).toHaveBeenCalledOnce())
+    await vi.waitFor(() => expect(f.msg.downloadRichMedia).toHaveBeenCalledOnce())
     f.emitDownload({
       fileModelId: '', msgId: locator.messageId, msgElementId: locator.elementId,
-      fileErrCode: '0', fileErrMsg: '', filePath: downloadedPath,
+      fileErrCode: '0', fileErrMsg: '', fileDownType: 1, thumbSize: 0, filePath: downloadedPath,
       totalSize: String(complete.length), trasferStatus: 4,
     })
 
@@ -1904,10 +1968,11 @@ describe('QQBridgeServer', () => {
     })
 
     const pendingResponses = Array.from({ length: 4 }, download)
-    await vi.waitFor(() => expect(f.richMedia.downloadFile).toHaveBeenCalledOnce())
+    await vi.waitFor(() => expect(f.msg.downloadRichMedia).toHaveBeenCalledOnce())
     f.emitDownload({
       fileModelId: '', msgId: locator.messageId, msgElementId: locator.elementId,
-      fileErrCode: '0', fileErrMsg: '', filePath: downloadedPath, totalSize: '16', trasferStatus: 4,
+      fileErrCode: '0', fileErrMsg: '', fileDownType: 1, thumbSize: 0,
+      filePath: downloadedPath, totalSize: '16', trasferStatus: 4,
     })
     const responses = await Promise.all(pendingResponses)
     expect(responses.map((response) => response.status)).toEqual([200, 200, 200, 200])
@@ -1917,7 +1982,7 @@ describe('QQBridgeServer', () => {
     const cached = await download()
     expect(Buffer.from(await cached.arrayBuffer()).toString()).toBe('abcdefghijklmnop')
     expect((await fetch(`${base}/media/open`, { method: 'POST' })).status).toBe(404)
-    expect(f.richMedia.downloadFile).toHaveBeenCalledOnce()
+    expect(f.msg.downloadRichMedia).toHaveBeenCalledOnce()
   })
 
   it('warns once per normalized slow HTTP route', async () => {
