@@ -516,7 +516,7 @@ describe('QQKernelBridge', () => {
   it('maps poke, member changes, mute notices, and generic gray tips to service actions', async () => {
     const f = fixture()
     const record = (msgId: string, element: MsgRecord['elements'][number]): MsgRecord => ({
-      ...f.message, msgId, msgSeq: `${msgId}-seq`, chatType: 2,
+      ...f.message, msgId, msgSeq: '123', chatType: 2,
       peerUid: '1058754719', peerUin: '1058754719', peerName: 'Test Group', elements: [element],
     })
     f.msg.getLatestDbMsgs.mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [
@@ -586,6 +586,7 @@ describe('QQKernelBridge', () => {
       { parts: [], serviceAction: { type: 'custom', text: '你领取了红包' } },
       { parts: [], serviceAction: { type: 'custom', text: 'Alice邀请Bob加入了群聊。' } },
     ])
+    expect(messages.every((message) => message.telegramMessageId === undefined)).toBe(true)
   })
 
   it('deletes recalled messages by msgId for both recall callback shapes', async () => {

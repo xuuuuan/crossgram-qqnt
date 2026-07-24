@@ -2488,7 +2488,12 @@ export class QQKernelBridge {
       timestamp: Number(record.msgTime) || Math.floor(Date.now() / 1000),
       outgoing: SEND_FROM_SELF.has(record.sendType) || record.senderUid === this.config?.selfUid,
       msgSeq: record.msgSeq,
-      telegramMessageId: record.chatType === CHAT_GROUP ? telegramMessageId(record.msgSeq) : undefined,
+      // Gray tips (poke, joins, reaction notices, etc.) reuse the msgSeq of a
+      // related content message, so only content messages can claim msgSeq as
+      // their Telegram megagroup message ID.
+      telegramMessageId: record.chatType === CHAT_GROUP && !serviceAction
+        ? telegramMessageId(record.msgSeq)
+        : undefined,
       telegramReplyToMessageId: record.chatType === CHAT_GROUP
         ? telegramMessageId(nativeReply?.replayMsgSeq)
         : undefined,
