@@ -26,7 +26,6 @@ const ELEMENT_FACE = 6
 const ELEMENT_REPLY = 7
 const ELEMENT_MARKET_FACE = 11
 const ELEMENT_MULTI_FORWARD = 16
-const STICKER_PIC_SUBTYPES = new Set([1, 2, 3, 4, 7, 8, 9, 10, 12, 13])
 const SEND_FROM_SELF = new Set([1, 2])
 const MEMBER_ADMIN = 3
 const MEMBER_OWNER = 4
@@ -3010,6 +3009,7 @@ function mapMedia(record: MsgRecord, element: MsgElement): QQMedia | undefined {
   if (element.picElement) {
     const picture = element.picElement
     const local = picture.sourcePath || [...(picture.thumbPath?.values() ?? [])][0]
+    const animated = isAnimatedPicture(picture)
     return {
       id: element.elementId || `${record.msgId}:image`,
       kind: 'image',
@@ -3017,6 +3017,7 @@ function mapMedia(record: MsgRecord, element: MsgElement): QQMedia | undefined {
       size: numberOrUndefined(picture.fileSize),
       width: picture.picWidth || undefined,
       height: picture.picHeight || undefined,
+      mimeType: imageMimeType(picture.fileName, animated),
       locator: {
         ...base, kind: 'image', fileName: picture.fileName, fileSize: picture.fileSize,
         filePath: local, fileUuid: picture.fileUuid, fileSubId: picture.fileSubId,
@@ -3060,10 +3061,10 @@ function mapSticker(record: MsgRecord, element: MsgElement): QQSticker | undefin
     }
   }
   const picture = element.picElement
-  if (!picture || !STICKER_PIC_SUBTYPES.has(picture.picSubType ?? 0)) return
+  if (!picture || !isStickerPicture(picture)) return
   const media = mapMedia(record, element)
   if (!media) return
-  const animated = [2000, 2001].includes(picture.picType ?? 0) || /\.(?:gif|apng)$/i.test(picture.fileName)
+  const animated = isAnimatedPicture(picture)
   const resId = picture.md5HexStr || element.elementId || `${record.msgId}:image`
   const reference: QQStickerReference = {
     kind: 'favorite', resId,
@@ -3136,9 +3137,7 @@ function favoriteStickerId(resId: string): string {
 function matchesElementKind(element: MsgElement, kind: 'image' | 'file' | 'sticker'): boolean {
   if (kind === 'file') return Boolean(element.fileElement)
   if (kind === 'sticker') {
-    return Boolean(element.marketFaceElement) || Boolean(
-      element.picElement && STICKER_PIC_SUBTYPES.has(element.picElement.picSubType ?? 0),
-    )
+    return Boolean(element.marketFaceElement) || Boolean(element.picElement && isStickerPicture(element.picElement))
   }
   return Boolean(element.picElement)
 }
@@ -3149,7 +3148,19 @@ function imageMimeType(path: string, animated: boolean): string {
   if (extension === '.webp') return 'image/webp'
   if (extension === '.jpg' || extension === '.jpeg') return 'image/jpeg'
   if (extension === '.bmp') return 'image/bmp'
-  return animated ? 'image/png' : 'image/png'
+  return animated ? 'image/apng' : 'image/png'
+}
+
+function isAnimatedPicture(picture: NonNullable<MsgElement['picElement']>): boolean {
+  return [2000, 2001].includes(picture.picType ?? 0) || /\.(?:gif|apng)$/i.test(picture.fileName)
+}
+
+function isStickerPicture(picture: NonNullable<MsgElement['picElement']>): boolean {
+  // QQ renders only normal pictures (0) and QZone pictures (5) as regular
+  // photos. Every other current/future subtype is an expression. Animated
+  // pictures are rendered as animated expressions even when their subtype is 0.
+  const subtype = picture.picSubType ?? 0
+  return isAnimatedPicture(picture) || (subtype !== 0 && subtype !== 5)
 }
 
 function fileStream(path: string, encrypted: boolean): Readable {

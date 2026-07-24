@@ -737,9 +737,9 @@ describe('QQKernelBridge', () => {
     expect(sent.parts).toMatchObject([{ type: 'sticker', sticker: { stickerId: 'market:42:emoji-a' } }])
   })
 
-  it('maps every QQ expression picture subtype as a sticker and keeps normal pictures as media', async () => {
+  it('maps every QQ expression picture subtype as a sticker and keeps only normal/QZone pictures as media', async () => {
     const f = fixture()
-    f.message.elements = [0, 1, 2, 3, 4, 7, 8, 9, 10, 12, 13].map((picSubType) => ({
+    f.message.elements = Array.from({ length: 14 }, (_, picSubType) => ({
       elementType: 2,
       elementId: `picture-${picSubType}`,
       picElement: {
@@ -751,9 +751,28 @@ describe('QQKernelBridge', () => {
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
 
     const [message] = (await bridge.getHistory(bridge.getConversation('uid-1715311957'))).messages
-    expect(message.parts[0]).toMatchObject({ type: 'media', media: { name: '0.png' } })
-    expect(message.parts.slice(1)).toHaveLength(10)
-    expect(message.parts.slice(1).every((part) => part.type === 'sticker')).toBe(true)
+    expect(message.parts.filter((part) => part.type === 'media')).toMatchObject([
+      { media: { name: '0.png' } }, { media: { name: '5.png' } },
+    ])
+    expect(message.parts.filter((part) => part.type === 'sticker')).toHaveLength(12)
+  })
+
+  it('maps animated pictures as animated stickers even with a normal picture subtype', async () => {
+    const f = fixture()
+    f.message.elements = [{
+      elementType: 2, elementId: 'animated-picture',
+      picElement: {
+        fileName: 'expression.gif', fileSize: '4', picWidth: 32, picHeight: 32,
+        md5HexStr: 'animated-md5', fileUuid: 'animated-uuid', fileSubId: '', picSubType: 0, picType: 2000,
+      },
+    }]
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    const [message] = (await bridge.getHistory(bridge.getConversation('uid-1715311957'))).messages
+    expect(message.parts).toMatchObject([{
+      type: 'sticker', sticker: { format: 'animated', mimeType: 'image/gif' },
+    }])
   })
 
   it('accepts repeated sticker catalog segment markers like the QQ client', async () => {
