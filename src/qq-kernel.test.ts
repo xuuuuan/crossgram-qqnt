@@ -490,6 +490,38 @@ describe('QQKernelBridge', () => {
     ] })
   })
 
+  it('includes mini-app source, title, and web links in Ark fallbacks', async () => {
+    const f = fixture()
+    f.message.elements = [{
+      elementType: 10, elementId: 'legacy-mini-app', arkElement: { bytesData: JSON.stringify({
+        app: 'com.tencent.miniapp_01', prompt: '[QQ小程序] 腾讯文档',
+        meta: { detail_1: {
+          title: '腾讯文档', desc: '项目排期',
+          url: 'mqqapi://miniapp/open?appid=1108338344',
+          qqdocurl: 'https://docs.qq.com/sheet/example',
+        } },
+      }) },
+    }, {
+      elementType: 10, elementId: 'rich-mini-app', arkElement: { bytesData: JSON.stringify({
+        app: 'com.tencent.miniapp.lua', meta: { miniapp: {
+          source: '示例小程序', title: '分享标题', desc: '分享描述',
+          jumpUrl: 'https://m.q.qq.com/a/s/example',
+          pcJumpUrl: 'https://m.q.qq.com/a/s/example',
+        } },
+      }) },
+    }]
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.getHistory(bridge.getConversation('uid-1715311957'))).resolves.toMatchObject({
+      messages: [{ parts: [{
+        type: 'text', text: '[小程序] 腾讯文档\n项目排期\nhttps://docs.qq.com/sheet/example',
+      }, {
+        type: 'text', text: '[小程序] 示例小程序\n分享标题\n分享描述\nhttps://m.q.qq.com/a/s/example',
+      }] }],
+    })
+  })
+
   it('uses one batch unread lookup and loads only the opened chat around its unread boundary', async () => {
     const f = fixture()
     const previous = { ...f.message, msgId: 'm0', msgSeq: 'seq0', msgTime: '1799999999' }

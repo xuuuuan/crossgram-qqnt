@@ -3547,6 +3547,8 @@ function structuredContentSummary(value: string | undefined): string {
   if (!value) return ''
   try {
     const parsed = JSON.parse(value) as unknown
+    const miniApp = miniAppContentSummary(parsed)
+    if (miniApp) return miniApp
     const preferred = findStructuredString(parsed, new Set([
       'prompt', 'desc', 'description', 'summary', 'title', 'text', 'content', 'brief',
     ]))
@@ -3554,6 +3556,47 @@ function structuredContentSummary(value: string | undefined): string {
   } catch {
     return xmlText(value)
   }
+}
+
+function miniAppContentSummary(value: unknown): string {
+  const root = recordValue(value)
+  const app = stringValue(root?.app)
+  if (!root || !(app === 'com.tencent.miniapp.lua' || app.startsWith('com.tencent.miniapp_'))) return ''
+
+  const meta = recordValue(root.meta)
+  const legacy = recordValue(meta?.detail_1)
+  const rich = recordValue(meta?.miniapp)
+  const source = stringValue(rich?.source) || stringValue(legacy?.title)
+  const title = stringValue(rich?.title) || stringValue(legacy?.desc)
+  const description = stringValue(rich?.desc)
+  const lines = [
+    source ? `[小程序] ${source}` : '[小程序]',
+    title !== source ? title : '',
+    description !== title && description !== source ? description : '',
+  ]
+
+  const urls = [
+    legacy?.qqdocurl, legacy?.pcJumpUrl, legacy?.jumpUrl, legacy?.url,
+    rich?.qqdocurl, rich?.pcJumpUrl, rich?.jumpUrl, rich?.url,
+  ].map(stringValue).filter((item) => /^https?:\/\/\S+$/i.test(item))
+  lines.push(...urls)
+
+  const unique = lines.filter((item, index) => item && lines.indexOf(item) === index)
+  if (unique.length === 1) {
+    const prompt = stringValue(root.prompt)
+    if (prompt) unique.push(prompt)
+  }
+  return unique.join('\n')
+}
+
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined
+}
+
+function stringValue(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : ''
 }
 
 function findStructuredString(value: unknown, preferredKeys: Set<string>, depth = 0): string {
