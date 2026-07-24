@@ -73,7 +73,7 @@ function installKernelRequireHook(bridge: QQKernelBridge): void {
   // bypassing Module._load. Wrap module.exports immediately after the native
   // addon populates it.
   process.dlopen = function qqntBridgeDlopen(module, filename, flags) {
-    const result = originalDlopen.call(this, module, filename, flags)
+    const result = originalDlopen.apply(this, arguments as unknown as Parameters<typeof originalDlopen>)
     const nativeModule = module as { exports: unknown }
     if (isKernelModule(nativeModule.exports)) {
       const raw = nativeModule.exports
