@@ -824,6 +824,25 @@ describe('QQKernelBridge', () => {
     expect(message.parts.filter((part) => part.type === 'sticker')).toHaveLength(12)
   })
 
+  it('does not expose a QQ thumbnail path as the original image', async () => {
+    const f = fixture()
+    f.message.elements = [{
+      elementType: 2, elementId: 'picture-with-thumb',
+      picElement: {
+        fileName: 'original.png', fileSize: '1024', picWidth: 32, picHeight: 32,
+        md5HexStr: 'image-md5', fileUuid: 'image-uuid', fileSubId: '', picSubType: 0,
+        thumbPath: new Map([[0, '/tmp/incomplete-thumbnail.png']]),
+      },
+    }]
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    const [message] = (await bridge.getHistory(bridge.getConversation('uid-1715311957'))).messages
+    expect(message.parts).toMatchObject([{
+      type: 'media', media: { locator: { filePath: undefined, fileUuid: 'image-uuid' } },
+    }])
+  })
+
   it('maps animated pictures as animated stickers even with a normal picture subtype', async () => {
     const f = fixture()
     f.message.elements = [{
@@ -1188,7 +1207,7 @@ describe('QQKernelBridge', () => {
       bridge.downloadFile(locator),
       bridge.downloadFile(locator),
     ])
-    expect(f.richMedia.downloadFile).toHaveBeenCalledOnce()
+    await vi.waitFor(() => expect(f.richMedia.downloadFile).toHaveBeenCalledOnce())
     f.emitDownload({
       fileModelId: '', msgId: locator.messageId, msgElementId: locator.elementId,
       fileErrCode: '0', fileErrMsg: '', filePath: downloadedPath, totalSize: '16', trasferStatus: 4,
@@ -1203,6 +1222,36 @@ describe('QQKernelBridge', () => {
     })
     expect((await readStream(sameContent)).toString()).toBe('abcdefghijklmnop')
     expect(f.richMedia.downloadFile).toHaveBeenCalledOnce()
+  })
+
+  it('redownloads an incomplete local image instead of streaming it at EOF', async () => {
+    const f = fixture()
+    const directory = await mkdtemp(join(tmpdir(), 'qqnt-media-incomplete-'))
+    tempPaths.push(directory)
+    const downloadedPath = join(directory, 'downloaded.png')
+    const complete = Buffer.from([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+      0, 0, 0, 0, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ])
+    await writeFile(downloadedPath, complete.subarray(0, 10))
+    const bridge = new QQKernelBridge({ tempPath: directory })
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const locator = {
+      messageId: 'incomplete-message', elementId: 'incomplete-element', chatType: 2 as const,
+      peerUid: 'group', kind: 'image' as const, fileName: 'downloaded.png',
+      fileSize: String(complete.length), filePath: downloadedPath, fileUuid: 'incomplete-uuid',
+    }
+
+    const pending = bridge.downloadFile(locator)
+    await vi.waitFor(() => expect(f.richMedia.downloadFile).toHaveBeenCalledOnce())
+    await writeFile(downloadedPath, complete)
+    f.emitDownload({
+      fileModelId: '', msgId: locator.messageId, msgElementId: locator.elementId,
+      fileErrCode: '0', fileErrMsg: '', filePath: downloadedPath,
+      totalSize: String(complete.length), trasferStatus: 4,
+    })
+
+    expect(await readStream(await pending)).toEqual(complete)
   })
 
   it('publishes a first-seen info update as a message even with an empty reaction list', async () => {
