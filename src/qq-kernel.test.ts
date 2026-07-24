@@ -45,6 +45,7 @@ function fixture() {
     deleteMsg: vi.fn(async () => ({ result: 0, errMsg: '' })),
     forwardMsg: vi.fn(async () => ({ result: 0, errMsg: '', detailErr: new Map() })),
     multiForwardMsg: vi.fn(async () => ({ result: 0, errMsg: '' })),
+    multiForwardMsgWithComment: vi.fn(async () => ({ result: 0, errMsg: '' })),
     getMultiMsg: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [message] })),
     getMsgs: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [message] })),
     getMsgsIncludeSelf: undefined as import('./kernel-types.js').KernelMsgService['getMsgsIncludeSelf'],
@@ -674,30 +675,32 @@ describe('QQKernelBridge', () => {
     expect(f.msg.forwardMsg).toHaveBeenCalledWith(['m1'], expect.anything(), [expect.anything()], expect.any(Map))
 
     const merged = {
-      ...forwarded, msgId: 'merged-1',
+      ...forwarded, msgId: 'merged-1', msgType: 11, subMsgType: 7,
       elements: [{
-        elementType: 16, elementId: 'merged',
-        multiForwardMsgElement: {
-          fileName: 'deac5471-1df8-43e4-ab42-a00f66c5b360', resId: 'opaque-res',
-          xmlContent: '<msg><item><title size="34">Alice &amp; Bob 的聊天记录</title></item></msg>',
-        },
+        elementType: 10, elementId: 'merged',
+        arkElement: { bytesData: JSON.stringify({
+          app: 'com.tencent.multimsg', prompt: 'Alice & Bob 的聊天记录',
+        }) },
       }],
     }
     const placeholder = {
       ...merged,
+      msgType: 2, subMsgType: 0,
       elements: [{
         elementType: 1, elementId: 'merged-placeholder', textElement: { content: '[聊天记录]' },
       }],
     }
+    const accepted = { ...merged, sendStatus: 1 }
     const events = bridge.subscribe()[Symbol.asyncIterator]()
     f.msg.getLatestDbMsgs
       .mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [forwarded, f.message] })
       .mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [placeholder, forwarded, f.message] })
+      .mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [accepted, forwarded, f.message] })
       .mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [merged, forwarded, f.message] })
     f.msg.getMsgsByMsgId.mockResolvedValueOnce({
       result: 0, errMsg: '', msgList: [f.message, { ...f.message, msgId: 'm2', sendNickName: 'Alice' }],
     })
-    f.msg.multiForwardMsg.mockImplementationOnce(async () => {
+    f.msg.multiForwardMsgWithComment.mockImplementationOnce(async () => {
       f.emitSent(placeholder)
       queueMicrotask(() => f.emitMessages([merged]))
       return { result: 0, errMsg: '' }
@@ -711,10 +714,11 @@ describe('QQKernelBridge', () => {
     await expect(events.next()).resolves.toMatchObject({ value: {
       type: 'message', message: { id: 'merged-1', parts: [{ type: 'multi-forward' }] },
     } })
-    expect(f.msg.multiForwardMsg).toHaveBeenCalledWith([
+    expect(f.msg.multiForwardMsgWithComment).toHaveBeenCalledWith([
       { msgId: 'm1', senderShowName: 'Self' },
       { msgId: 'm2', senderShowName: 'Alice' },
-    ], expect.anything(), expect.anything())
+    ], expect.anything(), expect.anything(), [], expect.any(Map))
+    expect(f.msg.multiForwardMsg).not.toHaveBeenCalled()
 
     const nested = {
       ...f.message, msgId: 'nested-1',

@@ -1070,11 +1070,13 @@ export class QQKernelBridge {
     try {
       let result: { result: number, errMsg: string }
       if (merged) {
-        if (!service.multiForwardMsg) throw new Error('multiForwardMsg is unavailable in this QQNT build')
+        if (!service.multiForwardMsgWithComment && !service.multiForwardMsg) {
+          throw new Error('multiForwardMsg is unavailable in this QQNT build')
+        }
         const records = await service.getMsgsByMsgId(contact(source), ids)
         if (records.result !== 0) throw new Error(`getMsgsByMsgId: ${records.errMsg} (${records.result})`)
         const byId = new Map(records.msgList.map((record) => [record.msgId, record]))
-        result = await service.multiForwardMsg(ids.map((msgId) => {
+        const messages = ids.map((msgId) => {
           const record = byId.get(msgId)
           return {
             msgId,
@@ -1082,7 +1084,12 @@ export class QQKernelBridge {
               ? record.sendRemarkName || record.sendMemberName || record.sendNickName || record.senderUin
               : undefined,
           }
-        }), contact(source), contact(destination))
+        })
+        result = service.multiForwardMsgWithComment
+          ? await service.multiForwardMsgWithComment(
+            messages, contact(source), contact(destination), [], new Map(),
+          )
+          : await service.multiForwardMsg!(messages, contact(source), contact(destination))
       } else {
         result = await service.forwardMsg(ids, contact(source), [contact(destination)], new Map())
       }
@@ -1920,7 +1927,7 @@ export class QQKernelBridge {
       const pendingMerged = outgoing && this.pendingMergedForwards.some((item) =>
         item.conversationId === conversation.id
         && Number(record.msgTime) >= item.startedAt - 1)
-      if (pendingMerged && !record.elements.some(isMultiForwardElement)) {
+      if (pendingMerged && !isMultiForwardRecord(record)) {
         log('info', `native merged-forward placeholder deferred source=${source} id=${record.msgId} peer=${record.peerUid} status=${record.sendStatus}`)
         continue
       }
@@ -2356,6 +2363,16 @@ export class QQKernelBridge {
         parts.push({
           type: 'multi-forward',
           title: multiForwardTitle(element.multiForwardMsgElement),
+          locator: {
+            conversationId: conversationId(record.chatType as 1 | 2, record.peerUid),
+            rootMessageId: multiForwardRootId ?? record.msgId,
+            ...(multiForwardRootId ? { parentMessageId: record.msgId } : {}),
+          },
+        })
+      } else if (isArkMultiForwardRecord(record) && element.arkElement) {
+        parts.push({
+          type: 'multi-forward',
+          title: arkMultiForwardTitle(element.arkElement.bytesData),
           locator: {
             conversationId: conversationId(record.chatType as 1 | 2, record.peerUid),
             rootMessageId: multiForwardRootId ?? record.msgId,
@@ -2993,7 +3010,7 @@ export class QQKernelBridge {
         !before.has(record.msgId)
         && Number(record.msgTime) >= startedAt - 1
         && (SEND_FROM_SELF.has(record.sendType) || record.senderUid === this.config?.selfUid)
-        && (!requireMergedCard || record.elements.some(isMultiForwardElement)))
+        && (!requireMergedCard || record.sendStatus >= 2 && isMultiForwardRecord(record)))
       if (forwarded.length >= expected) {
         return forwarded.slice(0, expected).reverse().map((record) => {
           const message = this.mapMessage(record)
@@ -4036,8 +4053,25 @@ function replyTargetId(
   return record.records?.find((item) => item.msgSeq === reply.replayMsgSeq)?.msgId
 }
 
-function isMultiForwardElement(element: MsgElement): boolean {
-  return element.elementType === ELEMENT_MULTI_FORWARD && Boolean(element.multiForwardMsgElement)
+function isMultiForwardRecord(record: MsgRecord): boolean {
+  return isArkMultiForwardRecord(record)
+    || record.elements.some((element) =>
+      element.elementType === ELEMENT_MULTI_FORWARD && Boolean(element.multiForwardMsgElement))
+}
+
+function isArkMultiForwardRecord(record: MsgRecord): boolean {
+  return record.msgType === 11 && record.subMsgType === 7
+    && record.elements.some((element) => Boolean(element.arkElement))
+}
+
+function arkMultiForwardTitle(bytesData: string): string {
+  try {
+    const value = JSON.parse(bytesData) as { prompt?: unknown }
+    if (typeof value.prompt === 'string' && value.prompt.trim()) return value.prompt.trim()
+  } catch {
+    // Keep an addressable card even if a future QQ build changes the payload.
+  }
+  return '聊天记录'
 }
 
 function pngDimensions(bytes: Uint8Array): { width: number, height: number } | undefined {

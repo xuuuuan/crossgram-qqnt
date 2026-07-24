@@ -251,6 +251,8 @@ export interface BottomEmojiTabInfo {
 export interface MsgRecord {
   msgId: string
   msgSeq?: string
+  msgType?: number
+  subMsgType?: number
   chatType: number
   sendType: number
   senderUid: string
@@ -314,6 +316,13 @@ export interface KernelMsgService {
     messages: Array<{ msgId: string, senderShowName?: string }>,
     source: Contact,
     destination: Contact,
+  ): Promise<{ result: number, errMsg: string }>
+  multiForwardMsgWithComment?(
+    messages: Array<{ msgId: string, senderShowName?: string }>,
+    source: Contact,
+    destination: Contact,
+    commentElements: MsgElement[],
+    attrs: Map<number, unknown>,
   ): Promise<{ result: number, errMsg: string }>
   getMultiMsg?(
     peer: Contact,
