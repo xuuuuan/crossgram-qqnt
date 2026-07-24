@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { createReadStream, createWriteStream, existsSync, mkdirSync, statSync } from 'node:fs'
-import { open as openFile, readFile, rename, rm, stat } from 'node:fs/promises'
+import { copyFile, open as openFile, readFile, rename, rm, stat } from 'node:fs/promises'
 import { basename, dirname, extname, join } from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { Readable } from 'node:stream'
@@ -781,8 +781,9 @@ export class QQKernelBridge {
         const prepared = await this.prepareImageElement(
           stickerPath, manifest.sticker.name, size,
           { width: manifest.sticker.width, height: manifest.sticker.height },
+          1,
+          false,
         )
-        prepared.element.picElement!.picSubType = 1
         if (prepared.owned) cleanup.push(prepared.path)
         elements.push(prepared.element)
       }
@@ -2726,6 +2727,8 @@ export class QQKernelBridge {
     originalName: string,
     size: number,
     declared: { width?: number, height?: number } = {},
+    picSubType = 0,
+    sourceOwned = true,
   ): Promise<{ path: string, owned: boolean, element: MsgElement }> {
     const [md5, dimensions] = await Promise.all([
       hashFile(stagingPath, 'md5'),
@@ -2734,31 +2737,38 @@ export class QQKernelBridge {
         : imageFileDimensions(stagingPath),
     ])
     const service = this.requireMsgService()
+    const fileName = `${md5}${safeExtension(originalName) || '.png'}`
     let nativePath = ''
     try {
       nativePath = service.getRichMediaFilePath?.(
-        ELEMENT_IMAGE, 0, md5, originalName, 1, 0, true,
+        ELEMENT_IMAGE, picSubType, md5, fileName, 1, 0, true,
       ) ?? service.getRichMediaFilePathForMobileQQSend?.({
-        elementType: ELEMENT_IMAGE, elementSubType: 0, md5HexStr: md5,
-        fileName: originalName, downloadType: 1, thumbSize: 0,
+        elementType: ELEMENT_IMAGE, elementSubType: picSubType, md5HexStr: md5,
+        fileName, downloadType: 1, thumbSize: 0,
         file_uuid: '', needCreate: true,
       }) ?? ''
     } catch (error) {
       log('error', 'QQ image send path lookup failed; using native media staging path', error)
     }
     let path = stagingPath
-    let owned = true
+    let owned = sourceOwned
     if (nativePath && nativePath !== stagingPath) {
       mkdirSync(dirname(nativePath), { recursive: true })
-      if (existsSync(nativePath)) {
-        await rm(stagingPath, { force: true })
+      const nativeFileMatches = existsSync(nativePath)
+        && statSync(nativePath).size === size
+        && await hashFile(nativePath, 'md5') === md5
+      if (nativeFileMatches) {
+        if (sourceOwned) await rm(stagingPath, { force: true })
         owned = false
       } else {
-        await rename(stagingPath, nativePath)
+        await rm(nativePath, { force: true })
+        if (sourceOwned) await rename(stagingPath, nativePath)
+        else await copyFile(stagingPath, nativePath)
+        owned = true
       }
       path = nativePath
     }
-    return { path, owned, element: imageElement(path, size, md5, dimensions, originalName) }
+    return { path, owned, element: imageElement(path, size, md5, dimensions, originalName, picSubType) }
   }
 
   private rememberMessageOrigin(messageId: string, originRequestId?: string): void {
@@ -3233,12 +3243,13 @@ function imageElement(
   md5: string,
   dimensions?: { width: number, height: number },
   originalName = basename(path),
+  picSubType = 0,
 ): MsgElement {
   return {
     elementType: ELEMENT_IMAGE,
     elementId: '',
     picElement: {
-      picSubType: 0,
+      picSubType,
       fileName: basename(path),
       fileSize: String(size),
       picWidth: dimensions?.width ?? 0,

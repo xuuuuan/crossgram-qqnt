@@ -55,6 +55,7 @@ function fixture() {
     getABatchOfContactMsgBoxInfo: vi.fn(async () => ({
       result: 0, errMsg: '', contactMsgBoxInfos: [] as ContactMsgBoxInfo[],
     })),
+    getRichMediaFilePath: vi.fn(() => ''),
     getMsgsBySeqAndCount: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [message] })),
     getMsgsByMsgId: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [message] })),
     getSourceOfReplyMsg: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [] as MsgRecord[] })),
@@ -1131,6 +1132,46 @@ describe('QQKernelBridge', () => {
     }))
     await bridge.setSavedSticker(reference, false)
     expect(f.msg.deleteFavEmoji).toHaveBeenCalledWith(['fav-res'])
+  })
+
+  it('stages favorite stickers with their final subtype and preserves the collection file', async () => {
+    const f = fixture()
+    const directory = await mkdtemp(join(tmpdir(), 'qqnt-favorite-send-'))
+    tempPaths.push(directory)
+    const sourcePath = join(directory, 'favorite.png')
+    const nativePath = join(directory, 'native', 'favorite.png')
+    const png = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+      'base64',
+    )
+    await writeFile(sourcePath, png)
+    await mkdir(join(directory, 'native'))
+    await writeFile(nativePath, Buffer.from('stale cache entry'))
+    f.msg.getRichMediaFilePath.mockReturnValue(nativePath)
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: directory })
+
+    await bridge.send({
+      conversationId: 'uid-1715311957',
+      sticker: {
+        kind: 'favorite', resId: 'fav-res', path: sourcePath, name: 'favorite.png',
+        width: 1, height: 1, animated: false,
+      },
+    }, Readable.from([]))
+
+    expect(f.msg.getRichMediaFilePath).toHaveBeenCalledWith(
+      2, 1, 'e44e7ecfec99356632c13cd3eaa3e250',
+      'e44e7ecfec99356632c13cd3eaa3e250.png', 1, 0, true,
+    )
+    expect(f.msg.sendMsg).toHaveBeenCalledWith(
+      'm1', expect.anything(), [expect.objectContaining({
+        picElement: expect.objectContaining({
+          picSubType: 1, md5HexStr: 'e44e7ecfec99356632c13cd3eaa3e250', sourcePath: nativePath,
+        }),
+      })], expect.any(Map),
+    )
+    expect(f.sentBodies).toEqual([png])
+    await expect(readFile(sourcePath)).resolves.toEqual(png)
   })
 
   it('returns every buddy as a contact without adding the full buddy list to dialogs', async () => {
