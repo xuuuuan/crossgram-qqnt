@@ -1431,6 +1431,40 @@ describe('QQKernelBridge', () => {
     expect(f.group.getNextMemberList).toHaveBeenNthCalledWith(
       2, 'scene', { uid: 'member-b', index: 2 }, 30,
     )
+    expect(f.group.createMemberListScene).toHaveBeenCalledTimes(1)
+    expect(f.group.destroyMemberListScene).toHaveBeenCalledTimes(1)
+    expect(f.group.destroyMemberListScene).toHaveBeenCalledWith('scene')
+  })
+
+  it('terminates a member chain when QQ returns a non-advancing page', async () => {
+    const f = fixture()
+    const repeated = {
+      errCode: 0, errMsg: '', result: {
+        ids: [{ uid: 'member-a', index: 1 }, { uid: 'member-b', index: 2 }],
+        infos: new Map([
+          ['member-a', {
+            uid: 'member-a', uin: '1', nick: 'A', remark: '', cardName: '', role: 2, avatarPath: '',
+          }],
+          ['member-b', {
+            uid: 'member-b', uin: '2', nick: 'B', remark: '', cardName: '', role: 2, avatarPath: '',
+          }],
+        ]),
+        finish: false,
+      },
+    }
+    f.group.getNextMemberList.mockResolvedValue(repeated)
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    const first = await bridge.getMembers(bridge.getConversation('1058754719'), undefined, 2)
+    const repeatedPage = await bridge.getMembers(
+      bridge.getConversation('1058754719'), first.nextCursor, 2,
+    )
+
+    expect(first.nextCursor).toEqual(expect.any(String))
+    expect(repeatedPage.nextCursor).toBeUndefined()
+    expect(f.group.createMemberListScene).toHaveBeenCalledTimes(1)
+    expect(f.group.destroyMemberListScene).toHaveBeenCalledTimes(1)
   })
 
   it('uses the member-list listener when a cold native request returns an empty snapshot', async () => {

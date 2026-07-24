@@ -29,6 +29,8 @@ const ELEMENT_MULTI_FORWARD = 16
 const SEND_FROM_SELF = new Set([1, 2])
 const MEMBER_ADMIN = 3
 const MEMBER_OWNER = 4
+const MEMBER_SCENE_TTL_MS = 5 * 60_000
+const MEMBER_SCENE_LIMIT = 64
 const MEDIA_PATH_CACHE_LIMIT = 1_024
 const MEDIA_DOWNLOAD_ORIGINAL = 1
 const MEDIA_THUMB_SIZE_ORIGINAL = 0
@@ -110,6 +112,7 @@ export class QQKernelBridge {
     infos: Map<string, MemberInfo>
     finish: boolean
   }>>>()
+  private readonly memberScenes = new Map<string, { conversationId: string, lastUsed: number }>()
   private readonly groupProfileAttempts = new Map<string, number>()
   private unreadBatchState = ''
   private unreadBatchPromise?: Promise<void>
@@ -205,6 +208,10 @@ export class QQKernelBridge {
     if (recentService?.removeKernelRecentContactListener && this.recentListenerId) {
       safeRemoveListener('recent', this.recentListenerId, () => recentService.removeKernelRecentContactListener!(this.recentListenerId!))
     }
+    if (groupService) {
+      for (const scene of this.memberScenes.keys()) this.destroyMemberScene(groupService, scene)
+    }
+    this.memberScenes.clear()
     this.listenerId = this.buddyListenerId = this.profileListenerId = this.groupListenerId = undefined
     this.msgService = undefined
     this.buddyService = undefined
@@ -1380,7 +1387,18 @@ export class QQKernelBridge {
   async getMembers(conversation: QQConversation, cursor?: string, limit = 100): Promise<MemberPage> {
     if (conversation.chatType !== CHAT_GROUP) return { members: [], total: 0 }
     const service = this.requireGroupService()
-    const scene = service.createMemberListScene(conversation.peerUin || conversation.peerUid, `mtproto-${randomUUID()}`)
+    this.pruneMemberScenes(service)
+    const start = decodeMemberCursor(cursor)
+    let scene = start.scene
+    if (scene && this.memberScenes.get(scene)?.conversationId !== conversation.id) {
+      throw new Error('member cursor expired')
+    }
+    if (!scene) {
+      scene = service.createMemberListScene(conversation.peerUin || conversation.peerUid, `mtproto-${randomUUID()}`)
+      this.memberScenes.set(scene, { conversationId: conversation.id, lastUsed: Date.now() })
+    } else {
+      this.memberScenes.get(scene)!.lastUsed = Date.now()
+    }
     const requested = clamp(limit, 1, 500)
     // QQ's own member-list UI requests at least 30. Current native builds can
     // return a false terminal empty page for smaller `num` values, so prefetch
@@ -1396,9 +1414,10 @@ export class QQKernelBridge {
       finish: boolean
     }>()
     this.pendingMemberPages.set(scene, listenerPage)
+    let keepScene = false
     try {
-      const start = decodeMemberCursor(cursor)
-      const response = await service.getNextMemberList(scene, start, nativeLimit)
+      const nativeStart = { uid: start.uid, index: start.index }
+      const response = await service.getNextMemberList(scene, nativeStart, nativeLimit)
       if (response.errCode !== 0) throw new Error(`getNextMemberList: ${response.errMsg} (${response.errCode})`)
       let result = response.result
       if (!result.ids.length && (conversation.participantCount ?? 0) > 0) {
@@ -1419,16 +1438,47 @@ export class QQKernelBridge {
         return [member]
       })
       const hasMore = selectedIds.length < result.ids.length || !result.finish
+      const last = selectedIds.at(-1)
+      // A native scene is stateful. Recreating it for every HTTP page makes
+      // current QQNT builds restart at page one even when lastId is supplied.
+      // Also refuse a non-advancing native cursor so a caller cannot spin on
+      // the same page forever.
+      const advances = Boolean(last && (last.uid !== start.uid || last.index !== start.index))
+      keepScene = hasMore && advances
       return {
         members,
         total: conversation.participantCount
           ?? (result.finish ? Math.max(0, start.index) + result.ids.length : undefined),
-        nextCursor: hasMore ? encodeMemberCursor(selectedIds.at(-1)) : undefined,
+        nextCursor: keepScene ? encodeMemberCursor(last, scene) : undefined,
       }
     } finally {
       this.pendingMemberPages.delete(scene)
+      if (!keepScene) {
+        this.memberScenes.delete(scene)
+        this.destroyMemberScene(service, scene, conversation.id)
+      }
+    }
+  }
+
+  private pruneMemberScenes(service: ReturnType<KernelSession['getGroupService']>): void {
+    const now = Date.now()
+    for (const [scene, state] of this.memberScenes) {
+      if (now - state.lastUsed <= MEMBER_SCENE_TTL_MS && this.memberScenes.size <= MEMBER_SCENE_LIMIT) continue
+      this.memberScenes.delete(scene)
+      this.destroyMemberScene(service, scene, state.conversationId)
+    }
+  }
+
+  private destroyMemberScene(
+    service: ReturnType<KernelSession['getGroupService']>,
+    scene: string,
+    conversationId = this.memberScenes.get(scene)?.conversationId ?? '',
+  ): void {
+    try {
       service.destroyMemberListScene(scene)
-      log('info', `native API complete name=destroyMemberListScene conversation=${conversation.id} scene=${scene}`)
+      log('info', `native API complete name=destroyMemberListScene conversation=${conversationId} scene=${scene}`)
+    } catch (error) {
+      log('error', `native member list scene cleanup failed conversation=${conversationId} scene=${scene}`, error)
     }
   }
 
@@ -3492,17 +3542,22 @@ function safeExtension(name: string): string {
   return extension.slice(0, 16)
 }
 
-function encodeMemberCursor(value?: { uid: string, index: number }): string | undefined {
-  return value ? Buffer.from(JSON.stringify(value)).toString('base64url') : undefined
+function encodeMemberCursor(value: { uid: string, index: number } | undefined, scene: string): string | undefined {
+  return value ? Buffer.from(JSON.stringify({ ...value, scene })).toString('base64url') : undefined
 }
 
-function decodeMemberCursor(value?: string): { uid: string, index: number } {
+function decodeMemberCursor(value?: string): { uid: string, index: number, scene?: string } {
   if (!value) return { uid: '', index: 0 }
   try {
-    const parsed = JSON.parse(Buffer.from(value, 'base64url').toString()) as { uid?: unknown, index?: unknown }
+    const parsed = JSON.parse(Buffer.from(value, 'base64url').toString()) as {
+      uid?: unknown
+      index?: unknown
+      scene?: unknown
+    }
     return {
       uid: typeof parsed.uid === 'string' ? parsed.uid : '',
       index: typeof parsed.index === 'number' ? parsed.index : 0,
+      scene: typeof parsed.scene === 'string' ? parsed.scene : undefined,
     }
   } catch {
     throw new Error('invalid member cursor')
