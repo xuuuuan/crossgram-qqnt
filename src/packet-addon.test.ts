@@ -27,9 +27,16 @@ describe('native packet addon', () => {
     )).toBe('https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=abc&spec=0&rkey=fresh')
   })
 
-  it('reports a useful error outside a QQ process instead of reading arbitrary memory', () => {
-    expect(() => loadPacketAddon().locateSendBinding()).toThrow(
-      /wrapper\.node is not loaded in this process/,
-    )
+  it('reports platform-appropriate errors outside a QQ process', () => {
+    const addon = loadPacketAddon()
+    if (process.platform === 'win32') {
+      expect(() => addon.locateSendBinding()).toThrow(
+        /wrapper\.node is not loaded in this process/,
+      )
+      return
+    }
+
+    expect(() => addon.locateSendBinding()).toThrow(/only supported on Windows/)
+    expect(() => addon.installSendHook()).toThrow(/only supported on Windows/)
   })
 })

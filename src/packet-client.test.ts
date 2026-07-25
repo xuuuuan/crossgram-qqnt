@@ -25,10 +25,12 @@ function fixture() {
       return url.toString()
     }),
     locateSendBinding: vi.fn(() => ({
-      moduleBase: '0x180000000', anchorRva: 1, xrefRva: 2, functionRva: 3, converterRva: 4, responseRva: 5,
+      moduleBase: '0x180000000', profile: 'xref-v1', timeDateStamp: 0x1122_3344,
+      sizeOfImage: 0x678000, anchorRva: 1, xrefRva: 2, functionRva: 3, converterRva: 4, responseRva: 5,
     })),
     installSendHook: vi.fn(() => ({
-      moduleBase: '0x180000000', anchorRva: 1, xrefRva: 2, functionRva: 3, converterRva: 4, responseRva: 5,
+      moduleBase: '0x180000000', profile: 'xref-v1', timeDateStamp: 0x1122_3344,
+      sizeOfImage: 0x678000, anchorRva: 1, xrefRva: 2, functionRva: 3, converterRva: 4, responseRva: 5,
     })),
   }
   const msgService = {

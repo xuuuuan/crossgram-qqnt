@@ -12,6 +12,12 @@ pub struct RuntimeFunction {
     pub end: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeIdentity {
+    pub time_date_stamp: u32,
+    pub size_of_image: u32,
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum PeError {
     #[error("truncated PE image")]
@@ -32,13 +38,29 @@ fn read_u32(image: &[u8], offset: usize) -> Result<u32, PeError> {
     Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
 }
 
-pub fn section(image: &[u8], wanted: &str) -> Result<Section, PeError> {
+fn header(image: &[u8]) -> Result<(usize, usize), PeError> {
     let pe = read_u32(image, 0x3c)? as usize;
     if image.get(pe..pe + 4) != Some(b"PE\0\0") {
         return Err(PeError::InvalidSignature);
     }
+    Ok((pe, read_u16(image, pe + 20)? as usize))
+}
+
+pub fn identity(image: &[u8]) -> Result<PeIdentity, PeError> {
+    let (pe, optional_size) = header(image)?;
+    if optional_size < 0x3c {
+        return Err(PeError::Truncated);
+    }
+    let optional = pe + 24;
+    Ok(PeIdentity {
+        time_date_stamp: read_u32(image, pe + 8)?,
+        size_of_image: read_u32(image, optional + 0x38)?,
+    })
+}
+
+pub fn section(image: &[u8], wanted: &str) -> Result<Section, PeError> {
+    let (pe, optional_size) = header(image)?;
     let count = read_u16(image, pe + 6)? as usize;
-    let optional_size = read_u16(image, pe + 20)? as usize;
     let table = pe + 24 + optional_size;
     for index in 0..count {
         let offset = table + index * 40;
@@ -209,6 +231,42 @@ pub fn indirect_rcx_jump_target(image: &[u8], thunk_rva: u32) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn image_with_optional_header(optional_size: u16) -> Vec<u8> {
+        let mut image = vec![0u8; 0x100];
+        image[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        image[0x40..0x44].copy_from_slice(b"PE\0\0");
+        image[0x48..0x4c].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        image[0x54..0x56].copy_from_slice(&optional_size.to_le_bytes());
+        image[0x90..0x94].copy_from_slice(&0x00ab_cdefu32.to_le_bytes());
+        image
+    }
+
+    #[test]
+    fn reads_pe_identity() {
+        assert_eq!(
+            identity(&image_with_optional_header(0x3c)),
+            Ok(PeIdentity {
+                time_date_stamp: 0x1234_5678,
+                size_of_image: 0x00ab_cdef,
+            }),
+        );
+    }
+
+    #[test]
+    fn rejects_truncated_optional_header_for_identity() {
+        assert_eq!(
+            identity(&image_with_optional_header(0x3b)),
+            Err(PeError::Truncated)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_signature_for_identity() {
+        let mut image = image_with_optional_header(0x3c);
+        image[0x40..0x44].copy_from_slice(b"PX\0\0");
+        assert_eq!(identity(&image), Err(PeError::InvalidSignature));
+    }
 
     #[test]
     fn finds_rip_relative_lea_and_owning_function() {

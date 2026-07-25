@@ -2461,11 +2461,13 @@ describe('QQBridgeServer', () => {
         return url.toString()
       }),
       locateSendBinding: vi.fn(() => ({
-        moduleBase: '0x180000000', anchorRva: 0x100, xrefRva: 0x200, functionRva: 0x180,
+        moduleBase: '0x180000000', profile: 'xref-v1', timeDateStamp: 0x1122_3344,
+        sizeOfImage: 0x678000, anchorRva: 0x100, xrefRva: 0x200, functionRva: 0x180,
         converterRva: 0x300, responseRva: 0x400,
       })),
       installSendHook: vi.fn(() => ({
-        moduleBase: '0x180000000', anchorRva: 0x100, xrefRva: 0x200, functionRva: 0x180,
+        moduleBase: '0x180000000', profile: 'xref-v1', timeDateStamp: 0x1122_3344,
+        sizeOfImage: 0x678000, anchorRva: 0x100, xrefRva: 0x200, functionRva: 0x180,
         converterRva: 0x300, responseRva: 0x400,
       })),
     }

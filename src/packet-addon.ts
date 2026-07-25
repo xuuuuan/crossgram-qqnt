@@ -17,6 +17,9 @@ export interface NativeRkey {
 
 export interface NativeSendBindingLocation {
   moduleBase: string
+  profile: string
+  timeDateStamp: number
+  sizeOfImage: number
   anchorRva: number
   xrefRva: number
   functionRva: number

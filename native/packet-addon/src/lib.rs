@@ -24,6 +24,9 @@ pub struct Rkey {
 #[napi(object)]
 pub struct SendBindingLocation {
     pub module_base: String,
+    pub profile: String,
+    pub time_date_stamp: u32,
+    pub size_of_image: u32,
     pub anchor_rva: u32,
     pub xref_rva: u32,
     pub function_rva: u32,
@@ -96,6 +99,11 @@ pub fn refresh_image_url(original_url: String, rkey: String) -> Result<String> {
 
 #[napi]
 pub fn locate_send_binding() -> Result<SendBindingLocation> {
+    if !cfg!(windows) {
+        return Err(Error::from_reason(
+            "locating the QQNT send binding is only supported on Windows",
+        ));
+    }
     let location = locator::locate_loaded_wrapper().map_err(|error| {
         Error::from_reason(format!("failed to locate QQNT send binding: {error}"))
     })?;
@@ -104,6 +112,11 @@ pub fn locate_send_binding() -> Result<SendBindingLocation> {
 
 #[napi]
 pub fn install_send_hook() -> Result<SendBindingLocation> {
+    if !cfg!(windows) {
+        return Err(Error::from_reason(
+            "installing the QQNT send hook is only supported on Windows",
+        ));
+    }
     let location = locator::locate_loaded_wrapper().map_err(|error| {
         Error::from_reason(format!("failed to locate QQNT send binding: {error}"))
     })?;
@@ -116,6 +129,9 @@ pub fn install_send_hook() -> Result<SendBindingLocation> {
 fn binding_location(location: locator::LocatedBinding) -> SendBindingLocation {
     SendBindingLocation {
         module_base: format!("0x{:x}", location.module_base),
+        profile: location.profile.name().into(),
+        time_date_stamp: location.identity.time_date_stamp,
+        size_of_image: location.identity.size_of_image,
         anchor_rva: location.anchor_rva,
         xref_rva: location.xref_rva,
         function_rva: location.function_rva,

@@ -5,8 +5,23 @@ pub const SEND_ANCHOR: &str =
     "assertion (argc == 2) failed: NodeIKernelMsgService::sendSsoCmdReqByContend needs 2 arguments";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocatorProfile {
+    XrefV1,
+}
+
+impl LocatorProfile {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::XrefV1 => "xref-v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LocatedBinding {
     pub module_base: usize,
+    pub identity: pe::PeIdentity,
+    pub profile: LocatorProfile,
     pub anchor_rva: u32,
     pub xref_rva: u32,
     pub function_rva: u32,
@@ -37,6 +52,27 @@ pub enum LocateError {
 }
 
 pub fn locate_in_image(image: &[u8], module_base: usize) -> Result<LocatedBinding, LocateError> {
+    let identity = pe::identity(image)?;
+    let profile = select_locator_profile(identity);
+    match profile {
+        LocatorProfile::XrefV1 => locate_xref_v1(image, module_base, identity, profile),
+    }
+}
+
+fn select_locator_profile(identity: pe::PeIdentity) -> LocatorProfile {
+    match (identity.time_date_stamp, identity.size_of_image) {
+        // Unknown builds keep using the fully validated xref probe. Add exact
+        // identity branches only when a QQNT build needs a different locator.
+        _ => LocatorProfile::XrefV1,
+    }
+}
+
+fn locate_xref_v1(
+    image: &[u8],
+    module_base: usize,
+    identity: pe::PeIdentity,
+    profile: LocatorProfile,
+) -> Result<LocatedBinding, LocateError> {
     let text = pe::section(image, ".text")?;
     let rdata = pe::section(image, ".rdata")?;
     let pdata = pe::section(image, ".pdata")?;
@@ -72,6 +108,8 @@ pub fn locate_in_image(image: &[u8], module_base: usize) -> Result<LocatedBindin
     .ok_or(LocateError::ResponseCallbackNotFound)?;
     Ok(LocatedBinding {
         module_base,
+        identity,
+        profile,
         anchor_rva,
         xref_rva,
         function_rva,
@@ -184,6 +222,10 @@ fn response_callback_from_send_wrapper(
 mod tests {
     use super::*;
 
+    const MODULE_BASE: usize = 0x0001_8000_0000;
+    const TIMESTAMP: u32 = 0x1122_3344;
+    const IMAGE_SIZE: u32 = 0xb00;
+
     fn write_call(image: &mut [u8], instruction: u32, target: u32) {
         image[instruction as usize] = 0xe8;
         let displacement = target as i32 - instruction as i32 - 5;
@@ -198,10 +240,25 @@ mod tests {
             .copy_from_slice(&displacement.to_le_bytes());
     }
 
-    #[test]
-    fn follows_the_send_wrappers_own_response_callback_chain() {
-        const MODULE_BASE: usize = 0x0001_8000_0000;
-        let mut image = vec![0x90u8; 0xb00];
+    fn write_section(image: &mut [u8], offset: usize, name: &[u8], address: u32, size: u32) {
+        image[offset..offset + 40].fill(0);
+        image[offset..offset + name.len()].copy_from_slice(name);
+        image[offset + 8..offset + 12].copy_from_slice(&size.to_le_bytes());
+        image[offset + 12..offset + 16].copy_from_slice(&address.to_le_bytes());
+    }
+
+    fn xref_v1_image() -> (Vec<u8>, [pe::RuntimeFunction; 7]) {
+        let mut image = vec![0x90u8; IMAGE_SIZE as usize];
+        image[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        image[0x40..0x44].copy_from_slice(b"PE\0\0");
+        image[0x46..0x48].copy_from_slice(&3u16.to_le_bytes());
+        image[0x48..0x4c].copy_from_slice(&TIMESTAMP.to_le_bytes());
+        image[0x54..0x56].copy_from_slice(&0x3cu16.to_le_bytes());
+        image[0x90..0x94].copy_from_slice(&IMAGE_SIZE.to_le_bytes());
+        write_section(&mut image, 0x94, b".text", 0x100, 0x700);
+        write_section(&mut image, 0xbc, b".rdata", 0x800, 0x200);
+        write_section(&mut image, 0xe4, b".pdata", 0xa00, 0x60);
+
         let send_wrapper = pe::RuntimeFunction {
             begin: 0x100,
             end: 0x180,
@@ -233,10 +290,18 @@ mod tests {
                 end: 0x740,
             },
         ];
+        for (index, function) in functions.iter().enumerate() {
+            let offset = 0xa00 + index * 12;
+            image[offset..offset + 4].copy_from_slice(&function.begin.to_le_bytes());
+            image[offset + 4..offset + 8].copy_from_slice(&function.end.to_le_bytes());
+            image[offset + 8..offset + 12].fill(0);
+        }
 
+        image[0x800..0x800 + SEND_ANCHOR.len()].copy_from_slice(SEND_ANCHOR.as_bytes());
         write_call(&mut image, 0x110, 0x700);
         write_call(&mut image, 0x120, 0x700);
         write_call(&mut image, 0x140, 0x190);
+        write_lea(&mut image, 0x150, 0x800);
         write_call(&mut image, 0x1a0, 0x250);
         write_lea(&mut image, 0x260, 0x900);
         image[0x908..0x910].copy_from_slice(&((MODULE_BASE + 0x400) as u64).to_le_bytes());
@@ -244,7 +309,44 @@ mod tests {
         write_lea(&mut image, 0x510, 0x580);
         image[0x580..0x584].copy_from_slice(&[0x48, 0x8b, 0x09, 0xe9]);
         image[0x584..0x588].copy_from_slice(&(0x600i32 - 0x580 - 8).to_le_bytes());
+        (image, functions)
+    }
 
+    #[test]
+    fn unknown_builds_use_the_validated_xref_profile() {
+        let (image, _) = xref_v1_image();
+        assert_eq!(
+            locate_in_image(&image, MODULE_BASE).unwrap(),
+            LocatedBinding {
+                module_base: MODULE_BASE,
+                identity: pe::PeIdentity {
+                    time_date_stamp: TIMESTAMP,
+                    size_of_image: IMAGE_SIZE,
+                },
+                profile: LocatorProfile::XrefV1,
+                anchor_rva: 0x800,
+                xref_rva: 0x150,
+                function_rva: 0x100,
+                converter_rva: 0x700,
+                response_rva: 0x600,
+            },
+        );
+        assert_eq!(LocatorProfile::XrefV1.name(), "xref-v1");
+    }
+
+    #[test]
+    fn unknown_build_without_anchor_fails_closed() {
+        let (mut image, _) = xref_v1_image();
+        image[0x800..0x800 + SEND_ANCHOR.len()].fill(0);
+        assert!(matches!(
+            locate_in_image(&image, MODULE_BASE),
+            Err(LocateError::AnchorNotFound)
+        ));
+    }
+
+    #[test]
+    fn follows_the_send_wrappers_own_response_callback_chain() {
+        let (image, functions) = xref_v1_image();
         assert_eq!(
             response_callback_from_send_wrapper(
                 &image,
@@ -254,11 +356,11 @@ mod tests {
                     virtual_size: 0x700,
                 },
                 pe::Section {
-                    virtual_address: 0x900,
-                    virtual_size: 0x100,
+                    virtual_address: 0x800,
+                    virtual_size: 0x200,
                 },
                 &functions,
-                send_wrapper,
+                functions[0],
                 0x700,
             ),
             Some(0x600),
