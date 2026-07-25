@@ -1884,8 +1884,6 @@ export class QQKernelBridge {
       this.requireSession().getMsgService().downloadRichMedia({
         fileModelId: '0',
         downSourceType: 0,
-        // NapCat passes both names so the same request works across the
-        // transition that renamed this field in QQNT.
         downloadSourceType: 0,
         triggerType: 1,
         msgId: locator.messageId,
