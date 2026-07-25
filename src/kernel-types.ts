@@ -18,6 +18,9 @@ export interface ProfileSimpleInfo {
 }
 
 export interface RecentContactInfo {
+  id?: string
+  contactId?: string
+  sortField?: string
   chatType: number
   peerUid: string
   peerUin: string
@@ -490,6 +493,18 @@ export interface KernelRecentService {
   addKernelRecentContactListener?(listener: unknown): string
   removeKernelRecentContactListener?(listenerId: string): void
   getRecentContactList?(): Promise<{ result: number, errMsg: string }>
+  getRecentContactListSync?(): {
+    errCode: number
+    errMsg: string
+    sortedContactList: string[]
+    changedList: RecentContactInfo[]
+  }
+  getRecentContactListSyncLimit?(count: number): {
+    errCode: number
+    errMsg: string
+    sortedContactList: string[]
+    changedList: RecentContactInfo[]
+  }
   getRecentContactInfos(): Promise<{ result: number, errMsg: string, relation: RecentContactInfo[] }>
 }
 

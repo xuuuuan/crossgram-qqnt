@@ -76,6 +76,8 @@ export class QQKernelBridge {
   private searchService?: NonNullable<ReturnType<NonNullable<KernelSession['getSearchService']>>>
   private avatarService?: NonNullable<ReturnType<NonNullable<KernelSession['getAvatarService']>>>
   private readonly contacts = new Map<string, QQConversation>()
+  private readonly recentContactIds = new Map<string, string>()
+  private recentContactOrder: string[] = []
   private readonly users = new Map<string, { id: string, numericId?: string, name: string, avatarUrl?: string }>()
   private readonly seenUsers = new Map<string, { id: string, numericId?: string, name: string, avatarUrl?: string }>()
   private readonly groups = new Map<string, {
@@ -164,6 +166,8 @@ export class QQKernelBridge {
     // A native wrapper can be re-initialized after logout/account switching.
     // Never leak the previous account's seen peers into the new address book.
     this.contacts.clear()
+    this.recentContactIds.clear()
+    this.recentContactOrder = []
     this.users.clear()
     this.seenUsers.clear()
     this.groups.clear()
@@ -321,12 +325,24 @@ export class QQKernelBridge {
         log('error', 'full recent contact refresh failed; using cached infos', error)
       }
     }
-    log('info', 'native API start name=getRecentContactInfos')
+    log('info', 'native API start name=getRecentContactsSnapshot')
     try {
-      const recent = await recentService.getRecentContactInfos()
-      log('info', `native API complete name=getRecentContactInfos result=${recent.result} err=${JSON.stringify(recent.errMsg)} contacts=${recent.relation.length}`)
-      if (recent.result !== 0) throw new Error(`getRecentContactInfos: ${recent.errMsg} (${recent.result})`)
-      for (const item of recent.relation) this.upsertRecent(item)
+      // The unbounded legacy snapshot only materializes the small UI cache on
+      // current QQNT builds (typically 8-10 rows), even though its sorted ID
+      // list contains every recent conversation. The count-aware variant
+      // returns the matching RecentContactInfo rows, including each top msgId.
+      const snapshot = recentService.getRecentContactListSyncLimit?.(500)
+        ?? recentService.getRecentContactListSync?.()
+      if (snapshot?.errCode === 0) {
+        this.consumeRecentContactList(snapshot.sortedContactList, snapshot.changedList)
+        log('info', `native API complete name=getRecentContactListSync contacts=${snapshot.changedList.length} ordered=${snapshot.sortedContactList.length}`)
+      } else {
+        log('info', 'native API fallback name=getRecentContactInfos')
+        const recent = await recentService.getRecentContactInfos()
+        log('info', `native API complete name=getRecentContactInfos result=${recent.result} err=${JSON.stringify(recent.errMsg)} contacts=${recent.relation.length}`)
+        if (recent.result !== 0) throw new Error(`getRecentContactInfos: ${recent.errMsg} (${recent.result})`)
+        for (const item of recent.relation) this.upsertRecent(item)
+      }
     } catch (error) {
       recentError = error
     }
@@ -339,14 +355,25 @@ export class QQKernelBridge {
     if (recentError) throw recentError
   }
 
-  async getDialogs(cursor?: string, limit = 100, afterId?: string): Promise<{ conversations: QQConversation[], nextCursor?: string }> {
+  async getDialogs(cursor?: string, limit = 100, afterId?: string): Promise<{
+    conversations: QQConversation[]
+    nextCursor?: string
+    total: number
+  }> {
     // A refresh failure must not erase/block the already subscribed recent
     // contact snapshot (QQ can transiently reject this call during startup).
     if (!this.contacts.size) {
       await withTimeout(this.refreshContacts(), 5_000, 'QQ dialog refresh timed out')
         .catch((error) => log('error', 'dialog refresh failed; using cache', error))
     }
-    const dialogs = [...this.contacts.values()]
+    const orderedIds = new Set(this.recentContactOrder)
+    const dialogs = [
+      ...this.recentContactOrder.flatMap((id) => {
+        const conversation = this.contacts.get(id)
+        return conversation ? [conversation] : []
+      }),
+      ...[...this.contacts.values()].filter((conversation) => !orderedIds.has(conversation.id)),
+    ]
     const afterIndex = afterId ? dialogs.findIndex((dialog) => dialog.id === afterId) : -1
     const offset = afterId ? (afterIndex < 0 ? 0 : afterIndex + 1) : parseCursor(cursor)
     const selected = dialogs.slice(offset, offset + clamp(limit, 1, 500))
@@ -362,6 +389,7 @@ export class QQKernelBridge {
     return {
       conversations: page,
       nextCursor: offset + page.length < dialogs.length ? String(offset + page.length) : undefined,
+      total: dialogs.length,
     }
   }
 
@@ -1981,21 +2009,22 @@ export class QQKernelBridge {
         onRecentContactListChanged: (value: string[] | RecentContactInfo[] | {
           changedList: RecentContactInfo[]
         }, legacyChanged?: RecentContactInfo[]) => {
+          const sorted = Array.isArray(value) && typeof value[0] === 'string' ? value as string[] : undefined
           const changed = Array.isArray(value)
             ? (typeof value[0] === 'string' ? legacyChanged ?? [] : value as RecentContactInfo[])
             : value.changedList ?? legacyChanged ?? []
           log('info', `recent contact update received: version=1 changed=${changed.length}`)
-          for (const item of changed) this.upsertRecent(item)
+          this.consumeRecentContactList(sorted, changed)
           this.resolveRecentListUpdates()
         },
-        onRecentContactListChangedVer2: (value: Array<{ changedList?: RecentContactInfo[] }> | {
-          changedRecentContactLists?: Array<{ changedList?: RecentContactInfo[] }>
+        onRecentContactListChangedVer2: (value: Array<{ sortedContactList?: string[], changedList?: RecentContactInfo[] }> | {
+          changedRecentContactLists?: Array<{ sortedContactList?: string[], changedList?: RecentContactInfo[] }>
         }) => {
           const lists = Array.isArray(value) ? value : value.changedRecentContactLists ?? []
           const changed = lists.flatMap((item) => item.changedList ?? [])
           log('info', `recent contact update received: version=2 lists=${lists.length} changed=${changed.length} messages=${changed.map((item) => `${item.chatType}:${item.peerUid}:${item.msgSeq ?? ''}:${item.msgId || '<none>'}`).join(',') || '<none>'}`)
           for (const list of lists) {
-            for (const item of list.changedList ?? []) this.upsertRecent(item)
+            this.consumeRecentContactList(list.sortedContactList, list.changedList ?? [])
           }
           this.resolveRecentListUpdates()
         },
@@ -2052,6 +2081,22 @@ export class QQKernelBridge {
 
   private resolveRecentListUpdates(): void {
     for (const resolve of [...this.pendingRecentListUpdates]) resolve()
+  }
+
+  private consumeRecentContactList(sortedContactList: string[] | undefined, changedList: RecentContactInfo[]): void {
+    for (const item of changedList) {
+      this.upsertRecent(item)
+      if (item.chatType !== CHAT_C2C && item.chatType !== CHAT_GROUP) continue
+      const id = conversationId(item.chatType as 1 | 2, item.peerUid)
+      if (item.contactId) this.recentContactIds.set(item.contactId, id)
+      if (item.id) this.recentContactIds.set(item.id, id)
+    }
+    if (!sortedContactList?.length) return
+    const ordered = sortedContactList.flatMap((contactId) => {
+      const id = this.recentContactIds.get(contactId)
+      return id ? [id] : []
+    })
+    if (ordered.length) this.recentContactOrder = [...new Set(ordered)]
   }
 
   private async requestBuddyList(): Promise<void> {
@@ -2443,8 +2488,24 @@ export class QQKernelBridge {
     const user = item.chatType === CHAT_C2C ? this.users.get(item.peerUid) : undefined
     const group = item.chatType === CHAT_GROUP ? this.groups.get(item.peerUin || item.peerUid) : undefined
     const current = this.contacts.get(conversationId(item.chatType, item.peerUid))
+    const id = conversationId(item.chatType, item.peerUid)
+    const previewText = item.abstractContent
+      ?.map((element) => element.content || element.fileName || '')
+      .filter(Boolean)
+      .join('')
+    const previewSenderId = item.senderUid || item.senderUin || item.peerUid
+    const preview = item.msgId ? {
+      id: item.msgId,
+      conversationId: id,
+      senderId: previewSenderId,
+      timestamp: Number(item.msgTime) || Math.floor(Date.now() / 1000),
+      outgoing: item.senderUid === this.config?.selfUid || item.senderUin === this.config?.selfUin,
+      msgSeq: item.msgSeq,
+      telegramMessageId: item.chatType === CHAT_GROUP ? telegramMessageId(item.msgSeq) : undefined,
+      parts: [{ type: 'text' as const, text: previewText || '[消息]' }],
+    } satisfies QQMessage : undefined
     const conversation: QQConversation = {
-      id: conversationId(item.chatType, item.peerUid),
+      id,
       kind: item.chatType === CHAT_GROUP ? 'group' : 'direct',
       title: user?.name || group?.name || item.remark || item.peerName || item.peerUin || item.peerUid,
       peerUid: item.peerUid,
@@ -2452,10 +2513,12 @@ export class QQKernelBridge {
       chatType: item.chatType,
       avatarUrl: user?.avatarUrl || group?.avatarUrl || item.avatarUrl,
       unreadCount: Number(item.unreadCnt) || 0,
-      // RecentContact is a dialog/contact index, not a message source. Its
-      // abstractContent frequently contains lossy placeholders such as
-      // "[图片]". Only message listeners and history populate lastMessage.
-      lastMessage: current?.lastMessage,
+      // The recent-contact abstract is intentionally only a preview. Its
+      // stable msgId still gives Telegram a valid top message, while opening
+      // the dialog replaces the lossy text/media placeholder with history.
+      lastMessage: current?.lastMessage && current.lastMessage.id === item.msgId
+        ? current.lastMessage
+        : preview ?? current?.lastMessage,
       firstUnread: Number(item.unreadCnt) > 0 ? current?.firstUnread : undefined,
       readInboxMaxMessage: Number(item.unreadCnt) > 0 ? current?.readInboxMaxMessage : undefined,
     }

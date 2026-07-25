@@ -264,7 +264,9 @@ describe('QQKernelBridge', () => {
     expect(dialogs.conversations[0]).toMatchObject({
       id: 'uid-1715311957', peerUin: '1715311957', title: 'xuuuuan',
     })
-    expect(dialogs.conversations[0].lastMessage).toBeUndefined()
+    expect(dialogs.conversations[0].lastMessage).toMatchObject({
+      id: 'm1', parts: [{ type: 'text', text: 'hello preview' }],
+    })
     const history = await bridge.getHistory(dialogs.conversations[0])
     expect(history.messages[0]).toMatchObject({ id: 'm1', parts: [{ type: 'text', text: 'hello' }] })
     expect(f.msg.getLatestDbMsgs).toHaveBeenCalledWith(expect.objectContaining({
@@ -300,7 +302,7 @@ describe('QQKernelBridge', () => {
     await expect(bridge.getUser('self')).resolves.toMatchObject({ name: 'Canonical Self' })
   })
 
-  it('keeps recent contacts message-free and bounds a missing UID lookup', async () => {
+  it('uses recent abstracts as top-message previews and bounds a missing UID lookup', async () => {
     const f = fixture()
     f.recent.getRecentContactInfos.mockResolvedValue({
       result: 0,
@@ -317,7 +319,11 @@ describe('QQKernelBridge', () => {
 
     const dialogs = await bridge.getDialogs()
     expect(dialogs.conversations).toMatchObject([{ id: '1058754719', title: 'Test Group' }])
-    expect(dialogs.conversations[0].lastMessage).toBeUndefined()
+    expect(dialogs.conversations[0].lastMessage).toMatchObject({
+      id: 'group-preview', senderId: 'u_group_member', timestamp: 1_800_000_000,
+      telegramMessageId: undefined,
+      parts: [{ type: 'text', text: 'group preview' }],
+    })
     expect(f.uix.getUin).not.toHaveBeenCalled()
 
     f.uix.getUin.mockImplementationOnce(() => new Promise(() => {}))
@@ -428,6 +434,85 @@ describe('QQKernelBridge', () => {
     expect(page).toMatchObject({ messages: [{ id: 'image', parts: [{ type: 'media' }] }] })
     expect(page.nextCursor).toBeUndefined()
     expect(f.search.searchMoreChatMsgs).toHaveBeenCalledWith(71)
+  })
+
+  it('paginates the complete ordered recent-contact snapshot instead of the small infos cache', async () => {
+    const f = fixture()
+    const full = Array.from({ length: 230 }, (_, index) => ({
+      id: `contact-${index}`,
+      contactId: `contact-${index}`,
+      sortField: String(1_000 - index),
+      chatType: 2 as const,
+      peerUid: `group-${index}`,
+      peerUin: `group-${index}`,
+      peerName: `Group ${index}`,
+    }))
+    f.recent.getRecentContactInfos.mockResolvedValue({
+      result: 0, errMsg: '', relation: full.slice(0, 8),
+    } as Awaited<ReturnType<typeof f.recent.getRecentContactInfos>>)
+    Object.assign(f.recent, { getRecentContactListSync: () => ({
+      errCode: 0,
+      errMsg: '',
+      sortedContactList: full.map((item) => item.contactId),
+      changedList: full,
+    }) })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    const first = await bridge.getDialogs(undefined, 100)
+    const second = await bridge.getDialogs(first.nextCursor, 100)
+    const third = await bridge.getDialogs(second.nextCursor, 100)
+
+    expect(first.conversations).toHaveLength(100)
+    expect(first.total).toBe(230)
+    expect(first.conversations[0]?.id).toBe('group-0')
+    expect(first.nextCursor).toBe('100')
+    expect(second.conversations[0]?.id).toBe('group-100')
+    expect(second.nextCursor).toBe('200')
+    expect(third.conversations).toHaveLength(30)
+    expect(third.nextCursor).toBeUndefined()
+  })
+
+  it('prefers the count-aware recent snapshot over the truncated legacy cache', async () => {
+    const f = fixture()
+    const full = Array.from({ length: 230 }, (_, index) => ({
+      id: `contact-${index}`,
+      contactId: `contact-${index}`,
+      sortField: String(1_000 - index),
+      chatType: 2 as const,
+      peerUid: `group-${index}`,
+      peerUin: `group-${index}`,
+      peerName: `Group ${index}`,
+      remark: '', avatarUrl: '', unreadCnt: '0',
+      msgId: `message-${index}`, msgSeq: String(index + 1), msgTime: String(1_800_000_000 - index),
+      senderUid: `member-${index}`, senderUin: '',
+      abstractContent: [{ elementType: 1, content: `Preview ${index}` }],
+    }))
+    const getRecentContactListSyncLimit = vi.fn(() => ({
+      errCode: 0,
+      errMsg: '',
+      sortedContactList: full.map((item) => item.contactId),
+      changedList: full,
+    }))
+    Object.assign(f.recent, {
+      getRecentContactListSyncLimit,
+      getRecentContactListSync: vi.fn(() => ({
+        errCode: 0, errMsg: '',
+        sortedContactList: full.map((item) => item.contactId),
+        changedList: full.slice(0, 8),
+      })),
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    const page = await bridge.getDialogs(undefined, 100)
+
+    expect(getRecentContactListSyncLimit).toHaveBeenCalledWith(500)
+    expect(page.total).toBe(230)
+    expect(page.conversations[99]).toMatchObject({
+      id: 'group-99',
+      lastMessage: { id: 'message-99', parts: [{ type: 'text', text: 'Preview 99' }] },
+    })
   })
 
   it('waits for the asynchronous full recent-contact callback before returning dialogs', async () => {
