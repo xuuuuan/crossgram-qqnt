@@ -1120,8 +1120,12 @@ export class QQKernelBridge {
     try {
       if (manifest.sticker && manifest.media?.length) throw new Error('a message cannot contain both sticker and media')
       if (manifest.sticker?.kind === 'market') {
+        this.stickers.set(marketStickerId(
+          manifest.sticker.packageId, manifest.sticker.stickerId,
+        ), stickerFromReference(manifest.sticker))
         elements.push(marketFaceElement(manifest.sticker))
       } else if (manifest.sticker?.kind === 'favorite') {
+        this.stickers.set(favoriteStickerId(manifest.sticker.resId), stickerFromReference(manifest.sticker))
         const stickerPath = manifest.sticker.path && existsSync(manifest.sticker.path)
           ? manifest.sticker.path
           : ''
@@ -2704,8 +2708,9 @@ export class QQKernelBridge {
     let replyToId: string | undefined
     let serviceAction: QQMessage['serviceAction']
     for (const element of record.elements ?? []) {
-      const sticker = mapSticker(record, element)
-      if (sticker) {
+      const mappedSticker = mapSticker(record, element)
+      if (mappedSticker) {
+        const sticker = mergeKnownSticker(this.stickers.get(mappedSticker.stickerId), mappedSticker)
         this.stickers.set(sticker.stickerId, sticker)
         parts.push({ type: 'sticker', sticker })
       } else if (element.elementType === ELEMENT_TEXT && element.textElement?.content) {
@@ -3817,6 +3822,77 @@ function mapSticker(record: MsgRecord, element: MsgElement): QQSticker | undefin
     mimeType: imageMimeType(picture.fileName, animated), width: reference.width,
     height: reference.height, size: reference.size, version: 1, reference,
   }
+}
+
+function stickerFromReference(reference: QQStickerReference): QQSticker {
+  if (reference.kind === 'market') {
+    return {
+      stickerId: marketStickerId(reference.packageId, reference.stickerId),
+      packId: reference.packageId,
+      title: reference.name,
+      format: reference.animated ? 'animated' : 'static',
+      mimeType: reference.animated ? 'image/gif' : 'image/png',
+      width: reference.width,
+      height: reference.height,
+      version: 1,
+      reference,
+    }
+  }
+  return {
+    stickerId: favoriteStickerId(reference.resId),
+    title: reference.name,
+    format: reference.animated ? 'animated' : 'static',
+    mimeType: imageMimeType(reference.name, reference.animated),
+    width: reference.width,
+    height: reference.height,
+    size: reference.size,
+    version: 1,
+    reference,
+  }
+}
+
+function mergeKnownSticker(known: QQSticker | undefined, current: QQSticker): QQSticker {
+  if (!known || known.reference.kind !== current.reference.kind) return current
+  const animated = known.format === 'animated' || current.format === 'animated'
+  if (known.reference.kind === 'market' && current.reference.kind === 'market') {
+    const reference: QQStickerReference = {
+      ...known.reference,
+      ...current.reference,
+      name: current.reference.name || known.reference.name,
+      key: current.reference.key || known.reference.key,
+      animated,
+      staticPath: current.reference.staticPath || known.reference.staticPath,
+      dynamicPath: current.reference.dynamicPath || known.reference.dynamicPath,
+      favoriteResId: current.reference.favoriteResId || known.reference.favoriteResId,
+    }
+    return {
+      ...known,
+      ...current,
+      title: current.title || known.title,
+      format: animated ? 'animated' : 'static',
+      mimeType: animated ? 'image/gif' : current.mimeType,
+      reference,
+    }
+  }
+  if (known.reference.kind === 'favorite' && current.reference.kind === 'favorite') {
+    const reference: QQStickerReference = {
+      ...known.reference,
+      ...current.reference,
+      path: current.reference.path || known.reference.path,
+      name: current.reference.name || known.reference.name,
+      animated,
+      locator: current.reference.locator || known.reference.locator,
+    }
+    return {
+      ...known,
+      ...current,
+      title: current.title || known.title,
+      format: animated ? 'animated' : 'static',
+      mimeType: imageMimeType(reference.name, animated),
+      reference,
+    }
+  }
+  return current
 }
 
 function mapMember(info: MemberInfo): MemberPage['members'][number] {

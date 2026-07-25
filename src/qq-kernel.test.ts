@@ -1429,7 +1429,9 @@ describe('QQKernelBridge', () => {
         marketFaceElement: {
           itemType: 6, faceInfo: 1, emojiPackageId: 42, subType: 3, mediaType: 0,
           imageWidth: 320, imageHeight: 180, faceName: '[Wave]', emojiId: 'emoji-a',
-          key: 'secret', emojiType: 2, staticFacePath: staticPath, dynamicFacePath: dynamicPath,
+          // QQ's send confirmation can omit both animation hints even though
+          // the submitted market face remains animated for other clients.
+          key: '', staticFacePath: staticPath,
         },
       }],
     } satisfies MsgRecord
@@ -1446,7 +1448,10 @@ describe('QQKernelBridge', () => {
         marketFaceElement: expect.objectContaining({ emojiPackageId: 42, emojiId: 'emoji-a', key: 'secret' }),
       })], expect.any(Map),
     )
-    expect(sent.parts).toMatchObject([{ type: 'sticker', sticker: { stickerId: 'market:42:emoji-a' } }])
+    expect(sent.parts).toMatchObject([{ type: 'sticker', sticker: {
+      stickerId: 'market:42:emoji-a', format: 'animated', mimeType: 'image/gif',
+      reference: { animated: true, key: 'secret', dynamicPath },
+    } }])
 
     await rm(dynamicPath)
     f.msg.fetchMarketEmoticonAioImage.mockImplementation(async () => {
