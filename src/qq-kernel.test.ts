@@ -1002,13 +1002,13 @@ describe('QQKernelBridge', () => {
           videoCodecFormat: 1,
         },
       } },
-      { type: 'text', text: '卡片标题' },
+      { type: 'card', card: { kind: 'application', title: '卡片标题' } },
       { type: 'text', text: '**Markdown**' },
       { type: 'text', text: '[暂不支持的消息 999]' },
     ] })
   })
 
-  it('includes mini-app source, title, and web links in Ark fallbacks', async () => {
+  it('parses legacy and current mini-app Ark payloads into structured cards', async () => {
     const f = fixture()
     f.message.elements = [{
       elementType: 10, elementId: 'legacy-mini-app', arkElement: { bytesData: JSON.stringify({
@@ -1032,11 +1032,45 @@ describe('QQKernelBridge', () => {
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
 
     await expect(bridge.getHistory(bridge.getConversation('uid-1715311957'))).resolves.toMatchObject({
-      messages: [{ parts: [{
-        type: 'text', text: '[小程序] 腾讯文档\n项目排期\nhttps://docs.qq.com/sheet/example',
-      }, {
-        type: 'text', text: '[小程序] 示例小程序\n分享标题\n分享描述\nhttps://m.q.qq.com/a/s/example',
-      }] }],
+      messages: [{ parts: [{ type: 'card', card: {
+        kind: 'mini-app', source: '腾讯文档', title: '项目排期',
+        url: 'https://docs.qq.com/sheet/example',
+      } }, { type: 'card', card: {
+        kind: 'mini-app', source: '示例小程序', title: '分享标题', description: '分享描述',
+        url: 'https://m.q.qq.com/a/s/example',
+      } }] }],
+    })
+  })
+
+  it('parses generic Ark shares and legacy XML structure messages into structured cards', async () => {
+    const f = fixture()
+    f.message.elements = [{
+      elementType: 10, elementId: 'news-card', arkElement: { bytesData: JSON.stringify({
+        app: 'com.tencent.structmsg', prompt: '[分享] 新闻', meta: { news: {
+          tag: '示例资讯', title: '结构化分享标题', desc: '结构化分享摘要',
+          jumpUrl: 'https://example.com/articles/42',
+          preview: 'https://cdn.example.com/cover.jpg',
+        } },
+      }) },
+    }, {
+      elementType: 12, elementId: 'xml-card', structMsgElement: { xmlContent:
+        '<msg serviceID="1" brief="[分享] XML 摘要" url="https://example.com/xml">'
+        + '<item><picture cover="https://cdn.example.com/xml.jpg"/>'
+        + '<title><![CDATA[XML 分享标题]]></title><summary>XML 分享描述</summary></item>'
+        + '<source name="XML 来源"/></msg>',
+      },
+    }]
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.getHistory(bridge.getConversation('uid-1715311957'))).resolves.toMatchObject({
+      messages: [{ parts: [{ type: 'card', card: {
+        kind: 'link', source: '示例资讯', title: '结构化分享标题', description: '结构化分享摘要',
+        url: 'https://example.com/articles/42', thumbnailUrl: 'https://cdn.example.com/cover.jpg',
+      } }, { type: 'card', card: {
+        kind: 'link', source: 'XML 来源', title: 'XML 分享标题', description: 'XML 分享描述',
+        url: 'https://example.com/xml', thumbnailUrl: 'https://cdn.example.com/xml.jpg',
+      } }] }],
     })
   })
 
