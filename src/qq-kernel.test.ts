@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import WebSocket from 'ws'
 import type { ContactMsgBoxInfo, KernelModule, KernelSession, MsgRecord } from './kernel-types.js'
 import type { PacketAddon } from './packet-addon.js'
+import { PROTOCOL_VERSION } from './protocol.js'
 import { QQKernelBridge } from './qq-kernel.js'
 import { QQBridgeServer } from './server.js'
 
@@ -294,8 +295,11 @@ describe('QQKernelBridge', () => {
       id: 'uid-1715311957', peerUin: '1715311957', title: 'xuuuuan',
     })
     expect(dialogs.conversations[0].lastMessage).toMatchObject({
-      id: 'm1', parts: [{ type: 'text', text: 'hello preview' }],
+      id: 'm1', parts: [{ type: 'text', text: 'hello' }],
     })
+    expect(f.msg.getMsgsByMsgId).toHaveBeenCalledWith(expect.objectContaining({
+      chatType: 1, peerUid: 'uid-1715311957',
+    }), ['m1'])
     const history = await bridge.getHistory(dialogs.conversations[0])
     expect(history.messages[0]).toMatchObject({ id: 'm1', parts: [{ type: 'text', text: 'hello' }] })
     expect(f.msg.getLatestDbMsgs).toHaveBeenCalledWith(expect.objectContaining({
@@ -331,7 +335,7 @@ describe('QQKernelBridge', () => {
     await expect(bridge.getUser('self')).resolves.toMatchObject({ name: 'Canonical Self' })
   })
 
-  it('uses recent abstracts as top-message previews and bounds a missing UID lookup', async () => {
+  it('hydrates a recent image abstract from the real message and bounds a missing UID lookup', async () => {
     const f = fixture()
     f.recent.getRecentContactInfos.mockResolvedValue({
       result: 0,
@@ -343,6 +347,17 @@ describe('QQKernelBridge', () => {
         abstractContent: [{ elementType: 1, content: 'group preview' }],
       }],
     })
+    const actualImage: MsgRecord = {
+      ...f.message,
+      msgId: 'group-preview', msgSeq: '42', chatType: 2,
+      peerUid: '1058754719', peerUin: '1058754719', peerName: 'Test Group',
+      senderUid: 'u_group_member', senderUin: '42', sendType: 2,
+      elements: [{ elementType: 2, elementId: 'actual-picture', picElement: {
+        fileName: 'actual.png', fileSize: '4', picWidth: 16, picHeight: 16,
+        md5HexStr: 'actual-md5', fileUuid: 'actual-uuid', fileSubId: '', picSubType: 0,
+      } }],
+    }
+    f.msg.getMsgsByMsgId.mockResolvedValue({ result: 0, errMsg: '', msgList: [actualImage] })
     const bridge = new QQKernelBridge({ userResolveTimeoutMs: 20 })
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
 
@@ -350,15 +365,47 @@ describe('QQKernelBridge', () => {
     expect(dialogs.conversations).toMatchObject([{ id: '1058754719', title: 'Test Group' }])
     expect(dialogs.conversations[0].lastMessage).toMatchObject({
       id: 'group-preview', senderId: 'u_group_member', timestamp: 1_800_000_000,
-      telegramMessageId: undefined,
-      parts: [{ type: 'text', text: 'group preview' }],
+      telegramMessageId: 42,
+      parts: [{ type: 'media', media: { kind: 'image', name: 'actual.png' } }],
     })
+    expect(JSON.stringify(dialogs.conversations[0].lastMessage)).not.toContain('group preview')
+    await bridge.getDialogs()
+    expect(f.msg.getMsgsByMsgId).toHaveBeenCalledOnce()
     expect(f.uix.getUin).not.toHaveBeenCalled()
 
     f.uix.getUin.mockImplementationOnce(() => new Promise(() => {}))
     await expect(bridge.getUser('u_hung')).resolves.toMatchObject({
       id: 'u_hung', name: 'u_hung', avatar: { id: 'avatar:user:u_hung' },
     })
+  })
+
+  it('keeps the newest real message when an older info update arrives later', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    await bridge.getDialogs()
+    const events = bridge.subscribe()[Symbol.asyncIterator]()
+    const newer: MsgRecord = {
+      ...f.message,
+      msgId: 'm2', msgSeq: '2', msgTime: '1800000002', sendType: 2,
+      senderUid: 'friend', senderUin: '20000',
+      elements: [{ elementType: 1, elementId: 'newer', textElement: { content: 'newest real message' } }],
+    }
+    const older: MsgRecord = {
+      ...f.message,
+      msgId: 'm-old', msgSeq: '1', msgTime: '1799999999',
+      elements: [{ elementType: 1, elementId: 'older', textElement: { content: 'late old update' } }],
+    }
+
+    f.emitReceived([newer])
+    await events.next()
+    f.emitMessages([older])
+    await events.next()
+
+    expect((await bridge.getDialogs()).conversations[0].lastMessage).toMatchObject({
+      id: 'm2', msgSeq: '2', parts: [{ type: 'text', text: 'newest real message' }],
+    })
+    await events.return?.()
   })
 
   it('loads the full recent-contact list and paginates dialogs after an opaque ID', async () => {
@@ -531,6 +578,20 @@ describe('QQKernelBridge', () => {
         changedList: full.slice(0, 8),
       })),
     })
+    f.msg.getMsgsByMsgId.mockImplementation(async (...args: unknown[]) => {
+      const [peer, ids] = args as [{ peerUid: string }, string[]]
+      const index = Number(ids[0]?.replace('message-', ''))
+      return {
+        result: 0, errMsg: '', msgList: [{
+          ...f.message,
+          msgId: ids[0], msgSeq: String(index + 1), msgTime: String(1_800_000_000 - index),
+          chatType: 2, peerUid: peer.peerUid, peerUin: peer.peerUid, peerName: `Group ${index}`,
+          elements: [{
+            elementType: 1, elementId: `actual-${index}`, textElement: { content: `Actual ${index}` },
+          }],
+        }],
+      }
+    })
     const bridge = new QQKernelBridge()
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
 
@@ -540,8 +601,9 @@ describe('QQKernelBridge', () => {
     expect(page.total).toBe(230)
     expect(page.conversations[99]).toMatchObject({
       id: 'group-99',
-      lastMessage: { id: 'message-99', parts: [{ type: 'text', text: 'Preview 99' }] },
+      lastMessage: { id: 'message-99', parts: [{ type: 'text', text: 'Actual 99' }] },
     })
+    expect(f.msg.getMsgsByMsgId).toHaveBeenCalledTimes(100)
   })
 
   it('waits for the asynchronous full recent-contact callback before returning dialogs', async () => {
@@ -2145,7 +2207,7 @@ describe('QQBridgeServer', () => {
     const { port } = server.address()
     const base = `http://127.0.0.1:${port}/v1`
     await expect(fetch(`${base}/status`).then((response) => response.json())).resolves.toMatchObject({
-      protocolVersion: 16, ready: true, selfUin: '10000',
+      protocolVersion: PROTOCOL_VERSION, ready: true, selfUin: '10000',
     })
     await expect(fetch(`${base}/dialogs`).then((response) => response.json())).resolves.toMatchObject({
       conversations: [{ peerUin: '1715311957' }],
@@ -2162,6 +2224,47 @@ describe('QQBridgeServer', () => {
     })
     expect(response.status).toBe(200)
     expect(await response.json()).toMatchObject({ id: 'm1' })
+  })
+
+  it('serves a hydrated image as the dialog top message instead of QQ recent abstract text', async () => {
+    const f = fixture()
+    f.recent.getRecentContactInfos.mockResolvedValue({
+      result: 0, errMsg: '', relation: [{
+        chatType: 2, peerUid: 'image-group', peerUin: 'image-group', peerName: 'Image Group',
+        remark: '', avatarUrl: '', unreadCnt: '0', msgId: 'image-top',
+        msgTime: '1800000088', senderUid: 'member', senderUin: '42',
+        abstractContent: [{ elementType: 2, content: '[图片]' }],
+      }],
+    })
+    f.msg.getMsgsByMsgId.mockResolvedValue({
+      result: 0, errMsg: '', msgList: [{
+        ...f.message,
+        msgId: 'image-top', msgSeq: '88', msgTime: '1800000088', chatType: 2,
+        peerUid: 'image-group', peerUin: 'image-group', peerName: 'Image Group',
+        senderUid: 'member', senderUin: '42', sendType: 2,
+        elements: [{ elementType: 2, elementId: 'image-element', picElement: {
+          fileName: 'top.jpg', fileSize: '1024', picWidth: 640, picHeight: 480,
+          md5HexStr: 'top-md5', fileUuid: 'top-uuid', fileSubId: '', picSubType: 0,
+        } }],
+      }],
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const url = `http://127.0.0.1:${server.address().port}/v1/dialogs`
+
+    const first = await fetch(url).then((response) => response.json()) as {
+      conversations: Array<{ lastMessage?: { parts: unknown[] } }>
+    }
+    expect(first.conversations[0]?.lastMessage).toMatchObject({
+      id: 'image-top', msgSeq: '88',
+      parts: [{ type: 'media', media: { kind: 'image', name: 'top.jpg', width: 640, height: 480 } }],
+    })
+    expect(JSON.stringify(first)).not.toContain('[图片]')
+
+    await fetch(url)
+    expect(f.msg.getMsgsByMsgId).toHaveBeenCalledOnce()
   })
 
   it('streams events over WebSocket, resumes by event id, and removes closed subscribers', async () => {

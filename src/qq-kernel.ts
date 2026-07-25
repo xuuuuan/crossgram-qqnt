@@ -65,6 +65,12 @@ interface MessageMappingContext {
   outgoing?: boolean
 }
 
+interface MessagePosition {
+  id: string
+  timestamp: number
+  msgSeq?: string
+}
+
 export class QQKernelBridge {
   readonly events = new Set<AsyncQueue<QQEvent>>()
   private readonly recentEvents: Array<{ id: string, event: QQEvent }> = []
@@ -83,6 +89,7 @@ export class QQKernelBridge {
   private packetClient?: QQPacketClient
   private readonly contacts = new Map<string, QQConversation>()
   private readonly recentContactIds = new Map<string, string>()
+  private readonly recentTopMessages = new Map<string, MessagePosition>()
   private recentContactOrder: string[] = []
   private readonly users = new Map<string, { id: string, numericId?: string, name: string, avatarUrl?: string }>()
   private readonly seenUsers = new Map<string, { id: string, numericId?: string, name: string, avatarUrl?: string }>()
@@ -171,6 +178,7 @@ export class QQKernelBridge {
     // Never leak the previous account's seen peers into the new address book.
     this.contacts.clear()
     this.recentContactIds.clear()
+    this.recentTopMessages.clear()
     this.recentContactOrder = []
     this.users.clear()
     this.seenUsers.clear()
@@ -380,8 +388,9 @@ export class QQKernelBridge {
     const afterIndex = afterId ? dialogs.findIndex((dialog) => dialog.id === afterId) : -1
     const offset = afterId ? (afterIndex < 0 ? 0 : afterIndex + 1) : parseCursor(cursor)
     const selected = dialogs.slice(offset, offset + clamp(limit, 1, 500))
-    await this.refreshUnreadMarkers(selected)
-    const page = await mapConcurrent(selected, 8, async (conversation) => {
+    const hydrated = await mapConcurrent(selected, 8, (conversation) => this.hydrateRecentTopMessage(conversation))
+    await this.refreshUnreadMarkers(hydrated)
+    const page = await mapConcurrent(hydrated, 8, async (conversation) => {
       if (conversation.chatType === CHAT_GROUP && isFallbackTitle(conversation.title, conversation.peerUin || conversation.peerUid)) {
         await this.ensureGroupProfile(conversation.peerUin || conversation.peerUid).catch((error) =>
           log('error', `group profile fallback failed group=${conversation.peerUin || conversation.peerUid}`, error))
@@ -618,6 +627,31 @@ export class QQKernelBridge {
     return message
   }
 
+  private async hydrateRecentTopMessage(conversation: QQConversation): Promise<QQConversation> {
+    const target = this.recentTopMessages.get(conversation.id)
+    if (!target || conversation.lastMessage?.id === target.id) return conversation
+    if (conversation.lastMessage && compareMessagePosition(conversation.lastMessage, target) >= 0) {
+      return conversation
+    }
+    try {
+      const message = await this.getMessage(conversation, target.id)
+      if (!message) {
+        log('warn', `recent top message unavailable conversation=${conversation.id} message=${target.id}`)
+        return conversation
+      }
+      const latest = latestMessage(conversation.lastMessage, message)
+      return latest === conversation.lastMessage
+        ? conversation
+        : this.mergeConversation({ ...conversation, lastMessage: latest })
+    } catch (error) {
+      // A recent-contact abstract is lossy and must never be persisted as a
+      // substitute for a real message. Keep the last hydrated message and let
+      // the next dialogs request retry this native lookup.
+      log('warn', `recent top message hydration failed conversation=${conversation.id} message=${target.id}`, error)
+      return conversation
+    }
+  }
+
   async searchMessages(conversation: QQConversation, query: SearchQuery): Promise<SearchPage> {
     const service = this.requireSearchService()
     const limit = clamp(query.limit ?? 50, 1, 200)
@@ -849,7 +883,7 @@ export class QQKernelBridge {
     const response = await retryTransientInvalidArgument(() => service.getMsgsByMsgId(peer, [id]))
     log('info', `native API complete name=getMsgsByMsgId conversation=${conversation.id} message=${id} result=${response.result} err=${JSON.stringify(response.errMsg)} records=${response.msgList.length}`)
     if (response.result !== 0) throw new Error(`getMsgsByMsgId: ${response.errMsg} (${response.result})`)
-    const record = response.msgList[0]
+    const record = response.msgList.find((item) => item.msgId === id)
     return record && !isRecalledRecord(record) ? record : null
   }
 
@@ -2425,21 +2459,17 @@ export class QQKernelBridge {
     const group = item.chatType === CHAT_GROUP ? this.groups.get(item.peerUin || item.peerUid) : undefined
     const current = this.contacts.get(conversationId(item.chatType, item.peerUid))
     const id = conversationId(item.chatType, item.peerUid)
-    const previewText = item.abstractContent
-      ?.map((element) => element.content || element.fileName || '')
-      .filter(Boolean)
-      .join('')
-    const previewSenderId = item.senderUid || item.senderUin || item.peerUid
-    const preview = item.msgId ? {
-      id: item.msgId,
-      conversationId: id,
-      senderId: previewSenderId,
-      timestamp: Number(item.msgTime) || Math.floor(Date.now() / 1000),
-      outgoing: item.senderUid === this.config?.selfUid || item.senderUin === this.config?.selfUin,
-      msgSeq: item.msgSeq,
-      telegramMessageId: item.chatType === CHAT_GROUP ? telegramMessageId(item.msgSeq) : undefined,
-      parts: [{ type: 'text' as const, text: previewText || '[消息]' }],
-    } satisfies QQMessage : undefined
+    if (item.msgId) {
+      const candidate: MessagePosition = {
+        id: item.msgId,
+        timestamp: validTimestamp(item.msgTime),
+        msgSeq: item.msgSeq,
+      }
+      const previous = this.recentTopMessages.get(id)
+      if (!previous || previous.id === candidate.id || compareMessagePosition(candidate, previous) > 0) {
+        this.recentTopMessages.set(id, candidate)
+      }
+    }
     const conversation: QQConversation = {
       id,
       kind: item.chatType === CHAT_GROUP ? 'group' : 'direct',
@@ -2449,12 +2479,11 @@ export class QQKernelBridge {
       chatType: item.chatType,
       avatarUrl: user?.avatarUrl || group?.avatarUrl || item.avatarUrl,
       unreadCount: Number(item.unreadCnt) || 0,
-      // The recent-contact abstract is intentionally only a preview. Its
-      // stable msgId still gives Telegram a valid top message, while opening
-      // the dialog replaces the lossy text/media placeholder with history.
-      lastMessage: current?.lastMessage && current.lastMessage.id === item.msgId
-        ? current.lastMessage
-        : preview ?? current?.lastMessage,
+      // abstractContent is only QQ's lossy UI summary (for example `[图片]`).
+      // Never expose it as a QQMessage: getDialogs hydrates msgId through the
+      // message service, while a delayed recent callback cannot replace a
+      // newer real message already received from the message listener.
+      lastMessage: current?.lastMessage,
       firstUnread: Number(item.unreadCnt) > 0 ? current?.firstUnread : undefined,
       readInboxMaxMessage: Number(item.unreadCnt) > 0 ? current?.readInboxMaxMessage : undefined,
     }
@@ -2631,6 +2660,7 @@ export class QQKernelBridge {
   private conversationFromRecord(record: MsgRecord): QQConversation {
     const id = conversationId(record.chatType as 1 | 2, record.peerUid)
     const current = this.contacts.get(id)
+    const message = this.mapMessage(record)
     const conversation: QQConversation = {
       id,
       kind: record.chatType === CHAT_GROUP ? 'group' : 'direct',
@@ -2641,8 +2671,8 @@ export class QQKernelBridge {
       avatarUrl: current?.avatarUrl,
       avatar: current?.avatar,
       unreadCount: current?.unreadCount,
+      lastMessage: latestMessage(current?.lastMessage, message),
     }
-    conversation.lastMessage = this.mapMessage(record)
     return this.mergeConversation(conversation)
   }
 
@@ -3417,6 +3447,30 @@ export class QQKernelBridge {
 
 function contact(conversation: QQConversation) {
   return { chatType: conversation.chatType, peerUid: conversation.peerUid, guildId: '' }
+}
+
+function latestMessage(current: QQMessage | undefined, candidate: QQMessage): QQMessage {
+  if (!current || current.id === candidate.id) return candidate
+  return compareMessagePosition(candidate, current) > 0 ? candidate : current
+}
+
+function compareMessagePosition(left: MessagePosition, right: MessagePosition): number {
+  const leftSeq = numericSequence(left.msgSeq)
+  const rightSeq = numericSequence(right.msgSeq)
+  if (leftSeq !== undefined && rightSeq !== undefined && leftSeq !== rightSeq) {
+    return leftSeq > rightSeq ? 1 : -1
+  }
+  if (left.timestamp !== right.timestamp) return left.timestamp > right.timestamp ? 1 : -1
+  return 0
+}
+
+function numericSequence(value: string | undefined): bigint | undefined {
+  return value && /^\d+$/.test(value) ? BigInt(value) : undefined
+}
+
+function validTimestamp(value: string | undefined): number {
+  const timestamp = Number(value)
+  return Number.isFinite(timestamp) && timestamp > 0 ? Math.trunc(timestamp) : 0
 }
 
 function matchesSearchMedia(message: QQMessage, kind: SearchQuery['mediaKind']): boolean {

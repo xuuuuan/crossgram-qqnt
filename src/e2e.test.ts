@@ -23,6 +23,28 @@ async function resolve(kind: 'direct' | 'group', id: string) {
 }
 
 describe.skipIf(!enabled)('live QQNT bridge E2E', () => {
+  it('returns the real QQ top message in dialogs instead of recent-contact abstract text', async () => {
+    const dialogsResponse = await fetch(`${base}/dialogs?limit=20`, { headers: headers() })
+    expect(dialogsResponse.status, await dialogsResponse.clone().text()).toBe(200)
+    const page = await dialogsResponse.json() as {
+      conversations: Array<{
+        id: string
+        lastMessage?: { id: string, parts: unknown[], senderId: string, timestamp: number, msgSeq?: string }
+      }>
+    }
+    const dialog = page.conversations.find((item) => item.lastMessage)
+    expect(dialog, 'expected at least one recent QQ conversation with a top message').toBeDefined()
+
+    const messageResponse = await fetch(`${base}/messages/get`, {
+      method: 'POST',
+      headers: headers({ 'content-type': 'application/json' }),
+      body: JSON.stringify({ conversationId: dialog!.id, messageId: dialog!.lastMessage!.id }),
+    })
+    expect(messageResponse.status, await messageResponse.clone().text()).toBe(200)
+    const actual = await messageResponse.json() as NonNullable<typeof dialog>['lastMessage']
+    expect(dialog!.lastMessage).toEqual(actual)
+  }, 30_000)
+
   it('exposes the current QQ nickname and a remote qlogo avatar URL', async () => {
     const statusResponse = await fetch(`${base}/status`, { headers: headers() })
     expect(statusResponse.status, await statusResponse.clone().text()).toBe(200)
