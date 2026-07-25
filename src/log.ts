@@ -2,6 +2,7 @@ import { appendFileSync, mkdirSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { inspect } from 'node:util'
+import type { EventEmitter } from 'node:events'
 
 export const logPath = process.env.QQNT_BRIDGE_LOG
   ?? (process.platform === 'win32'
@@ -12,6 +13,23 @@ export const slowHttpLogPath = process.env.QQNT_BRIDGE_SLOW_HTTP_LOG
   ?? join(dirname(logPath), 'qqnt-bridge-slow-http.log')
 
 const slowHttpKeys = new Map<string, Set<string>>()
+const guardedConsoleStreams = new WeakSet<object>()
+
+// Electron keeps stdout/stderr inherited from the process that launched QQ.
+// Once a short-lived launcher closes its pipe, console.* emits EPIPE on the
+// stream. An unhandled stream error would otherwise surface as an uncaught
+// exception in QQ's browser process.
+export function guardConsoleStream(stream: Pick<EventEmitter, 'on'> | undefined): void {
+  if (!stream || guardedConsoleStreams.has(stream)) return
+  guardedConsoleStreams.add(stream)
+  stream.on('error', () => {
+    // File logging remains available; losing an optional console must never
+    // destabilize the injected host process.
+  })
+}
+
+guardConsoleStream(process.stdout)
+guardConsoleStream(process.stderr)
 
 const ANSI = {
   reset: '\u001b[0m',
@@ -37,9 +55,14 @@ export function log(level: 'info' | 'warn' | 'error', message: string, ...detail
     // QQ logging must never make the host process fail.
   }
   const output = consoleOutput(level, message)
-  if (level === 'error') console.error(output, ...details)
-  else if (level === 'warn') console.warn(output, ...details)
-  else console.log(output, ...details)
+  try {
+    if (level === 'error') console.error(output, ...details)
+    else if (level === 'warn') console.warn(output, ...details)
+    else console.log(output, ...details)
+  } catch {
+    // Some console implementations throw synchronously instead of emitting an
+    // error event when their backing pipe has already closed.
+  }
 }
 
 function consoleOutput(level: 'info' | 'warn' | 'error', message: string): string {

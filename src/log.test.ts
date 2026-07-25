@@ -1,8 +1,30 @@
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { EventEmitter } from 'node:events'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
-import { recordSlowHttpRequest } from './log.js'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { guardConsoleStream, log, recordSlowHttpRequest } from './log.js'
+
+describe('host-safe logging', () => {
+  afterEach(() => vi.restoreAllMocks())
+
+  it('absorbs asynchronous errors from an inherited console pipe', () => {
+    const stream = new EventEmitter()
+    guardConsoleStream(stream)
+    guardConsoleStream(stream)
+
+    expect(() => stream.emit('error', Object.assign(new Error('broken pipe'), { code: 'EPIPE' }))).not.toThrow()
+    expect(stream.listenerCount('error')).toBe(1)
+  })
+
+  it('absorbs synchronous console write failures', () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {
+      throw Object.assign(new Error('broken pipe'), { code: 'EPIPE' })
+    })
+
+    expect(() => log('info', 'pipe is gone')).not.toThrow()
+  })
+})
 
 describe('slow HTTP request records', () => {
   const paths: string[] = []
