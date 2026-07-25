@@ -2204,6 +2204,59 @@ describe('QQKernelBridge', () => {
       },
     })
   })
+
+  it('uses a reaction gray-tip target sequence to publish an immediate authoritative snapshot', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const conversation = await bridge.resolveConversation(2, '1058754719')
+    const target = {
+      ...f.message,
+      msgId: 'reaction-target', msgSeq: '9001', chatType: 2 as const,
+      peerUid: '1058754719', peerUin: '1058754719', peerName: 'Test Group',
+      sendType: 1, senderUid: 'self', senderUin: '10000', emojiLikesList: [],
+    }
+    f.msg.getLatestDbMsgs.mockResolvedValue({ result: 0, errMsg: '', msgList: [target] })
+    await bridge.getHistory(conversation)
+    f.msg.getMsgsByMsgId.mockResolvedValue({
+      result: 0, errMsg: '', msgList: [{
+        ...target,
+        emojiLikesList: [{ emojiType: '1', emojiId: '14', likesCnt: '1', isClicked: false }],
+      }],
+    })
+    const events = bridge.subscribe()[Symbol.asyncIterator]()
+    const startedAt = Math.floor(Date.now() / 1000)
+
+    f.emitReceived([{
+      ...target,
+      msgId: 'reaction-graytip', msgSeq: 'notice-seq', sendType: 0,
+      senderUid: 'alice', senderUin: '42', sendNickName: 'Alice', emojiLikesList: undefined,
+      elements: [{ elementType: 8, elementId: 'reaction-notice', grayTipElement: {
+        xmlElement: {
+          templId: '10382',
+          content: '<gtip><qq jp="Alice"/><nor txt="回应了你的消息："/><url msgseq="9001"/><face id="14"/></gtip>',
+        },
+      } }],
+    }])
+
+    await expect(events.next()).resolves.toMatchObject({
+      value: {
+        type: 'message',
+        message: { id: 'reaction-graytip', serviceAction: { text: 'Alice回应了你的消息：' } },
+      },
+    })
+    const reaction = await events.next()
+    expect(reaction).toMatchObject({ value: {
+      type: 'message-reactions', timestamp: expect.any(Number),
+      target: { messageId: 'reaction-target', targetId: 'reaction-target' },
+      context: { reactions: [{ key: '1:14', count: 1 }] },
+    } })
+    expect(reaction.value?.type === 'message-reactions' ? reaction.value.timestamp : 0)
+      .toBeGreaterThanOrEqual(startedAt)
+    expect(f.msg.getMsgsByMsgId).toHaveBeenCalledWith(
+      expect.objectContaining({ chatType: 2, peerUid: '1058754719' }), ['reaction-target'],
+    )
+  })
 })
 
 describe('QQBridgeServer', () => {
@@ -2340,6 +2393,54 @@ describe('QQBridgeServer', () => {
     resumedSocket.close()
     await once(resumedSocket, 'close')
     await vi.waitFor(() => expect(bridge.events.size).toBe(0))
+  })
+
+  it('streams a gray-tip-triggered reaction refresh over WebSocket without waiting for an info update', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const conversation = await bridge.resolveConversation(2, '1058754719')
+    const target = {
+      ...f.message,
+      msgId: 'ws-reaction-target', msgSeq: '7001', chatType: 2 as const,
+      peerUid: '1058754719', peerUin: '1058754719', peerName: 'Test Group',
+      emojiLikesList: [],
+    }
+    f.msg.getLatestDbMsgs.mockResolvedValue({ result: 0, errMsg: '', msgList: [target] })
+    await bridge.getHistory(conversation)
+    f.msg.getMsgsByMsgId.mockResolvedValue({
+      result: 0, errMsg: '', msgList: [{
+        ...target,
+        emojiLikesList: [{ emojiType: '2', emojiId: '128522', likesCnt: '2', isClicked: false }],
+      }],
+    })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const socket = new WebSocket(`ws://127.0.0.1:${server.address().port}/v1/events/ws`)
+    await once(socket, 'open')
+
+    const frames: unknown[] = []
+    socket.on('message', (raw) => frames.push(JSON.parse(raw.toString())))
+    f.emitReceived([{
+      ...target,
+      msgId: 'ws-reaction-graytip', sendType: 0, senderUid: 'alice', senderUin: '42',
+      emojiLikesList: undefined,
+      elements: [{ elementType: 8, elementId: 'reaction-notice', grayTipElement: {
+        xmlElement: {
+          templId: '10382',
+          content: '<gtip><nor txt="Alice回应了你的消息："/><url msgseq="7001"/></gtip>',
+        },
+      } }],
+    }])
+
+    await vi.waitFor(() => expect(frames).toHaveLength(2))
+    expect(frames[1]).toMatchObject({ event: {
+      type: 'message-reactions',
+      target: { messageId: 'ws-reaction-target' },
+      context: { reactions: [{ key: '2:128522', count: 2 }] },
+    } })
+    socket.close()
+    await once(socket, 'close')
   })
 
   it('can listen for WebSocket events on a separately configured address', async () => {

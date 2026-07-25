@@ -113,7 +113,7 @@ export interface MsgElement {
       wording: string
     }
     jsonGrayTipElement?: { busiId?: string, recentAbstract: string, jsonStr: string }
-    xmlElement?: { content: string, members?: Map<string, string> }
+    xmlElement?: { busiId?: string, content: string, templId?: string, members?: Map<string, string> }
     fileReceiptElement?: { fileName: string }
     feedMsgElement?: { content: string }
     proclamationElement?: { isSetProclamation: number }
