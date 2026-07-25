@@ -65,6 +65,22 @@ pub fn find_bytes(image: &[u8], needle: &[u8]) -> Vec<u32> {
         .collect()
 }
 
+pub fn find_bytes_in_section(image: &[u8], section: Section, needle: &[u8]) -> Vec<u32> {
+    let start = section.virtual_address as usize;
+    let end = start
+        .saturating_add(section.virtual_size as usize)
+        .min(image.len());
+    image
+        .get(start..end)
+        .map(|bytes| {
+            find_bytes(bytes, needle)
+                .into_iter()
+                .map(|offset| offset + section.virtual_address)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub fn find_rip_relative_xrefs(image: &[u8], text: Section, target: u32) -> Vec<u32> {
     let start = text.virtual_address as usize;
     let end = start
@@ -115,6 +131,81 @@ pub fn containing_function(functions: &[RuntimeFunction], address: u32) -> Optio
     })
 }
 
+/// Finds the first pair of nearby direct calls that share a target.
+///
+/// Generated N-API wrappers convert adjacent arguments with adjacent calls to
+/// the same conversion function. Looking through the owning function keeps the
+/// locator independent of QQNT's version-specific RVAs.
+pub fn first_nearby_repeated_call_target(image: &[u8], function: RuntimeFunction) -> Option<u32> {
+    let calls = direct_calls(image, function);
+    calls.windows(2).find_map(|pair| {
+        let (first_call, first_target) = pair[0];
+        let (second_call, second_target) = pair[1];
+        (first_target == second_target
+            && (8..=32).contains(&second_call.saturating_sub(first_call)))
+        .then_some(first_target)
+    })
+}
+
+pub fn direct_calls(image: &[u8], function: RuntimeFunction) -> Vec<(u32, u32)> {
+    let Some(bytes) = image.get(function.begin as usize..function.end as usize) else {
+        return Vec::new();
+    };
+    bytes
+        .windows(5)
+        .enumerate()
+        .filter_map(|(offset, instruction)| {
+            if instruction[0] != 0xe8 {
+                return None;
+            }
+            let call_rva = function.begin.checked_add(offset as u32)?;
+            let displacement = i32::from_le_bytes(instruction[1..5].try_into().ok()?) as i64;
+            let target = call_rva as i64 + 5 + displacement;
+            u32::try_from(target).ok().map(|target| (call_rva, target))
+        })
+        .collect()
+}
+
+pub fn rip_relative_lea_targets(image: &[u8], function: RuntimeFunction) -> Vec<(u32, u32)> {
+    let Some(bytes) = image.get(function.begin as usize..function.end as usize) else {
+        return Vec::new();
+    };
+    bytes
+        .windows(7)
+        .enumerate()
+        .filter_map(|(offset, instruction)| {
+            if !(0x40..=0x4f).contains(&instruction[0])
+                || instruction[1] != 0x8d
+                || instruction[2] & 0xc7 != 0x05
+            {
+                return None;
+            }
+            let instruction_rva = function.begin.checked_add(offset as u32)?;
+            let displacement = i32::from_le_bytes(instruction[3..7].try_into().ok()?) as i64;
+            let target = instruction_rva as i64 + 7 + displacement;
+            u32::try_from(target)
+                .ok()
+                .map(|target| (instruction_rva, target))
+        })
+        .collect()
+}
+
+pub fn read_u64(image: &[u8], rva: u32) -> Option<u64> {
+    let bytes = image.get(rva as usize..rva as usize + 8)?;
+    Some(u64::from_le_bytes(bytes.try_into().ok()?))
+}
+
+/// Resolves the compiler thunk used by QQNT's async response dispatcher:
+/// `mov rcx, [rcx]; jmp rel32`.
+pub fn indirect_rcx_jump_target(image: &[u8], thunk_rva: u32) -> Option<u32> {
+    let bytes = image.get(thunk_rva as usize..thunk_rva as usize + 8)?;
+    if bytes[..4] != [0x48, 0x8b, 0x09, 0xe9] {
+        return None;
+    }
+    let displacement = i32::from_le_bytes(bytes[4..8].try_into().ok()?) as i64;
+    u32::try_from(thunk_rva as i64 + 8 + displacement).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,5 +254,61 @@ mod tests {
     fn finds_all_anchor_occurrences() {
         assert_eq!(find_bytes(b"abc--abc", b"abc"), vec![0, 5]);
         assert!(find_bytes(b"abc", b"").is_empty());
+        assert_eq!(
+            find_bytes_in_section(
+                b"skip--abc--abc",
+                Section {
+                    virtual_address: 6,
+                    virtual_size: 10,
+                },
+                b"abc",
+            ),
+            vec![6, 11],
+        );
+    }
+
+    #[test]
+    fn finds_adjacent_calls_to_the_same_converter() {
+        let mut image = vec![0x90u8; 0x200];
+        let function = RuntimeFunction {
+            begin: 0x40,
+            end: 0xa0,
+        };
+        for call_rva in [0x58u32, 0x68] {
+            image[call_rva as usize] = 0xe8;
+            let displacement = 0x120i32 - call_rva as i32 - 5;
+            image[call_rva as usize + 1..call_rva as usize + 5]
+                .copy_from_slice(&displacement.to_le_bytes());
+        }
+        assert_eq!(
+            first_nearby_repeated_call_target(&image, function),
+            Some(0x120),
+        );
+        assert_eq!(
+            direct_calls(&image, function),
+            vec![(0x58, 0x120), (0x68, 0x120)]
+        );
+    }
+
+    #[test]
+    fn finds_lea_targets_and_response_thunks() {
+        let mut image = vec![0x90u8; 0x300];
+        let function = RuntimeFunction {
+            begin: 0x40,
+            end: 0xa0,
+        };
+        image[0x50..0x53].copy_from_slice(&[0x4c, 0x8d, 0x05]);
+        image[0x53..0x57].copy_from_slice(&(0x180i32 - 0x50 - 7).to_le_bytes());
+        assert_eq!(
+            rip_relative_lea_targets(&image, function),
+            vec![(0x50, 0x180)],
+        );
+
+        image[0x180..0x188].copy_from_slice(&0x1800_1234_5678_9abcu64.to_le_bytes());
+        assert_eq!(read_u64(&image, 0x180), Some(0x1800_1234_5678_9abc));
+
+        image[0x200..0x204].copy_from_slice(&[0x48, 0x8b, 0x09, 0xe9]);
+        image[0x204..0x208].copy_from_slice(&(0x140i32 - 0x200 - 8).to_le_bytes());
+        assert_eq!(indirect_rcx_jump_target(&image, 0x200), Some(0x140));
     }
 }

@@ -25,7 +25,10 @@ function fixture() {
       return url.toString()
     }),
     locateSendBinding: vi.fn(() => ({
-      moduleBase: '0x180000000', anchorRva: 1, xrefRva: 2, functionRva: 3,
+      moduleBase: '0x180000000', anchorRva: 1, xrefRva: 2, functionRva: 3, converterRva: 4, responseRva: 5,
+    })),
+    installSendHook: vi.fn(() => ({
+      moduleBase: '0x180000000', anchorRva: 1, xrefRva: 2, functionRva: 3, converterRva: 4, responseRva: 5,
     })),
   }
   const msgService = {
@@ -50,7 +53,7 @@ describe('QQPacketClient', () => {
   it('uses private and group RKeys according to the QQ image appid', async () => {
     const f = fixture()
     await expect(f.client.getImageDirectUrl(image(
-      'https://multimedia.nt.qq.com.cn/download?appid=1406&fileid=private&rkey=old',
+      '/download?appid=1406&fileid=private&rkey=old',
     ))).resolves.toContain('rkey=private')
     await expect(f.client.getImageDirectUrl(image(
       'https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=group&rkey=old',
@@ -58,7 +61,12 @@ describe('QQPacketClient', () => {
 
     expect(f.send).toHaveBeenCalledOnce()
     expect(f.send).toHaveBeenCalledWith('OidbSvcTrpcTcp.0x9067_202', Buffer.from('request'))
-    expect(f.addon.locateSendBinding).toHaveBeenCalledOnce()
+    expect(f.addon.installSendHook).toHaveBeenCalledOnce()
+    expect(f.addon.refreshImageUrl).toHaveBeenNthCalledWith(
+      1,
+      'https://multimedia.nt.qq.com.cn/download?appid=1406&fileid=private&rkey=old',
+      '&rkey=private',
+    )
   })
 
   it('single-flights refreshes and expires the whole cache at the shortest TTL', async () => {
@@ -78,7 +86,7 @@ describe('QQPacketClient', () => {
     f.advance(2)
     await f.client.getImageDirectUrl(url)
     expect(f.send).toHaveBeenCalledTimes(2)
-    expect(f.addon.locateSendBinding).toHaveBeenCalledOnce()
+    expect(f.addon.installSendHook).toHaveBeenCalledOnce()
   })
 
   it('accepts a direct Buffer response and refreshes zero-timestamp keys relative to now', async () => {
@@ -90,6 +98,20 @@ describe('QQPacketClient', () => {
     f.advance(901)
     await f.client.getImageDirectUrl(locator)
     expect(f.send).toHaveBeenCalledTimes(2)
+  })
+
+  it('decodes rspbuffer when QQ also reports a non-zero convenience result', async () => {
+    const f = fixture()
+    f.send.mockResolvedValue({
+      result: 145,
+      errMsg: 'request parse failed',
+      rspbuffer: Buffer.from('authoritative-response'),
+    })
+
+    await expect(f.client.getImageDirectUrl(image(
+      '/download?appid=1407&fileid=group',
+    ))).resolves.toContain('rkey=group')
+    expect(f.addon.decodeFetchRkeyResponse).toHaveBeenCalledWith(Buffer.from('authoritative-response'))
   })
 
   it.each([
@@ -120,8 +142,10 @@ describe('QQPacketClient', () => {
     await expect(noSender.getImageDirectUrl(image(
       'https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=group',
     ))).resolves.toBeUndefined()
-    f.addon.locateSendBinding = vi.fn(() => { throw new Error('anchor missing') })
-    const noAnchor = new QQPacketClient({ sendSsoCmdReqByContend: f.send }, { addon: f.addon })
+    f.addon.installSendHook = vi.fn(() => { throw new Error('anchor missing') })
+    const noAnchor = new QQPacketClient({
+      sendSsoCmdReqByContend: f.send as NonNullable<KernelMsgService['sendSsoCmdReqByContend']>,
+    }, { addon: f.addon })
     await expect(noAnchor.getImageDirectUrl(image(
       'https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=group',
     ))).resolves.toBeUndefined()

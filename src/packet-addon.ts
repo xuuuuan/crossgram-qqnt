@@ -20,6 +20,8 @@ export interface NativeSendBindingLocation {
   anchorRva: number
   xrefRva: number
   functionRva: number
+  converterRva: number
+  responseRva: number
 }
 
 export interface PacketAddon {
@@ -32,6 +34,7 @@ export interface PacketAddon {
   decodeFetchRkeyResponse(payload: Buffer): NativeRkey[]
   refreshImageUrl(originalUrl: string, rkey: string): string
   locateSendBinding(): NativeSendBindingLocation
+  installSendHook(): NativeSendBindingLocation
 }
 
 let loadedAddon: PacketAddon | undefined
@@ -46,7 +49,7 @@ export function loadPacketAddon(): PacketAddon {
   const required = createRequire(moduleFilename)(candidate) as Partial<PacketAddon>
   for (const name of [
     'sendPacket', 'encodeFetchRkeyRequest', 'decodeFetchRkeyResponse',
-    'refreshImageUrl', 'locateSendBinding',
+    'refreshImageUrl', 'locateSendBinding', 'installSendHook',
   ] satisfies Array<keyof PacketAddon>) {
     if (typeof required[name] !== 'function') throw new Error(`QQNT packet addon is missing ${name}`)
   }

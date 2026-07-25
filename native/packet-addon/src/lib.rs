@@ -1,3 +1,4 @@
+mod hook;
 mod locator;
 mod pe;
 mod proto;
@@ -26,6 +27,8 @@ pub struct SendBindingLocation {
     pub anchor_rva: u32,
     pub xref_rva: u32,
     pub function_rva: u32,
+    pub converter_rva: u32,
+    pub response_rva: u32,
 }
 
 /// Calls QQNT's bound sendSsoCmdReqByContend function from the addon so the
@@ -96,10 +99,27 @@ pub fn locate_send_binding() -> Result<SendBindingLocation> {
     let location = locator::locate_loaded_wrapper().map_err(|error| {
         Error::from_reason(format!("failed to locate QQNT send binding: {error}"))
     })?;
-    Ok(SendBindingLocation {
+    Ok(binding_location(location))
+}
+
+#[napi]
+pub fn install_send_hook() -> Result<SendBindingLocation> {
+    let location = locator::locate_loaded_wrapper().map_err(|error| {
+        Error::from_reason(format!("failed to locate QQNT send binding: {error}"))
+    })?;
+    hook::install(&location).map_err(|error| {
+        Error::from_reason(format!("failed to install QQNT send hook: {error}"))
+    })?;
+    Ok(binding_location(location))
+}
+
+fn binding_location(location: locator::LocatedBinding) -> SendBindingLocation {
+    SendBindingLocation {
         module_base: format!("0x{:x}", location.module_base),
         anchor_rva: location.anchor_rva,
         xref_rva: location.xref_rva,
         function_rva: location.function_rva,
-    })
+        converter_rva: location.converter_rva,
+        response_rva: location.response_rva,
+    }
 }

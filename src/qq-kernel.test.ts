@@ -2462,6 +2462,11 @@ describe('QQBridgeServer', () => {
       }),
       locateSendBinding: vi.fn(() => ({
         moduleBase: '0x180000000', anchorRva: 0x100, xrefRva: 0x200, functionRva: 0x180,
+        converterRva: 0x300, responseRva: 0x400,
+      })),
+      installSendHook: vi.fn(() => ({
+        moduleBase: '0x180000000', anchorRva: 0x100, xrefRva: 0x200, functionRva: 0x180,
+        converterRva: 0x300, responseRva: 0x400,
       })),
     }
     const bridge = new QQKernelBridge({
@@ -2487,7 +2492,7 @@ describe('QQBridgeServer', () => {
     expect(sendPacket).toHaveBeenCalledWith(
       'OidbSvcTrpcTcp.0x9067_202', Buffer.from('fetch-rkey-request'),
     )
-    expect(addon.locateSendBinding).toHaveBeenCalledOnce()
+    expect(addon.installSendHook).toHaveBeenCalledOnce()
     expect(f.msg.downloadRichMedia).not.toHaveBeenCalled()
 
     const unsupported = await fetch(base, {

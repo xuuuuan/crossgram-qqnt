@@ -48,6 +48,36 @@ describe.skipIf(!enabled)('live QQNT bridge E2E', () => {
     expect(new Uint8Array(await avatarResponse.arrayBuffer()).slice(0, 3)).toEqual(new Uint8Array([0xff, 0xd8, 0xff]))
   })
 
+  it('refreshes a QQ image RKey through the native packet hook and supports CDN ranges', async () => {
+    const response = await fetch(`${base}/files/direct-url`, {
+      method: 'POST',
+      headers: headers({ 'content-type': 'application/json' }),
+      body: JSON.stringify({
+        messageId: '7666383158988150809',
+        elementId: '7666383158988150808',
+        chatType: 2,
+        peerUid: '1002974327',
+        kind: 'image',
+        fileName: 'A1A07C530F47B8C3946C881C509D4C22.jpg',
+        fileSize: '164882',
+        fileUuid: '',
+        originImageUrl: '/download?appid=1407&fileid=EhSduvhPaULWrCWdqKW-X9MN8t6jsxiSiAog_wooqYPctLftlQMyBHByb2RQgL2jAVoQ5faoiM59PRBAPHo86fwa43oCYReCAQJuag&spec=0',
+      }),
+    })
+    expect(response.status, await response.clone().text()).toBe(200)
+    const { url } = await response.json() as { url: string }
+    const direct = new URL(url)
+    expect(direct.origin).toBe('https://multimedia.nt.qq.com.cn')
+    expect(direct.searchParams.get('rkey')).toBeTruthy()
+
+    const range = await fetch(direct, { headers: { range: 'bytes=0-127' } })
+    expect(range.status, await range.clone().text()).toBe(206)
+    expect(range.headers.get('content-range')).toBe('bytes 0-127/164882')
+    const bytes = new Uint8Array(await range.arrayBuffer())
+    expect(bytes).toHaveLength(128)
+    expect(bytes.slice(0, 3)).toEqual(new Uint8Array([0xff, 0xd8, 0xff]))
+  }, 30_000)
+
   it('sends and reads back private and group text messages only in the approved chats', async () => {
     for (const [kind, numericId] of [
       ['direct', allowedDirect],

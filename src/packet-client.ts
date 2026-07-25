@@ -6,6 +6,7 @@ import type { QQMediaLocator } from './protocol.js'
 const PRIVATE_IMAGE_APP_ID = '1406'
 const PRIVATE_IMAGE_RKEY_KIND = 10
 const GROUP_IMAGE_RKEY_KIND = 20
+const QQ_IMAGE_ORIGIN = 'https://multimedia.nt.qq.com.cn'
 const DEFAULT_PACKET_TIMEOUT_MS = 10_000
 
 type PacketResponse = Buffer | Uint8Array | {
@@ -47,7 +48,10 @@ export class QQPacketClient {
   async getImageDirectUrl(locator: QQMediaLocator): Promise<string | undefined> {
     if (locator.kind !== 'image' || !locator.originImageUrl) return
     try {
-      const original = new URL(locator.originImageUrl)
+      // Current QQNT builds expose originImageUrl as /download?... while some
+      // older builds include the multimedia host. Normalize both shapes before
+      // selecting and appending the refreshed RKey.
+      const original = new URL(locator.originImageUrl, QQ_IMAGE_ORIGIN)
       const kind = original.searchParams.get('appid') === PRIVATE_IMAGE_APP_ID
         ? PRIVATE_IMAGE_RKEY_KIND
         : GROUP_IMAGE_RKEY_KIND
@@ -79,11 +83,15 @@ export class QQPacketClient {
     if (typeof send !== 'function') throw new Error('sendSsoCmdReqByContend is unavailable in this QQNT build')
 
     const request = addon.encodeFetchRkeyRequest()
+    const requestPayload = Buffer.from(request.payload)
     const response = await withTimeout(
-      Promise.resolve(addon.sendPacket(send.bind(this.msgService), request.command, request.payload)),
+      Promise.resolve(addon.sendPacket(send.bind(this.msgService), request.command, requestPayload)),
       this.timeoutMs,
       `QQ packet request timed out after ${this.timeoutMs}ms`,
     ) as PacketResponse
+    if (response && typeof response === 'object' && !Buffer.isBuffer(response) && !(response instanceof Uint8Array)) {
+      log('info', `QQ packet response command=${request.command} result=${response.result ?? '<unset>'} err=${JSON.stringify(response.errMsg ?? '')} bytes=${response.rspbuffer?.byteLength ?? 0}`)
+    }
     const payload = responsePayload(response)
     const decoded = addon.decodeFetchRkeyResponse(payload)
     if (!decoded.length) throw new Error('FetchRkey response was empty')
@@ -111,20 +119,20 @@ export class QQPacketClient {
 
   private locateBinding(addon: PacketAddon): void {
     if (this.located) return
-    const location = addon.locateSendBinding()
+    const location = addon.installSendHook()
     this.located = true
-    log('info', `QQNT packet binding located module=${location.moduleBase} anchorRva=0x${location.anchorRva.toString(16)} xrefRva=0x${location.xrefRva.toString(16)} functionRva=0x${location.functionRva.toString(16)}`)
+    log('info', `QQNT packet hook installed module=${location.moduleBase} anchorRva=0x${location.anchorRva.toString(16)} xrefRva=0x${location.xrefRva.toString(16)} functionRva=0x${location.functionRva.toString(16)} converterRva=0x${location.converterRva.toString(16)} responseRva=0x${location.responseRva.toString(16)}`)
   }
 }
 
 function responsePayload(response: PacketResponse): Buffer {
   if (Buffer.isBuffer(response) || response instanceof Uint8Array) return Buffer.from(response)
   if (!response || typeof response !== 'object') throw new Error('QQ packet response has an invalid shape')
+  if (response.rspbuffer) return Buffer.from(response.rspbuffer)
   if (response.result !== undefined && response.result !== 0) {
     throw new Error(`QQ packet request failed: ${response.errMsg ?? ''} (${response.result})`)
   }
-  if (!response.rspbuffer) throw new Error('QQ packet response did not contain rspbuffer')
-  return Buffer.from(response.rspbuffer)
+  throw new Error('QQ packet response did not contain rspbuffer')
 }
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
