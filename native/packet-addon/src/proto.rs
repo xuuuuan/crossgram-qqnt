@@ -702,7 +702,7 @@ pub fn decode_rkeys(bytes: &[u8]) -> Result<Vec<RkeyInfo>, DecodeRkeyError> {
 }
 
 pub fn decode_sys_faces(bytes: &[u8]) -> Result<Vec<SysFace>, DecodePacketError> {
-    let body = decode_oidb_body(bytes)?;
+    let body = decode_envelope(bytes)?;
     let response = FetchSysFacesResponse::decode(body.as_slice())?;
     let mut faces = Vec::new();
     for content in [response.common, response.special_big]
