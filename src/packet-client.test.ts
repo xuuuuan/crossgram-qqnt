@@ -1,8 +1,14 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { KernelMsgService } from './kernel-types.js'
 import type { NativeRkey, PacketAddon } from './packet-addon.js'
 import { QQPacketClient } from './packet-client.js'
 import type { QQMediaLocator } from './protocol.js'
+
+const originalPlatform = process.platform
+
+function setPlatform(platform: NodeJS.Platform): void {
+  Object.defineProperty(process, 'platform', { configurable: true, value: platform })
+}
 
 function fixture() {
   let now = 1_800_000_000_000
@@ -24,6 +30,14 @@ function fixture() {
       url.searchParams.set('rkey', rkey.replace(/^&?rkey=/, ''))
       return url.toString()
     }),
+    probePacketBinding: vi.fn(() => ({
+      moduleBase: '0x180000000', modulePath: '/qqnt/wrapper.node', profile: 'linux-xref-v1',
+      buildId: 'build-id', sha256: 'sha256', nameSlotRva: '0x1', bindingNameRva: '0x2',
+      bindingName: 'sendSsoCmdReqByContend', napiCallbackSlotRva: '0x3', napiCallbackRva: '0x4',
+      napiCallbackFingerprint: 'fingerprint', responseActionSlotRva: '0x5', responseActionRva: '0x6',
+      responseActionFingerprint: 'fingerprint', converterRva: '0x7', converterFingerprint: 'fingerprint',
+      resolveActionRva: '0x8', resolveActionFingerprint: 'fingerprint',
+    })),
     locateSendBinding: vi.fn(() => ({
       moduleBase: '0x180000000', profile: 'xref-v1', timeDateStamp: 0x1122_3344,
       sizeOfImage: 0x678000, anchorRva: 1, xrefRva: 2, functionRva: 3, converterRva: 4, responseRva: 5,
@@ -52,6 +66,17 @@ function image(originImageUrl?: string): QQMediaLocator {
 }
 
 describe('QQPacketClient', () => {
+  beforeEach(() => {
+    setPlatform('win32')
+    vi.stubEnv('QQNT_BRIDGE_LINUX_PACKET_MODE', undefined)
+  })
+
+  afterEach(() => {
+    setPlatform(originalPlatform)
+    vi.restoreAllMocks()
+    vi.unstubAllEnvs()
+  })
+
   it('uses private and group RKeys according to the QQ image appid', async () => {
     const f = fixture()
     await expect(f.client.getImageDirectUrl(image(
@@ -136,6 +161,27 @@ describe('QQPacketClient', () => {
       ...image('https://example/image'), kind: 'file',
     })).resolves.toBeUndefined()
     expect(loadAddon).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['disabled', 'QQNT packet disabled mode is unavailable on Linux'],
+    ['probe', 'QQNT packet probe mode is unavailable on Linux'],
+    ['hook', 'QQNT packet hook mode is probe-only unavailable on Linux'],
+    ['unexpected', 'invalid QQNT_BRIDGE_LINUX_PACKET_MODE: unexpected'],
+  ])('does not send FetchRkey in Linux %s mode', async (mode, unavailable) => {
+    setPlatform('linux')
+    vi.stubEnv('QQNT_BRIDGE_LINUX_PACKET_MODE', mode)
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const f = fixture()
+
+    await expect(f.client.getImageDirectUrl(image(
+      'https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=group',
+    ))).resolves.toBeUndefined()
+
+    expect(f.addon.encodeFetchRkeyRequest).not.toHaveBeenCalled()
+    expect(f.addon.installSendHook).not.toHaveBeenCalled()
+    expect(f.send).not.toHaveBeenCalled()
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining(unavailable))
   })
 
   it('falls back when the QQ build has no packet sender or xref anchor', async () => {

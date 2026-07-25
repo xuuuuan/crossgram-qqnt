@@ -2444,6 +2444,9 @@ describe('QQBridgeServer', () => {
   })
 
   it('serves an image direct URL through the xref-verified packet path', async () => {
+    const originalPlatform = process.platform
+    Object.defineProperty(process, 'platform', { configurable: true, value: 'win32' })
+    try {
     const f = fixture()
     const sendPacket = vi.fn(async () => ({ rspbuffer: Buffer.from('fetch-rkey-response') }))
     Object.assign(f.msg, { sendSsoCmdReqByContend: sendPacket })
@@ -2460,6 +2463,14 @@ describe('QQBridgeServer', () => {
         url.searchParams.set('rkey', rkey.replace(/^&?rkey=/, ''))
         return url.toString()
       }),
+      probePacketBinding: vi.fn(() => ({
+        moduleBase: '0x180000000', modulePath: '/qqnt/wrapper.node', profile: 'linux-xref-v1',
+        buildId: 'build-id', sha256: 'sha256', nameSlotRva: '0x1', bindingNameRva: '0x2',
+        bindingName: 'sendSsoCmdReqByContend', napiCallbackSlotRva: '0x3', napiCallbackRva: '0x4',
+        napiCallbackFingerprint: 'fingerprint', responseActionSlotRva: '0x5', responseActionRva: '0x6',
+        responseActionFingerprint: 'fingerprint', converterRva: '0x7', converterFingerprint: 'fingerprint',
+        resolveActionRva: '0x8', resolveActionFingerprint: 'fingerprint',
+      })),
       locateSendBinding: vi.fn(() => ({
         moduleBase: '0x180000000', profile: 'xref-v1', timeDateStamp: 0x1122_3344,
         sizeOfImage: 0x678000, anchorRva: 0x100, xrefRva: 0x200, functionRva: 0x180,
@@ -2506,6 +2517,9 @@ describe('QQBridgeServer', () => {
     })
     expect(unsupported.status).toBe(404)
     expect(sendPacket).toHaveBeenCalledOnce()
+    } finally {
+      Object.defineProperty(process, 'platform', { configurable: true, value: originalPlatform })
+    }
   })
 
   it('warns once per normalized slow HTTP route', async () => {

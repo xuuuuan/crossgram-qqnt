@@ -5,6 +5,7 @@ import type {
 } from './kernel-types.js'
 import { teeBuddyService, teeGroupService, teeMsgService, teeProfileService, teeRecentService } from './listener-tee.js'
 import { log, logPath } from './log.js'
+import { createPacketBindingProber, linuxPacketMode, type PacketBindingProbe } from './packet-addon.js'
 import { QQKernelBridge } from './qq-kernel.js'
 import { QQBridgeServer } from './server.js'
 
@@ -57,6 +58,7 @@ function installKernelRequireHook(bridge: QQKernelBridge): void {
   const originalLoad = moduleWithLoad._load
   const wrappedModules = new WeakMap<object, KernelModule>()
   const originalDlopen = process.dlopen
+  const probePacketBinding = createPacketBindingProber()
 
   moduleWithLoad._load = function qqntBridgeLoad(request, parent, isMain) {
     const loaded = originalLoad.call(this, request, parent, isMain)
@@ -76,6 +78,7 @@ function installKernelRequireHook(bridge: QQKernelBridge): void {
     const result = originalDlopen.apply(this, arguments as unknown as Parameters<typeof originalDlopen>)
     const nativeModule = module as { exports: unknown }
     if (isKernelModule(nativeModule.exports)) {
+      probeLinuxPacketBinding()
       const raw = nativeModule.exports
       let wrapped = wrappedModules.get(raw)
       if (!wrapped) {
@@ -87,6 +90,24 @@ function installKernelRequireHook(bridge: QQKernelBridge): void {
     }
     return result
   }
+
+  function probeLinuxPacketBinding(): void {
+    if (process.platform !== 'linux') return
+    try {
+      const mode = linuxPacketMode()
+      if (mode === 'disabled') return
+      const probe = probePacketBinding()
+      if (!probe) return
+      logLinuxPacketProbe(probe)
+      if (mode === 'hook') log('info', 'QQNT Linux packet profile verified but hook remains probe-only')
+    } catch (error) {
+      log('warn', 'QQNT Linux packet binding probe unavailable', error)
+    }
+  }
+}
+
+function logLinuxPacketProbe(probe: PacketBindingProbe): void {
+  log('info', `QQNT Linux packet profile verified profile=${probe.profile} buildIdPrefix=${probe.buildId.slice(0, 16)} sha256Prefix=${probe.sha256.slice(0, 16)} nameSlotRva=${probe.nameSlotRva} bindingNameRva=${probe.bindingNameRva} napiCallbackSlotRva=${probe.napiCallbackSlotRva} napiCallbackRva=${probe.napiCallbackRva} responseActionSlotRva=${probe.responseActionSlotRva} responseActionRva=${probe.responseActionRva} converterRva=${probe.converterRva} resolveActionRva=${probe.resolveActionRva}`)
 }
 
 function isKernelModule(value: unknown): value is KernelModule & object {

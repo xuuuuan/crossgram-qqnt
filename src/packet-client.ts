@@ -1,6 +1,6 @@
 import type { KernelMsgService } from './kernel-types.js'
 import { log } from './log.js'
-import { loadPacketAddon, type PacketAddon } from './packet-addon.js'
+import { linuxPacketMode, loadPacketAddon, type PacketAddon } from './packet-addon.js'
 import type { QQMediaLocator } from './protocol.js'
 
 const PRIVATE_IMAGE_APP_ID = '1406'
@@ -77,6 +77,11 @@ export class QQPacketClient {
   }
 
   private async fetchRkeys(): Promise<RkeyCache> {
+    if (process.platform === 'linux') {
+      const mode = linuxPacketMode()
+      if (mode === 'hook') throw new Error('QQNT packet hook mode is probe-only unavailable on Linux')
+      throw new Error(`QQNT packet ${mode} mode is unavailable on Linux`)
+    }
     const addon = this.loadAddon()
     this.locateBinding(addon)
     const send = this.msgService.sendSsoCmdReqByContend

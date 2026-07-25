@@ -27,6 +27,29 @@ export interface NativeSendBindingLocation {
   responseRva: number
 }
 
+export interface PacketBindingProbe {
+  moduleBase: string
+  modulePath: string
+  profile: string
+  buildId: string
+  sha256: string
+  nameSlotRva: string
+  bindingNameRva: string
+  bindingName: string
+  napiCallbackSlotRva: string
+  napiCallbackRva: string
+  napiCallbackFingerprint: string
+  responseActionSlotRva: string
+  responseActionRva: string
+  responseActionFingerprint: string
+  converterRva: string
+  converterFingerprint: string
+  resolveActionRva: string
+  resolveActionFingerprint: string
+}
+
+export type LinuxPacketMode = 'disabled' | 'probe' | 'hook'
+
 export interface PacketAddon {
   sendPacket(
     send: (command: string, payload: Buffer) => unknown,
@@ -36,6 +59,7 @@ export interface PacketAddon {
   encodeFetchRkeyRequest(): NativePacketRequest
   decodeFetchRkeyResponse(payload: Buffer): NativeRkey[]
   refreshImageUrl(originalUrl: string, rkey: string): string
+  probePacketBinding(): PacketBindingProbe
   locateSendBinding(): NativeSendBindingLocation
   installSendHook(): NativeSendBindingLocation
 }
@@ -52,7 +76,7 @@ export function loadPacketAddon(): PacketAddon {
   const required = createRequire(moduleFilename)(candidate) as Partial<PacketAddon>
   for (const name of [
     'sendPacket', 'encodeFetchRkeyRequest', 'decodeFetchRkeyResponse',
-    'refreshImageUrl', 'locateSendBinding', 'installSendHook',
+    'refreshImageUrl', 'probePacketBinding', 'locateSendBinding', 'installSendHook',
   ] satisfies Array<keyof PacketAddon>) {
     if (typeof required[name] !== 'function') throw new Error(`QQNT packet addon is missing ${name}`)
   }
@@ -73,6 +97,32 @@ function packetAddonCandidates(): string[] {
     join(sourceDir, `qqnt_packet.${platformSuffix}.node`),
     artifact ? join(artifactDir, artifact) : undefined,
   ].filter((candidate): candidate is string => Boolean(candidate))
+}
+
+export function linuxPacketMode(): LinuxPacketMode {
+  if (process.platform !== 'linux') return 'disabled'
+  switch (process.env.QQNT_BRIDGE_LINUX_PACKET_MODE) {
+    case 'probe': return 'probe'
+    case 'hook': return 'hook'
+    case 'disabled':
+    case undefined: return 'disabled'
+    default: throw new Error(`invalid QQNT_BRIDGE_LINUX_PACKET_MODE: ${process.env.QQNT_BRIDGE_LINUX_PACKET_MODE}`)
+  }
+}
+
+export function createPacketBindingProber(
+  loadAddon: () => Pick<PacketAddon, 'probePacketBinding'> = loadPacketAddon,
+): () => PacketBindingProbe | undefined {
+  let probing = false
+  return () => {
+    if (probing) return
+    probing = true
+    try {
+      return loadAddon().probePacketBinding()
+    } finally {
+      probing = false
+    }
+  }
 }
 
 export function resetPacketAddonForTesting(): void {

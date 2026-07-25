@@ -1,3 +1,4 @@
+mod elf;
 mod hook;
 mod locator;
 mod pe;
@@ -32,6 +33,28 @@ pub struct SendBindingLocation {
     pub function_rva: u32,
     pub converter_rva: u32,
     pub response_rva: u32,
+}
+
+#[napi(object)]
+pub struct PacketBindingProbe {
+    pub module_base: String,
+    pub module_path: String,
+    pub profile: String,
+    pub build_id: String,
+    pub sha256: String,
+    pub name_slot_rva: String,
+    pub binding_name_rva: String,
+    pub binding_name: String,
+    pub napi_callback_slot_rva: String,
+    pub napi_callback_rva: String,
+    pub napi_callback_fingerprint: String,
+    pub response_action_slot_rva: String,
+    pub response_action_rva: String,
+    pub response_action_fingerprint: String,
+    pub converter_rva: String,
+    pub converter_fingerprint: String,
+    pub resolve_action_rva: String,
+    pub resolve_action_fingerprint: String,
 }
 
 /// Calls QQNT's bound sendSsoCmdReqByContend function from the addon so the
@@ -95,6 +118,41 @@ pub fn refresh_image_url(original_url: String, rkey: String) -> Result<String> {
     pairs.push(("rkey".into(), value.into()));
     url.query_pairs_mut().clear().extend_pairs(pairs);
     Ok(url.into())
+}
+
+#[napi]
+pub fn probe_packet_binding() -> Result<PacketBindingProbe> {
+    if !cfg!(target_os = "linux") {
+        return Err(Error::from_reason(
+            "probing the QQNT packet binding is only supported on Linux",
+        ));
+    }
+    let probe = locator::probe_packet_binding().map_err(|error| {
+        Error::from_reason(format!("failed to probe QQNT packet binding: {error}"))
+    })?;
+    Ok(PacketBindingProbe {
+        module_base: format!("0x{:x}", probe.module_base),
+        module_path: probe.module_path,
+        profile: probe.profile.into(),
+        build_id: elf::hex(&probe.build_id),
+        sha256: elf::hex(&probe.sha256),
+        name_slot_rva: format!("0x{:x}", probe.name_slot_rva),
+        binding_name_rva: format!("0x{:x}", probe.binding_name_rva),
+        binding_name: String::from_utf8(probe.binding_name)
+            .map_err(|_| Error::from_reason("packet binding name is not valid UTF-8"))?
+            .trim_end_matches('\0')
+            .into(),
+        napi_callback_slot_rva: format!("0x{:x}", probe.napi_callback_slot_rva),
+        napi_callback_rva: format!("0x{:x}", probe.napi_callback_rva),
+        napi_callback_fingerprint: elf::hex(&probe.napi_callback_fingerprint),
+        response_action_slot_rva: format!("0x{:x}", probe.response_action_slot_rva),
+        response_action_rva: format!("0x{:x}", probe.response_action_rva),
+        response_action_fingerprint: elf::hex(&probe.response_action_fingerprint),
+        converter_rva: format!("0x{:x}", probe.converter_rva),
+        converter_fingerprint: elf::hex(&probe.converter_fingerprint),
+        resolve_action_rva: format!("0x{:x}", probe.resolve_action_rva),
+        resolve_action_fingerprint: elf::hex(&probe.resolve_action_fingerprint),
+    })
 }
 
 #[napi]
