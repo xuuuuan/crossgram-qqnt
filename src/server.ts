@@ -12,6 +12,8 @@ import { log, recordSlowHttpRequest, slowHttpLogPath } from './log.js'
 export interface BridgeServerOptions {
   host?: string
   port?: number
+  webSocketHost?: string
+  webSocketPort?: number
   token?: string
   slowRequestThresholdMs?: number
   slowRequestPath?: string
@@ -19,10 +21,13 @@ export interface BridgeServerOptions {
 
 export class QQBridgeServer {
   private server?: Server
+  private webSocketHttpServer?: Server
   private webSocketServer?: WebSocketServer
   private requestSequence = 0
   readonly host: string
   readonly port: number
+  readonly webSocketHost: string
+  readonly webSocketPort?: number
   readonly token?: string
   readonly slowRequestThresholdMs: number
   readonly slowRequestPath: string
@@ -30,6 +35,8 @@ export class QQBridgeServer {
   constructor(readonly bridge: QQKernelBridge, options: BridgeServerOptions = {}) {
     this.host = options.host ?? '127.0.0.1'
     this.port = options.port ?? 18767
+    this.webSocketHost = options.webSocketHost ?? this.host
+    this.webSocketPort = options.webSocketPort
     this.token = options.token
     this.slowRequestThresholdMs = options.slowRequestThresholdMs ?? 500
     this.slowRequestPath = options.slowRequestPath ?? slowHttpLogPath
@@ -70,61 +77,106 @@ export class QQBridgeServer {
       })
     })
     this.webSocketServer = new WebSocketServer({ noServer: true })
-    this.server.on('upgrade', (request, socket, head) => {
-      const requestId = ++this.requestSequence
-      const target = request.url ?? '/'
-      if (!isWebSocketEventsRequest(target)) {
-        rejectUpgrade(socket, 404, 'Not Found')
-        return
-      }
-      if (!this.authorize(request)) {
-        rejectUpgrade(socket, 401, 'Unauthorized')
-        return
-      }
-      if (!this.bridge.status.ready) {
-        rejectUpgrade(socket, 503, 'Service Unavailable')
-        return
-      }
-      const lastEventId = new URL(target, `http://${request.headers.host ?? 'localhost'}`)
-        .searchParams.get('lastEventId') ?? undefined
-      log('info', `WebSocket upgrade request=${requestId} target=${JSON.stringify(target)} remote=${request.socket.remoteAddress ?? '<unknown>'}`)
-      this.webSocketServer?.handleUpgrade(request, socket, head, (webSocket) => {
-        void this.eventsWebSocket(webSocket, requestId, lastEventId).catch((error) => {
-          log('error', `WebSocket event stream failed request=${requestId}`, error)
-          webSocket.terminate()
-        })
+    const upgrade = (request: IncomingMessage, socket: Duplex, head: Buffer) =>
+      this.handleWebSocketUpgrade(request, socket, head)
+    if (this.webSocketPort === undefined) {
+      this.server.on('upgrade', upgrade)
+    } else {
+      this.webSocketHttpServer = createServer((request, response) => {
+        if (!this.authorize(request)) {
+          json(response, 401, { error: 'unauthorized' })
+        } else if (!this.bridge.status.ready) {
+          json(response, 503, { error: 'QQNT kernel is not ready' })
+        } else if (request.method === 'GET' && isWebSocketEventsRequest(request.url ?? '/')) {
+          json(response, 426, { error: 'WebSocket upgrade required' })
+        } else {
+          json(response, 404, { error: 'not found' })
+        }
       })
-    })
+      this.webSocketHttpServer.on('upgrade', upgrade)
+      this.webSocketHttpServer.keepAliveTimeout = 65_000
+      this.webSocketHttpServer.headersTimeout = 70_000
+      this.webSocketHttpServer.requestTimeout = 0
+    }
     this.server.keepAliveTimeout = 65_000
     this.server.headersTimeout = 70_000
     this.server.requestTimeout = 0
     this.server.listen(this.port, this.host)
     try {
       await once(this.server, 'listening')
+      if (this.webSocketHttpServer) {
+        this.webSocketHttpServer.listen(this.webSocketPort, this.webSocketHost)
+        await once(this.webSocketHttpServer, 'listening')
+      }
     } catch (error) {
       this.server.close()
+      this.webSocketHttpServer?.close()
+      this.webSocketHttpServer = undefined
       this.server = undefined
       throw error
     }
     log('info', `listening on http://${this.host}:${this.address().port}/v1`)
+    if (this.webSocketHttpServer) {
+      const address = this.webSocketAddress()
+      log('info', `WebSocket listening on ws://${address.host}:${address.port}/v1/events/ws`)
+    }
   }
 
   async stop(): Promise<void> {
     const server = this.server
     if (!server) return
     this.server = undefined
+    const webSocketHttpServer = this.webSocketHttpServer
+    this.webSocketHttpServer = undefined
     const webSocketServer = this.webSocketServer
     this.webSocketServer = undefined
     for (const client of webSocketServer?.clients ?? []) client.terminate()
     webSocketServer?.close()
     server.close()
-    await once(server, 'close')
+    webSocketHttpServer?.close()
+    await Promise.all([
+      once(server, 'close'),
+      ...(webSocketHttpServer ? [once(webSocketHttpServer, 'close')] : []),
+    ])
   }
 
   address(): { host: string, port: number } {
     const address = this.server?.address()
     if (!address || typeof address === 'string') throw new Error('bridge server is not listening')
     return { host: this.host, port: address.port }
+  }
+
+  webSocketAddress(): { host: string, port: number } {
+    const server = this.webSocketHttpServer ?? this.server
+    const address = server?.address()
+    if (!address || typeof address === 'string') throw new Error('bridge WebSocket server is not listening')
+    return { host: this.webSocketHttpServer ? this.webSocketHost : this.host, port: address.port }
+  }
+
+  private handleWebSocketUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void {
+    const requestId = ++this.requestSequence
+    const target = request.url ?? '/'
+    if (!isWebSocketEventsRequest(target)) {
+      rejectUpgrade(socket, 404, 'Not Found')
+      return
+    }
+    if (!this.authorize(request)) {
+      rejectUpgrade(socket, 401, 'Unauthorized')
+      return
+    }
+    if (!this.bridge.status.ready) {
+      rejectUpgrade(socket, 503, 'Service Unavailable')
+      return
+    }
+    const lastEventId = new URL(target, `http://${request.headers.host ?? 'localhost'}`)
+      .searchParams.get('lastEventId') ?? undefined
+    log('info', `WebSocket upgrade request=${requestId} target=${JSON.stringify(target)} remote=${request.socket.remoteAddress ?? '<unknown>'}`)
+    this.webSocketServer?.handleUpgrade(request, socket, head, (webSocket) => {
+      void this.eventsWebSocket(webSocket, requestId, lastEventId).catch((error) => {
+        log('error', `WebSocket event stream failed request=${requestId}`, error)
+        webSocket.terminate()
+      })
+    })
   }
 
   private async route(request: IncomingMessage, response: ServerResponse, requestId: number): Promise<void> {
@@ -353,14 +405,63 @@ export class QQBridgeServer {
     }
     if (request.method === 'POST' && path === '/v1/files/download') {
       const locator = await readJson<QQMediaLocator>(request)
-      log('info', `HTTP API file download id=${requestId} kind=${locator.kind} message=${locator.messageId} element=${locator.elementId} peer=${locator.peerUid} pathPresent=${Boolean(locator.filePath)}`)
-      const stream = await this.bridge.downloadFile(locator)
-      response.writeHead(200, {
+      const range = parseByteRange(request.headers.range)
+      log('info', `HTTP API file download id=${requestId} kind=${locator.kind} message=${locator.messageId} element=${locator.elementId} peer=${locator.peerUid} pathPresent=${Boolean(locator.filePath)} range=${JSON.stringify(request.headers.range ?? '')}`)
+      if (range === false) {
+        response.writeHead(416, { 'content-range': 'bytes */*', 'cache-control': 'no-store' })
+        response.end()
+        return
+      }
+      // qlogo avatars are remote HTTP bodies without a stable local length.
+      // Keep the legacy whole-body response; the platform client will slice it
+      // locally when talking to this or an older bridge.
+      if (locator.avatarUin) {
+        const stream = await this.bridge.downloadFile(locator)
+        response.writeHead(200, {
+          'content-type': 'application/octet-stream',
+          'cache-control': 'no-store',
+          'transfer-encoding': 'chunked',
+        })
+        await pipe(stream, response)
+        return
+      }
+      const asset = await this.bridge.openFile(locator, range ?? {})
+      if (range && asset.offset >= asset.size) {
+        response.writeHead(416, {
+          'content-range': `bytes */${asset.size}`,
+          'accept-ranges': 'bytes',
+          'cache-control': 'no-store',
+        })
+        response.end()
+        return
+      }
+      const status = range ? 206 : 200
+      response.writeHead(status, {
         'content-type': 'application/octet-stream',
+        'content-length': String(asset.length),
+        ...(range ? { 'content-range': `bytes ${asset.offset}-${asset.offset + asset.length - 1}/${asset.size}` } : {}),
+        'accept-ranges': 'bytes',
         'cache-control': 'no-store',
-        'transfer-encoding': 'chunked',
       })
-      await pipe(stream, response)
+      await pipe(asset.stream, response)
+      return
+    }
+    if (request.method === 'POST' && path === '/v1/files/play-url') {
+      const locator = await readJson<QQMediaLocator>(request)
+      const result = await this.bridge.getVideoPlayUrl(locator)
+      log('info', `HTTP API video play URL id=${requestId} message=${locator.messageId} element=${locator.elementId} peer=${locator.peerUid}`)
+      json(response, 200, result)
+      return
+    }
+    if (request.method === 'POST' && path === '/v1/files/direct-url') {
+      const locator = await readJson<QQMediaLocator>(request)
+      const result = await this.bridge.getDirectUrl(locator)
+      if (!result) {
+        json(response, 404, { error: 'direct URL is unavailable' })
+        return
+      }
+      log('info', `HTTP API media direct URL id=${requestId} kind=${locator.kind} message=${locator.messageId} element=${locator.elementId} peer=${locator.peerUid}`)
+      json(response, 200, result)
       return
     }
     json(response, 404, { error: 'not found' })
@@ -467,6 +568,17 @@ function optionalNumberParam(url: URL, name: string): number | undefined {
   const value = Number(raw)
   if (!Number.isFinite(value)) throw new Error(`invalid ${name}`)
   return value
+}
+
+function parseByteRange(value: string | undefined): { offset: number, limit?: number } | null | false {
+  if (value === undefined) return null
+  const match = /^bytes=(\d+)-(\d*)$/.exec(value.trim())
+  if (!match) return false
+  const offset = Number(match[1])
+  const end = match[2] ? Number(match[2]) : undefined
+  if (!Number.isSafeInteger(offset) || offset < 0) return false
+  if (end !== undefined && (!Number.isSafeInteger(end) || end < offset)) return false
+  return { offset, ...(end === undefined ? {} : { limit: end - offset + 1 }) }
 }
 
 async function pipe(source: Readable, destination: ServerResponse): Promise<void> {

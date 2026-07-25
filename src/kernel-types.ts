@@ -154,7 +154,27 @@ export interface MsgElement {
     }
   }
   pttElement?: { duration: number, text?: string }
-  videoElement?: { fileName: string, fileTime: number }
+  videoElement?: {
+    filePath?: string
+    fileName: string
+    videoMd5?: string
+    thumbMd5?: string
+    /** Duration in seconds. */
+    fileTime: number
+    thumbSize?: number
+    /** 1 avi, 2 mp4, 3 wmv, 4 mkv, 5 rmvb, 6 rm, 7 asf, 8 mov, 9 mod, 10 ts, 11 mts. */
+    fileFormat?: number
+    fileSize?: string
+    thumbWidth?: number
+    thumbHeight?: number
+    thumbPath?: Map<number, string>
+    fileUuid?: string
+    fileSubId?: string
+    fileBizId?: number
+    originVideoMd5?: string
+    /** Native QQ video codec enum: 0 h264, 1 h265. */
+    sourceVideoCodecFormat?: number
+  }
   arkElement?: { bytesData: string }
   markdownElement?: { content: string }
   structLongMsgElement?: { xmlContent?: string, resId?: string }
@@ -268,6 +288,9 @@ export interface MsgRecord {
   sendRemarkName: string
   sendMemberName: string
   sendNickName: string
+  /** Per-record avatar identity retained by QQ for imported/forwarded messages. */
+  avatarMeta?: string
+  avatarFlag?: number
   elements: MsgElement[]
   records?: MsgRecord[]
   emojiLikesList?: Array<{
@@ -311,6 +334,14 @@ export interface FileTransNotifyInfo {
 }
 
 export interface KernelMsgService {
+  sendSsoCmdReqByContend?(
+    command: string,
+    payload: Uint8Array,
+  ): Promise<Buffer | Uint8Array | {
+    result?: number
+    errMsg?: string
+    rspbuffer?: Buffer | Uint8Array
+  }>
   addKernelMsgListener(listener: unknown): string
   removeKernelMsgListener(listenerId: string): void
   sendMsg(msgId: string, peer: Contact, msgElements: MsgElement[], attrs: Map<number, unknown>): Promise<{ result: number, errMsg: string }>
@@ -572,6 +603,22 @@ export interface KernelGroupService {
 
 export interface KernelRichMediaService {
   getRichMediaFileDir?(elementType: number, downType: number, isTemp: boolean): string
+  getVideoPlayUrl?(
+    peer: { chatType: number, peerUid: string, guildId: string },
+    msgId: string,
+    elemId: string,
+    videoCodecFormat: number,
+    videoRequestWay: number,
+  ): Promise<{
+    result: number
+    errMsg: string
+    urlResult: {
+      v4IpUrl: Array<{ url: string, isHttps: boolean, httpsDomain: string }>
+      v6IpUrl: Array<{ url: string, isHttps: boolean, httpsDomain: string }>
+      domainUrl: Array<{ url: string, isHttps: boolean, httpsDomain: string }>
+      videoCodecFormat: number
+    }
+  }>
 }
 
 export interface KernelSession {

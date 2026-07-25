@@ -20,6 +20,10 @@ if ((processType === undefined || processType === 'browser') && !bootstrapState[
   const server = new QQBridgeServer(bridge, {
     host: process.env.QQNT_BRIDGE_HOST ?? '127.0.0.1',
     port: Number(process.env.QQNT_BRIDGE_PORT ?? 18767),
+    webSocketHost: process.env.QQNT_BRIDGE_WS_HOST,
+    webSocketPort: process.env.QQNT_BRIDGE_WS_PORT === undefined
+      ? undefined
+      : Number(process.env.QQNT_BRIDGE_WS_PORT),
     token: process.env.QQNT_BRIDGE_TOKEN,
   })
 

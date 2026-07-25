@@ -5,7 +5,7 @@
   "description": "Local streaming bridge exposing the QQNT kernel to mtproto-relay",
   "type": "module",
   "scripts": {
-    "build": "pnpm build:native && esbuild src/main.ts --bundle --outfile=dist/main.js --platform=node --target=node22 --format=cjs && node scripts/copy-native.mjs",
+    "build": "pnpm build:native && esbuild src/main.ts --bundle --outfile=dist/main.js --platform=node --target=node22 --format=cjs --define:import.meta.url=__filename && node scripts/copy-native.mjs",
     "build:native": "napi build --platform --release --cwd native/packet-addon --output-dir artifacts --no-js --dts index.d.ts",
     "test": "pnpm build:native && vitest run && pnpm test:native",
     "test:native": "cargo test --manifest-path native/packet-addon/Cargo.toml",

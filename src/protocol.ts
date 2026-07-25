@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 12
+export const PROTOCOL_VERSION = 14
 
 export type QQChatType = 1 | 2
 
@@ -25,6 +25,10 @@ export interface QQMediaLocator {
   md5?: string
   sha?: string
   sha3?: string
+  /** QQ's original CDN URL. The bridge replaces its expired RKey through OIDB. */
+  originImageUrl?: string
+  /** Present only for native QQ video elements. 0 h264, 1 h265. */
+  videoCodecFormat?: number
   /** Numeric QQ account used to fetch a user avatar from the fixed qlogo endpoint. */
   avatarUin?: string
 }
@@ -37,6 +41,8 @@ export interface QQMedia {
   size?: number
   width?: number
   height?: number
+  /** Playback duration in seconds. Present for native QQ video elements. */
+  duration?: number
   locator: QQMediaLocator
 }
 
@@ -247,6 +253,7 @@ export interface SendManifest {
     size?: number
     width?: number
     height?: number
+    duration?: number
   }>
 }
 

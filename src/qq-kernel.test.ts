@@ -6,8 +6,11 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import WebSocket from 'ws'
 import type { ContactMsgBoxInfo, FileTransNotifyInfo, KernelModule, KernelSession, MsgRecord } from './kernel-types.js'
+import type { PacketAddon } from './packet-addon.js'
 import { QQKernelBridge } from './qq-kernel.js'
 import { QQBridgeServer } from './server.js'
+
+const avatarFixturePath = process.platform === 'win32' ? process.execPath : '/dev/null'
 
 function fixture() {
   let msgHandlers: Record<string, (...args: unknown[]) => unknown> = {}
@@ -19,7 +22,7 @@ function fixture() {
     uid: string, uin: string, nick: string, remark: string, avatarUrl: string
     coreInfo?: { nick?: string, avatarUrl?: string }
   }>([['self', { uid: 'self', uin: '10000', nick: 'Self', remark: '', avatarUrl: '' }]])
-  let avatarPath = '/dev/null'
+  let avatarPath = avatarFixturePath
   const sentBodies: Buffer[] = []
   const message: MsgRecord = {
     msgId: 'm1', msgSeq: 'seq1', chatType: 1, sendType: 1, senderUid: 'self', senderUin: '10000',
@@ -153,7 +156,14 @@ function fixture() {
     searchMoreChatMsgs: vi.fn((_searchId: number) => {}),
     cancelSearchChatMsgs: vi.fn((_searchId: number, _code: number, _reason: string) => {}),
   }
-  const richMedia = {}
+  const richMedia = {
+    getVideoPlayUrl: vi.fn(async () => ({
+      result: 0, errMsg: '', urlResult: {
+        domainUrl: [{ url: 'https://video.example/clip', isHttps: true, httpsDomain: '' }],
+        v4IpUrl: [], v6IpUrl: [], videoCodecFormat: 0,
+      },
+    })),
+  }
   const uix = {
     getUid: vi.fn(async (uins: Set<string>) => ({ uidInfo: new Map([...uins].flatMap((uin) => {
       if (uin === '1715311957') return [[uin, 'uid-1715311957']]
@@ -852,7 +862,7 @@ describe('QQKernelBridge', () => {
     })
   })
 
-  it('hides recalled records from history and renders unsupported elements as text fallbacks', async () => {
+  it('hides recalled records, maps native videos, and renders unsupported elements as text fallbacks', async () => {
     const f = fixture()
     f.msg.getLatestDbMsgs.mockResolvedValueOnce({
       result: 0, errMsg: '', msgList: [
@@ -863,7 +873,12 @@ describe('QQKernelBridge', () => {
         }] },
         { ...f.message, msgId: 'fallbacks', elements: [
           { elementType: 4, elementId: 'voice', pttElement: { duration: 3, text: '转写内容' } },
-          { elementType: 5, elementId: 'video', videoElement: { fileName: 'clip.mp4', fileTime: 4 } },
+          { elementType: 5, elementId: 'video', videoElement: {
+            filePath: '/missing/clip.mp4', fileName: 'clip.mp4', fileTime: 4,
+            fileFormat: 2, fileSize: '1048576', thumbWidth: 1280, thumbHeight: 720,
+            videoMd5: 'video-md5', fileUuid: 'video-uuid', fileSubId: 'video-sub-id', fileBizId: 4601,
+            sourceVideoCodecFormat: 1,
+          } },
           { elementType: 10, elementId: 'ark', arkElement: {
             bytesData: JSON.stringify({ meta: { news: { title: '卡片标题' } } }),
           } },
@@ -878,7 +893,16 @@ describe('QQKernelBridge', () => {
     expect(history.messages).toHaveLength(1)
     expect(history.messages[0]).toMatchObject({ id: 'fallbacks', parts: [
       { type: 'text', text: '[语音] 转写内容' },
-      { type: 'text', text: '[视频] clip.mp4' },
+      { type: 'media', media: {
+        id: 'video', kind: 'file', name: 'clip.mp4', mimeType: 'video/mp4',
+        size: 1048576, width: 1280, height: 720, duration: 4,
+        locator: {
+          messageId: 'fallbacks', elementId: 'video', chatType: 1, peerUid: 'uid-1715311957',
+          kind: 'file', fileName: 'clip.mp4', fileSize: '1048576', filePath: '/missing/clip.mp4',
+          fileUuid: 'video-uuid', fileSubId: 'video-sub-id', fileBizId: 4601, md5: 'video-md5',
+          videoCodecFormat: 1,
+        },
+      } },
       { type: 'text', text: '卡片标题' },
       { type: 'text', text: '**Markdown**' },
       { type: 'text', text: '[暂不支持的消息 999]' },
@@ -1069,6 +1093,54 @@ describe('QQKernelBridge', () => {
     })).resolves.toMatchObject([{ id: 'nested-1' }])
     expect(f.msg.getMultiMsg).toHaveBeenNthCalledWith(2, expect.anything(), 'merged-1', 'nested-1')
     expect(f.msg.getMultiMsg).toHaveBeenNthCalledWith(3, expect.anything(), 'nested-1', 'nested-1')
+  })
+
+  it('creates transcript-scoped virtual participants from forwarded names and avatars', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    await bridge.getDialogs()
+    const forwarded = [
+      {
+        ...f.message, msgId: 'forward-alice-1', senderUid: 'placeholder', senderUin: '1094950020',
+        sendType: 1, sendNickName: 'Alice', sendMemberName: '', avatarMeta: 'avatar-a',
+      },
+      {
+        ...f.message, msgId: 'forward-alice-2', senderUid: 'placeholder', senderUin: '1094950020',
+        sendType: 0, sendNickName: ' Alice ', sendMemberName: '', avatarMeta: 'avatar-a',
+      },
+      {
+        ...f.message, msgId: 'forward-bob', senderUid: 'placeholder', senderUin: '1094950020',
+        sendType: 0, sendNickName: 'Bob', sendMemberName: '', avatarMeta: 'avatar-b',
+      },
+      {
+        ...f.message, msgId: 'forward-other-alice', senderUid: 'placeholder', senderUin: '1094950020',
+        sendType: 0, sendNickName: 'Alice', sendMemberName: '', avatarMeta: 'avatar-b',
+      },
+    ] satisfies MsgRecord[]
+    f.msg.getMultiMsg.mockResolvedValue({ result: 0, errMsg: '', msgList: forwarded })
+    const locator = { conversationId: 'uid-1715311957', rootMessageId: 'merged-virtual' }
+
+    const first = await bridge.getMultiForwardMessages(locator)
+    const repeated = await bridge.getMultiForwardMessages(locator)
+    const otherTranscript = await bridge.getMultiForwardMessages({
+      ...locator, rootMessageId: 'merged-other',
+    })
+
+    expect(first.map((message) => message.senderId)).toEqual([
+      first[0]!.senderId,
+      first[0]!.senderId,
+      first[2]!.senderId,
+      first[3]!.senderId,
+    ])
+    expect(new Set(first.map((message) => message.senderId)).size).toBe(3)
+    expect(first[0]!.senderId).toMatch(/^qqnt-multi-forward-participant:[0-9a-f]{32}$/)
+    expect(first.map((message) => message.outgoing)).toEqual([false, false, false, false])
+    expect(first.map((message) => message.sender?.numericId)).toEqual([
+      undefined, undefined, undefined, undefined,
+    ])
+    expect(repeated.map((message) => message.senderId)).toEqual(first.map((message) => message.senderId))
+    expect(otherTranscript.map((message) => message.senderId)).not.toEqual(first.map((message) => message.senderId))
   })
 
   it('uses include-self for current QQ direct-chat history', async () => {
@@ -1321,6 +1393,7 @@ describe('QQKernelBridge', () => {
       picElement: {
         fileName: 'original.png', fileSize: '1024', picWidth: 32, picHeight: 32,
         md5HexStr: 'image-md5', fileUuid: 'image-uuid', fileSubId: '', picSubType: 0,
+        originImageUrl: 'https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=image&rkey=expired',
         thumbPath: new Map([[0, '/tmp/incomplete-thumbnail.png']]),
       },
     }]
@@ -1329,7 +1402,10 @@ describe('QQKernelBridge', () => {
 
     const [message] = (await bridge.getHistory(bridge.getConversation('uid-1715311957'))).messages
     expect(message.parts).toMatchObject([{
-      type: 'media', media: { locator: { filePath: undefined, fileUuid: 'image-uuid' } },
+      type: 'media', media: { locator: {
+        filePath: undefined, fileUuid: 'image-uuid',
+        originImageUrl: 'https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=image&rkey=expired',
+      } },
     }])
   })
 
@@ -1548,7 +1624,7 @@ describe('QQKernelBridge', () => {
         conversation: {
           id: '1058754719',
           title: 'Bridge Test Group',
-          avatar: { id: 'avatar:group:1058754719', locator: { filePath: '/dev/null' } },
+          avatar: { id: 'avatar:group:1058754719', locator: { filePath: avatarFixturePath } },
         },
         message: {
           sender: {
@@ -1918,9 +1994,10 @@ describe('QQKernelBridge', () => {
     const first = await bridge.getDialogs()
     expect(first.conversations.find((item) => item.id === '1058754719')?.avatar?.locator.filePath).toBeUndefined()
 
-    f.setAvatarPath('/dev/null')
+    const resolvedPath = process.platform === 'win32' ? process.execPath : '/dev/null'
+    f.setAvatarPath(resolvedPath)
     const second = await bridge.getDialogs()
-    expect(second.conversations.find((item) => item.id === '1058754719')?.avatar?.locator.filePath).toBe('/dev/null')
+    expect(second.conversations.find((item) => item.id === '1058754719')?.avatar?.locator.filePath).toBe(resolvedPath)
   })
 
   it('writes multiple reactions sequentially and emits updates for history messages', async () => {
@@ -2182,6 +2259,15 @@ describe('QQBridgeServer', () => {
 
   it('serves status, dialogs, and a chunked send endpoint', async () => {
     const f = fixture()
+    f.search.searchChatMsgs.mockImplementation(() => {
+      queueMicrotask(() => f.emitSearch({
+        searchId: 71, hasMore: false, resultItems: [{
+          msgId: 'http-search', msgSeq: '7', msgTime: '1700000000', senderUid: 'self',
+          senderUin: '10000', senderNick: 'Self', msgRecord: { ...f.message, msgId: 'http-search' },
+        }],
+      }))
+      return 71
+    })
     const bridge = new QQKernelBridge()
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
     server = new QQBridgeServer(bridge, { port: 0 })
@@ -2189,7 +2275,7 @@ describe('QQBridgeServer', () => {
     const { port } = server.address()
     const base = `http://127.0.0.1:${port}/v1`
     await expect(fetch(`${base}/status`).then((response) => response.json())).resolves.toMatchObject({
-      protocolVersion: 12, ready: true, selfUin: '10000',
+      protocolVersion: 14, ready: true, selfUin: '10000',
     })
     await expect(fetch(`${base}/dialogs`).then((response) => response.json())).resolves.toMatchObject({
       conversations: [{ peerUin: '1715311957' }],
@@ -2306,21 +2392,117 @@ describe('QQBridgeServer', () => {
 
     const cached = await download()
     expect(Buffer.from(await cached.arrayBuffer()).toString()).toBe('abcdefghijklmnop')
+    const ranged = await fetch(`${base}/files/download`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', range: 'bytes=5-8' },
+      body: JSON.stringify(locator),
+    })
+    expect(ranged.status).toBe(206)
+    expect(ranged.headers.get('accept-ranges')).toBe('bytes')
+    expect(ranged.headers.get('content-range')).toBe('bytes 5-8/16')
+    expect(ranged.headers.get('content-length')).toBe('4')
+    expect(Buffer.from(await ranged.arrayBuffer()).toString()).toBe('fghi')
+    const beyondEnd = await fetch(`${base}/files/download`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', range: 'bytes=16-' },
+      body: JSON.stringify(locator),
+    })
+    expect(beyondEnd.status).toBe(416)
+    expect(beyondEnd.headers.get('content-range')).toBe('bytes */16')
     expect((await fetch(`${base}/media/open`, { method: 'POST' })).status).toBe(404)
     expect(f.msg.downloadRichMedia).toHaveBeenCalledOnce()
   })
 
+  it('resolves a native video play URL with domain candidates first', async () => {
+    const f = fixture()
+    f.richMedia.getVideoPlayUrl.mockResolvedValueOnce({
+      result: 0, errMsg: '', urlResult: {
+        domainUrl: [{ url: 'https://media.example/domain.mp4?token=secret', isHttps: true, httpsDomain: '' }],
+        v4IpUrl: [{ url: 'https://192.0.2.10/ip.mp4', isHttps: true, httpsDomain: 'cdn.example' }],
+        v6IpUrl: [], videoCodecFormat: 1,
+      },
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/v1/files/play-url`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        messageId: 'video-message', elementId: 'video-element', chatType: 2, peerUid: 'group',
+        kind: 'file', fileName: 'clip.mp4', videoCodecFormat: 1,
+      }),
+    })
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toEqual({ url: 'https://media.example/domain.mp4?token=secret' })
+    expect(f.richMedia.getVideoPlayUrl).toHaveBeenCalledWith(
+      { chatType: 2, peerUid: 'group', guildId: '' },
+      'video-message', 'video-element', 1, 2,
+    )
+    expect(f.msg.downloadRichMedia).not.toHaveBeenCalled()
+  })
+
+  it('serves an image direct URL through the xref-verified packet path', async () => {
+    const f = fixture()
+    const sendPacket = vi.fn(async () => ({ rspbuffer: Buffer.from('fetch-rkey-response') }))
+    Object.assign(f.msg, { sendSsoCmdReqByContend: sendPacket })
+    const addon: PacketAddon = {
+      sendPacket: vi.fn((send, command, payload) => send(command, payload)),
+      encodeFetchRkeyRequest: vi.fn(() => ({
+        command: 'OidbSvcTrpcTcp.0x9067_202', payload: Buffer.from('fetch-rkey-request'),
+      })),
+      decodeFetchRkeyResponse: vi.fn(() => [{
+        value: '&rkey=fresh-group', ttlSeconds: '3600', createdAt: 1_800_000_000, kind: 20,
+      }]),
+      refreshImageUrl: vi.fn((original, rkey) => {
+        const url = new URL(original)
+        url.searchParams.set('rkey', rkey.replace(/^&?rkey=/, ''))
+        return url.toString()
+      }),
+      locateSendBinding: vi.fn(() => ({
+        moduleBase: '0x180000000', anchorRva: 0x100, xrefRva: 0x200, functionRva: 0x180,
+      })),
+    }
+    const bridge = new QQKernelBridge({
+      packetClient: { addon, now: () => 1_800_000_000_000 },
+    })
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const base = `http://127.0.0.1:${server.address().port}/v1/files/direct-url`
+    const response = await fetch(base, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        messageId: 'image-message', elementId: 'image-element', chatType: 2, peerUid: 'group',
+        kind: 'image', fileName: 'image.jpg',
+        originImageUrl: 'https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=image&rkey=expired',
+      }),
+    })
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toEqual({
+      url: 'https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=image&rkey=fresh-group',
+    })
+    expect(sendPacket).toHaveBeenCalledWith(
+      'OidbSvcTrpcTcp.0x9067_202', Buffer.from('fetch-rkey-request'),
+    )
+    expect(addon.locateSendBinding).toHaveBeenCalledOnce()
+    expect(f.msg.downloadRichMedia).not.toHaveBeenCalled()
+
+    const unsupported = await fetch(base, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        messageId: 'file-message', elementId: 'file-element', chatType: 2, peerUid: 'group',
+        kind: 'file', fileName: 'document.bin',
+      }),
+    })
+    expect(unsupported.status).toBe(404)
+    expect(sendPacket).toHaveBeenCalledOnce()
+  })
+
   it('warns once per normalized slow HTTP route', async () => {
     const f = fixture()
-    f.search.searchChatMsgs.mockImplementation(() => {
-      queueMicrotask(() => f.emitSearch({
-        searchId: 71, hasMore: false, resultItems: [{
-          msgId: 'http-search', msgSeq: '7', msgTime: '1700000000', senderUid: 'self',
-          senderUin: '10000', senderNick: 'Self', msgRecord: { ...f.message, msgId: 'http-search' },
-        }],
-      }))
-      return 71
-    })
     const bridge = new QQKernelBridge()
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
     const directory = await mkdtemp(join(tmpdir(), 'qqnt-bridge-server-'))

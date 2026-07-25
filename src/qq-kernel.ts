@@ -7,6 +7,8 @@ import { Readable } from 'node:stream'
 import { AsyncQueue, deferred } from './async.js'
 import { markBridgeListener } from './listener-tee.js'
 import { log } from './log.js'
+import { resolveMultiForwardParticipants } from './multi-forward-participants.js'
+import { QQPacketClient, type QQPacketClientOptions } from './packet-client.js'
 import type {
   CustomEmotionData, EmojiLikesUserInfo, FileTransNotifyInfo, GroupProfileInfo, InitSessionConfig, KernelModule, KernelSession,
   MarketStickerPackInfo, MemberInfo, MsgElement, MsgRecord, ProfileSimpleInfo, RecentContactInfo, SearchMsgKeywordsResult,
@@ -49,6 +51,7 @@ export interface QQKernelOptions {
   sendTimeoutMs?: number
   downloadTimeoutMs?: number
   userResolveTimeoutMs?: number
+  packetClient?: QQPacketClientOptions
 }
 
 interface SearchContext {
@@ -58,6 +61,12 @@ interface SearchContext {
   hasMore: boolean
   lastUsed: number
   busy: boolean
+}
+
+interface MessageMappingContext {
+  multiForwardRootId?: string
+  sender?: NonNullable<QQMessage['sender']>
+  outgoing?: boolean
 }
 
 export class QQKernelBridge {
@@ -75,6 +84,7 @@ export class QQKernelBridge {
   private recentService?: ReturnType<KernelSession['getRecentContactService']>
   private searchService?: NonNullable<ReturnType<NonNullable<KernelSession['getSearchService']>>>
   private avatarService?: NonNullable<ReturnType<NonNullable<KernelSession['getAvatarService']>>>
+  private packetClient?: QQPacketClient
   private readonly contacts = new Map<string, QQConversation>()
   private readonly recentContactIds = new Map<string, string>()
   private recentContactOrder: string[] = []
@@ -143,12 +153,14 @@ export class QQKernelBridge {
   private readonly sendTimeoutMs: number
   private readonly downloadTimeoutMs: number
   private readonly userResolveTimeoutMs: number
+  private readonly packetClientOptions: QQPacketClientOptions
 
   constructor(options: QQKernelOptions = {}) {
     this.tempPath = options.tempPath ?? join(process.env.TMPDIR ?? '/tmp', 'qqnt-mtproto-bridge')
     this.sendTimeoutMs = options.sendTimeoutMs ?? 60_000
     this.downloadTimeoutMs = options.downloadTimeoutMs ?? 120_000
     this.userResolveTimeoutMs = options.userResolveTimeoutMs ?? 2_000
+    this.packetClientOptions = options.packetClient ?? {}
     mkdirSync(this.tempPath, { recursive: true })
   }
 
@@ -248,6 +260,7 @@ export class QQKernelBridge {
     this.recentService = undefined
     this.searchService = undefined
     this.avatarService = undefined
+    this.packetClient = undefined
     this.session = undefined
     this.recentEvents.splice(0)
     for (const pending of this.pendingMessages.values()) pending.reject(new Error('QQNT session detached'))
@@ -818,9 +831,25 @@ export class QQKernelBridge {
       if (fallback.result === 0) response = fallback
     }
     if (response.result !== 0) throw new Error(`getMultiMsg: ${response.errMsg} (${response.result})`)
-    return response.msgList
-      .filter((record) => !isRecalledRecord(record))
-      .map((record) => this.mapMessage(record, locator.rootMessageId))
+    const records = response.msgList.filter((record) => !isRecalledRecord(record))
+    const participants = resolveMultiForwardParticipants(locator, records)
+    return records.map((record) => {
+      const participant = participants.get(record)!
+      return this.mapMessage(record, {
+        multiForwardRootId: locator.rootMessageId,
+        sender: {
+          id: participant.id,
+          name: participant.name,
+          alias: participant.alias,
+          avatar: participant.avatarUin
+            ? qlogoAvatarMedia(participant.id, participant.avatarUin)
+            : undefined,
+        },
+        // A merged-forward transcript is an archive. Even the current QQ
+        // account is a participant in that archive, not the live account peer.
+        outgoing: false,
+      })
+    })
   }
 
   private async getMessageRecord(conversation: QQConversation, id: string): Promise<MsgRecord | null> {
@@ -1182,6 +1211,8 @@ export class QQKernelBridge {
           media.media.size ??= spec.size
           media.media.width ??= spec.width
           media.media.height ??= spec.height
+          media.media.duration ??= spec.duration
+          media.media.mimeType ??= spec.mimeType
         }
         preserveUntil = Date.now() + 10 * 60_000
       }
@@ -1731,6 +1762,53 @@ export class QQKernelBridge {
 
   async downloadFile(locator: QQMediaLocator): Promise<Readable> {
     if (locator.avatarUin) return this.downloadQlogoAvatar(locator.avatarUin)
+    return (await this.openFile(locator)).stream
+  }
+
+  async getVideoPlayUrl(locator: QQMediaLocator): Promise<{ url: string }> {
+    if (locator.videoCodecFormat === undefined) throw new Error('QQ media locator is not a native video')
+    const richMediaService = this.requireSession().getRichMediaService()
+    const getVideoPlayUrl = richMediaService.getVideoPlayUrl?.bind(richMediaService)
+    if (!getVideoPlayUrl) throw new Error('getVideoPlayUrl is unavailable in this QQNT build')
+    log('info', `native API start name=getVideoPlayUrl message=${locator.messageId} element=${locator.elementId} peer=${locator.peerUid} codec=${locator.videoCodecFormat}`)
+    const response = await withTimeout(getVideoPlayUrl(
+      { chatType: locator.chatType, peerUid: locator.peerUid, guildId: '' },
+      locator.messageId,
+      locator.elementId,
+      locator.videoCodecFormat,
+      2,
+    ), 10_000, `QQ video play URL request timed out: ${locator.messageId}:${locator.elementId}`)
+    if (response.result !== 0) {
+      throw new Error(`getVideoPlayUrl: ${response.errMsg} (${response.result})`)
+    }
+    const candidates = [
+      ...(response.urlResult.domainUrl ?? []),
+      ...(response.urlResult.v4IpUrl ?? []),
+      ...(response.urlResult.v6IpUrl ?? []),
+    ]
+    for (const candidate of candidates) {
+      const url = normalizeVideoPlayUrl(candidate)
+      if (!url) continue
+      log('info', `native API complete name=getVideoPlayUrl message=${locator.messageId} element=${locator.elementId} codec=${response.urlResult.videoCodecFormat}`)
+      return { url }
+    }
+    throw new Error('getVideoPlayUrl completed without a usable URL')
+  }
+
+  async getDirectUrl(locator: QQMediaLocator): Promise<{ url: string } | undefined> {
+    if (locator.kind === 'image' && locator.originImageUrl) {
+      const url = await this.packetClientForSession().getImageDirectUrl(locator)
+      return url ? { url } : undefined
+    }
+    if (locator.videoCodecFormat !== undefined) return this.getVideoPlayUrl(locator)
+    return
+  }
+
+  async openFile(
+    locator: QQMediaLocator,
+    range: { offset?: number, limit?: number } = {},
+  ): Promise<{ stream: Readable, size: number, offset: number, length: number }> {
+    if (locator.avatarUin) throw new Error('QQ avatars do not expose a seekable local file')
     let path = locator.filePath
     if (locator.messageId.startsWith('reaction:')) {
       if (!path || !existsSync(path)) throw new Error(`QQ reaction resource is unavailable: ${locator.fileName}`)
@@ -1743,8 +1821,15 @@ export class QQKernelBridge {
       path = await this.downloadMedia(locator)
     }
     const size = statSync(path).size
-    log('info', `file stream open message=${locator.messageId} element=${locator.elementId} peer=${locator.peerUid} path=${JSON.stringify(path)} size=${size}`)
-    return size ? createReadStream(path) : Readable.from([])
+    const offset = Math.max(0, Math.trunc(range.offset ?? 0))
+    const available = Math.max(0, size - offset)
+    const requested = range.limit === undefined ? available : Math.max(0, Math.trunc(range.limit))
+    const length = Math.min(available, requested)
+    log('info', `file stream open message=${locator.messageId} element=${locator.elementId} peer=${locator.peerUid} path=${JSON.stringify(path)} size=${size} offset=${offset} length=${length}`)
+    return {
+      stream: length ? createReadStream(path, { start: offset, end: offset + length - 1 }) : Readable.from([]),
+      size, offset, length,
+    }
   }
 
   private async downloadQlogoAvatar(uin: string): Promise<Readable> {
@@ -2710,9 +2795,9 @@ export class QQKernelBridge {
     return this.mergeConversation(conversation)
   }
 
-  private mapMessage(record: MsgRecord, multiForwardRootId?: string): QQMessage {
-    this.rememberRecordSender(record)
-    let senderId = record.senderUid || record.senderUin
+  private mapMessage(record: MsgRecord, context: MessageMappingContext = {}): QQMessage {
+    if (!context.sender) this.rememberRecordSender(record)
+    let senderId = context.sender?.id ?? (record.senderUid || record.senderUin)
     const parts: QQMessage['parts'] = []
     let replyToId: string | undefined
     let serviceAction: QQMessage['serviceAction']
@@ -2757,8 +2842,8 @@ export class QQKernelBridge {
           title: multiForwardTitle(element.multiForwardMsgElement),
           locator: {
             conversationId: conversationId(record.chatType as 1 | 2, record.peerUid),
-            rootMessageId: multiForwardRootId ?? record.msgId,
-            ...(multiForwardRootId ? { parentMessageId: record.msgId } : {}),
+            rootMessageId: context.multiForwardRootId ?? record.msgId,
+            ...(context.multiForwardRootId ? { parentMessageId: record.msgId } : {}),
           },
         })
       } else if (isArkMultiForwardRecord(record) && element.arkElement) {
@@ -2767,8 +2852,8 @@ export class QQKernelBridge {
           title: arkMultiForwardTitle(element.arkElement.bytesData),
           locator: {
             conversationId: conversationId(record.chatType as 1 | 2, record.peerUid),
-            rootMessageId: multiForwardRootId ?? record.msgId,
-            ...(multiForwardRootId ? { parentMessageId: record.msgId } : {}),
+            rootMessageId: context.multiForwardRootId ?? record.msgId,
+            ...(context.multiForwardRootId ? { parentMessageId: record.msgId } : {}),
           },
         })
       } else {
@@ -2796,7 +2881,7 @@ export class QQKernelBridge {
       id: record.msgId,
       conversationId: conversationId(record.chatType as 1 | 2, record.peerUid),
       senderId,
-      sender: {
+      sender: context.sender ?? {
         id: senderId,
         numericId: sender?.numericId || record.senderUin || undefined,
         name: sender?.name || record.sendNickName || record.sendRemarkName || record.senderUin || record.senderUid,
@@ -2806,7 +2891,8 @@ export class QQKernelBridge {
           : undefined,
       },
       timestamp: Number(record.msgTime) || Math.floor(Date.now() / 1000),
-      outgoing: SEND_FROM_SELF.has(record.sendType) || record.senderUid === this.config?.selfUid,
+      outgoing: context.outgoing
+        ?? (SEND_FROM_SELF.has(record.sendType) || record.senderUid === this.config?.selfUid),
       msgSeq: record.msgSeq,
       // Gray tips (poke, joins, reaction notices, etc.) reuse the msgSeq of a
       // related content message, so only content messages can claim msgSeq as
@@ -3147,6 +3233,12 @@ export class QQKernelBridge {
   private requireSession(): KernelSession {
     if (!this.session) throw new Error('QQNT kernel is not ready')
     return this.session
+  }
+
+  private packetClientForSession(): QQPacketClient {
+    return this.packetClient ??= new QQPacketClient(
+      this.requireSession().getMsgService(), this.packetClientOptions,
+    )
   }
 
   private stagingPath(kind?: 'image' | 'file'): string {
@@ -3729,6 +3821,27 @@ function mapMedia(record: MsgRecord, element: MsgElement): QQMedia | undefined {
         // not a valid substitute for the original requested by this locator.
         filePath: picture.sourcePath, fileUuid: picture.fileUuid, fileSubId: picture.fileSubId,
         fileBizId: picture.fileBizId, md5: picture.md5HexStr,
+        originImageUrl: picture.originImageUrl,
+      },
+    }
+  }
+
+  if (element.videoElement) {
+    const video = element.videoElement
+    return {
+      id: element.elementId || `${record.msgId}:video`,
+      kind: 'file',
+      name: video.fileName,
+      mimeType: videoMimeType(video.fileName, video.fileFormat),
+      size: numberOrUndefined(video.fileSize),
+      width: video.thumbWidth || undefined,
+      height: video.thumbHeight || undefined,
+      duration: Number.isFinite(video.fileTime) && video.fileTime >= 0 ? video.fileTime : undefined,
+      locator: {
+        ...base, kind: 'file', fileName: video.fileName, fileSize: video.fileSize,
+        filePath: video.filePath, fileUuid: video.fileUuid, fileSubId: video.fileSubId,
+        fileBizId: video.fileBizId, md5: video.videoMd5 || video.originVideoMd5,
+        videoCodecFormat: video.sourceVideoCodecFormat ?? 0,
       },
     }
   }
@@ -3857,6 +3970,39 @@ function imageMimeType(path: string, animated: boolean): string {
   if (extension === '.jpg' || extension === '.jpeg') return 'image/jpeg'
   if (extension === '.bmp') return 'image/bmp'
   return 'image/png'
+}
+
+function videoMimeType(path: string, format?: number): string {
+  const byFormat: Record<number, string> = {
+    1: 'video/x-msvideo', 2: 'video/mp4', 3: 'video/x-ms-wmv', 4: 'video/x-matroska',
+    5: 'application/vnd.rn-realmedia-vbr', 6: 'application/vnd.rn-realmedia',
+    7: 'video/x-ms-asf', 8: 'video/quicktime', 9: 'video/mod', 10: 'video/mp2t', 11: 'video/mp2t',
+  }
+  if (format && byFormat[format]) return byFormat[format]
+  const extension = extname(path).toLowerCase()
+  if (extension === '.avi') return 'video/x-msvideo'
+  if (extension === '.wmv') return 'video/x-ms-wmv'
+  if (extension === '.mkv') return 'video/x-matroska'
+  if (extension === '.mov') return 'video/quicktime'
+  if (extension === '.ts' || extension === '.mts') return 'video/mp2t'
+  if (extension === '.webm') return 'video/webm'
+  return 'video/mp4'
+}
+
+function normalizeVideoPlayUrl(info: { url: string, isHttps: boolean, httpsDomain: string }): string | undefined {
+  try {
+    const url = new URL(info.url)
+    if (info.isHttps) url.protocol = 'https:'
+    // QQ may return a raw CDN IP together with the hostname required for TLS.
+    // Using that hostname also gives fetch the correct SNI value.
+    if (info.isHttps && info.httpsDomain && /^(?:\d{1,3}\.){3}\d{1,3}$|:/.test(url.hostname)) {
+      url.hostname = info.httpsDomain
+    }
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return
+    return url.toString()
+  } catch {
+    return
+  }
 }
 
 function isAnimatedPicture(picture: NonNullable<MsgElement['picElement']>): boolean {

@@ -35,6 +35,7 @@ export interface PacketAddon {
 }
 
 let loadedAddon: PacketAddon | undefined
+const moduleFilename = typeof __filename === 'string' ? __filename : fileURLToPath(import.meta.url)
 
 export function loadPacketAddon(): PacketAddon {
   if (loadedAddon) return loadedAddon
@@ -42,7 +43,7 @@ export function loadPacketAddon(): PacketAddon {
   if (!candidate) {
     throw new Error(`QQNT packet addon was not found; tried: ${packetAddonCandidates().join(', ')}`)
   }
-  const required = createRequire(import.meta.url)(candidate) as Partial<PacketAddon>
+  const required = createRequire(moduleFilename)(candidate) as Partial<PacketAddon>
   for (const name of [
     'sendPacket', 'encodeFetchRkeyRequest', 'decodeFetchRkeyResponse',
     'refreshImageUrl', 'locateSendBinding',
@@ -53,7 +54,7 @@ export function loadPacketAddon(): PacketAddon {
 }
 
 function packetAddonCandidates(): string[] {
-  const sourceDir = dirname(fileURLToPath(import.meta.url))
+  const sourceDir = dirname(moduleFilename)
   const artifactDir = join(sourceDir, '..', 'native', 'packet-addon', 'artifacts')
   const artifact = existsSync(artifactDir)
     ? readdirSync(artifactDir).find((name) => name.endsWith('.node'))
