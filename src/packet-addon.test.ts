@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { createPacketBindingProber, linuxPacketMode, loadPacketAddon, type PacketBindingProbe } from './packet-addon.js'
+import { createPacketBindingProber, createPacketHookInstaller, loadPacketAddon, type NativeSendBindingLocation, type PacketBindingProbe } from './packet-addon.js'
 
 describe('native packet addon', () => {
   afterEach(() => {
@@ -31,17 +31,6 @@ describe('native packet addon', () => {
     )).toBe('https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=abc&spec=0&rkey=fresh')
   })
 
-  it.runIf(process.platform === 'linux')('parses Linux packet mode fail closed', () => {
-    vi.stubEnv('QQNT_BRIDGE_LINUX_PACKET_MODE', undefined)
-    expect(linuxPacketMode()).toBe('disabled')
-    vi.stubEnv('QQNT_BRIDGE_LINUX_PACKET_MODE', 'probe')
-    expect(linuxPacketMode()).toBe('probe')
-    vi.stubEnv('QQNT_BRIDGE_LINUX_PACKET_MODE', 'hook')
-    expect(linuxPacketMode()).toBe('hook')
-    vi.stubEnv('QQNT_BRIDGE_LINUX_PACKET_MODE', 'unexpected')
-    expect(linuxPacketMode).toThrow('invalid QQNT_BRIDGE_LINUX_PACKET_MODE: unexpected')
-  })
-
   it('prevents synchronous recursive probes and restores the prober state', () => {
     const result: PacketBindingProbe = {
       moduleBase: '0x1', modulePath: '/qqnt/wrapper.node', profile: 'linux-xref-v1',
@@ -68,6 +57,28 @@ describe('native packet addon', () => {
     expect(probePacketBinding).toHaveBeenCalledTimes(2)
   })
 
+  it('prevents synchronous recursive installs and restores the installer state', () => {
+    const location: NativeSendBindingLocation = {
+      moduleBase: '0x1', profile: 'xref-v1', timeDateStamp: 0, sizeOfImage: 0,
+      anchorRva: 0, xrefRva: 0, functionRva: 0, converterRva: 0x7, responseRva: 0x8,
+    }
+    let installer!: () => NativeSendBindingLocation | undefined
+    const installSendHook = vi.fn(() => {
+      expect(installer()).toBeUndefined()
+      return location
+    })
+    const loadAddon = vi.fn(() => ({ installSendHook }))
+    installer = createPacketHookInstaller(loadAddon)
+
+    expect(installer()).toBe(location)
+    expect(loadAddon).toHaveBeenCalledOnce()
+    expect(installSendHook).toHaveBeenCalledOnce()
+
+    expect(installer()).toBe(location)
+    expect(loadAddon).toHaveBeenCalledTimes(2)
+    expect(installSendHook).toHaveBeenCalledTimes(2)
+  })
+
   it('reports platform-appropriate errors outside a QQ process', () => {
     const addon = loadPacketAddon()
     if (process.platform === 'win32') {
@@ -83,6 +94,10 @@ describe('native packet addon', () => {
       expect(() => addon.probePacketBinding()).toThrow(/only supported on Linux/)
     }
     expect(() => addon.locateSendBinding()).toThrow(/only supported on Windows/)
-    expect(() => addon.installSendHook()).toThrow(/only supported on Windows/)
+    if (process.platform === 'linux') {
+      expect(() => addon.installSendHook()).toThrow(/wrapper\.node is not loaded in this process/)
+    } else {
+      expect(() => addon.installSendHook()).toThrow(/only supported on Windows and Linux/)
+    }
   })
 })

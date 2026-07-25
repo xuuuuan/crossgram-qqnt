@@ -87,7 +87,6 @@ function image(originImageUrl?: string): QQMediaLocator {
 describe('QQPacketClient', () => {
   beforeEach(() => {
     setPlatform('win32')
-    vi.stubEnv('QQNT_BRIDGE_LINUX_PACKET_MODE', undefined)
   })
 
   afterEach(() => {
@@ -260,25 +259,17 @@ describe('QQPacketClient', () => {
     expect(loadAddon).not.toHaveBeenCalled()
   })
 
-  it.each([
-    ['disabled', 'QQNT packet disabled mode is unavailable on Linux'],
-    ['probe', 'QQNT packet probe mode is unavailable on Linux'],
-    ['hook', 'QQNT packet hook mode is probe-only unavailable on Linux'],
-    ['unexpected', 'invalid QQNT_BRIDGE_LINUX_PACKET_MODE: unexpected'],
-  ])('does not send FetchRkey in Linux %s mode', async (mode, unavailable) => {
+  it('installs the hook and sends FetchRkey on Linux', async () => {
     setPlatform('linux')
-    vi.stubEnv('QQNT_BRIDGE_LINUX_PACKET_MODE', mode)
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     const f = fixture()
 
     await expect(f.client.getImageDirectUrl(image(
       'https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=group',
-    ))).resolves.toBeUndefined()
+    ))).resolves.toContain('rkey=group')
 
-    expect(f.addon.encodeFetchRkeyRequest).not.toHaveBeenCalled()
-    expect(f.addon.installSendHook).not.toHaveBeenCalled()
-    expect(f.send).not.toHaveBeenCalled()
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining(unavailable))
+    expect(f.addon.installSendHook).toHaveBeenCalledOnce()
+    expect(f.addon.encodeFetchRkeyRequest).toHaveBeenCalledOnce()
+    expect(f.send).toHaveBeenCalledWith('OidbSvcTrpcTcp.0x9067_202', Buffer.from('request'))
   })
 
   it('falls back when the QQ build has no packet sender or xref anchor', async () => {
