@@ -5,12 +5,42 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import WebSocket from 'ws'
-import type { ContactMsgBoxInfo, FileTransNotifyInfo, KernelModule, KernelSession, MsgRecord } from './kernel-types.js'
+import type { ContactMsgBoxInfo, KernelModule, KernelSession, MsgRecord } from './kernel-types.js'
 import type { PacketAddon } from './packet-addon.js'
 import { QQKernelBridge } from './qq-kernel.js'
 import { QQBridgeServer } from './server.js'
 
 const avatarFixturePath = process.platform === 'win32' ? process.execPath : '/dev/null'
+
+function packetAddonFixture(): PacketAddon {
+  const binding = {
+    moduleBase: '0x180000000', profile: 'xref-v1', timeDateStamp: 0x1122_3344,
+    sizeOfImage: 0x678000, anchorRva: 0x100, xrefRva: 0x200, functionRva: 0x180,
+    converterRva: 0x300, responseRva: 0x400,
+  }
+  return {
+    sendPacket: vi.fn((send, command, payload) => send(command, payload)),
+    encodeFetchRkeyRequest: vi.fn(() => ({ command: '', payload: Buffer.alloc(0) })),
+    decodeFetchRkeyResponse: vi.fn(() => []),
+    encodeVideoDownloadRequest: vi.fn(() => ({ command: '', payload: Buffer.alloc(0) })),
+    decodeVideoDownloadResponse: vi.fn(() => ({ url: '', ttlSeconds: 0, createdAt: 0 })),
+    encodeGroupFileDownloadRequest: vi.fn(() => ({ command: '', payload: Buffer.alloc(0) })),
+    decodeGroupFileDownloadResponse: vi.fn(() => ({ url: '', ttlSeconds: 0, createdAt: 0 })),
+    encodePrivateFileDownloadRequest: vi.fn(() => ({ command: '', payload: Buffer.alloc(0) })),
+    decodePrivateFileDownloadResponse: vi.fn(() => ({ url: '', ttlSeconds: 0, createdAt: 0 })),
+    refreshImageUrl: vi.fn((url) => url),
+    probePacketBinding: vi.fn(() => ({
+      moduleBase: binding.moduleBase, modulePath: '/qqnt/wrapper.node', profile: 'linux-xref-v1',
+      buildId: 'build-id', sha256: 'sha256', nameSlotRva: '0x1', bindingNameRva: '0x2',
+      bindingName: 'sendSsoCmdReqByContend', napiCallbackSlotRva: '0x3', napiCallbackRva: '0x4',
+      napiCallbackFingerprint: 'fingerprint', responseActionSlotRva: '0x5', responseActionRva: '0x6',
+      responseActionFingerprint: 'fingerprint', converterRva: '0x7', converterFingerprint: 'fingerprint',
+      resolveActionRva: '0x8', resolveActionFingerprint: 'fingerprint',
+    })),
+    locateSendBinding: vi.fn(() => binding),
+    installSendHook: vi.fn(() => binding),
+  }
+}
 
 function fixture() {
   let msgHandlers: Record<string, (...args: unknown[]) => unknown> = {}
@@ -62,7 +92,6 @@ function fixture() {
       result: 0, errMsg: '', contactMsgBoxInfos: [] as ContactMsgBoxInfo[],
     })),
     getRichMediaFilePath: vi.fn(() => ''),
-    downloadRichMedia: vi.fn(),
     getMsgsBySeqAndCount: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [message] })),
     getMsgsByMsgId: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [message] })),
     getSourceOfReplyMsg: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [] as MsgRecord[] })),
@@ -156,14 +185,7 @@ function fixture() {
     searchMoreChatMsgs: vi.fn((_searchId: number) => {}),
     cancelSearchChatMsgs: vi.fn((_searchId: number, _code: number, _reason: string) => {}),
   }
-  const richMedia = {
-    getVideoPlayUrl: vi.fn(async () => ({
-      result: 0, errMsg: '', urlResult: {
-        domainUrl: [{ url: 'https://video.example/clip', isHttps: true, httpsDomain: '' }],
-        v4IpUrl: [], v6IpUrl: [], videoCodecFormat: 0,
-      },
-    })),
-  }
+  const richMedia = {}
   const uix = {
     getUid: vi.fn(async (uins: Set<string>) => ({ uidInfo: new Map([...uins].flatMap((uin) => {
       if (uin === '1715311957') return [[uin, 'uid-1715311957']]
@@ -212,9 +234,6 @@ function fixture() {
     },
     emitRecall(chatType: number, peerUid: string, msgSeq: string) {
       msgHandlers.onMsgRecall?.(chatType, peerUid, msgSeq)
-    },
-    emitDownload(info: FileTransNotifyInfo) {
-      msgHandlers.onRichMediaDownloadComplete?.(info)
     },
     emitBuddyList(categories: Array<{ buddyList: unknown[] }>) {
       buddyHandlers.onBuddyListChange?.(categories)
@@ -1800,161 +1819,6 @@ describe('QQKernelBridge', () => {
     })
   })
 
-  it('streams a complete qlogo avatar from the fixed QQ endpoint', async () => {
-    const requested = vi.fn(async (input: URL | RequestInfo, init?: RequestInit) => {
-      expect(String(input)).toBe('https://q1.qlogo.cn/g?b=qq&nk=42&s=640')
-      expect(init?.headers).toBeUndefined()
-      return new Response(Uint8Array.from([1, 2]), { status: 200 })
-    })
-    vi.stubGlobal('fetch', requested)
-    try {
-      const bridge = new QQKernelBridge()
-      const stream = await bridge.downloadFile({
-        messageId: 'avatar:user:member',
-        elementId: 'avatar:user:member',
-        chatType: 1,
-        peerUid: 'member',
-        kind: 'image',
-        fileName: '42.jpg',
-        avatarUin: '42',
-      })
-      const chunks: Buffer[] = []
-      for await (const chunk of stream) chunks.push(Buffer.from(chunk))
-      expect(Buffer.concat(chunks)).toEqual(Buffer.from([1, 2]))
-      expect(requested).toHaveBeenCalledOnce()
-    } finally {
-      vi.unstubAllGlobals()
-    }
-  })
-
-  it('streams local reaction resources without enqueueing a native message download', async () => {
-    const f = fixture()
-    const directory = await mkdtemp(join(tmpdir(), 'qqnt-reaction-resource-'))
-    tempPaths.push(directory)
-    const resourcePath = join(directory, 'reaction.png')
-    await writeFile(resourcePath, 'local-reaction')
-    const bridge = new QQKernelBridge({ tempPath: directory })
-    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
-
-    const stream = await bridge.downloadFile({
-      messageId: `reaction:${resourcePath}`, elementId: `reaction:${resourcePath}`,
-      chatType: 1, peerUid: '', kind: 'image', fileName: 'reaction.png',
-      filePath: resourcePath, fileSize: '14',
-    })
-
-    expect((await readStream(stream)).toString()).toBe('local-reaction')
-    expect(f.msg.downloadRichMedia).not.toHaveBeenCalled()
-  })
-
-  it('coalesces concurrent native media downloads and reuses the completed path', async () => {
-    const f = fixture()
-    const directory = await mkdtemp(join(tmpdir(), 'qqnt-media-singleflight-'))
-    tempPaths.push(directory)
-    const downloadedPath = join(directory, 'downloaded.bin')
-    await writeFile(downloadedPath, 'abcdefghijklmnop')
-    const bridge = new QQKernelBridge({ tempPath: directory })
-    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
-    const locator = {
-      messageId: 'download-message', elementId: 'download-element', chatType: 2 as const,
-      peerUid: 'group', kind: 'file' as const, fileName: 'downloaded.bin', fileSize: '16',
-      filePath: join(directory, 'missing.bin'), fileUuid: 'download-uuid', md5: 'ABCDEF',
-    }
-
-    const pendingStreams = Promise.all([
-      bridge.downloadFile(locator),
-      bridge.downloadFile({ ...locator, md5: 'different-locator-snapshot' }),
-      bridge.downloadFile(locator),
-      bridge.downloadFile(locator),
-    ])
-    await vi.waitFor(() => expect(f.msg.downloadRichMedia).toHaveBeenCalledOnce())
-    expect(f.msg.downloadRichMedia).toHaveBeenCalledWith({
-      fileModelId: '0', downSourceType: 0, downloadSourceType: 0, triggerType: 1,
-      msgId: locator.messageId, chatType: locator.chatType, peerUid: locator.peerUid,
-      elementId: locator.elementId, thumbSize: 0, downloadType: 1, filePath: '',
-    })
-    f.emitDownload({
-      fileModelId: '', msgId: locator.messageId, msgElementId: locator.elementId,
-      fileErrCode: '0', fileErrMsg: '', fileDownType: 1, thumbSize: 0,
-      filePath: downloadedPath, totalSize: '16', trasferStatus: 4,
-    })
-
-    const files = await Promise.all((await pendingStreams).map(readStream))
-    expect(files.map((bytes) => bytes.toString())).toEqual(Array(4).fill('abcdefghijklmnop'))
-
-    const sameContent = await bridge.downloadFile({
-      ...locator, messageId: 'another-message', elementId: 'another-element', fileUuid: 'another-uuid',
-      md5: 'abcdef',
-    })
-    expect((await readStream(sameContent)).toString()).toBe('abcdefghijklmnop')
-    expect(f.msg.downloadRichMedia).toHaveBeenCalledOnce()
-  })
-
-  it('does not resolve an original download with a concurrent thumbnail callback', async () => {
-    const f = fixture()
-    const directory = await mkdtemp(join(tmpdir(), 'qqnt-media-callback-match-'))
-    tempPaths.push(directory)
-    const thumbnailPath = join(directory, 'thumbnail.jpg')
-    const originalPath = join(directory, 'original.jpg')
-    await writeFile(thumbnailPath, 'thumb')
-    await writeFile(originalPath, 'original')
-    const bridge = new QQKernelBridge({ tempPath: directory })
-    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
-    const locator = {
-      messageId: 'parallel-message', elementId: 'parallel-element', chatType: 2 as const,
-      peerUid: 'group', kind: 'image' as const, fileName: 'original.jpg',
-      filePath: thumbnailPath, fileUuid: 'parallel-uuid',
-    }
-
-    let settled = false
-    const pending = bridge.downloadFile(locator).then((stream) => {
-      settled = true
-      return stream
-    })
-    await vi.waitFor(() => expect(f.msg.downloadRichMedia).toHaveBeenCalledOnce())
-    f.emitDownload({
-      fileModelId: '', msgId: locator.messageId, msgElementId: locator.elementId,
-      fileErrCode: '0', fileErrMsg: '', fileDownType: 2, thumbSize: 720,
-      filePath: thumbnailPath, totalSize: '5', trasferStatus: 4,
-    })
-    await Promise.resolve()
-    expect(settled).toBe(false)
-
-    f.emitDownload({
-      fileModelId: '', msgId: locator.messageId, msgElementId: locator.elementId,
-      fileErrCode: '0', fileErrMsg: '', fileDownType: 1, thumbSize: 0,
-      filePath: originalPath, totalSize: '8', trasferStatus: 4,
-    })
-    expect((await readStream(await pending)).toString()).toBe('original')
-  })
-
-  it('uses QQ download completion for images without parsing the completed file', async () => {
-    const f = fixture()
-    const directory = await mkdtemp(join(tmpdir(), 'qqnt-media-native-complete-'))
-    tempPaths.push(directory)
-    const downloadedPath = join(directory, 'downloaded.jpg')
-    // QQ is authoritative here: valid QQ image payloads are not required to
-    // satisfy a bridge-side JPEG/PNG parser after the native success event.
-    const complete = Buffer.alloc(173_994, 0x61)
-    await writeFile(downloadedPath, complete)
-    const bridge = new QQKernelBridge({ tempPath: directory })
-    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
-    const locator = {
-      messageId: 'incomplete-message', elementId: 'incomplete-element', chatType: 2 as const,
-      peerUid: 'group', kind: 'image' as const, fileName: 'downloaded.jpg',
-      fileSize: String(complete.length), filePath: downloadedPath, fileUuid: 'incomplete-uuid',
-    }
-
-    const pending = bridge.downloadFile(locator)
-    await vi.waitFor(() => expect(f.msg.downloadRichMedia).toHaveBeenCalledOnce())
-    f.emitDownload({
-      fileModelId: '', msgId: locator.messageId, msgElementId: locator.elementId,
-      fileErrCode: '0', fileErrMsg: '', fileDownType: 1, thumbSize: 0, filePath: downloadedPath,
-      totalSize: String(complete.length), trasferStatus: 4,
-    })
-
-    expect(await readStream(await pending)).toEqual(complete)
-  })
-
   it('publishes a first-seen info update as a message even with an empty reaction list', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
@@ -2275,7 +2139,7 @@ describe('QQBridgeServer', () => {
     const { port } = server.address()
     const base = `http://127.0.0.1:${port}/v1`
     await expect(fetch(`${base}/status`).then((response) => response.json())).resolves.toMatchObject({
-      protocolVersion: 14, ready: true, selfUin: '10000',
+      protocolVersion: 15, ready: true, selfUin: '10000',
     })
     await expect(fetch(`${base}/dialogs`).then((response) => response.json())).resolves.toMatchObject({
       conversations: [{ peerUin: '1715311957' }],
@@ -2356,91 +2220,57 @@ describe('QQBridgeServer', () => {
     await vi.waitFor(() => expect(bridge.events.size).toBe(0))
   })
 
-  it('serves complete files and coalesces concurrent native downloads', async () => {
+  it('does not expose the removed QQNT local-file download route', async () => {
     const f = fixture()
-    const directory = await mkdtemp(join(tmpdir(), 'qqnt-media-http-singleflight-'))
-    tempPaths.push(directory)
-    const downloadedPath = join(directory, 'downloaded.bin')
-    await writeFile(downloadedPath, 'abcdefghijklmnop')
-    const bridge = new QQKernelBridge({ tempPath: directory })
-    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
-    server = new QQBridgeServer(bridge, { port: 0 })
-    await server.start()
-    const base = `http://127.0.0.1:${server.address().port}/v1`
-    const locator = {
-      messageId: 'http-message', elementId: 'http-element', chatType: 2,
-      peerUid: 'group', kind: 'file', fileName: 'downloaded.bin', fileSize: '16',
-      filePath: join(directory, 'missing.bin'), fileUuid: 'http-uuid', md5: '1234abcd',
-    }
-    const download = () => fetch(`${base}/files/download`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(locator),
-    })
-
-    const pendingResponses = Array.from({ length: 4 }, download)
-    await vi.waitFor(() => expect(f.msg.downloadRichMedia).toHaveBeenCalledOnce())
-    f.emitDownload({
-      fileModelId: '', msgId: locator.messageId, msgElementId: locator.elementId,
-      fileErrCode: '0', fileErrMsg: '', fileDownType: 1, thumbSize: 0,
-      filePath: downloadedPath, totalSize: '16', trasferStatus: 4,
-    })
-    const responses = await Promise.all(pendingResponses)
-    expect(responses.map((response) => response.status)).toEqual([200, 200, 200, 200])
-    const files = await Promise.all(responses.map(async (response) => Buffer.from(await response.arrayBuffer()).toString()))
-    expect(files).toEqual(Array(4).fill('abcdefghijklmnop'))
-
-    const cached = await download()
-    expect(Buffer.from(await cached.arrayBuffer()).toString()).toBe('abcdefghijklmnop')
-    const ranged = await fetch(`${base}/files/download`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', range: 'bytes=5-8' },
-      body: JSON.stringify(locator),
-    })
-    expect(ranged.status).toBe(206)
-    expect(ranged.headers.get('accept-ranges')).toBe('bytes')
-    expect(ranged.headers.get('content-range')).toBe('bytes 5-8/16')
-    expect(ranged.headers.get('content-length')).toBe('4')
-    expect(Buffer.from(await ranged.arrayBuffer()).toString()).toBe('fghi')
-    const beyondEnd = await fetch(`${base}/files/download`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', range: 'bytes=16-' },
-      body: JSON.stringify(locator),
-    })
-    expect(beyondEnd.status).toBe(416)
-    expect(beyondEnd.headers.get('content-range')).toBe('bytes */16')
-    expect((await fetch(`${base}/media/open`, { method: 'POST' })).status).toBe(404)
-    expect(f.msg.downloadRichMedia).toHaveBeenCalledOnce()
-  })
-
-  it('resolves a native video play URL with domain candidates first', async () => {
-    const f = fixture()
-    f.richMedia.getVideoPlayUrl.mockResolvedValueOnce({
-      result: 0, errMsg: '', urlResult: {
-        domainUrl: [{ url: 'https://media.example/domain.mp4?token=secret', isHttps: true, httpsDomain: '' }],
-        v4IpUrl: [{ url: 'https://192.0.2.10/ip.mp4', isHttps: true, httpsDomain: 'cdn.example' }],
-        v6IpUrl: [], videoCodecFormat: 1,
-      },
-    })
     const bridge = new QQKernelBridge()
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
     server = new QQBridgeServer(bridge, { port: 0 })
     await server.start()
-    const response = await fetch(`http://127.0.0.1:${server.address().port}/v1/files/play-url`, {
+    const base = `http://127.0.0.1:${server.address().port}/v1`
+
+    const response = await fetch(`${base}/files/download`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ filePath: 'C:\\QQ\\downloaded.bin' }),
+    })
+
+    expect(response.status).toBe(404)
+  })
+
+  it('serves a packet-resolved video direct URL and its expiry', async () => {
+    const originalPlatform = process.platform
+    Object.defineProperty(process, 'platform', { configurable: true, value: 'win32' })
+    try {
+    const f = fixture()
+    const sendPacket = vi.fn(async () => ({ rspbuffer: Buffer.from('video-response') }))
+    Object.assign(f.msg, { sendSsoCmdReqByContend: sendPacket })
+    const addon = packetAddonFixture()
+    addon.encodeVideoDownloadRequest = vi.fn(() => ({
+      command: 'OidbSvcTrpcTcp.0x11ea_200', payload: Buffer.from('video-request'),
+    }))
+    addon.decodeVideoDownloadResponse = vi.fn(() => ({
+      url: 'https://media.example/domain.mp4?token=secret', ttlSeconds: 60, createdAt: 1_800_000_000,
+    }))
+    const bridge = new QQKernelBridge({ packetClient: { addon, now: () => 1_800_000_000_000 } })
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/v1/files/direct-url`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        messageId: 'video-message', elementId: 'video-element', chatType: 2, peerUid: 'group',
-        kind: 'file', fileName: 'clip.mp4', videoCodecFormat: 1,
+        messageId: 'video-message', elementId: 'video-element', chatType: 2, peerUid: '1002974327',
+        kind: 'file', fileName: 'clip.mp4', fileUuid: 'video-uuid', videoCodecFormat: 1,
       }),
     })
 
     expect(response.status).toBe(200)
-    await expect(response.json()).resolves.toEqual({ url: 'https://media.example/domain.mp4?token=secret' })
-    expect(f.richMedia.getVideoPlayUrl).toHaveBeenCalledWith(
-      { chatType: 2, peerUid: 'group', guildId: '' },
-      'video-message', 'video-element', 1, 2,
-    )
-    expect(f.msg.downloadRichMedia).not.toHaveBeenCalled()
+    await expect(response.json()).resolves.toEqual({
+      url: 'https://media.example/domain.mp4?token=secret', expiresAt: 1_800_000_054_000,
+    })
+    expect(sendPacket).toHaveBeenCalledWith('OidbSvcTrpcTcp.0x11ea_200', Buffer.from('video-request'))
+    } finally {
+      Object.defineProperty(process, 'platform', { configurable: true, value: originalPlatform })
+    }
   })
 
   it('serves an image direct URL through the xref-verified packet path', async () => {
@@ -2451,7 +2281,7 @@ describe('QQBridgeServer', () => {
     const sendPacket = vi.fn(async () => ({ rspbuffer: Buffer.from('fetch-rkey-response') }))
     Object.assign(f.msg, { sendSsoCmdReqByContend: sendPacket })
     const addon: PacketAddon = {
-      sendPacket: vi.fn((send, command, payload) => send(command, payload)),
+      ...packetAddonFixture(),
       encodeFetchRkeyRequest: vi.fn(() => ({
         command: 'OidbSvcTrpcTcp.0x9067_202', payload: Buffer.from('fetch-rkey-request'),
       })),
@@ -2463,24 +2293,6 @@ describe('QQBridgeServer', () => {
         url.searchParams.set('rkey', rkey.replace(/^&?rkey=/, ''))
         return url.toString()
       }),
-      probePacketBinding: vi.fn(() => ({
-        moduleBase: '0x180000000', modulePath: '/qqnt/wrapper.node', profile: 'linux-xref-v1',
-        buildId: 'build-id', sha256: 'sha256', nameSlotRva: '0x1', bindingNameRva: '0x2',
-        bindingName: 'sendSsoCmdReqByContend', napiCallbackSlotRva: '0x3', napiCallbackRva: '0x4',
-        napiCallbackFingerprint: 'fingerprint', responseActionSlotRva: '0x5', responseActionRva: '0x6',
-        responseActionFingerprint: 'fingerprint', converterRva: '0x7', converterFingerprint: 'fingerprint',
-        resolveActionRva: '0x8', resolveActionFingerprint: 'fingerprint',
-      })),
-      locateSendBinding: vi.fn(() => ({
-        moduleBase: '0x180000000', profile: 'xref-v1', timeDateStamp: 0x1122_3344,
-        sizeOfImage: 0x678000, anchorRva: 0x100, xrefRva: 0x200, functionRva: 0x180,
-        converterRva: 0x300, responseRva: 0x400,
-      })),
-      installSendHook: vi.fn(() => ({
-        moduleBase: '0x180000000', profile: 'xref-v1', timeDateStamp: 0x1122_3344,
-        sizeOfImage: 0x678000, anchorRva: 0x100, xrefRva: 0x200, functionRva: 0x180,
-        converterRva: 0x300, responseRva: 0x400,
-      })),
     }
     const bridge = new QQKernelBridge({
       packetClient: { addon, now: () => 1_800_000_000_000 },
@@ -2501,12 +2313,12 @@ describe('QQBridgeServer', () => {
     expect(response.status).toBe(200)
     await expect(response.json()).resolves.toEqual({
       url: 'https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=image&rkey=fresh-group',
+      expiresAt: 1_800_003_570_000,
     })
     expect(sendPacket).toHaveBeenCalledWith(
       'OidbSvcTrpcTcp.0x9067_202', Buffer.from('fetch-rkey-request'),
     )
     expect(addon.installSendHook).toHaveBeenCalledOnce()
-    expect(f.msg.downloadRichMedia).not.toHaveBeenCalled()
 
     const unsupported = await fetch(base, {
       method: 'POST', headers: { 'content-type': 'application/json' },

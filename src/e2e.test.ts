@@ -23,7 +23,7 @@ async function resolve(kind: 'direct' | 'group', id: string) {
 }
 
 describe.skipIf(!enabled)('live QQNT bridge E2E', () => {
-  it('exposes the current QQ nickname and a streamable qlogo avatar', async () => {
+  it('exposes the current QQ nickname and a remote qlogo avatar URL', async () => {
     const statusResponse = await fetch(`${base}/status`, { headers: headers() })
     expect(statusResponse.status, await statusResponse.clone().text()).toBe(200)
     const status = await statusResponse.json() as { selfUid: string, selfUin: string }
@@ -39,11 +39,15 @@ describe.skipIf(!enabled)('live QQNT bridge E2E', () => {
       avatar: { locator: { avatarUin: status.selfUin } },
     })
     expect(user.name).not.toBe(status.selfUin)
-    const avatarResponse = await fetch(`${base}/files/download`, {
+    const directResponse = await fetch(`${base}/files/direct-url`, {
       method: 'POST',
       headers: headers({ 'content-type': 'application/json' }),
       body: JSON.stringify(user.avatar!.locator),
     })
+    expect(directResponse.status, await directResponse.clone().text()).toBe(200)
+    const { url } = await directResponse.json() as { url: string }
+    expect(new URL(url).hostname).toBe('q1.qlogo.cn')
+    const avatarResponse = await fetch(url)
     expect(avatarResponse.status).toBe(200)
     expect(new Uint8Array(await avatarResponse.arrayBuffer()).slice(0, 3)).toEqual(new Uint8Array([0xff, 0xd8, 0xff]))
   })
@@ -215,7 +219,7 @@ describe.skipIf(!enabled)('live QQNT bridge E2E', () => {
     expect(message.parts.filter((part) => part.type === 'media')).toHaveLength(2)
   }, 180_000)
 
-  it.runIf(Boolean(process.env.QQNT_BRIDGE_E2E_FILE))('streams a file to xuuuuan and downloads the complete file', async () => {
+  it.runIf(Boolean(process.env.QQNT_BRIDGE_E2E_FILE))('streams a private file and resolves a ranged CDN direct URL', async () => {
     const path = process.env.QQNT_BRIDGE_E2E_FILE!
     const info = await stat(path)
     const conversation = await resolve('direct', allowedDirect)
@@ -235,11 +239,17 @@ describe.skipIf(!enabled)('live QQNT bridge E2E', () => {
     const message = JSON.parse(body) as { parts: Array<{ type: string, media?: { locator: unknown } }> }
     const locator = message.parts.find((part) => part.type === 'media')?.media?.locator
     expect(locator).toBeTruthy()
-    const downloaded = await fetch(`${base}/files/download`, {
+    const resolved = await fetch(`${base}/files/direct-url`, {
       method: 'POST', headers: headers({ 'content-type': 'application/json' }),
       body: JSON.stringify(locator),
     })
-    expect(downloaded.status).toBe(200)
-    expect((await downloaded.arrayBuffer()).byteLength).toBe(info.size)
+    expect(resolved.status, await resolved.clone().text()).toBe(200)
+    const { url, expiresAt } = await resolved.json() as { url: string, expiresAt: number }
+    expect(new URL(url).protocol).toMatch(/^https?:$/)
+    expect(expiresAt).toBeGreaterThan(Date.now())
+    const end = Math.min(info.size, 128) - 1
+    const downloaded = await fetch(url, { headers: { range: `bytes=0-${end}` } })
+    expect(downloaded.status, await downloaded.clone().text()).toBe(206)
+    expect((await downloaded.arrayBuffer()).byteLength).toBe(end + 1)
   }, 180_000)
 })

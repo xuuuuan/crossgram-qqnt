@@ -403,56 +403,6 @@ export class QQBridgeServer {
       else json(response, 200, user)
       return
     }
-    if (request.method === 'POST' && path === '/v1/files/download') {
-      const locator = await readJson<QQMediaLocator>(request)
-      const range = parseByteRange(request.headers.range)
-      log('info', `HTTP API file download id=${requestId} kind=${locator.kind} message=${locator.messageId} element=${locator.elementId} peer=${locator.peerUid} pathPresent=${Boolean(locator.filePath)} range=${JSON.stringify(request.headers.range ?? '')}`)
-      if (range === false) {
-        response.writeHead(416, { 'content-range': 'bytes */*', 'cache-control': 'no-store' })
-        response.end()
-        return
-      }
-      // qlogo avatars are remote HTTP bodies without a stable local length.
-      // Keep the legacy whole-body response; the platform client will slice it
-      // locally when talking to this or an older bridge.
-      if (locator.avatarUin) {
-        const stream = await this.bridge.downloadFile(locator)
-        response.writeHead(200, {
-          'content-type': 'application/octet-stream',
-          'cache-control': 'no-store',
-          'transfer-encoding': 'chunked',
-        })
-        await pipe(stream, response)
-        return
-      }
-      const asset = await this.bridge.openFile(locator, range ?? {})
-      if (range && asset.offset >= asset.size) {
-        response.writeHead(416, {
-          'content-range': `bytes */${asset.size}`,
-          'accept-ranges': 'bytes',
-          'cache-control': 'no-store',
-        })
-        response.end()
-        return
-      }
-      const status = range ? 206 : 200
-      response.writeHead(status, {
-        'content-type': 'application/octet-stream',
-        'content-length': String(asset.length),
-        ...(range ? { 'content-range': `bytes ${asset.offset}-${asset.offset + asset.length - 1}/${asset.size}` } : {}),
-        'accept-ranges': 'bytes',
-        'cache-control': 'no-store',
-      })
-      await pipe(asset.stream, response)
-      return
-    }
-    if (request.method === 'POST' && path === '/v1/files/play-url') {
-      const locator = await readJson<QQMediaLocator>(request)
-      const result = await this.bridge.getVideoPlayUrl(locator)
-      log('info', `HTTP API video play URL id=${requestId} message=${locator.messageId} element=${locator.elementId} peer=${locator.peerUid}`)
-      json(response, 200, result)
-      return
-    }
     if (request.method === 'POST' && path === '/v1/files/direct-url') {
       const locator = await readJson<QQMediaLocator>(request)
       const result = await this.bridge.getDirectUrl(locator)
@@ -568,17 +518,6 @@ function optionalNumberParam(url: URL, name: string): number | undefined {
   const value = Number(raw)
   if (!Number.isFinite(value)) throw new Error(`invalid ${name}`)
   return value
-}
-
-function parseByteRange(value: string | undefined): { offset: number, limit?: number } | null | false {
-  if (value === undefined) return null
-  const match = /^bytes=(\d+)-(\d*)$/.exec(value.trim())
-  if (!match) return false
-  const offset = Number(match[1])
-  const end = match[2] ? Number(match[2]) : undefined
-  if (!Number.isSafeInteger(offset) || offset < 0) return false
-  if (end !== undefined && (!Number.isSafeInteger(end) || end < offset)) return false
-  return { offset, ...(end === undefined ? {} : { limit: end - offset + 1 }) }
 }
 
 async function pipe(source: Readable, destination: ServerResponse): Promise<void> {

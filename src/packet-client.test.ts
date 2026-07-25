@@ -25,6 +25,25 @@ function fixture() {
       command: 'OidbSvcTrpcTcp.0x9067_202', payload: Buffer.from('request'),
     })),
     decodeFetchRkeyResponse: vi.fn(() => decoded),
+    encodeVideoDownloadRequest: vi.fn((chatType, peer, selfUid, fileUuid) => ({
+      command: chatType === 2 ? 'OidbSvcTrpcTcp.0x11ea_200' : 'OidbSvcTrpcTcp.0x11e9_200',
+      payload: Buffer.from(JSON.stringify({ peer, selfUid, fileUuid })),
+    })),
+    decodeVideoDownloadResponse: vi.fn(() => ({
+      url: 'https://cdn.qq.example/video.mp4?token=fresh', ttlSeconds: 60, createdAt: now / 1_000,
+    })),
+    encodeGroupFileDownloadRequest: vi.fn((group, fileUuid) => ({
+      command: 'OidbSvcTrpcTcp.0x6d6_2', payload: Buffer.from(JSON.stringify({ group, fileUuid })),
+    })),
+    decodeGroupFileDownloadResponse: vi.fn(() => ({
+      url: 'https://cdn.qq.example/group-file?token=fresh', ttlSeconds: 300, createdAt: 0,
+    })),
+    encodePrivateFileDownloadRequest: vi.fn((selfUid, fileUuid, fileHash) => ({
+      command: 'OidbSvcTrpcTcp.0xe37_1200', payload: Buffer.from(JSON.stringify({ selfUid, fileUuid, fileHash })),
+    })),
+    decodePrivateFileDownloadResponse: vi.fn(() => ({
+      url: 'http://cdn.qq.example/private-file?token=fresh', ttlSeconds: 300, createdAt: 0,
+    })),
     refreshImageUrl: vi.fn((original, rkey) => {
       const url = new URL(original)
       url.searchParams.set('rkey', rkey.replace(/^&?rkey=/, ''))
@@ -114,6 +133,84 @@ describe('QQPacketClient', () => {
     await f.client.getImageDirectUrl(url)
     expect(f.send).toHaveBeenCalledTimes(2)
     expect(f.addon.installSendHook).toHaveBeenCalledOnce()
+  })
+
+  it('returns the stable remote qlogo URL for avatars without loading the packet addon', async () => {
+    const loadAddon = vi.fn<() => PacketAddon>()
+    const client = new QQPacketClient({ sendSsoCmdReqByContend: vi.fn() }, { loadAddon })
+    await expect(client.getMediaDirectUrl({
+      messageId: 'avatar:user:uid', elementId: 'avatar:user:uid', chatType: 1, peerUid: 'uid',
+      kind: 'image', fileName: '1715311957.jpg', avatarUin: '1715311957',
+    }, 'self-uid')).resolves.toEqual({
+      url: 'https://q1.qlogo.cn/g?b=qq&nk=1715311957&s=640',
+      expiresAt: Number.MAX_SAFE_INTEGER,
+    })
+    expect(loadAddon).not.toHaveBeenCalled()
+  })
+
+  it('single-flights and caches packet-resolved video URLs for concurrent Telegram ranges', async () => {
+    const f = fixture()
+    let resolve!: (value: unknown) => void
+    f.send.mockImplementationOnce(() => new Promise((done) => { resolve = done }))
+    const locator: QQMediaLocator = {
+      messageId: 'video-message', elementId: 'video-element', chatType: 2, peerUid: '1002974327',
+      kind: 'file', fileName: 'clip.mp4', fileUuid: 'video-uuid', videoCodecFormat: 0,
+    }
+    const pending = Array.from({ length: 8 }, () => f.client.getMediaDirectUrl(locator, 'self-uid'))
+    await vi.waitFor(() => expect(f.send).toHaveBeenCalledOnce())
+    resolve({ rspbuffer: Buffer.from('video-response') })
+    expect(await Promise.all(pending)).toEqual(Array(8).fill({
+      url: 'https://cdn.qq.example/video.mp4?token=fresh', expiresAt: 1_800_000_054_000,
+    }))
+    expect(f.addon.encodeVideoDownloadRequest).toHaveBeenCalledOnce()
+    expect(f.addon.encodeVideoDownloadRequest).toHaveBeenCalledWith(2, '1002974327', 'self-uid', 'video-uuid')
+    expect(f.addon.decodeVideoDownloadResponse).toHaveBeenCalledWith(Buffer.from('video-response'))
+
+    f.advance(53_999)
+    await f.client.getMediaDirectUrl(locator, 'self-uid')
+    expect(f.send).toHaveBeenCalledOnce()
+    f.advance(2)
+    await f.client.getMediaDirectUrl(locator, 'self-uid')
+    expect(f.send).toHaveBeenCalledTimes(2)
+  })
+
+  it('selects group and private file URL protocols without using QQNT downloads', async () => {
+    const f = fixture()
+    const group: QQMediaLocator = {
+      messageId: 'group-message', elementId: 'group-element', chatType: 2, peerUid: '1002974327',
+      kind: 'file', fileName: 'group.bin', fileUuid: 'group-file-uuid',
+    }
+    const privateFile: QQMediaLocator = {
+      messageId: 'private-message', elementId: 'private-element', chatType: 1, peerUid: 'friend-uid',
+      kind: 'file', fileName: 'private.bin', fileUuid: 'private-file-uuid', file10MMd5: 'first-10m-md5',
+    }
+
+    await expect(f.client.getMediaDirectUrl(group, 'self-uid')).resolves.toMatchObject({
+      url: 'https://cdn.qq.example/group-file?token=fresh',
+    })
+    await expect(f.client.getMediaDirectUrl(privateFile, 'self-uid')).resolves.toMatchObject({
+      url: 'http://cdn.qq.example/private-file?token=fresh',
+    })
+    expect(f.addon.encodeGroupFileDownloadRequest).toHaveBeenCalledWith('1002974327', 'group-file-uuid')
+    expect(f.addon.encodePrivateFileDownloadRequest).toHaveBeenCalledWith(
+      'self-uid', 'private-file-uuid', 'first-10m-md5',
+    )
+    expect(f.send.mock.calls.map(([command]) => command)).toEqual([
+      'OidbSvcTrpcTcp.0x6d6_2', 'OidbSvcTrpcTcp.0xe37_1200',
+    ])
+  })
+
+  it('fails closed when a remote file has no direct-link identity', async () => {
+    const f = fixture()
+    await expect(f.client.getMediaDirectUrl({
+      messageId: 'missing', elementId: 'missing', chatType: 2, peerUid: '1002974327',
+      kind: 'file', fileName: 'missing.bin', filePath: 'C:\\QQ\\missing.bin',
+    }, 'self-uid')).resolves.toBeUndefined()
+    await expect(f.client.getMediaDirectUrl({
+      messageId: 'private', elementId: 'private', chatType: 1, peerUid: 'friend',
+      kind: 'file', fileName: 'private.bin', fileUuid: 'private-uuid',
+    }, 'self-uid')).resolves.toBeUndefined()
+    expect(f.send).not.toHaveBeenCalled()
   })
 
   it('accepts a direct Buffer response and refreshes zero-timestamp keys relative to now', async () => {

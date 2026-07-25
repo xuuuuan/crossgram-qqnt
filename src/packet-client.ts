@@ -1,6 +1,7 @@
 import type { KernelMsgService } from './kernel-types.js'
 import { log } from './log.js'
 import { linuxPacketMode, loadPacketAddon, type PacketAddon } from './packet-addon.js'
+import type { NativeDirectUrl, NativePacketRequest } from './packet-addon.js'
 import type { QQMediaLocator } from './protocol.js'
 
 const PRIVATE_IMAGE_APP_ID = '1406'
@@ -27,6 +28,11 @@ interface RkeyCache {
   values: Map<number, string>
 }
 
+export interface QQDirectUrl {
+  url: string
+  expiresAt: number
+}
+
 /** Sends OIDB packets through QQNT's native message-service binding. */
 export class QQPacketClient {
   private readonly loadAddon: () => PacketAddon
@@ -34,6 +40,8 @@ export class QQPacketClient {
   private readonly timeoutMs: number
   private cache?: RkeyCache
   private refresh?: Promise<RkeyCache>
+  private readonly directUrls = new Map<string, QQDirectUrl>()
+  private readonly directUrlRefreshes = new Map<string, Promise<QQDirectUrl | undefined>>()
   private located = false
 
   constructor(
@@ -65,6 +73,61 @@ export class QQPacketClient {
     }
   }
 
+  async getMediaDirectUrl(locator: QQMediaLocator, selfUid: string): Promise<QQDirectUrl | undefined> {
+    if (locator.avatarUin) {
+      if (!/^\d+$/.test(locator.avatarUin)) return
+      const url = new URL('https://q1.qlogo.cn/g')
+      url.search = new URLSearchParams({ b: 'qq', nk: locator.avatarUin, s: '640' }).toString()
+      return { url: url.toString(), expiresAt: Number.MAX_SAFE_INTEGER }
+    }
+    if (locator.kind === 'image') {
+      const url = await this.getImageDirectUrl(locator)
+      return url ? { url, expiresAt: this.cache?.expiresAt ?? this.now() } : undefined
+    }
+    if (!locator.fileUuid) return
+    const key = JSON.stringify([
+      locator.chatType, locator.peerUid, locator.fileUuid,
+      locator.videoCodecFormat === undefined ? 'file' : 'video', locator.file10MMd5 ?? '',
+    ])
+    const cached = this.directUrls.get(key)
+    if (cached && this.now() < cached.expiresAt) return cached
+    const active = this.directUrlRefreshes.get(key)
+    if (active) return active
+    const refresh = this.fetchMediaDirectUrl(locator, selfUid)
+      .then((value) => {
+        if (value) this.rememberDirectUrl(key, value)
+        return value
+      })
+      .finally(() => this.directUrlRefreshes.delete(key))
+    this.directUrlRefreshes.set(key, refresh)
+    return refresh
+  }
+
+  private async fetchMediaDirectUrl(locator: QQMediaLocator, selfUid: string): Promise<QQDirectUrl | undefined> {
+    try {
+      this.assertPacketSupport()
+      const addon = this.loadAddon()
+      let request: NativePacketRequest
+      let decode: (payload: Buffer) => NativeDirectUrl
+      if (locator.videoCodecFormat !== undefined) {
+        request = addon.encodeVideoDownloadRequest(locator.chatType, locator.peerUid, selfUid, locator.fileUuid!)
+        decode = addon.decodeVideoDownloadResponse.bind(addon)
+      } else if (locator.chatType === 2) {
+        request = addon.encodeGroupFileDownloadRequest(locator.peerUid, locator.fileUuid!)
+        decode = addon.decodeGroupFileDownloadResponse.bind(addon)
+      } else {
+        if (!locator.file10MMd5) throw new Error('private QQ file locator has no 10 MiB MD5')
+        request = addon.encodePrivateFileDownloadRequest(selfUid, locator.fileUuid!, locator.file10MMd5)
+        decode = addon.decodePrivateFileDownloadResponse.bind(addon)
+      }
+      const result = decode(await this.sendPacket(addon, request))
+      return { url: result.url, expiresAt: directUrlExpiry(result, this.now()) }
+    } catch (error) {
+      log('warn', `QQ media direct URL unavailable message=${locator.messageId} element=${locator.elementId}: ${errorMessage(error)}`)
+      return
+    }
+  }
+
   private async getRkeys(): Promise<Map<number, string>> {
     const now = this.now()
     if (this.cache && now < this.cache.expiresAt) return this.cache.values
@@ -77,23 +140,10 @@ export class QQPacketClient {
   }
 
   private async fetchRkeys(): Promise<RkeyCache> {
-    if (process.platform === 'linux') {
-      const mode = linuxPacketMode()
-      if (mode === 'hook') throw new Error('QQNT packet hook mode is probe-only unavailable on Linux')
-      throw new Error(`QQNT packet ${mode} mode is unavailable on Linux`)
-    }
+    this.assertPacketSupport()
     const addon = this.loadAddon()
-    this.locateBinding(addon)
-    const send = this.msgService.sendSsoCmdReqByContend
-    if (typeof send !== 'function') throw new Error('sendSsoCmdReqByContend is unavailable in this QQNT build')
-
     const request = addon.encodeFetchRkeyRequest()
-    const requestPayload = Buffer.from(request.payload)
-    const response = await withTimeout(
-      Promise.resolve(addon.sendPacket(send.bind(this.msgService), request.command, requestPayload)),
-      this.timeoutMs,
-      `QQ packet request timed out after ${this.timeoutMs}ms`,
-    ) as PacketResponse
+    const response = await this.sendPacketRaw(addon, request)
     if (response && typeof response === 'object' && !Buffer.isBuffer(response) && !(response instanceof Uint8Array)) {
       log('info', `QQ packet response command=${request.command} result=${response.result ?? '<unset>'} err=${JSON.stringify(response.errMsg ?? '')} bytes=${response.rspbuffer?.byteLength ?? 0}`)
     }
@@ -122,12 +172,47 @@ export class QQPacketClient {
     return cache
   }
 
+  private rememberDirectUrl(key: string, value: QQDirectUrl): void {
+    this.directUrls.delete(key)
+    this.directUrls.set(key, value)
+    while (this.directUrls.size > 1_024) this.directUrls.delete(this.directUrls.keys().next().value!)
+  }
+
+  private async sendPacket(addon: PacketAddon, request: NativePacketRequest): Promise<Buffer> {
+    return responsePayload(await this.sendPacketRaw(addon, request))
+  }
+
+  private async sendPacketRaw(addon: PacketAddon, request: NativePacketRequest): Promise<PacketResponse> {
+    this.locateBinding(addon)
+    const send = this.msgService.sendSsoCmdReqByContend
+    if (typeof send !== 'function') throw new Error('sendSsoCmdReqByContend is unavailable in this QQNT build')
+    return withTimeout(
+      Promise.resolve(addon.sendPacket(send.bind(this.msgService), request.command, Buffer.from(request.payload))),
+      this.timeoutMs,
+      `QQ packet request timed out after ${this.timeoutMs}ms`,
+    ) as Promise<PacketResponse>
+  }
+
+  private assertPacketSupport(): void {
+    if (process.platform !== 'linux') return
+    const mode = linuxPacketMode()
+    if (mode === 'hook') throw new Error('QQNT packet hook mode is probe-only unavailable on Linux')
+    throw new Error(`QQNT packet ${mode} mode is unavailable on Linux`)
+  }
+
   private locateBinding(addon: PacketAddon): void {
     if (this.located) return
     const location = addon.installSendHook()
     this.located = true
     log('info', `QQNT packet hook installed module=${location.moduleBase} profile=${location.profile} timeDateStamp=0x${location.timeDateStamp.toString(16)} sizeOfImage=0x${location.sizeOfImage.toString(16)} anchorRva=0x${location.anchorRva.toString(16)} xrefRva=0x${location.xrefRva.toString(16)} functionRva=0x${location.functionRva.toString(16)} converterRva=0x${location.converterRva.toString(16)} responseRva=0x${location.responseRva.toString(16)}`)
   }
+}
+
+function directUrlExpiry(result: NativeDirectUrl, now: number): number {
+  const createdAt = result.createdAt > 0 ? result.createdAt * 1_000 : now
+  const ttl = Math.max(1, result.ttlSeconds || 300) * 1_000
+  const remaining = Math.max(0, createdAt + ttl - now)
+  return Math.max(now, now + remaining - Math.min(30_000, Math.floor(remaining / 10)))
 }
 
 function responsePayload(response: PacketResponse): Buffer {

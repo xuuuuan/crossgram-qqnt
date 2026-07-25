@@ -406,20 +406,6 @@ export interface KernelMsgService {
     file_uuid: string
     needCreate: boolean
   }): string
-  downloadRichMedia(request: {
-    fileModelId: string
-    downSourceType: number
-    /** Older QQNT builds used this spelling alongside downSourceType. */
-    downloadSourceType?: number
-    triggerType: number
-    msgId: string
-    chatType: number
-    peerUid: string
-    elementId: string
-    thumbSize: number
-    downloadType: number
-    filePath: string
-  }): void
   setMsgEmojiLikes?(
     peer: Contact,
     msgSeq: string,
@@ -603,22 +589,6 @@ export interface KernelGroupService {
 
 export interface KernelRichMediaService {
   getRichMediaFileDir?(elementType: number, downType: number, isTemp: boolean): string
-  getVideoPlayUrl?(
-    peer: { chatType: number, peerUid: string, guildId: string },
-    msgId: string,
-    elemId: string,
-    videoCodecFormat: number,
-    videoRequestWay: number,
-  ): Promise<{
-    result: number
-    errMsg: string
-    urlResult: {
-      v4IpUrl: Array<{ url: string, isHttps: boolean, httpsDomain: string }>
-      v6IpUrl: Array<{ url: string, isHttps: boolean, httpsDomain: string }>
-      domainUrl: Array<{ url: string, isHttps: boolean, httpsDomain: string }>
-      videoCodecFormat: number
-    }
-  }>
 }
 
 export interface KernelSession {

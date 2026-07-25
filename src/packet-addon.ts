@@ -15,6 +15,12 @@ export interface NativeRkey {
   kind: number
 }
 
+export interface NativeDirectUrl {
+  url: string
+  ttlSeconds: number
+  createdAt: number
+}
+
 export interface NativeSendBindingLocation {
   moduleBase: string
   profile: string
@@ -58,6 +64,12 @@ export interface PacketAddon {
   ): unknown
   encodeFetchRkeyRequest(): NativePacketRequest
   decodeFetchRkeyResponse(payload: Buffer): NativeRkey[]
+  encodeVideoDownloadRequest(chatType: number, peer: string, selfUid: string, fileUuid: string): NativePacketRequest
+  decodeVideoDownloadResponse(payload: Buffer): NativeDirectUrl
+  encodeGroupFileDownloadRequest(group: string, fileUuid: string): NativePacketRequest
+  decodeGroupFileDownloadResponse(payload: Buffer): NativeDirectUrl
+  encodePrivateFileDownloadRequest(selfUid: string, fileUuid: string, fileHash: string): NativePacketRequest
+  decodePrivateFileDownloadResponse(payload: Buffer): NativeDirectUrl
   refreshImageUrl(originalUrl: string, rkey: string): string
   probePacketBinding(): PacketBindingProbe
   locateSendBinding(): NativeSendBindingLocation
@@ -76,6 +88,9 @@ export function loadPacketAddon(): PacketAddon {
   const required = createRequire(moduleFilename)(candidate) as Partial<PacketAddon>
   for (const name of [
     'sendPacket', 'encodeFetchRkeyRequest', 'decodeFetchRkeyResponse',
+    'encodeVideoDownloadRequest', 'decodeVideoDownloadResponse',
+    'encodeGroupFileDownloadRequest', 'decodeGroupFileDownloadResponse',
+    'encodePrivateFileDownloadRequest', 'decodePrivateFileDownloadResponse',
     'refreshImageUrl', 'probePacketBinding', 'locateSendBinding', 'installSendHook',
   ] satisfies Array<keyof PacketAddon>) {
     if (typeof required[name] !== 'function') throw new Error(`QQNT packet addon is missing ${name}`)

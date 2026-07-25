@@ -375,7 +375,7 @@ pnpm exec vitest run src/e2e.test.ts -t "refreshes a QQ image RKey"
 ## 8. 安全规则
 
 1. **只读内存快照**：必须通过 `VirtualQuery` 过滤可读页面，禁止直接对 `wrapper.node` 做 `slice`。
-2. **Hook 失败自动回退**：若 `installSendHook` 抛出异常，`QQPacketClient` 应返回 `undefined`，让上层走 `downloadRichMedia` 旧路径。
+2. **Hook 失败即关闭下载**：若 `installSendHook` 抛出异常，`QQPacketClient` 应返回 `undefined`；上层不得回退到 `downloadRichMedia` 本地落盘。
 3. **长度上限**：响应字节和错误消息必须有长度上限，防止恶意/异常回包导致 OOM。
 4. **替换 `.node` 前先结束 QQ**：`start.ps1` 已包含 `Stop-Process -Name QQ`，避免 `EBUSY`。
 5. **测试隔离**：Rust 单测和 TS 单元测试均使用 mock，不依赖真实 QQ。

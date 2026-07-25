@@ -33,9 +33,6 @@ const MEMBER_ADMIN = 3
 const MEMBER_OWNER = 4
 const MEMBER_SCENE_TTL_MS = 5 * 60_000
 const MEMBER_SCENE_LIMIT = 64
-const MEDIA_PATH_CACHE_LIMIT = 1_024
-const MEDIA_DOWNLOAD_ORIGINAL = 1
-const MEDIA_THUMB_SIZE_ORIGINAL = 0
 // Keep this in sync with Telegram's account-level reaction catalog. QQ emoji
 // outside this set are exposed as custom reactions backed by QQ's own icon.
 const TELEGRAM_STANDARD_REACTIONS = new Set([
@@ -49,7 +46,6 @@ const TELEGRAM_STANDARD_REACTIONS = new Set([
 export interface QQKernelOptions {
   tempPath?: string
   sendTimeoutMs?: number
-  downloadTimeoutMs?: number
   userResolveTimeoutMs?: number
   packetClient?: QQPacketClientOptions
 }
@@ -123,9 +119,6 @@ export class QQKernelBridge {
     expectedMediaKind?: 'image' | 'file' | 'sticker'
     originRequestId?: string
   }> = []
-  private readonly pendingDownloads = new Map<string, ReturnType<typeof deferred<FileTransNotifyInfo>>>()
-  private readonly activeMediaDownloads = new Map<string, Promise<string>>()
-  private readonly downloadedMediaPaths = new Map<string, string>()
   private readonly pendingReactions = new Map<string, ReturnType<typeof deferred<QQReactionState>>>()
   private readonly pendingGroupProfiles = new Map<string, ReturnType<typeof deferred<void>>>()
   private readonly pendingUserProfiles = new Map<string, ReturnType<typeof deferred<void>>>()
@@ -151,14 +144,12 @@ export class QQKernelBridge {
   private listenerRetry?: NodeJS.Timeout
   private readonly tempPath: string
   private readonly sendTimeoutMs: number
-  private readonly downloadTimeoutMs: number
   private readonly userResolveTimeoutMs: number
   private readonly packetClientOptions: QQPacketClientOptions
 
   constructor(options: QQKernelOptions = {}) {
     this.tempPath = options.tempPath ?? join(process.env.TMPDIR ?? '/tmp', 'qqnt-mtproto-bridge')
     this.sendTimeoutMs = options.sendTimeoutMs ?? 60_000
-    this.downloadTimeoutMs = options.downloadTimeoutMs ?? 120_000
     this.userResolveTimeoutMs = options.userResolveTimeoutMs ?? 2_000
     this.packetClientOptions = options.packetClient ?? {}
     mkdirSync(this.tempPath, { recursive: true })
@@ -269,18 +260,14 @@ export class QQKernelBridge {
       item.pending.reject(new Error('QQNT session detached'))
       item.accepted.resolve()
     }
-    for (const pending of this.pendingDownloads.values()) pending.reject(new Error('QQNT session detached'))
     for (const pending of this.pendingSearchPages.values()) pending.reject(new Error('QQNT session detached'))
     this.pendingMessages.clear()
     this.pendingAcceptances.clear()
     this.pendingMinimumStatuses.clear()
     this.pendingUnassigned.splice(0)
-    this.pendingDownloads.clear()
     this.pendingSearchPages.clear()
     this.earlySearchPages.clear()
     this.searchContexts.clear()
-    this.activeMediaDownloads.clear()
-    this.downloadedMediaPaths.clear()
     for (const pending of this.pendingReactions.values()) pending.reject(new Error('QQNT session detached'))
     this.pendingReactions.clear()
     for (const pending of this.pendingGroupProfiles.values()) pending.reject(new Error('QQNT session detached'))
@@ -1012,8 +999,14 @@ export class QQKernelBridge {
         }
       }
       if (reference.locator) {
+        const direct = await this.getDirectUrl(reference.locator)
+        if (!direct) throw new Error(`QQ favorite sticker direct URL is unavailable: ${reference.resId}`)
+        const response = await fetch(direct.url)
+        if (!response.ok || !response.body) {
+          throw new Error(`QQ favorite sticker download failed: ${response.status}`)
+        }
         return {
-          stream: await this.downloadFile(reference.locator),
+          stream: Readable.fromWeb(response.body),
           mimeType: imageMimeType(reference.name, reference.animated),
           size: reference.size,
         }
@@ -1042,7 +1035,7 @@ export class QQKernelBridge {
     }
     if (!service.addFavEmoji) throw new Error('QQ favorite creation is unavailable')
     const path = reference.kind === 'favorite'
-      ? reference.path || (reference.locator ? await this.downloadMedia(reference.locator) : '')
+      ? reference.path
       : (await this.resolveMarketStickerPath(reference)).path
     if (!path) throw new Error('QQ sticker has no native file path')
     const result = await service.addFavEmoji(reference.kind === 'market' ? {
@@ -1073,7 +1066,7 @@ export class QQKernelBridge {
       } else if (manifest.sticker?.kind === 'favorite') {
         const stickerPath = manifest.sticker.path && existsSync(manifest.sticker.path)
           ? manifest.sticker.path
-          : manifest.sticker.locator ? await this.downloadMedia(manifest.sticker.locator) : ''
+          : ''
         if (!stickerPath) {
           throw new Error(`QQ favorite sticker file is missing: ${manifest.sticker.resId}`)
         }
@@ -1760,163 +1753,8 @@ export class QQKernelBridge {
     }
   }
 
-  async downloadFile(locator: QQMediaLocator): Promise<Readable> {
-    if (locator.avatarUin) return this.downloadQlogoAvatar(locator.avatarUin)
-    return (await this.openFile(locator)).stream
-  }
-
-  async getVideoPlayUrl(locator: QQMediaLocator): Promise<{ url: string }> {
-    if (locator.videoCodecFormat === undefined) throw new Error('QQ media locator is not a native video')
-    const richMediaService = this.requireSession().getRichMediaService()
-    const getVideoPlayUrl = richMediaService.getVideoPlayUrl?.bind(richMediaService)
-    if (!getVideoPlayUrl) throw new Error('getVideoPlayUrl is unavailable in this QQNT build')
-    log('info', `native API start name=getVideoPlayUrl message=${locator.messageId} element=${locator.elementId} peer=${locator.peerUid} codec=${locator.videoCodecFormat}`)
-    const response = await withTimeout(getVideoPlayUrl(
-      { chatType: locator.chatType, peerUid: locator.peerUid, guildId: '' },
-      locator.messageId,
-      locator.elementId,
-      locator.videoCodecFormat,
-      2,
-    ), 10_000, `QQ video play URL request timed out: ${locator.messageId}:${locator.elementId}`)
-    if (response.result !== 0) {
-      throw new Error(`getVideoPlayUrl: ${response.errMsg} (${response.result})`)
-    }
-    const candidates = [
-      ...(response.urlResult.domainUrl ?? []),
-      ...(response.urlResult.v4IpUrl ?? []),
-      ...(response.urlResult.v6IpUrl ?? []),
-    ]
-    for (const candidate of candidates) {
-      const url = normalizeVideoPlayUrl(candidate)
-      if (!url) continue
-      log('info', `native API complete name=getVideoPlayUrl message=${locator.messageId} element=${locator.elementId} codec=${response.urlResult.videoCodecFormat}`)
-      return { url }
-    }
-    throw new Error('getVideoPlayUrl completed without a usable URL')
-  }
-
-  async getDirectUrl(locator: QQMediaLocator): Promise<{ url: string } | undefined> {
-    if (locator.kind === 'image' && locator.originImageUrl) {
-      const url = await this.packetClientForSession().getImageDirectUrl(locator)
-      return url ? { url } : undefined
-    }
-    if (locator.videoCodecFormat !== undefined) return this.getVideoPlayUrl(locator)
-    return
-  }
-
-  async openFile(
-    locator: QQMediaLocator,
-    range: { offset?: number, limit?: number } = {},
-  ): Promise<{ stream: Readable, size: number, offset: number, length: number }> {
-    if (locator.avatarUin) throw new Error('QQ avatars do not expose a seekable local file')
-    let path = locator.filePath
-    if (locator.messageId.startsWith('reaction:')) {
-      if (!path || !existsSync(path)) throw new Error(`QQ reaction resource is unavailable: ${locator.fileName}`)
-    } else if (locator.messageId.startsWith('avatar:')) {
-      if (!path || !existsSync(path)) path = await this.refreshAvatarFile(locator)
-    } else if (locator.kind === 'image' || !path || !existsSync(path)) {
-      // A message sourcePath can be published while QQ is still writing it.
-      // Ask the message service for the original and use its precisely matched
-      // completion event as the only readiness boundary.
-      path = await this.downloadMedia(locator)
-    }
-    const size = statSync(path).size
-    const offset = Math.max(0, Math.trunc(range.offset ?? 0))
-    const available = Math.max(0, size - offset)
-    const requested = range.limit === undefined ? available : Math.max(0, Math.trunc(range.limit))
-    const length = Math.min(available, requested)
-    log('info', `file stream open message=${locator.messageId} element=${locator.elementId} peer=${locator.peerUid} path=${JSON.stringify(path)} size=${size} offset=${offset} length=${length}`)
-    return {
-      stream: length ? createReadStream(path, { start: offset, end: offset + length - 1 }) : Readable.from([]),
-      size, offset, length,
-    }
-  }
-
-  private async downloadQlogoAvatar(uin: string): Promise<Readable> {
-    if (!/^\d+$/.test(uin)) throw new Error(`invalid QQ avatar UIN: ${uin}`)
-    const url = new URL('https://q1.qlogo.cn/g')
-    url.search = new URLSearchParams({ b: 'qq', nk: uin, s: '640' }).toString()
-    const response = await withTimeout(fetch(url), 10_000, `QQ qlogo request timed out: ${uin}`)
-    if (!response.ok || !response.body) {
-      throw new Error(`QQ qlogo request failed: ${uin} (${response.status})`)
-    }
-    log('info', `qlogo avatar stream open uin=${uin} status=${response.status}`)
-    return Readable.fromWeb(response.body)
-  }
-
-  private async downloadMedia(locator: QQMediaLocator): Promise<string> {
-    const identity = mediaDownloadIdentity(locator)
-    const cached = this.downloadedMediaPaths.get(identity)
-    if (cached) {
-      if (existsSync(cached)) {
-        this.downloadedMediaPaths.delete(identity)
-        this.downloadedMediaPaths.set(identity, cached)
-        return cached
-      }
-      this.downloadedMediaPaths.delete(identity)
-    }
-
-    const transferKey = mediaDownloadKey(locator)
-    const active = this.activeMediaDownloads.get(transferKey)
-    if (active) {
-      log('info', `native API join name=downloadRichMedia message=${locator.messageId} element=${locator.elementId} transfer=${transferKey} identity=${identity}`)
-      return active
-    }
-
-    const download = this.startMediaDownload(locator)
-    this.activeMediaDownloads.set(transferKey, download)
-    try {
-      const path = await download
-      this.rememberDownloadedMediaPath(identity, path)
-      return path
-    } finally {
-      if (this.activeMediaDownloads.get(transferKey) === download) this.activeMediaDownloads.delete(transferKey)
-    }
-  }
-
-  private async startMediaDownload(locator: QQMediaLocator): Promise<string> {
-    const key = mediaDownloadKey(locator)
-    const pending = deferred<FileTransNotifyInfo>()
-    this.pendingDownloads.set(key, pending)
-    log('info', `native API start name=downloadRichMedia message=${locator.messageId} element=${locator.elementId} peer=${locator.peerUid} kind=${locator.kind} downloadType=${MEDIA_DOWNLOAD_ORIGINAL} thumbSize=${MEDIA_THUMB_SIZE_ORIGINAL}`)
-    let completed: FileTransNotifyInfo
-    try {
-      this.requireSession().getMsgService().downloadRichMedia({
-        fileModelId: '0',
-        downSourceType: 0,
-        downloadSourceType: 0,
-        triggerType: 1,
-        msgId: locator.messageId,
-        chatType: locator.chatType,
-        peerUid: locator.peerUid,
-        elementId: locator.elementId,
-        thumbSize: MEDIA_THUMB_SIZE_ORIGINAL,
-        downloadType: MEDIA_DOWNLOAD_ORIGINAL,
-        filePath: '',
-      })
-      completed = await withTimeout(pending.promise, this.downloadTimeoutMs, `QQ media download timed out: ${key}`)
-    } finally {
-      if (this.pendingDownloads.get(key) === pending) this.pendingDownloads.delete(key)
-    }
-    if (completed.fileErrCode !== '0' && completed.fileErrCode !== '') {
-      throw new Error(`QQ media download failed: ${completed.fileErrMsg} (${completed.fileErrCode})`)
-    }
-    if (completed.trasferStatus !== 4) {
-      throw new Error(`QQ media download completed with unexpected status: ${completed.trasferStatus}`)
-    }
-    if (!completed.filePath || !existsSync(completed.filePath)) throw new Error('QQ media download completed without a file')
-    log('info', `native API complete name=downloadRichMedia message=${locator.messageId} element=${locator.elementId} status=${completed.trasferStatus} error=${completed.fileErrCode} path=${JSON.stringify(completed.filePath)} size=${completed.totalSize}`)
-    return completed.filePath
-  }
-
-  private rememberDownloadedMediaPath(identity: string, path: string): void {
-    this.downloadedMediaPaths.delete(identity)
-    while (this.downloadedMediaPaths.size >= MEDIA_PATH_CACHE_LIMIT) {
-      const oldest = this.downloadedMediaPaths.keys().next().value as string | undefined
-      if (oldest === undefined) break
-      this.downloadedMediaPaths.delete(oldest)
-    }
-    this.downloadedMediaPaths.set(identity, path)
+  async getDirectUrl(locator: QQMediaLocator): Promise<{ url: string, expiresAt: number } | undefined> {
+    return this.packetClientForSession().getMediaDirectUrl(locator, this.requireConfig().selfUid)
   }
 
   private registerListeners(): void {
@@ -1972,8 +1810,6 @@ export class QQKernelBridge {
       ) => 'peer' in value
         ? this.onDelete(value.peer.chatType, value.peer.peerUid, value.msgIds)
         : this.onDelete(value.chatType, value.peerUid, ids ?? []),
-      onRichMediaDownloadComplete: (value: FileTransNotifyInfo | { notifyInfo: FileTransNotifyInfo }) =>
-        this.onDownload('notifyInfo' in value ? value.notifyInfo : value),
       onRichMediaUploadComplete: (value: FileTransNotifyInfo | { notifyInfo: FileTransNotifyInfo }) => {
         const info = 'notifyInfo' in value ? value.notifyInfo : value
         const details = `msg=${info.msgId} status=${info.trasferStatus} error=${info.fileErrCode} server=${info.fileSrvErrCode ?? ''} step=${info.step ?? ''}`
@@ -2481,15 +2317,6 @@ export class QQKernelBridge {
         this.onDelete(chatType, peerUid, [record.msgId])
       })
       .catch((error) => log('error', `native recall lookup failed msgSeq=${msgSeq} peer=${peerUid}`, error))
-  }
-
-  private onDownload(info: FileTransNotifyInfo): void {
-    const key = mediaDownloadEventKey(info)
-    log('info', `native media download event message=${info.msgId} element=${info.msgElementId} downloadType=${info.fileDownType} thumbSize=${info.thumbSize} status=${info.trasferStatus} error=${info.fileErrCode} server=${info.fileSrvErrCode ?? ''} path=${JSON.stringify(info.filePath || '')} size=${info.totalSize}`)
-    const pending = this.pendingDownloads.get(key)
-    if (!pending) return
-    this.pendingDownloads.delete(key)
-    pending.resolve(info)
   }
 
   private dispatch(event: QQEvent): void {
@@ -3203,34 +3030,14 @@ export class QQKernelBridge {
     }
   }
 
-  private async refreshAvatarFile(locator: QQMediaLocator): Promise<string> {
-    const service = this.getAvatarService()
-    if (!service) throw new Error('QQ avatar service is unavailable')
-    const key = `${locator.chatType === CHAT_GROUP ? 'group' : 'user'}:${locator.peerUid}`
-    log('info', `avatar media refresh start kind=${locator.chatType === CHAT_GROUP ? 'group' : 'user'} peer=${locator.peerUid}`)
-    let filePath = ''
-    if (locator.chatType === CHAT_GROUP) {
-      await service.forceDownloadGroupAvatar(locator.peerUid, 0).catch(() => undefined)
-      filePath = await waitForAvatarPath(() =>
-        service.getGroupAvatarPath(locator.peerUid, 0) || service.getConfGroupAvatarPath(locator.peerUid))
-    } else {
-      await service.forceDownloadAvatar(locator.peerUid, 0).catch(() => undefined)
-      filePath = await waitForAvatarPath(() => service.getAvatarPath(locator.peerUid, 0))
-    }
-    if (!filePath || !existsSync(filePath)) throw new Error(`QQ avatar is unavailable: ${locator.peerUid}`)
-    const avatar = avatarMedia(key, filePath)
-    this.avatarCache.set(key, avatar)
-    const conversation = [...this.contacts.values()].find((item) =>
-      item.chatType === locator.chatType
-      && (item.peerUid === locator.peerUid || item.peerUin === locator.peerUid))
-    if (conversation) this.mergeConversation({ ...conversation, avatar })
-    log('info', `avatar media refresh complete kind=${locator.chatType === CHAT_GROUP ? 'group' : 'user'} peer=${locator.peerUid} path=${JSON.stringify(filePath)}`)
-    return filePath
-  }
-
   private requireSession(): KernelSession {
     if (!this.session) throw new Error('QQNT kernel is not ready')
     return this.session
+  }
+
+  private requireConfig(): InitSessionConfig {
+    if (!this.config) throw new Error('QQNT kernel is not ready')
+    return this.config
   }
 
   private packetClientForSession(): QQPacketClient {
@@ -3854,6 +3661,7 @@ function mapMedia(record: MsgRecord, element: MsgElement): QQMedia | undefined {
         ...base, kind: 'file', fileName: file.fileName, fileSize: file.fileSize,
         filePath: file.filePath, fileUuid: file.fileUuid, fileSubId: file.fileSubId,
         fileBizId: file.fileBizId, md5: file.fileMd5, sha: file.fileSha, sha3: file.fileSha3,
+        file10MMd5: file.file10MMd5,
       },
     }
   }
@@ -3985,22 +3793,6 @@ function videoMimeType(path: string, format?: number): string {
   if (extension === '.ts' || extension === '.mts') return 'video/mp2t'
   if (extension === '.webm') return 'video/webm'
   return 'video/mp4'
-}
-
-function normalizeVideoPlayUrl(info: { url: string, isHttps: boolean, httpsDomain: string }): string | undefined {
-  try {
-    const url = new URL(info.url)
-    if (info.isHttps) url.protocol = 'https:'
-    // QQ may return a raw CDN IP together with the hostname required for TLS.
-    // Using that hostname also gives fetch the correct SNI value.
-    if (info.isHttps && info.httpsDomain && /^(?:\d{1,3}\.){3}\d{1,3}$|:/.test(url.hostname)) {
-      url.hostname = info.httpsDomain
-    }
-    if (url.protocol !== 'http:' && url.protocol !== 'https:') return
-    return url.toString()
-  } catch {
-    return
-  }
 }
 
 function isAnimatedPicture(picture: NonNullable<MsgElement['picElement']>): boolean {
@@ -4473,24 +4265,6 @@ function summarizeNativeResult(value: unknown): string {
   const object = value as { result?: unknown, errMsg?: unknown, data?: unknown }
   const data = Array.isArray(object.data) ? `array(${object.data.length})` : typeof object.data
   return `result=${String(object.result ?? '<none>')} err=${JSON.stringify(String(object.errMsg ?? ''))} data=${data}`
-}
-
-function mediaDownloadIdentity(locator: QQMediaLocator): string {
-  if (locator.md5) return `md5:${locator.md5.toLowerCase()}`
-  if (locator.sha3) return `sha3:${locator.sha3.toLowerCase()}`
-  if (locator.sha) return `sha:${locator.sha.toLowerCase()}`
-  if (locator.fileUuid) return `uuid:${locator.fileUuid}`
-  return `message:${locator.messageId}:element:${locator.elementId}`
-}
-
-function mediaDownloadKey(locator: QQMediaLocator): string {
-  return JSON.stringify([
-    locator.messageId, locator.elementId, MEDIA_DOWNLOAD_ORIGINAL, MEDIA_THUMB_SIZE_ORIGINAL,
-  ])
-}
-
-function mediaDownloadEventKey(info: FileTransNotifyInfo): string {
-  return JSON.stringify([info.msgId, info.msgElementId, info.fileDownType, info.thumbSize])
 }
 
 function safeRemoveListener(service: string, id: string, remove: () => void): void {

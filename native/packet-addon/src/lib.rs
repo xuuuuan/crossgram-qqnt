@@ -23,6 +23,13 @@ pub struct Rkey {
 }
 
 #[napi(object)]
+pub struct DirectUrl {
+    pub url: String,
+    pub ttl_seconds: u32,
+    pub created_at: u32,
+}
+
+#[napi(object)]
 pub struct SendBindingLocation {
     pub module_base: String,
     pub profile: String,
@@ -97,6 +104,66 @@ pub fn decode_fetch_rkey_response(payload: Buffer) -> Result<Vec<Rkey>> {
                 .collect()
         })
         .map_err(|error| Error::from_reason(format!("invalid FetchRkey response: {error}")))
+}
+
+#[napi]
+pub fn encode_video_download_request(
+    chat_type: u32,
+    peer: String,
+    self_uid: String,
+    file_uuid: String,
+) -> Result<PacketRequest> {
+    packet_request(
+        proto::video_download_packet(chat_type, &peer, &self_uid, &file_uuid),
+        "video download",
+    )
+}
+
+#[napi]
+pub fn decode_video_download_response(payload: Buffer) -> Result<DirectUrl> {
+    direct_url(
+        proto::decode_video_download(payload.as_ref()),
+        "video download",
+    )
+}
+
+#[napi]
+pub fn encode_group_file_download_request(
+    group: String,
+    file_uuid: String,
+) -> Result<PacketRequest> {
+    packet_request(
+        proto::group_file_download_packet(&group, &file_uuid),
+        "group file download",
+    )
+}
+
+#[napi]
+pub fn decode_group_file_download_response(payload: Buffer) -> Result<DirectUrl> {
+    direct_url(
+        proto::decode_group_file_download(payload.as_ref()),
+        "group file download",
+    )
+}
+
+#[napi]
+pub fn encode_private_file_download_request(
+    self_uid: String,
+    file_uuid: String,
+    file_hash: String,
+) -> Result<PacketRequest> {
+    packet_request(
+        proto::private_file_download_packet(&self_uid, &file_uuid, &file_hash),
+        "private file download",
+    )
+}
+
+#[napi]
+pub fn decode_private_file_download_response(payload: Buffer) -> Result<DirectUrl> {
+    direct_url(
+        proto::decode_private_file_download(payload.as_ref()),
+        "private file download",
+    )
 }
 
 #[napi]
@@ -196,4 +263,32 @@ fn binding_location(location: locator::LocatedBinding) -> SendBindingLocation {
         converter_rva: location.converter_rva,
         response_rva: location.response_rva,
     }
+}
+
+fn packet_request(
+    packet: std::result::Result<proto::OidbEnvelope, String>,
+    name: &str,
+) -> Result<PacketRequest> {
+    let envelope =
+        packet.map_err(|error| Error::from_reason(format!("invalid {name} request: {error}")))?;
+    Ok(PacketRequest {
+        command: format!(
+            "OidbSvcTrpcTcp.0x{:x}_{}",
+            envelope.command, envelope.sub_command
+        ),
+        payload: envelope.encode_to_vec().into(),
+    })
+}
+
+fn direct_url(
+    result: std::result::Result<proto::DirectUrl, proto::DecodePacketError>,
+    name: &str,
+) -> Result<DirectUrl> {
+    result
+        .map(|value| DirectUrl {
+            url: value.url,
+            ttl_seconds: value.ttl_seconds,
+            created_at: value.created_at,
+        })
+        .map_err(|error| Error::from_reason(format!("invalid {name} response: {error}")))
 }

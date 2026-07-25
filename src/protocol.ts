@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 14
+export const PROTOCOL_VERSION = 15
 
 export type QQChatType = 1 | 2
 
@@ -25,6 +25,8 @@ export interface QQMediaLocator {
   md5?: string
   sha?: string
   sha3?: string
+  /** MD5 of the first 10 MiB, required by QQ's private-file URL API. */
+  file10MMd5?: string
   /** QQ's original CDN URL. The bridge replaces its expired RKey through OIDB. */
   originImageUrl?: string
   /** Present only for native QQ video elements. 0 h264, 1 h265. */
