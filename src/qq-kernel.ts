@@ -1728,7 +1728,7 @@ export class QQKernelBridge {
         conversation,
         target: { conversationId: conversation.id, messageId: message.id, targetId: message.id },
         context: message.reactionContext,
-        timestamp: message.timestamp,
+        timestamp: Math.floor(Date.now() / 1000),
       })
       return message.reactionContext
     } finally {
@@ -2343,12 +2343,64 @@ export class QQKernelBridge {
           conversation,
           target: { conversationId: conversation.id, messageId: message.id, targetId: message.id },
           context: message.reactionContext ?? { reactions: [], maxSelected: 20 },
-          timestamp: message.timestamp,
+          timestamp: Math.floor(Date.now() / 1000),
         })
       } else {
         log('info', `native message duplicate suppressed source=${source} id=${message.id} peer=${record.peerUid} status=${record.sendStatus}`)
       }
+      const reactionGrayTipSeq = reactionGrayTipSequence(record)
+      if (reactionGrayTipSeq) {
+        await this.refreshReactionsFromGrayTip(conversation, reactionGrayTipSeq).catch((error) => {
+          log('error', `reaction gray-tip refresh failed conversation=${conversation.id} seq=${reactionGrayTipSeq}`, error)
+        })
+      }
     }
+  }
+
+  private async refreshReactionsFromGrayTip(
+    conversation: QQConversation,
+    msgSeq: string,
+  ): Promise<void> {
+    const cached = (this.messages.get(conversation.id) ?? [])
+      .find((message) => message.msgSeq === msgSeq && !message.serviceAction)
+    const service = this.requireMsgService()
+    let record: MsgRecord | undefined
+    if (cached) {
+      const response = await retryTransientInvalidArgument(() =>
+        service.getMsgsByMsgId(contact(conversation), [cached.id]))
+      record = response.msgList.find((item) => item.msgId === cached.id)
+    } else if (service.getMsgsBySeqAndCount) {
+      const peer = contact(conversation)
+      const responses = await Promise.all([true, false].map((queryOrder) =>
+        retryHistoryCall(() => service.getMsgsBySeqAndCount!(peer, msgSeq, 4, queryOrder, true))))
+      record = responses.flatMap((response) => response.msgList)
+        .find((item) => item.msgSeq === msgSeq && !isGrayTipRecord(item) && !isRecalledRecord(item))
+    }
+    if (!record) {
+      log('warn', `reaction gray-tip target lookup failed conversation=${conversation.id} seq=${msgSeq}`)
+      return
+    }
+
+    const targetRecord = record
+    const previous = cached
+      ?? (this.messages.get(conversation.id) ?? []).find((message) => message.id === targetRecord.msgId)
+    const refreshed = this.mapMessage(targetRecord)
+    if (targetRecord.emojiLikesList === undefined && previous?.reactionContext) {
+      refreshed.reactionContext = previous.reactionContext
+    }
+    this.rememberMessage(refreshed)
+    if (JSON.stringify(previous?.reactionContext?.reactions)
+      === JSON.stringify(refreshed.reactionContext?.reactions)) return
+    if (!refreshed.reactionContext) return
+
+    this.dispatch({
+      type: 'message-reactions',
+      eventId: `reaction-graytip:${refreshed.id}:${Date.now()}:${++this.reactionEventSequence}`,
+      conversation,
+      target: { conversationId: conversation.id, messageId: refreshed.id, targetId: refreshed.id },
+      context: refreshed.reactionContext,
+      timestamp: Math.floor(Date.now() / 1000),
+    })
   }
 
   private onDelete(chatType: number, peerUid: string, ids: string[]): void {
@@ -4555,6 +4607,23 @@ function telegramMessageId(value?: string): number | undefined {
   if (!value || !/^\d+$/.test(value)) return
   const id = Number(value)
   return Number.isSafeInteger(id) && id > 0 && id <= 0x7fffffff ? id : undefined
+}
+
+function reactionGrayTipSequence(record: MsgRecord): string | undefined {
+  if (record.chatType !== CHAT_GROUP) return
+  const xml = record.elements.find((element) =>
+    element.grayTipElement?.xmlElement?.templId === '10382')?.grayTipElement?.xmlElement
+  if (!xml) return
+  return xmlTagAttribute(xml.content, 'url', 'msgseq') || record.msgSeq
+}
+
+function xmlTagAttribute(xml: string, tag: string, attribute: string): string {
+  const match = new RegExp(`<${tag}\\b([^>]*)`, 'i').exec(xml)
+  return match ? xmlAttribute(match[1] ?? '', attribute) : ''
+}
+
+function isGrayTipRecord(record: MsgRecord): boolean {
+  return record.elements.some((element) => Boolean(element.grayTipElement))
 }
 
 function isMultiForwardRecord(record: MsgRecord): boolean {
