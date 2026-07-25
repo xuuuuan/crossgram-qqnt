@@ -1,0 +1,31 @@
+[package]
+name = "qqnt-packet"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "3.6.0", default-features = false, features = ["napi8"] }
+napi-derive = "3.3.0"
+prost = "0.14.1"
+thiserror = "2.0.12"
+url = "2.5.4"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60.2", features = [
+  "Win32_Foundation",
+  "Win32_System_LibraryLoader",
+  "Win32_System_ProcessStatus",
+  "Win32_System_Threading",
+] }
+
+[build-dependencies]
+napi-build = "2.2.3"
+
+[profile.release]
+lto = true
+strip = "symbols"
+

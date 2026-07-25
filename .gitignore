@@ -1,3 +1,6 @@
 /node_modules
 /dist
+/native/packet-addon/target
+/native/packet-addon/artifacts/*.node
+/native/packet-addon/artifacts/index.d.ts
 /AGENTS.md

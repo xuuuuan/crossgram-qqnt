@@ -5,11 +5,14 @@
   "description": "Local streaming bridge exposing the QQNT kernel to mtproto-relay",
   "type": "module",
   "scripts": {
-    "build": "esbuild src/main.ts --bundle --outfile=dist/main.js --platform=node --target=node22 --format=cjs",
-    "test": "vitest run",
+    "build": "pnpm build:native && esbuild src/main.ts --bundle --outfile=dist/main.js --platform=node --target=node22 --format=cjs && node scripts/copy-native.mjs",
+    "build:native": "napi build --platform --release --cwd native/packet-addon --output-dir artifacts --no-js --dts index.d.ts",
+    "test": "pnpm build:native && vitest run && pnpm test:native",
+    "test:native": "cargo test --manifest-path native/packet-addon/Cargo.toml",
     "test:e2e": "QQNT_BRIDGE_E2E=1 vitest run src/e2e.test.ts"
   },
   "devDependencies": {
+    "@napi-rs/cli": "^3.7.4",
     "@types/node": "^26.1.1",
     "@types/ws": "^8.18.1",
     "esbuild": "^0.28.1",

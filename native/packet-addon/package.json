@@ -1,0 +1,11 @@
+{
+  "name": "@qqnt-bridge/packet-addon",
+  "version": "0.1.0",
+  "private": true,
+  "napi": {
+    "binaryName": "qqnt_packet",
+    "targets": [
+      "x86_64-pc-windows-msvc"
+    ]
+  }
+}
