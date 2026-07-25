@@ -61,6 +61,7 @@ interface SearchContext {
 
 interface MessageMappingContext {
   multiForwardRootId?: string
+  multiForwardConversationId?: string
   sender?: NonNullable<QQMessage['sender']>
   outgoing?: boolean
 }
@@ -880,6 +881,7 @@ export class QQKernelBridge {
       const participant = participants.get(record)!
       return this.mapMessage(record, {
         multiForwardRootId: locator.rootMessageId,
+        multiForwardConversationId: locator.conversationId,
         sender: {
           id: participant.id,
           name: participant.name,
@@ -2741,7 +2743,8 @@ export class QQKernelBridge {
           type: 'multi-forward',
           title: multiForwardTitle(element.multiForwardMsgElement),
           locator: {
-            conversationId: conversationId(record.chatType as 1 | 2, record.peerUid),
+            conversationId: context.multiForwardConversationId
+              ?? conversationId(record.chatType as 1 | 2, record.peerUid),
             rootMessageId: context.multiForwardRootId ?? record.msgId,
             ...(context.multiForwardRootId ? { parentMessageId: record.msgId } : {}),
           },
@@ -2751,7 +2754,8 @@ export class QQKernelBridge {
           type: 'multi-forward',
           title: arkMultiForwardTitle(element.arkElement.bytesData),
           locator: {
-            conversationId: conversationId(record.chatType as 1 | 2, record.peerUid),
+            conversationId: context.multiForwardConversationId
+              ?? conversationId(record.chatType as 1 | 2, record.peerUid),
             rootMessageId: context.multiForwardRootId ?? record.msgId,
             ...(context.multiForwardRootId ? { parentMessageId: record.msgId } : {}),
           },

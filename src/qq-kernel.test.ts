@@ -1165,7 +1165,7 @@ describe('QQKernelBridge', () => {
     expect(f.msg.multiForwardMsg).not.toHaveBeenCalled()
 
     const nested = {
-      ...f.message, msgId: 'nested-1',
+      ...f.message, msgId: 'nested-1', chatType: 1, peerUid: 'archived-direct-peer',
       elements: [{
         elementType: 16, elementId: 'nested',
         multiForwardMsgElement: { fileName: '嵌套聊天记录', resId: 'nested-res' },
@@ -1178,6 +1178,8 @@ describe('QQKernelBridge', () => {
       id: 'nested-1', parts: [{
         type: 'multi-forward', title: '嵌套聊天记录',
         locator: {
+          // Nested archive records retain their original peer. The locator must
+          // keep using the physical conversation that contains the outer card.
           conversationId: 'uid-1715311957', rootMessageId: 'merged-1', parentMessageId: 'nested-1',
         },
       }],
