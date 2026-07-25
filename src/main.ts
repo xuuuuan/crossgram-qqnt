@@ -5,7 +5,7 @@ import type {
 } from './kernel-types.js'
 import { teeBuddyService, teeGroupService, teeMsgService, teeProfileService, teeRecentService } from './listener-tee.js'
 import { log, logPath } from './log.js'
-import { createPacketBindingProber, linuxPacketMode, type PacketBindingProbe } from './packet-addon.js'
+import { createPacketBindingProber, createPacketHookInstaller, type PacketBindingProbe } from './packet-addon.js'
 import { QQKernelBridge } from './qq-kernel.js'
 import { QQBridgeServer } from './server.js'
 
@@ -59,6 +59,7 @@ function installKernelRequireHook(bridge: QQKernelBridge): void {
   const wrappedModules = new WeakMap<object, KernelModule>()
   const originalDlopen = process.dlopen
   const probePacketBinding = createPacketBindingProber()
+  const installPacketHook = createPacketHookInstaller()
 
   moduleWithLoad._load = function qqntBridgeLoad(request, parent, isMain) {
     const loaded = originalLoad.call(this, request, parent, isMain)
@@ -94,14 +95,22 @@ function installKernelRequireHook(bridge: QQKernelBridge): void {
   function probeLinuxPacketBinding(): void {
     if (process.platform !== 'linux') return
     try {
-      const mode = linuxPacketMode()
-      if (mode === 'disabled') return
       const probe = probePacketBinding()
       if (!probe) return
       logLinuxPacketProbe(probe)
-      if (mode === 'hook') log('info', 'QQNT Linux packet profile verified but hook remains probe-only')
+      installLinuxPacketHook()
     } catch (error) {
       log('warn', 'QQNT Linux packet binding probe unavailable', error)
+    }
+  }
+
+  function installLinuxPacketHook(): void {
+    try {
+      const location = installPacketHook()
+      if (!location) return
+      log('info', `QQNT Linux packet hook installed module=${location.moduleBase} profile=${location.profile} converterRva=0x${location.converterRva.toString(16)} resolverRva=0x${location.responseRva.toString(16)}`)
+    } catch (error) {
+      log('error', 'QQNT Linux packet hook install failed; packet media URLs will be unavailable', error)
     }
   }
 }

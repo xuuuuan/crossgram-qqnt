@@ -65,8 +65,6 @@ export interface PacketBindingProbe {
   resolveActionFingerprint: string
 }
 
-export type LinuxPacketMode = 'disabled' | 'probe' | 'hook'
-
 export interface PacketAddon {
   sendPacket(
     send: (command: string, payload: Buffer) => unknown,
@@ -128,17 +126,6 @@ function packetAddonCandidates(): string[] {
   ].filter((candidate): candidate is string => Boolean(candidate))
 }
 
-export function linuxPacketMode(): LinuxPacketMode {
-  if (process.platform !== 'linux') return 'disabled'
-  switch (process.env.QQNT_BRIDGE_LINUX_PACKET_MODE) {
-    case 'probe': return 'probe'
-    case 'hook': return 'hook'
-    case 'disabled':
-    case undefined: return 'disabled'
-    default: throw new Error(`invalid QQNT_BRIDGE_LINUX_PACKET_MODE: ${process.env.QQNT_BRIDGE_LINUX_PACKET_MODE}`)
-  }
-}
-
 export function createPacketBindingProber(
   loadAddon: () => Pick<PacketAddon, 'probePacketBinding'> = loadPacketAddon,
 ): () => PacketBindingProbe | undefined {
@@ -150,6 +137,21 @@ export function createPacketBindingProber(
       return loadAddon().probePacketBinding()
     } finally {
       probing = false
+    }
+  }
+}
+
+export function createPacketHookInstaller(
+  loadAddon: () => Pick<PacketAddon, 'installSendHook'> = loadPacketAddon,
+): () => NativeSendBindingLocation | undefined {
+  let installing = false
+  return () => {
+    if (installing) return
+    installing = true
+    try {
+      return loadAddon().installSendHook()
+    } finally {
+      installing = false
     }
   }
 }

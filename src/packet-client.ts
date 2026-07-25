@@ -1,6 +1,6 @@
 import type { KernelMsgService } from './kernel-types.js'
 import { log } from './log.js'
-import { linuxPacketMode, loadPacketAddon, type PacketAddon } from './packet-addon.js'
+import { loadPacketAddon, type PacketAddon } from './packet-addon.js'
 import type { NativeDirectUrl, NativePacketRequest, NativeSysFace } from './packet-addon.js'
 import type { QQMediaLocator } from './protocol.js'
 
@@ -86,7 +86,6 @@ export class QQPacketClient {
   }
 
   private async fetchSysFaces(): Promise<Map<string, NativeSysFace>> {
-    this.assertPacketSupport()
     const addon = this.loadAddon()
     const request = addon.encodeFetchSysFacesRequest()
     const faces = addon.decodeFetchSysFacesResponse(await this.sendPacket(addon, request))
@@ -129,7 +128,6 @@ export class QQPacketClient {
 
   private async fetchMediaDirectUrl(locator: QQMediaLocator, selfUid: string): Promise<QQDirectUrl | undefined> {
     try {
-      this.assertPacketSupport()
       const addon = this.loadAddon()
       let request: NativePacketRequest
       let decode: (payload: Buffer) => NativeDirectUrl
@@ -164,7 +162,6 @@ export class QQPacketClient {
   }
 
   private async fetchRkeys(): Promise<RkeyCache> {
-    this.assertPacketSupport()
     const addon = this.loadAddon()
     const request = addon.encodeFetchRkeyRequest()
     const response = await this.sendPacketRaw(addon, request)
@@ -215,13 +212,6 @@ export class QQPacketClient {
       this.timeoutMs,
       `QQ packet request timed out after ${this.timeoutMs}ms`,
     ) as Promise<PacketResponse>
-  }
-
-  private assertPacketSupport(): void {
-    if (process.platform !== 'linux') return
-    const mode = linuxPacketMode()
-    if (mode === 'hook') throw new Error('QQNT packet hook mode is probe-only unavailable on Linux')
-    throw new Error(`QQNT packet ${mode} mode is unavailable on Linux`)
   }
 
   private locateBinding(addon: PacketAddon): void {

@@ -279,11 +279,11 @@ pub fn locate_send_binding() -> Result<SendBindingLocation> {
 
 #[napi]
 pub fn install_send_hook() -> Result<SendBindingLocation> {
-    if !cfg!(windows) {
-        return Err(Error::from_reason(
-            "installing the QQNT send hook is only supported on Windows",
-        ));
-    }
+    install_send_hook_impl()
+}
+
+#[cfg(windows)]
+fn install_send_hook_impl() -> Result<SendBindingLocation> {
     let location = locator::locate_loaded_wrapper().map_err(|error| {
         Error::from_reason(format!("failed to locate QQNT send binding: {error}"))
     })?;
@@ -291,6 +291,48 @@ pub fn install_send_hook() -> Result<SendBindingLocation> {
         Error::from_reason(format!("failed to install QQNT send hook: {error}"))
     })?;
     Ok(binding_location(location))
+}
+
+#[cfg(target_os = "linux")]
+static CACHED_PROBE: std::sync::Mutex<Option<elf::PacketBindingProbe>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(target_os = "linux")]
+fn install_send_hook_impl() -> Result<SendBindingLocation> {
+    // Cache the probe: once the converter is patched its prologue no longer
+    // matches the profile fingerprint, so a re-probe on the idempotent install
+    // path would fail. The first call reads the original bytes.
+    let mut cache = CACHED_PROBE
+        .lock()
+        .map_err(|_| Error::from_reason("QQNT packet probe cache poisoned"))?;
+    if cache.is_none() {
+        let probe = locator::probe_packet_binding().map_err(|error| {
+            Error::from_reason(format!("failed to probe QQNT packet binding: {error}"))
+        })?;
+        *cache = Some(probe);
+    }
+    let probe = cache.as_ref().expect("probe cached");
+    hook::install(probe).map_err(|error| {
+        Error::from_reason(format!("failed to install QQNT send hook: {error}"))
+    })?;
+    Ok(SendBindingLocation {
+        module_base: format!("0x{:x}", probe.module_base),
+        profile: probe.profile.into(),
+        time_date_stamp: 0,
+        size_of_image: 0,
+        anchor_rva: 0,
+        xref_rva: 0,
+        function_rva: 0,
+        converter_rva: probe.converter_rva as u32,
+        response_rva: probe.resolve_action_rva as u32,
+    })
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn install_send_hook_impl() -> Result<SendBindingLocation> {
+    Err(Error::from_reason(
+        "installing the QQNT send hook is only supported on Windows and Linux",
+    ))
 }
 
 fn binding_location(location: locator::LocatedBinding) -> SendBindingLocation {
