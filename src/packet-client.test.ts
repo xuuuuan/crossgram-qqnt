@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { KernelMsgService } from './kernel-types.js'
-import type { NativeRkey, PacketAddon } from './packet-addon.js'
+import type { NativeRkey, NativeSysFace, PacketAddon } from './packet-addon.js'
 import { QQPacketClient } from './packet-client.js'
 import type { QQMediaLocator } from './protocol.js'
 
@@ -16,6 +16,10 @@ function fixture() {
     { value: '&rkey=private', ttlSeconds: '120', createdAt: now / 1_000, kind: 10 },
     { value: '&rkey=group', ttlSeconds: '60', createdAt: now / 1_000, kind: 20 },
   ]
+  let decodedSysFaces: NativeSysFace[] = [{
+    faceId: '476', name: '/不是吧', url: 'https://face.qq.example/476.png',
+    aniStickerType: 2, aniStickerPackId: 3, aniStickerId: 476, width: 240, height: 180,
+  }]
   const send = vi.fn<(
     command: string, payload: Uint8Array,
   ) => Promise<unknown>>(async () => ({ result: 0, errMsg: '', rspbuffer: Buffer.from('response') }))
@@ -25,6 +29,10 @@ function fixture() {
       command: 'OidbSvcTrpcTcp.0x9067_202', payload: Buffer.from('request'),
     })),
     decodeFetchRkeyResponse: vi.fn(() => decoded),
+    encodeFetchSysFacesRequest: vi.fn(() => ({
+      command: 'OidbSvcTrpcTcp.0x9154_1', payload: Buffer.from('sys-face-request'),
+    })),
+    decodeFetchSysFacesResponse: vi.fn(() => decodedSysFaces),
     encodeVideoDownloadRequest: vi.fn((chatType, peer, selfUid, fileUuid) => ({
       command: chatType === 2 ? 'OidbSvcTrpcTcp.0x11ea_200' : 'OidbSvcTrpcTcp.0x11e9_200',
       payload: Buffer.from(JSON.stringify({ peer, selfUid, fileUuid })),
@@ -74,6 +82,7 @@ function fixture() {
     addon, client, send,
     advance(ms: number) { now += ms },
     setDecoded(value: NativeRkey[]) { decoded = value },
+    setDecodedSysFaces(value: NativeSysFace[]) { decodedSysFaces = value },
   }
 }
 
@@ -133,6 +142,36 @@ describe('QQPacketClient', () => {
     await f.client.getImageDirectUrl(url)
     expect(f.send).toHaveBeenCalledTimes(2)
     expect(f.addon.installSendHook).toHaveBeenCalledOnce()
+  })
+
+  it('single-flights and caches the complete QQ system-face catalog', async () => {
+    const f = fixture()
+    let resolve!: (value: unknown) => void
+    f.send.mockImplementationOnce(() => new Promise((done) => { resolve = done }))
+
+    const pending = Array.from({ length: 8 }, () => f.client.getSysFace('476'))
+    await vi.waitFor(() => expect(f.send).toHaveBeenCalledOnce())
+    resolve({ rspbuffer: Buffer.from('sys-face-response') })
+    expect(await Promise.all(pending)).toEqual(Array(8).fill(expect.objectContaining({
+      faceId: '476', name: '/不是吧', url: 'https://face.qq.example/476.png', width: 240, height: 180,
+    })))
+    expect(f.send).toHaveBeenCalledWith('OidbSvcTrpcTcp.0x9154_1', Buffer.from('sys-face-request'))
+    expect(f.addon.decodeFetchSysFacesResponse).toHaveBeenCalledWith(Buffer.from('sys-face-response'))
+
+    await expect(f.client.getSysFace('999')).resolves.toBeUndefined()
+    expect(f.send).toHaveBeenCalledOnce()
+  })
+
+  it('rejects unusable QQ system-face catalogs without poisoning a later retry', async () => {
+    const f = fixture()
+    f.setDecodedSysFaces([])
+    await expect(f.client.getSysFace('476')).rejects.toThrow('FetchSysFaces response was empty')
+    f.setDecodedSysFaces([{
+      faceId: '476', name: '/不是吧', url: 'https://face.qq.example/476.png',
+      aniStickerType: 2, aniStickerPackId: 3, aniStickerId: 476, width: 240, height: 240,
+    }])
+    await expect(f.client.getSysFace('476')).resolves.toMatchObject({ faceId: '476' })
+    expect(f.send).toHaveBeenCalledTimes(2)
   })
 
   it('returns the stable remote qlogo URL for avatars without loading the packet addon', async () => {

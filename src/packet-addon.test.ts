@@ -31,6 +31,12 @@ describe('native packet addon', () => {
     )).toBe('https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=abc&spec=0&rkey=fresh')
   })
 
+  it('encodes the complete system-face catalog request', () => {
+    const request = loadPacketAddon().encodeFetchSysFacesRequest()
+    expect(request.command).toBe('OidbSvcTrpcTcp.0x9154_1')
+    expect(request.payload.toString('hex')).toBe('08d4a2021001220510071a01306001')
+  })
+
   it.runIf(process.platform === 'linux')('parses Linux packet mode fail closed', () => {
     vi.stubEnv('QQNT_BRIDGE_LINUX_PACKET_MODE', undefined)
     expect(linuxPacketMode()).toBe('disabled')

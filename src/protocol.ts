@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 17
+export const PROTOCOL_VERSION = 18
 
 export type QQChatType = 1 | 2
 
@@ -49,6 +49,22 @@ export interface QQMedia {
 }
 
 export type QQStickerReference =
+  | {
+      kind: 'sysface'
+      faceId: string
+      faceType: number
+      name: string
+      packId?: string
+      stickerId?: string
+      sourceType?: number
+      stickerType?: number
+      resultId?: string
+      imageType?: number
+      width?: number
+      height?: number
+      animated: true
+      url?: string
+    }
   | {
       kind: 'market'
       packageId: string

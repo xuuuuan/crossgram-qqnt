@@ -21,6 +21,17 @@ export interface NativeDirectUrl {
   createdAt: number
 }
 
+export interface NativeSysFace {
+  faceId: string
+  name: string
+  url: string
+  aniStickerType: number
+  aniStickerPackId: number
+  aniStickerId: number
+  width: number
+  height: number
+}
+
 export interface NativeSendBindingLocation {
   moduleBase: string
   profile: string
@@ -64,6 +75,8 @@ export interface PacketAddon {
   ): unknown
   encodeFetchRkeyRequest(): NativePacketRequest
   decodeFetchRkeyResponse(payload: Buffer): NativeRkey[]
+  encodeFetchSysFacesRequest(): NativePacketRequest
+  decodeFetchSysFacesResponse(payload: Buffer): NativeSysFace[]
   encodeVideoDownloadRequest(chatType: number, peer: string, selfUid: string, fileUuid: string): NativePacketRequest
   decodeVideoDownloadResponse(payload: Buffer): NativeDirectUrl
   encodeGroupFileDownloadRequest(group: string, fileUuid: string): NativePacketRequest
@@ -88,6 +101,7 @@ export function loadPacketAddon(): PacketAddon {
   const required = createRequire(moduleFilename)(candidate) as Partial<PacketAddon>
   for (const name of [
     'sendPacket', 'encodeFetchRkeyRequest', 'decodeFetchRkeyResponse',
+    'encodeFetchSysFacesRequest', 'decodeFetchSysFacesResponse',
     'encodeVideoDownloadRequest', 'decodeVideoDownloadResponse',
     'encodeGroupFileDownloadRequest', 'decodeGroupFileDownloadResponse',
     'encodePrivateFileDownloadRequest', 'decodePrivateFileDownloadResponse',

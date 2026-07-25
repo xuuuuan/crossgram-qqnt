@@ -30,6 +30,18 @@ pub struct DirectUrl {
 }
 
 #[napi(object)]
+pub struct SysFace {
+    pub face_id: String,
+    pub name: String,
+    pub url: String,
+    pub ani_sticker_type: i32,
+    pub ani_sticker_pack_id: i32,
+    pub ani_sticker_id: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+#[napi(object)]
 pub struct SendBindingLocation {
     pub module_base: String,
     pub profile: String,
@@ -104,6 +116,36 @@ pub fn decode_fetch_rkey_response(payload: Buffer) -> Result<Vec<Rkey>> {
                 .collect()
         })
         .map_err(|error| Error::from_reason(format!("invalid FetchRkey response: {error}")))
+}
+
+#[napi]
+pub fn encode_fetch_sys_faces_request() -> PacketRequest {
+    let envelope = proto::fetch_sys_faces_packet();
+    PacketRequest {
+        command: "OidbSvcTrpcTcp.0x9154_1".into(),
+        payload: envelope.encode_to_vec().into(),
+    }
+}
+
+#[napi]
+pub fn decode_fetch_sys_faces_response(payload: Buffer) -> Result<Vec<SysFace>> {
+    proto::decode_sys_faces(payload.as_ref())
+        .map(|faces| {
+            faces
+                .into_iter()
+                .map(|face| SysFace {
+                    face_id: face.q_sid,
+                    name: face.q_des,
+                    url: face.url.map(|url| url.base_url).unwrap_or_default(),
+                    ani_sticker_type: face.ani_sticker_type,
+                    ani_sticker_pack_id: face.ani_sticker_pack_id,
+                    ani_sticker_id: face.ani_sticker_id,
+                    width: face.ani_sticker_width,
+                    height: face.ani_sticker_height,
+                })
+                .collect()
+        })
+        .map_err(|error| Error::from_reason(format!("invalid FetchSysFaces response: {error}")))
 }
 
 #[napi]

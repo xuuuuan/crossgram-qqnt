@@ -1,7 +1,7 @@
 import type { KernelMsgService } from './kernel-types.js'
 import { log } from './log.js'
 import { linuxPacketMode, loadPacketAddon, type PacketAddon } from './packet-addon.js'
-import type { NativeDirectUrl, NativePacketRequest } from './packet-addon.js'
+import type { NativeDirectUrl, NativePacketRequest, NativeSysFace } from './packet-addon.js'
 import type { QQMediaLocator } from './protocol.js'
 
 const PRIVATE_IMAGE_APP_ID = '1406'
@@ -42,6 +42,8 @@ export class QQPacketClient {
   private refresh?: Promise<RkeyCache>
   private readonly directUrls = new Map<string, QQDirectUrl>()
   private readonly directUrlRefreshes = new Map<string, Promise<QQDirectUrl | undefined>>()
+  private sysFaces?: Map<string, NativeSysFace>
+  private sysFaceRefresh?: Promise<Map<string, NativeSysFace>>
   private located = false
 
   constructor(
@@ -71,6 +73,28 @@ export class QQPacketClient {
       log('warn', `QQ image direct URL unavailable message=${locator.messageId} element=${locator.elementId}: ${errorMessage(error)}`)
       return
     }
+  }
+
+  async getSysFace(faceId: string): Promise<NativeSysFace | undefined> {
+    if (!this.sysFaces) {
+      this.sysFaceRefresh ??= this.fetchSysFaces().finally(() => {
+        this.sysFaceRefresh = undefined
+      })
+      await this.sysFaceRefresh
+    }
+    return this.sysFaces?.get(faceId)
+  }
+
+  private async fetchSysFaces(): Promise<Map<string, NativeSysFace>> {
+    this.assertPacketSupport()
+    const addon = this.loadAddon()
+    const request = addon.encodeFetchSysFacesRequest()
+    const faces = addon.decodeFetchSysFacesResponse(await this.sendPacket(addon, request))
+    if (!faces.length) throw new Error('FetchSysFaces response was empty')
+    const catalog = new Map(faces.filter((face) => face.faceId).map((face) => [face.faceId, face]))
+    if (!catalog.size) throw new Error('FetchSysFaces response contained no usable faces')
+    this.sysFaces = catalog
+    return catalog
   }
 
   async getMediaDirectUrl(locator: QQMediaLocator, selfUid: string): Promise<QQDirectUrl | undefined> {

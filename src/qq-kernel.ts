@@ -1048,6 +1048,31 @@ export class QQKernelBridge {
     mimeType: string
     size?: number
   }> {
+    if (reference.kind === 'sysface') {
+      const resolved = reference.url
+        ? undefined
+        : await this.packetClientForSession().getSysFace(reference.faceId)
+      const url = reference.url || resolved?.url
+      if (!url) throw new Error(`QQ system face resource is unavailable: ${reference.faceId}`)
+      if (resolved) {
+        reference.url = resolved.url
+        reference.name ||= resolved.name
+        reference.packId ??= String(resolved.aniStickerPackId)
+        reference.stickerId ??= String(resolved.aniStickerId)
+        reference.stickerType ??= resolved.aniStickerType
+        reference.width ??= positiveInteger(resolved.width, 240)
+        reference.height ??= positiveInteger(resolved.height, 240)
+      }
+      const response = await fetch(url)
+      if (!response.ok || !response.body) {
+        throw new Error(`QQ system face download failed: ${response.status}`)
+      }
+      return {
+        stream: Readable.fromWeb(response.body),
+        mimeType: systemFaceMimeType(url, response.headers.get('content-type')),
+        size: numberOrUndefined(response.headers.get('content-length') ?? undefined),
+      }
+    }
     if (reference.kind === 'favorite') {
       if (reference.path && existsSync(reference.path)) {
         return {
@@ -1080,6 +1105,7 @@ export class QQKernelBridge {
   }
 
   async setSavedSticker(reference: QQStickerReference, saved: boolean): Promise<void> {
+    if (reference.kind === 'sysface') throw new Error('QQ system faces cannot be added to favorites')
     const service = this.requireMsgService()
     if (!saved) {
       if (!service.deleteFavEmoji) throw new Error('QQ favorite deletion is unavailable')
@@ -1119,7 +1145,10 @@ export class QQKernelBridge {
     let preserveUntil: number | undefined
     try {
       if (manifest.sticker && manifest.media?.length) throw new Error('a message cannot contain both sticker and media')
-      if (manifest.sticker?.kind === 'market') {
+      if (manifest.sticker?.kind === 'sysface') {
+        this.stickers.set(sysFaceStickerId(manifest.sticker.faceId), stickerFromReference(manifest.sticker))
+        elements.push(sysFaceElement(manifest.sticker))
+      } else if (manifest.sticker?.kind === 'market') {
         this.stickers.set(marketStickerId(
           manifest.sticker.packageId, manifest.sticker.stickerId,
         ), stickerFromReference(manifest.sticker))
@@ -3653,6 +3682,24 @@ function marketFaceElement(reference: Extract<QQStickerReference, { kind: 'marke
   }
 }
 
+function sysFaceElement(reference: Extract<QQStickerReference, { kind: 'sysface' }>): MsgElement {
+  return {
+    elementType: ELEMENT_FACE,
+    elementId: '',
+    faceElement: {
+      faceIndex: Number(reference.faceId),
+      faceText: reference.name,
+      faceType: reference.faceType,
+      packId: reference.packId,
+      stickerId: reference.stickerId,
+      sourceType: reference.sourceType,
+      stickerType: reference.stickerType,
+      resultId: reference.resultId,
+      imageType: reference.imageType,
+    },
+  }
+}
+
 function imageElement(
   path: string,
   size: number,
@@ -3785,6 +3832,23 @@ function mapMedia(record: MsgRecord, element: MsgElement): QQMedia | undefined {
 }
 
 function mapSticker(record: MsgRecord, element: MsgElement): QQSticker | undefined {
+  const face = element.faceElement
+  if (element.elementType === ELEMENT_FACE && face && (face.faceType === 3 || face.faceType === 4)) {
+    const faceId = String(face.faceIndex)
+    const reference: QQStickerReference = {
+      kind: 'sysface', faceId, faceType: face.faceType,
+      name: face.faceText || `[QQ表情 ${faceId}]`,
+      packId: face.packId, stickerId: face.stickerId,
+      sourceType: face.sourceType, stickerType: face.stickerType,
+      resultId: face.resultId, imageType: face.imageType,
+      animated: true,
+    }
+    return {
+      stickerId: sysFaceStickerId(faceId), title: reference.name,
+      format: 'animated', mimeType: 'image/apng',
+      width: 240, height: 240, version: 1, reference,
+    }
+  }
   const market = element.marketFaceElement
   if (element.elementType === ELEMENT_MARKET_FACE && market?.emojiId) {
     const packageId = String(market.emojiPackageId)
@@ -3825,6 +3889,18 @@ function mapSticker(record: MsgRecord, element: MsgElement): QQSticker | undefin
 }
 
 function stickerFromReference(reference: QQStickerReference): QQSticker {
+  if (reference.kind === 'sysface') {
+    return {
+      stickerId: sysFaceStickerId(reference.faceId),
+      title: reference.name,
+      format: 'animated',
+      mimeType: systemFaceMimeType(reference.url ?? '', undefined),
+      width: reference.width ?? 240,
+      height: reference.height ?? 240,
+      version: 1,
+      reference,
+    }
+  }
   if (reference.kind === 'market') {
     return {
       stickerId: marketStickerId(reference.packageId, reference.stickerId),
@@ -3895,6 +3971,18 @@ function mergeKnownSticker(known: QQSticker | undefined, current: QQSticker): QQ
   return current
 }
 
+function sysFaceStickerId(faceId: string): string {
+  return `sysface:${faceId}`
+}
+
+function systemFaceMimeType(url: string, contentType: string | null | undefined): string {
+  const normalized = contentType?.split(';', 1)[0]?.trim().toLowerCase()
+  if (normalized?.startsWith('image/') || normalized === 'application/json') return normalized
+  if (/\.gif(?:$|[?#])/i.test(url)) return 'image/gif'
+  if (/\.json(?:$|[?#])/i.test(url)) return 'application/json'
+  return 'image/apng'
+}
+
 function mapMember(info: MemberInfo): MemberPage['members'][number] {
   return {
     user: {
@@ -3951,7 +4039,9 @@ function favoriteStickerId(resId: string): string {
 function matchesElementKind(element: MsgElement, kind: 'image' | 'file' | 'sticker'): boolean {
   if (kind === 'file') return Boolean(element.fileElement)
   if (kind === 'sticker') {
-    return Boolean(element.marketFaceElement) || Boolean(element.picElement && isStickerPicture(element.picElement))
+    return Boolean(element.marketFaceElement)
+      || Boolean(element.faceElement && (element.faceElement.faceType === 3 || element.faceElement.faceType === 4))
+      || Boolean(element.picElement && isStickerPicture(element.picElement))
   }
   return Boolean(element.picElement)
 }

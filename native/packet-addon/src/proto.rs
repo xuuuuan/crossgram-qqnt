@@ -28,6 +28,86 @@ pub struct OidbEnvelope {
 }
 
 #[derive(Clone, PartialEq, Message)]
+pub struct FetchSysFacesRequest {
+    #[prost(int32, tag = "1")]
+    pub field1: i32,
+    #[prost(int32, tag = "2")]
+    pub field2: i32,
+    #[prost(string, tag = "3")]
+    pub field3: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct FaceResourceUrl {
+    #[prost(string, tag = "1")]
+    pub base_url: String,
+    #[prost(string, tag = "2")]
+    pub adv_url: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct SysFace {
+    #[prost(string, tag = "1")]
+    pub q_sid: String,
+    #[prost(string, tag = "2")]
+    pub q_des: String,
+    #[prost(string, tag = "3")]
+    pub em_code: String,
+    #[prost(int32, tag = "4")]
+    pub q_cid: i32,
+    #[prost(int32, tag = "5")]
+    pub ani_sticker_type: i32,
+    #[prost(int32, tag = "6")]
+    pub ani_sticker_pack_id: i32,
+    #[prost(int32, tag = "7")]
+    pub ani_sticker_id: i32,
+    #[prost(message, optional, tag = "8")]
+    pub url: Option<FaceResourceUrl>,
+    #[prost(string, repeated, tag = "9")]
+    pub emoji_name_alias: Vec<String>,
+    #[prost(int32, tag = "13")]
+    pub ani_sticker_width: i32,
+    #[prost(int32, tag = "14")]
+    pub ani_sticker_height: i32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct SysFacePack {
+    #[prost(string, tag = "1")]
+    pub name: String,
+    #[prost(message, repeated, tag = "2")]
+    pub faces: Vec<SysFace>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct SysFaceContent {
+    #[prost(message, repeated, tag = "1")]
+    pub packs: Vec<SysFacePack>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct MagicSysFaceList {
+    #[prost(message, repeated, tag = "2")]
+    pub faces: Vec<SysFace>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct MagicSysFaceContent {
+    #[prost(message, optional, tag = "1")]
+    pub list: Option<MagicSysFaceList>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct FetchSysFacesResponse {
+    #[prost(message, optional, tag = "2")]
+    pub common: Option<SysFaceContent>,
+    #[prost(message, optional, tag = "3")]
+    pub special_big: Option<SysFaceContent>,
+    #[prost(message, optional, tag = "4")]
+    pub special_magic: Option<MagicSysFaceContent>,
+}
+
+#[derive(Clone, PartialEq, Message)]
 pub struct FetchRkeyRequest {
     #[prost(message, optional, tag = "1")]
     pub request_head: Option<MultiMediaRequestHead>,
@@ -332,6 +412,24 @@ pub fn fetch_rkey_packet() -> OidbEnvelope {
     }
 }
 
+pub fn fetch_sys_faces_packet() -> OidbEnvelope {
+    let body = FetchSysFacesRequest {
+        field1: 0,
+        field2: 7,
+        field3: "0".into(),
+    }
+    .encode_to_vec();
+
+    OidbEnvelope {
+        command: 0x9154,
+        sub_command: 1,
+        error_code: 0,
+        body,
+        error_message: None,
+        is_reserved: 1,
+    }
+}
+
 pub fn video_download_packet(
     chat_type: u32,
     peer: &str,
@@ -603,6 +701,24 @@ pub fn decode_rkeys(bytes: &[u8]) -> Result<Vec<RkeyInfo>, DecodeRkeyError> {
     Ok(response.data.map(|data| data.rkeys).unwrap_or_default())
 }
 
+pub fn decode_sys_faces(bytes: &[u8]) -> Result<Vec<SysFace>, DecodePacketError> {
+    let body = decode_oidb_body(bytes)?;
+    let response = FetchSysFacesResponse::decode(body.as_slice())?;
+    let mut faces = Vec::new();
+    for content in [response.common, response.special_big]
+        .into_iter()
+        .flatten()
+    {
+        for pack in content.packs {
+            faces.extend(pack.faces);
+        }
+    }
+    if let Some(list) = response.special_magic.and_then(|content| content.list) {
+        faces.extend(list.faces);
+    }
+    Ok(faces)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -616,6 +732,84 @@ mod tests {
             hex(&packet.encode_to_vec()),
             "08e7a00210ca01221c0a130a05080110ca011206a80602b006011a02080222050a030a14026001"
         );
+    }
+
+    #[test]
+    fn fetch_sys_faces_request_has_stable_wire_shape() {
+        let packet = fetch_sys_faces_packet();
+        assert_eq!(packet.command, 0x9154);
+        assert_eq!(packet.sub_command, 1);
+        assert_eq!(
+            FetchSysFacesRequest::decode(packet.body.as_slice()).unwrap(),
+            FetchSysFacesRequest {
+                field1: 0,
+                field2: 7,
+                field3: "0".into()
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_all_system_face_sections() {
+        fn face(id: &str, url: &str) -> SysFace {
+            SysFace {
+                q_sid: id.into(),
+                q_des: format!("face-{id}"),
+                em_code: String::new(),
+                q_cid: 0,
+                ani_sticker_type: 2,
+                ani_sticker_pack_id: 3,
+                ani_sticker_id: id.parse().unwrap(),
+                url: Some(FaceResourceUrl {
+                    base_url: url.into(),
+                    adv_url: String::new(),
+                }),
+                emoji_name_alias: vec![format!("alias-{id}")],
+                ani_sticker_width: 240,
+                ani_sticker_height: 180,
+            }
+        }
+        let response = FetchSysFacesResponse {
+            common: Some(SysFaceContent {
+                packs: vec![SysFacePack {
+                    name: "common".into(),
+                    faces: vec![face("14", "https://face/14.png")],
+                }],
+            }),
+            special_big: Some(SysFaceContent {
+                packs: vec![SysFacePack {
+                    name: "big".into(),
+                    faces: vec![face("476", "https://face/476.png")],
+                }],
+            }),
+            special_magic: Some(MagicSysFaceContent {
+                list: Some(MagicSysFaceList {
+                    faces: vec![face("500", "https://face/500.json")],
+                }),
+            }),
+        };
+        let envelope = OidbEnvelope {
+            command: 0x9154,
+            sub_command: 1,
+            error_code: 0,
+            body: response.encode_to_vec(),
+            error_message: None,
+            is_reserved: 1,
+        };
+
+        let result = decode_sys_faces(&envelope.encode_to_vec()).unwrap();
+        assert_eq!(
+            result
+                .iter()
+                .map(|face| face.q_sid.as_str())
+                .collect::<Vec<_>>(),
+            ["14", "476", "500"]
+        );
+        assert_eq!(
+            result[1].url.as_ref().unwrap().base_url,
+            "https://face/476.png"
+        );
+        assert_eq!(result[1].ani_sticker_width, 240);
     }
 
     #[test]

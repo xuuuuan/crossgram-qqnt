@@ -23,6 +23,8 @@ function packetAddonFixture(): PacketAddon {
     sendPacket: vi.fn((send, command, payload) => send(command, payload)),
     encodeFetchRkeyRequest: vi.fn(() => ({ command: '', payload: Buffer.alloc(0) })),
     decodeFetchRkeyResponse: vi.fn(() => []),
+    encodeFetchSysFacesRequest: vi.fn(() => ({ command: '', payload: Buffer.alloc(0) })),
+    decodeFetchSysFacesResponse: vi.fn(() => []),
     encodeVideoDownloadRequest: vi.fn(() => ({ command: '', payload: Buffer.alloc(0) })),
     decodeVideoDownloadResponse: vi.fn(() => ({ url: '', ttlSeconds: 0, createdAt: 0 })),
     encodeGroupFileDownloadRequest: vi.fn(() => ({ command: '', payload: Buffer.alloc(0) })),
@@ -284,6 +286,7 @@ async function readStream(stream: Readable): Promise<Buffer> {
 describe('QQKernelBridge', () => {
   const tempPaths: string[] = []
   afterEach(async () => {
+    vi.unstubAllGlobals()
     await Promise.all(tempPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })))
   })
 
@@ -733,6 +736,72 @@ describe('QQKernelBridge', () => {
       }),
       expect.objectContaining({ elementType: 1, textElement: expect.objectContaining({ content: '!', atType: 0 }) }),
     ], expect.any(Map))
+  })
+
+  it('maps QQ animated system faces as stickers, opens their catalog asset, and round-trips metadata', async () => {
+    const f = fixture()
+    f.message.elements = [{
+      elementType: 6, elementId: 'large-face', faceElement: {
+        faceIndex: 476, faceText: '/不是吧', faceType: 3,
+        packId: '3', stickerId: '476', sourceType: 1, stickerType: 2,
+        resultId: 'result-476', imageType: 1,
+      },
+    }]
+    const addon = packetAddonFixture()
+    addon.encodeFetchSysFacesRequest = vi.fn(() => ({
+      command: 'OidbSvcTrpcTcp.0x9154_1', payload: Buffer.from('catalog-request'),
+    }))
+    addon.decodeFetchSysFacesResponse = vi.fn(() => [{
+      faceId: '476', name: '/不是吧', url: 'https://face.qq.example/476.png',
+      aniStickerType: 2, aniStickerPackId: 3, aniStickerId: 476, width: 320, height: 180,
+    }])
+    f.msg.sendSsoCmdReqByContend = vi.fn(async () => ({
+      result: 0, errMsg: '', rspbuffer: Buffer.from('catalog-response'),
+    }))
+    const apng = Buffer.from('animated-system-face')
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(apng, {
+      headers: { 'content-type': 'image/apng', 'content-length': String(apng.length) },
+    })))
+    const bridge = new QQKernelBridge({ packetClient: { addon } })
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    const history = await bridge.getHistory(bridge.getConversation('uid-1715311957'))
+    expect(history.messages[0].parts).toEqual([{ type: 'sticker', sticker: expect.objectContaining({
+      stickerId: 'sysface:476', format: 'animated', mimeType: 'image/apng',
+      reference: expect.objectContaining({
+        kind: 'sysface', faceId: '476', faceType: 3, name: '/不是吧',
+        packId: '3', stickerId: '476', sourceType: 1, stickerType: 2,
+        resultId: 'result-476', imageType: 1, animated: true,
+      }),
+    }) }])
+    const reference = history.messages[0].parts[0].type === 'sticker'
+      ? history.messages[0].parts[0].sticker.reference
+      : undefined
+    expect(reference).toBeDefined()
+    const asset = await bridge.openSticker(reference!)
+    expect(asset).toMatchObject({ mimeType: 'image/apng', size: apng.length })
+    expect(await readStream(asset.stream)).toEqual(apng)
+    expect(reference).toMatchObject({
+      kind: 'sysface', url: 'https://face.qq.example/476.png', width: 320, height: 180,
+    })
+    expect(f.msg.sendSsoCmdReqByContend).toHaveBeenCalledWith(
+      'OidbSvcTrpcTcp.0x9154_1', Buffer.from('catalog-request'),
+    )
+
+    f.msg.sendMsg.mockImplementationOnce(async () => {
+      queueMicrotask(() => f.emitMessages([{ ...f.message, sendStatus: 2 }]))
+      return { result: 0, errMsg: '' }
+    })
+    f.msg.getMsgUniqueId.mockReturnValueOnce('0')
+    const sent = await bridge.send({ conversationId: 'uid-1715311957', sticker: reference! }, Readable.from([]))
+    expect(f.msg.sendMsg).toHaveBeenCalledWith('0', expect.anything(), [{
+      elementType: 6, elementId: '', faceElement: {
+        faceIndex: 476, faceText: '/不是吧', faceType: 3,
+        packId: '3', stickerId: '476', sourceType: 1, stickerType: 2,
+        resultId: 'result-476', imageType: 1,
+      },
+    }], expect.any(Map))
+    expect(sent.parts).toMatchObject([{ type: 'sticker', sticker: { stickerId: 'sysface:476' } }])
   })
 
   it('resolves received group and C2C reply targets when QQNT only exposes sequence metadata', async () => {
