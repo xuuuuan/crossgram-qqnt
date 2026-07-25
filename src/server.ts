@@ -414,6 +414,39 @@ export class QQBridgeServer {
       json(response, 200, result)
       return
     }
+    if (request.method === 'POST' && path === '/v1/reactions/asset') {
+      const locator = await readJson<{ reactionKey?: string }>(request)
+      const range = parseByteRange(request.headers.range)
+      if (range === false) {
+        response.writeHead(416, { 'content-range': 'bytes */*', 'cache-control': 'no-store' })
+        response.end()
+        return
+      }
+      const asset = locator.reactionKey
+        ? await this.bridge.openReactionResource(locator.reactionKey, range ?? {})
+        : undefined
+      if (!asset) {
+        json(response, 404, { error: 'reaction resource not found' })
+        return
+      }
+      if (range && asset.offset >= asset.size) {
+        response.writeHead(416, {
+          'content-range': `bytes */${asset.size}`, 'accept-ranges': 'bytes', 'cache-control': 'no-store',
+        })
+        response.end()
+        return
+      }
+      response.writeHead(range ? 206 : 200, {
+        'content-type': asset.mimeType,
+        'content-length': String(asset.length),
+        ...(range ? { 'content-range': `bytes ${asset.offset}-${asset.offset + asset.length - 1}/${asset.size}` } : {}),
+        'accept-ranges': 'bytes',
+        'cache-control': 'no-store',
+      })
+      log('info', `HTTP API reaction asset id=${requestId} key=${locator.reactionKey} offset=${asset.offset} length=${asset.length} size=${asset.size}`)
+      await pipe(asset.stream, response)
+      return
+    }
     json(response, 404, { error: 'not found' })
   }
 
@@ -518,6 +551,17 @@ function optionalNumberParam(url: URL, name: string): number | undefined {
   const value = Number(raw)
   if (!Number.isFinite(value)) throw new Error(`invalid ${name}`)
   return value
+}
+
+function parseByteRange(value: string | undefined): { offset: number, limit?: number } | null | false {
+  if (value === undefined) return null
+  const match = /^bytes=(\d+)-(\d*)$/.exec(value.trim())
+  if (!match) return false
+  const offset = Number(match[1])
+  const end = match[2] ? Number(match[2]) : undefined
+  if (!Number.isSafeInteger(offset) || offset < 0) return false
+  if (end !== undefined && (!Number.isSafeInteger(end) || end < offset)) return false
+  return { offset, ...(end === undefined ? {} : { limit: end - offset + 1 }) }
 }
 
 async function pipe(source: Readable, destination: ServerResponse): Promise<void> {

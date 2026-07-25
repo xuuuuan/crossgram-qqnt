@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 15
+export const PROTOCOL_VERSION = 16
 
 export type QQChatType = 1 | 2
 
@@ -213,8 +213,8 @@ export interface QQReactionDefinition {
           height: number
           size?: number
           locator: {
-            /** PNG/APNG source file exposed by the injected bridge. */
-            filePath: string
+            /** Opaque catalog key accepted only by the dedicated reaction asset endpoint. */
+            reactionKey: string
           }
         }
       }

@@ -97,6 +97,7 @@ export class QQKernelBridge {
   private readonly messages = new Map<string, QQMessage[]>()
   private reactionDefinitions: QQReactionDefinition[] = []
   private readonly reactionByKey = new Map<string, QQReactionDefinition>()
+  private readonly reactionAssets = new Map<string, { path: string, mimeType: 'image/png' | 'image/apng' }>()
   private reactionCatalogPromise?: Promise<void>
   private reactionEventSequence = 0
   private readonly stickerPacks = new Map<string, QQStickerPack>()
@@ -183,6 +184,7 @@ export class QQKernelBridge {
     this.messageOrigins.clear()
     this.reactionDefinitions = []
     this.reactionByKey.clear()
+    this.reactionAssets.clear()
     this.reactionCatalogPromise = undefined
     this.stickerPacks.clear()
     this.stickerPackInfo.clear()
@@ -276,6 +278,7 @@ export class QQKernelBridge {
     this.pendingUserProfiles.clear()
     for (const pending of this.pendingMemberPages.values()) pending.reject(new Error('QQNT session detached'))
     this.pendingMemberPages.clear()
+    this.reactionAssets.clear()
   }
 
   subscribe(lastEventId?: string): AsyncQueue<QQEvent> {
@@ -1440,6 +1443,29 @@ export class QQKernelBridge {
       await withTimeout(this.loadReactionCatalogOnce(), 5_000, 'QQ reaction catalog request timed out')
     }
     return { available: this.reactionDefinitions, reactions: [], maxSelected: 20 }
+  }
+
+  async openReactionResource(
+    reactionKey: string,
+    range: { offset?: number, limit?: number } = {},
+  ): Promise<{ stream: Readable, mimeType: string, size: number, offset: number, length: number } | undefined> {
+    if (!this.reactionDefinitions.length) await this.getReactionCatalog()
+    const resource = this.reactionAssets.get(reactionKey)
+    if (!resource || !existsSync(resource.path)) return
+    const size = statSync(resource.path).size
+    const offset = Math.max(0, Math.trunc(range.offset ?? 0))
+    const available = Math.max(0, size - offset)
+    const requested = range.limit === undefined ? available : Math.max(0, Math.trunc(range.limit))
+    const length = Math.min(available, requested)
+    return {
+      stream: length
+        ? createReadStream(resource.path, { start: offset, end: offset + length - 1 })
+        : Readable.from([]),
+      mimeType: resource.mimeType,
+      size,
+      offset,
+      length,
+    }
   }
 
   async getMessageReactions(conversation: QQConversation, messageId: string): Promise<QQReactionState> {
@@ -2861,6 +2887,7 @@ export class QQKernelBridge {
     }
     const definitions: QQReactionDefinition[] = []
     const aliases = new Map<string, QQReactionDefinition>()
+    const assets = new Map<string, { path: string, mimeType: 'image/png' | 'image/apng' }>()
     for (const item of config.emoji ?? []) {
       if (item.QHide === '1' || !item.QSid) continue
       const emojiId = item.QCid || item.AQLid
@@ -2891,10 +2918,11 @@ export class QQKernelBridge {
               width: dimensions?.width ?? 56,
               height: dimensions?.height ?? 56,
               size: info.size,
-              locator: { filePath },
+              locator: { reactionKey: nativeKey },
             },
           },
         }
+        assets.set(nativeKey, { path: filePath, mimeType: 'image/png' })
       }
       definitions.push(definition)
       if (item.QCid) aliases.set(reactionKey('2', item.QCid), definition)
@@ -2908,8 +2936,9 @@ export class QQKernelBridge {
       const animated = existsSync(animatedPath)
       const info = await stat(animated ? animatedPath : filePath)
       const dimensions = pngDimensions(await readFile(filePath))
+      const key = reactionKey('1', item.QSid)
       definitions.push({
-        key: reactionKey('1', item.QSid),
+        key,
         title: cleanFaceName(item.QDes),
         presentation: {
           type: 'custom',
@@ -2923,13 +2952,19 @@ export class QQKernelBridge {
             width: dimensions?.width ?? 128,
             height: dimensions?.height ?? 128,
             size: animated ? undefined : info.size,
-            locator: { filePath: animated ? animatedPath : filePath },
+            locator: { reactionKey: key },
           },
         },
+      })
+      assets.set(key, {
+        path: animated ? animatedPath : filePath,
+        mimeType: animated ? 'image/apng' : 'image/png',
       })
     }
     this.reactionDefinitions = definitions
     this.reactionByKey.clear()
+    this.reactionAssets.clear()
+    for (const [key, asset] of assets) this.reactionAssets.set(key, asset)
     for (const definition of definitions) this.reactionByKey.set(definition.key, definition)
     for (const [key, definition] of aliases) this.reactionByKey.set(key, definition)
     log('info', `loaded ${definitions.length} QQ reaction definitions`)

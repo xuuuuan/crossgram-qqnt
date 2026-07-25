@@ -2049,7 +2049,8 @@ describe('QQKernelBridge', () => {
     })
     await vi.waitFor(async () => expect((await bridge.getReactionCatalog()).available).toHaveLength(2))
 
-    expect((await bridge.getReactionCatalog()).available).toEqual(expect.arrayContaining([
+    const catalog = await bridge.getReactionCatalog()
+    expect(catalog.available).toEqual(expect.arrayContaining([
       expect.objectContaining({
         key: '2:128522',
         presentation: expect.objectContaining({
@@ -2062,11 +2063,16 @@ describe('QQKernelBridge', () => {
         presentation: expect.objectContaining({
           type: 'custom', alt: '🙂',
           resource: expect.objectContaining({
-            format: 'video', mimeType: 'video/webm', locator: { filePath: join(animatedPath, 's14.png') },
+            format: 'video', mimeType: 'video/webm', locator: { reactionKey: '1:14' },
           }),
         }),
       }),
     ]))
+    expect(JSON.stringify(catalog)).not.toContain(root)
+    const resource = await bridge.openReactionResource('1:14', { offset: 1, limit: 3 })
+    expect(resource).toMatchObject({ mimeType: 'image/apng', size: png.length, offset: 1, length: 3 })
+    expect(await readStream(resource!.stream)).toEqual(png.subarray(1, 4))
+    await expect(bridge.openReactionResource('unknown')).resolves.toBeUndefined()
   })
 
   it('does not expose or write reactions in direct conversations', async () => {
@@ -2139,7 +2145,7 @@ describe('QQBridgeServer', () => {
     const { port } = server.address()
     const base = `http://127.0.0.1:${port}/v1`
     await expect(fetch(`${base}/status`).then((response) => response.json())).resolves.toMatchObject({
-      protocolVersion: 15, ready: true, selfUin: '10000',
+      protocolVersion: 16, ready: true, selfUin: '10000',
     })
     await expect(fetch(`${base}/dialogs`).then((response) => response.json())).resolves.toMatchObject({
       conversations: [{ peerUin: '1715311957' }],
@@ -2235,6 +2241,30 @@ describe('QQBridgeServer', () => {
     })
 
     expect(response.status).toBe(404)
+  })
+
+  it('serves only catalog-keyed reaction assets with byte ranges', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const open = vi.spyOn(bridge, 'openReactionResource').mockResolvedValue({
+      stream: Readable.from(Buffer.from('bcd')), mimeType: 'image/png',
+      size: 5, offset: 1, length: 3,
+    })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const base = `http://127.0.0.1:${server.address().port}/v1`
+
+    const response = await fetch(`${base}/reactions/asset`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', range: 'bytes=1-3' },
+      body: JSON.stringify({ reactionKey: '1:14', filePath: 'C:\\should-not-be-readable' }),
+    })
+
+    expect(response.status).toBe(206)
+    expect(response.headers.get('content-range')).toBe('bytes 1-3/5')
+    expect(Buffer.from(await response.arrayBuffer()).toString()).toBe('bcd')
+    expect(open).toHaveBeenCalledWith('1:14', { offset: 1, limit: 3 })
   })
 
   it('serves a packet-resolved video direct URL and its expiry', async () => {
