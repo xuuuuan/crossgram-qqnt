@@ -2,6 +2,7 @@ import { createReadStream } from 'node:fs'
 import { Readable } from 'node:stream'
 import { stat } from 'node:fs/promises'
 import { basename } from 'node:path'
+import { createHash } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
 
 const enabled = process.env.QQNT_BRIDGE_E2E === '1'
@@ -9,6 +10,10 @@ const base = process.env.QQNT_BRIDGE_URL ?? 'http://127.0.0.1:18767/v1'
 const token = process.env.QQNT_BRIDGE_TOKEN
 const allowedDirect = '1715311957'
 const allowedGroups = new Set(['1058754719', '1084013940'])
+const testPng = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+  'base64',
+)
 
 function headers(extra: Record<string, string> = {}) {
   return { ...(token ? { authorization: `Bearer ${token}` } : {}), ...extra }
@@ -181,18 +186,17 @@ describe.skipIf(!enabled)('live QQNT bridge E2E', () => {
   }, 180_000)
 
   it('streams a PNG image to xuuuuan and returns a confirmed image element', async () => {
-    const imagePath = new URL('../../mtproto-relay-cordis/packages/platform-static/src/test-image.png', import.meta.url)
-    const image = await stat(imagePath)
+    const hashes = bufferHashes(testPng)
     const conversation = await resolve('direct', allowedDirect)
     const manifest = Buffer.from(JSON.stringify({
       conversationId: conversation.id, media: [{
-        kind: 'image', name: basename(imagePath.pathname), size: image.size, mimeType: 'image/png',
+        kind: 'image', name: 'qqnt-bridge-e2e.png', size: testPng.length, mimeType: 'image/png', ...hashes,
       }],
     })).toString('base64url')
     const sent = await fetch(`${base}/messages`, {
       method: 'POST',
-      headers: headers({ 'x-qqnt-manifest': manifest, 'content-length': String(image.size) }),
-      body: createReadStream(imagePath) as never,
+      headers: headers({ 'x-qqnt-manifest': manifest, 'content-length': String(testPng.length) }),
+      body: Readable.from(testPng) as never,
       duplex: 'half',
     } as RequestInit)
     const body = await sent.text()
@@ -209,26 +213,22 @@ describe.skipIf(!enabled)('live QQNT bridge E2E', () => {
   }, 180_000)
 
   it('streams two PNG images to xuuuuan as one QQ message', async () => {
-    const imagePath = new URL('../../mtproto-relay-cordis/packages/platform-static/src/test-image.png', import.meta.url)
-    const image = await stat(imagePath)
+    const hashes = bufferHashes(testPng)
     const conversation = await resolve('direct', allowedDirect)
-    const name = basename(imagePath.pathname)
     const manifest = Buffer.from(JSON.stringify({
       conversationId: conversation.id,
       mediaFraming: 'length-prefixed-v1',
       media: [
-        { kind: 'image', name: `first-${name}`, size: image.size, mimeType: 'image/png' },
-        { kind: 'image', name: `second-${name}`, size: image.size, mimeType: 'image/png' },
+        { kind: 'image', name: 'first-qqnt-bridge-e2e.png', size: testPng.length, mimeType: 'image/png', ...hashes },
+        { kind: 'image', name: 'second-qqnt-bridge-e2e.png', size: testPng.length, mimeType: 'image/png', ...hashes },
       ],
     })).toString('base64url')
     const body = Readable.from((async function* () {
       for (let index = 0; index < 2; index++) {
-        for await (const chunk of createReadStream(imagePath)) {
-          const header = Buffer.allocUnsafe(4)
-          header.writeUInt32BE(chunk.length)
-          yield header
-          yield chunk
-        }
+        const header = Buffer.allocUnsafe(4)
+        header.writeUInt32BE(testPng.length)
+        yield header
+        yield testPng
         yield Buffer.alloc(4)
       }
     })())
@@ -244,10 +244,11 @@ describe.skipIf(!enabled)('live QQNT bridge E2E', () => {
   it.runIf(Boolean(process.env.QQNT_BRIDGE_E2E_FILE))('streams a private file and resolves a ranged CDN direct URL', async () => {
     const path = process.env.QQNT_BRIDGE_E2E_FILE!
     const info = await stat(path)
+    const hashes = await fileHashes(path)
     const conversation = await resolve('direct', allowedDirect)
     const manifest = Buffer.from(JSON.stringify({
       conversationId: conversation.id,
-      media: [{ kind: 'file', name: basename(path), size: info.size }],
+      media: [{ kind: 'file', name: basename(path), size: info.size, ...hashes }],
     })).toString('base64url')
     const sent = await fetch(`${base}/messages`, {
       method: 'POST',
@@ -275,3 +276,28 @@ describe.skipIf(!enabled)('live QQNT bridge E2E', () => {
     expect((await downloaded.arrayBuffer()).byteLength).toBe(end + 1)
   }, 180_000)
 })
+
+async function fileHashes(path: string | URL): Promise<{ md5: string, sha1: string, file10MMd5: string }> {
+  const md5 = createHash('md5')
+  const sha1 = createHash('sha1')
+  const first10M = createHash('md5')
+  let accepted = 0
+  for await (const chunk of createReadStream(path)) {
+    md5.update(chunk)
+    sha1.update(chunk)
+    if (accepted < 10 * 1024 * 1024) {
+      const value = chunk.subarray(0, Math.min(chunk.length, 10 * 1024 * 1024 - accepted))
+      first10M.update(value)
+      accepted += value.length
+    }
+  }
+  return { md5: md5.digest('hex'), sha1: sha1.digest('hex'), file10MMd5: first10M.digest('hex') }
+}
+
+function bufferHashes(value: Buffer): { md5: string, sha1: string, file10MMd5: string } {
+  return {
+    md5: createHash('md5').update(value).digest('hex'),
+    sha1: createHash('sha1').update(value).digest('hex'),
+    file10MMd5: createHash('md5').update(value.subarray(0, 10 * 1024 * 1024)).digest('hex'),
+  }
+}

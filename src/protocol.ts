@@ -282,6 +282,11 @@ export interface SendManifest {
     name: string
     mimeType?: string
     size?: number
+    /** Full-file hashes supplied by the relay so protocol upload needs no local staging pass. */
+    md5?: string
+    sha1?: string
+    /** MD5 of the first min(10 MiB, file size), used by private-file upload. */
+    file10MMd5?: string
     width?: number
     height?: number
     duration?: number

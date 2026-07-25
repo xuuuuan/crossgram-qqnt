@@ -10,6 +10,7 @@ import type { PacketAddon } from './packet-addon.js'
 import { PROTOCOL_VERSION } from './protocol.js'
 import { QQKernelBridge } from './qq-kernel.js'
 import { QQBridgeServer } from './server.js'
+import { QQPacketClient } from './packet-client.js'
 
 const avatarFixturePath = process.platform === 'win32' ? process.execPath : '/dev/null'
 
@@ -1487,6 +1488,72 @@ describe('QQKernelBridge', () => {
       ], expect.any(Map),
     )
     expect(sent.parts.filter((part) => part.type === 'media')).toHaveLength(2)
+  })
+
+  it('sends hashed image and file manifests through protocol upload without local media paths', async () => {
+    const f = fixture()
+    const image = Buffer.from([1, 2, 3])
+    const file = Buffer.from([4, 5, 6, 7])
+    const received: Buffer[] = []
+    const imageUpload = vi.spyOn(QQPacketClient.prototype, 'uploadImage')
+      .mockImplementation(async (_chat, _peer, _self, _spec, source) => {
+        for await (const chunk of source) received.push(Buffer.from(chunk))
+        return { fileUuid: 'image-uuid', ipv4s: [], msgInfo: Buffer.from('msg-info'), msgInfoBodies: [] }
+      })
+    const fileUpload = vi.spyOn(QQPacketClient.prototype, 'uploadFile')
+      .mockImplementation(async (_chat, _peer, _uin, _uid, _spec, source) => {
+        for await (const chunk of source) received.push(Buffer.from(chunk))
+        return { fileUuid: 'file-uuid', exists: true, commandId: 95 }
+      })
+    const protocolSend = vi.spyOn(QQPacketClient.prototype, 'sendDirectMessage')
+      .mockImplementation(async (_chat, peerUid, _peerUin, parts) => {
+        const elements = parts.map((part) => part.kind === 'image' ? {
+          elementType: 2, elementId: 'image-element', picElement: {
+            fileName: 'direct.png', fileSize: String(image.length), sourcePath: '',
+            fileUuid: part.upload.fileUuid, md5HexStr: '5289df737df57326fcdd22597afb1fac',
+            picWidth: 1, picHeight: 1, picType: 1001, picSubType: 0,
+          },
+        } : {
+          elementType: 3, elementId: 'file-element', fileElement: {
+            fileName: 'direct.bin', fileSize: String(file.length), filePath: '',
+            fileUuid: part.kind === 'file' ? part.upload.fileUuid : '',
+            fileMd5: 'a6b8537b97d58b417d3dfdd1030b15d2',
+          },
+        })
+        queueMicrotask(() => f.emitMessages([{
+          ...f.message, msgId: 'protocol-message', peerUid, peerUin: peerUid,
+          chatType: 2, sendStatus: 2, elements,
+        }]))
+        return { sequence: 1n, clientSequence: 2n, sendTime: 3 }
+      })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const frame = (value: Buffer) => [
+      Buffer.from([0, 0, 0, value.length]), value, Buffer.alloc(4),
+    ]
+
+    await bridge.send({
+      conversationId: '1058754719', mediaFraming: 'length-prefixed-v1',
+      media: [{
+        kind: 'image', name: 'direct.png', size: image.length,
+        md5: '5289df737df57326fcdd22597afb1fac', sha1: '7037807198c22a7d2b0807371d763779a84fdfcf',
+        file10MMd5: '5289df737df57326fcdd22597afb1fac', width: 1, height: 1,
+      }, {
+        kind: 'file', name: 'direct.bin', size: file.length,
+        md5: 'a6b8537b97d58b417d3dfdd1030b15d2', sha1: '13a936c521299ecb9702d0b63e6458171f926bba',
+        file10MMd5: 'a6b8537b97d58b417d3dfdd1030b15d2',
+      }],
+    }, Readable.from([...frame(image), ...frame(file)]))
+
+    expect(Buffer.concat(received)).toEqual(Buffer.concat([image, file]))
+    expect(imageUpload).toHaveBeenCalledOnce()
+    expect(fileUpload).toHaveBeenCalledOnce()
+    expect(protocolSend).toHaveBeenCalledWith(2, '1058754719', '1058754719', [
+      expect.objectContaining({ kind: 'image', upload: expect.objectContaining({ fileUuid: 'image-uuid' }) }),
+      expect.objectContaining({ kind: 'file', upload: expect.objectContaining({ fileUuid: 'file-uuid' }) }),
+    ], 'self')
+    expect(f.msg.sendMsg).not.toHaveBeenCalled()
+    expect(f.sentBodies).toEqual([])
   })
 
   it('lists, decrypts, sends, and maps QQ market stickers', async () => {

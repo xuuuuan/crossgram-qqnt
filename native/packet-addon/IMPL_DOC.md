@@ -12,6 +12,7 @@
 
 - 图片直链无法获取（`/v1/files/direct-url` 返回 404）
 - 发包日志出现 `result=145 请求包解析失败`
+- 图片/文件上传仍落入 `.qqnt-bridge-staging` 或 Highway 分块失败
 - QQ 主进程在 bridge 加载后崩溃
 - 响应回包中 `rspbuffer` 始终为空
 
@@ -56,6 +57,18 @@
 ---
 
 ## 3. 核心数据结构
+
+### 3.0 协议直传
+
+Bridge protocol v18 的发送 manifest 由 relay 提供完整文件的 MD5、SHA-1 和前 10 MiB MD5。
+注入端先通过 `0x11c4/0x11c5`（图片）、`0x6d6_0`（群文件）或
+`0xe37_1700`（私聊文件）取得服务器引用，再通过 `HttpConn.0x6ff_501`
+取得 Highway ticket，将 HTTP 请求体直接切成 1 MiB Highway block。整个流程不创建
+staging 文件；服务端命中秒传时仍会完整 drain 并校验请求体长度。上传完成后图片以
+预上传返回的 `MsgInfo`、群文件以 trans element、私聊文件以 `0x211` 文件消息通过
+`MessageSvc.PbSendMsg` 直接发送，不再把空 `sourcePath/filePath` 交回 QQNT 原生上传器。
+旧 manifest 没有 hash，或含有尚未支持的原生 reply/mention 组合时保留 native path
+fallback，便于滚动升级。
 
 ### 3.1 QQ 内部字符串布局
 

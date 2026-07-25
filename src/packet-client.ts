@@ -3,6 +3,14 @@ import { log } from './log.js'
 import { loadPacketAddon, type PacketAddon } from './packet-addon.js'
 import type { NativeDirectUrl, NativePacketRequest, NativeSysFace } from './packet-addon.js'
 import type { QQMediaLocator } from './protocol.js'
+import {
+  decodeDirectMessageResponse, decodeFileUploadResponse, decodeHighwayResponse, decodeHighwaySessionResponse,
+  decodeImageUploadResponse, decodePrivateFileMetadataResponse, encodeDirectMessageRequest,
+  encodeFileUploadRequest, encodeHighwayFrame, encodeHighwaySessionRequest, encodeImageHighwayExt,
+  encodeImageUploadRequest, encodePrivateFileMetadataRequest,
+  HIGHWAY_BLOCK_SIZE, type DirectFileSpec, type DirectImageSpec, type HighwaySession,
+  type DirectMessagePart, type DirectMessageSendResponse, type PreparedFileUpload, type PreparedImageUpload,
+} from './upload-protocol.js'
 
 const PRIVATE_IMAGE_APP_ID = '1406'
 const PRIVATE_IMAGE_RKEY_KIND = 10
@@ -21,6 +29,7 @@ export interface QQPacketClientOptions {
   loadAddon?: () => PacketAddon
   now?: () => number
   timeoutMs?: number
+  fetch?: typeof globalThis.fetch
 }
 
 interface RkeyCache {
@@ -38,6 +47,7 @@ export class QQPacketClient {
   private readonly loadAddon: () => PacketAddon
   private readonly now: () => number
   private readonly timeoutMs: number
+  private readonly fetchImpl: typeof globalThis.fetch
   private cache?: RkeyCache
   private refresh?: Promise<RkeyCache>
   private readonly directUrls = new Map<string, QQDirectUrl>()
@@ -45,6 +55,9 @@ export class QQPacketClient {
   private sysFaces?: Map<string, NativeSysFace>
   private sysFaceRefresh?: Promise<Map<string, NativeSysFace>>
   private located = false
+  private highwaySession?: { value: HighwaySession, createdAt: number }
+  private highwaySessionRefresh?: Promise<HighwaySession>
+  private highwaySequence = 0
 
   constructor(
     private readonly msgService: Pick<KernelMsgService, 'sendSsoCmdReqByContend'>,
@@ -53,6 +66,98 @@ export class QQPacketClient {
     this.loadAddon = options.addon ? () => options.addon! : options.loadAddon ?? loadPacketAddon
     this.now = options.now ?? Date.now
     this.timeoutMs = options.timeoutMs ?? DEFAULT_PACKET_TIMEOUT_MS
+    this.fetchImpl = options.fetch ?? globalThis.fetch
+  }
+
+  async uploadImage(
+    chatType: 1 | 2,
+    peerUid: string,
+    selfUin: string,
+    spec: DirectImageSpec,
+    source: AsyncIterable<Uint8Array>,
+    signal?: AbortSignal,
+  ): Promise<PreparedImageUpload> {
+    this.assertPacketSupport()
+    const addon = this.loadAddon()
+    const request = encodeImageUploadRequest(chatType, peerUid, spec)
+    const upload = decodeImageUploadResponse(await this.sendPacket(addon, request))
+    const chunks = exactBlocks(source, spec.size, HIGHWAY_BLOCK_SIZE, signal)
+    if (!upload.ukey) {
+      for await (const _chunk of chunks) { /* drain a fast-upload request body */ }
+      return upload
+    }
+    const session = await this.getHighwaySession(addon)
+    const extendInfo = encodeImageHighwayExt(upload, spec.sha1)
+    let offset = 0
+    for await (const chunk of chunks) {
+      const frame = encodeHighwayFrame({
+        selfUin, commandId: chatType === 2 ? 1004 : 1003,
+        sequence: ++this.highwaySequence, ticket: session.ticket,
+        fileSize: spec.size, offset, fileMd5: spec.md5, extendInfo, body: chunk,
+      })
+      await this.uploadHighwayBlock(session, selfUin, frame, signal)
+      offset += chunk.length
+    }
+    return upload
+  }
+
+  async uploadFile(
+    chatType: 1 | 2,
+    peerUid: string,
+    selfUin: string,
+    selfUid: string,
+    spec: DirectFileSpec,
+    source: AsyncIterable<Uint8Array>,
+    signal?: AbortSignal,
+  ): Promise<PreparedFileUpload> {
+    this.assertPacketSupport()
+    const addon = this.loadAddon()
+    const request = encodeFileUploadRequest(chatType, peerUid, selfUid, spec)
+    const upload = decodeFileUploadResponse(
+      chatType, await this.sendPacket(addon, request), selfUin, peerUid, spec,
+    )
+    const chunks = exactBlocks(source, spec.size, HIGHWAY_BLOCK_SIZE, signal)
+    if (upload.exists) {
+      for await (const _chunk of chunks) { /* drain a fast-upload request body */ }
+    } else {
+      if (!upload.extendInfo) throw new Error('file upload response has no Highway metadata')
+      const session = await this.getHighwaySession(addon)
+      let offset = 0
+      for await (const chunk of chunks) {
+        const frame = encodeHighwayFrame({
+          selfUin, commandId: upload.commandId, sequence: ++this.highwaySequence,
+          ticket: session.ticket, fileSize: spec.size, offset,
+          fileMd5: spec.md5, extendInfo: upload.extendInfo, body: chunk,
+        })
+        await this.uploadHighwayBlock(session, selfUin, frame, signal)
+        offset += chunk.length
+      }
+    }
+    if (chatType === 1) {
+      if (!upload.fileHash) throw new Error('private file upload response contained no file hash')
+      const metadataRequest = encodePrivateFileMetadataRequest(
+        selfUid, peerUid, upload.fileUuid, upload.fileHash,
+      )
+      upload.privateMetadata = decodePrivateFileMetadataResponse(
+        await this.sendPacket(addon, metadataRequest),
+      )
+    }
+    return upload
+  }
+
+  async sendDirectMessage(
+    chatType: 1 | 2,
+    peerUid: string,
+    peerUin: string,
+    parts: DirectMessagePart[],
+    selfUid: string,
+  ): Promise<DirectMessageSendResponse> {
+    this.assertPacketSupport()
+    const addon = this.loadAddon()
+    const request = encodeDirectMessageRequest(chatType, peerUid, peerUin, parts, { selfUid })
+    const response = decodeDirectMessageResponse(await this.sendPacket(addon, request))
+    log('info', `QQ protocol message accepted conversation=${peerUid} sequence=${response.sequence} clientSequence=${response.clientSequence}`)
+    return response
   }
 
   async getImageDirectUrl(locator: QQMediaLocator): Promise<string | undefined> {
@@ -203,6 +308,48 @@ export class QQPacketClient {
     return responsePayload(await this.sendPacketRaw(addon, request))
   }
 
+  private async getHighwaySession(addon: PacketAddon): Promise<HighwaySession> {
+    const cached = this.highwaySession
+    if (cached && this.now() - cached.createdAt < 12 * 60 * 60_000) return cached.value
+    if (!this.highwaySessionRefresh) {
+      this.highwaySessionRefresh = this.sendPacket(addon, encodeHighwaySessionRequest())
+        .then(decodeHighwaySessionResponse)
+        .then((value) => {
+          this.highwaySession = { value, createdAt: this.now() }
+          return value
+        })
+        .finally(() => { this.highwaySessionRefresh = undefined })
+    }
+    return this.highwaySessionRefresh
+  }
+
+  private async uploadHighwayBlock(
+    session: HighwaySession,
+    selfUin: string,
+    frame: Buffer,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    let lastError: unknown
+    for (const server of session.servers) {
+      try {
+        const response = await this.fetchImpl(
+          `http://${server.host}:${server.port}/cgi-bin/httpconn?htcmd=0x6FF0087&uin=${encodeURIComponent(selfUin)}`,
+          {
+            method: 'POST', body: frame, signal,
+            headers: { connection: 'keep-alive', 'content-type': 'application/octet-stream' },
+          },
+        )
+        if (!response.ok) throw new Error(`Highway HTTP ${response.status}: ${await response.text()}`)
+        decodeHighwayResponse(new Uint8Array(await response.arrayBuffer()))
+        return
+      } catch (error) {
+        if (signal?.aborted) throw signal.reason ?? error
+        lastError = error
+      }
+    }
+    throw new Error(`all Highway upload servers failed: ${errorMessage(lastError)}`)
+  }
+
   private async sendPacketRaw(addon: PacketAddon, request: NativePacketRequest): Promise<PacketResponse> {
     this.locateBinding(addon)
     const send = this.msgService.sendSsoCmdReqByContend
@@ -255,4 +402,28 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: s
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+async function* exactBlocks(
+  source: AsyncIterable<Uint8Array>,
+  expectedSize: number,
+  blockSize: number,
+  signal?: AbortSignal,
+): AsyncIterable<Buffer> {
+  let buffered = Buffer.alloc(0)
+  let received = 0
+  for await (const value of source) {
+    if (signal?.aborted) throw signal.reason ?? new Error('upload aborted')
+    const chunk = Buffer.from(value)
+    if (!chunk.length) continue
+    received += chunk.length
+    if (received > expectedSize) throw new Error(`upload exceeded declared size ${expectedSize}`)
+    buffered = buffered.length ? Buffer.concat([buffered, chunk]) : chunk
+    while (buffered.length >= blockSize) {
+      yield buffered.subarray(0, blockSize)
+      buffered = Buffer.from(buffered.subarray(blockSize))
+    }
+  }
+  if (received !== expectedSize) throw new Error(`incomplete upload: expected ${expectedSize} bytes, received ${received}`)
+  if (buffered.length) yield buffered
 }
