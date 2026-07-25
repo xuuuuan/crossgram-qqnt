@@ -310,7 +310,11 @@ describe('QQKernelBridge', () => {
       chatType: 1, peerUid: 'uid-1715311957',
     }), 50)
     f.msg.sendMsg.mockImplementationOnce(async () => {
-      queueMicrotask(() => f.emitMessages([{ ...f.message, sendStatus: 2 }]))
+      queueMicrotask(() => f.emitMessages([{ ...f.message, sendStatus: 2, elements: [{
+        elementType: 6, elementId: 'large-face-echo', faceElement: {
+          faceIndex: 476, faceText: '/不是吧', faceType: 3,
+        },
+      }] }]))
       return { result: 0, errMsg: '' }
     })
     const sent = await bridge.send({
@@ -801,7 +805,13 @@ describe('QQKernelBridge', () => {
         resultId: 'result-476', imageType: 1,
       },
     }], expect.any(Map))
-    expect(sent.parts).toMatchObject([{ type: 'sticker', sticker: { stickerId: 'sysface:476' } }])
+    expect(sent.parts).toMatchObject([{ type: 'sticker', sticker: {
+      stickerId: 'sysface:476', reference: {
+        kind: 'sysface', faceId: '476', packId: '3', stickerId: '476',
+        sourceType: 1, stickerType: 2, resultId: 'result-476', imageType: 1,
+        url: 'https://face.qq.example/476.png', width: 320, height: 180,
+      },
+    } }])
   })
 
   it('resolves received group and C2C reply targets when QQNT only exposes sequence metadata', async () => {

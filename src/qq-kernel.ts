@@ -3987,6 +3987,33 @@ function stickerFromReference(reference: QQStickerReference): QQSticker {
 function mergeKnownSticker(known: QQSticker | undefined, current: QQSticker): QQSticker {
   if (!known || known.reference.kind !== current.reference.kind) return current
   const animated = known.format === 'animated' || current.format === 'animated'
+  if (known.reference.kind === 'sysface' && current.reference.kind === 'sysface') {
+    const reference: QQStickerReference = {
+      ...known.reference,
+      ...current.reference,
+      name: current.reference.name || known.reference.name,
+      packId: current.reference.packId || known.reference.packId,
+      stickerId: current.reference.stickerId || known.reference.stickerId,
+      sourceType: current.reference.sourceType ?? known.reference.sourceType,
+      stickerType: current.reference.stickerType ?? known.reference.stickerType,
+      resultId: current.reference.resultId || known.reference.resultId,
+      imageType: current.reference.imageType ?? known.reference.imageType,
+      width: current.reference.width ?? known.reference.width,
+      height: current.reference.height ?? known.reference.height,
+      url: current.reference.url || known.reference.url,
+      animated: true,
+    }
+    return {
+      ...known,
+      ...current,
+      title: current.title || known.title,
+      format: 'animated',
+      mimeType: current.mimeType || known.mimeType,
+      width: current.width ?? known.width,
+      height: current.height ?? known.height,
+      reference,
+    }
+  }
   if (known.reference.kind === 'market' && current.reference.kind === 'market') {
     const reference: QQStickerReference = {
       ...known.reference,
