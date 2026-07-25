@@ -627,6 +627,25 @@ export class QQKernelBridge {
     return message
   }
 
+  async markRead(conversation: QQConversation, messageId: string): Promise<void> {
+    const service = this.requireMsgService()
+    if (!service.setSpecificMsgReadAndReport) {
+      throw new Error('QQNT does not expose setSpecificMsgReadAndReport')
+    }
+    log('info', `native API start name=setSpecificMsgReadAndReport conversation=${conversation.id} message=${messageId}`)
+    const result = await withTimeout(
+      service.setSpecificMsgReadAndReport(contact(conversation), messageId),
+      5_000,
+      'QQ mark-read request timed out',
+    )
+    if (result.result !== 0) {
+      throw new Error(`setSpecificMsgReadAndReport: ${result.errMsg} (${result.result})`)
+    }
+    this.unreadBatchState = ''
+    this.unreadBatchPromise = undefined
+    log('info', `native API complete name=setSpecificMsgReadAndReport conversation=${conversation.id} message=${messageId}`)
+  }
+
   private async hydrateRecentTopMessage(conversation: QQConversation): Promise<QQConversation> {
     const target = this.recentTopMessages.get(conversation.id)
     if (!target || conversation.lastMessage?.id === target.id) return conversation

@@ -346,6 +346,7 @@ export interface KernelMsgService {
   removeKernelMsgListener(listenerId: string): void
   sendMsg(msgId: string, peer: Contact, msgElements: MsgElement[], attrs: Map<number, unknown>): Promise<{ result: number, errMsg: string }>
   recallMsg(peer: Contact, msgIds: string[]): Promise<{ result: number, errMsg: string }>
+  setSpecificMsgReadAndReport?(peer: Contact, msgId: string): Promise<{ result: number, errMsg: string }>
   deleteMsg(peer: Contact, msgIds: string[]): Promise<{ result: number, errMsg: string }>
   forwardMsg(msgIds: string[], source: Contact, destinations: Contact[], attrs: Map<number, unknown>): Promise<{ result: number, errMsg: string }>
   multiForwardMsg?(

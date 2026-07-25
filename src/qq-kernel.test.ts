@@ -79,6 +79,7 @@ function fixture() {
       return { result: 0, errMsg: '' }
     }),
     recallMsg: vi.fn(async () => ({ result: 0, errMsg: '' })),
+    setSpecificMsgReadAndReport: vi.fn(async () => ({ result: 0, errMsg: '' })),
     deleteMsg: vi.fn(async () => ({ result: 0, errMsg: '' })),
     forwardMsg: vi.fn(async () => ({ result: 0, errMsg: '', detailErr: new Map() })),
     multiForwardMsg: vi.fn(async () => ({ result: 0, errMsg: '' })),
@@ -377,6 +378,23 @@ describe('QQKernelBridge', () => {
     await expect(bridge.getUser('u_hung')).resolves.toMatchObject({
       id: 'u_hung', name: 'u_hung', avatar: { id: 'avatar:user:u_hung' },
     })
+  })
+
+  it('marks an opaque message read through the native QQ API', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const conversation = bridge.getConversation('uid-1715311957')
+
+    await bridge.markRead(conversation, 'opaque-message-id')
+
+    expect(f.msg.setSpecificMsgReadAndReport).toHaveBeenCalledWith({
+      chatType: 1, peerUid: 'uid-1715311957', guildId: '',
+    }, 'opaque-message-id')
+    f.msg.setSpecificMsgReadAndReport.mockResolvedValueOnce({ result: 5, errMsg: 'denied' })
+    await expect(bridge.markRead(conversation, 'denied')).rejects.toThrow(
+      'setSpecificMsgReadAndReport: denied (5)',
+    )
   })
 
   it('keeps the newest real message when an older info update arrives later', async () => {
@@ -2224,6 +2242,15 @@ describe('QQBridgeServer', () => {
     })
     expect(response.status).toBe(200)
     expect(await response.json()).toMatchObject({ id: 'm1' })
+    const read = await fetch(`${base}/messages/read`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ conversationId: 'uid-1715311957', messageId: 'm1' }),
+    })
+    expect(read.status).toBe(200)
+    await expect(read.json()).resolves.toEqual({ ok: true })
+    expect(f.msg.setSpecificMsgReadAndReport).toHaveBeenCalledWith(
+      expect.objectContaining({ chatType: 1, peerUid: 'uid-1715311957' }), 'm1',
+    )
   })
 
   it('serves a hydrated image as the dialog top message instead of QQ recent abstract text', async () => {

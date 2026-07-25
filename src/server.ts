@@ -414,6 +414,13 @@ export class QQBridgeServer {
       json(response, 200, result)
       return
     }
+    if (request.method === 'POST' && path === '/v1/messages/read') {
+      const body = await readJson<{ conversationId: string, messageId: string }>(request)
+      await this.bridge.markRead(this.bridge.getConversation(body.conversationId), body.messageId)
+      log('info', `HTTP API mark read id=${requestId} conversation=${body.conversationId} message=${body.messageId}`)
+      json(response, 200, { ok: true })
+      return
+    }
     if (request.method === 'POST' && path === '/v1/reactions/asset') {
       const locator = await readJson<{ reactionKey?: string }>(request)
       const range = parseByteRange(request.headers.range)
