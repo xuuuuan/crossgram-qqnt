@@ -1071,13 +1071,13 @@ describe('QQKernelBridge', () => {
           videoCodecFormat: 1,
         },
       } },
-      { type: 'text', text: '卡片标题' },
+      { type: 'card', card: { kind: 'application', title: '卡片标题' } },
       { type: 'text', text: '**Markdown**' },
       { type: 'text', text: '[暂不支持的消息 999]' },
     ] })
   })
 
-  it('includes mini-app source, title, and web links in Ark fallbacks', async () => {
+  it('parses legacy and current mini-app Ark payloads into structured cards', async () => {
     const f = fixture()
     f.message.elements = [{
       elementType: 10, elementId: 'legacy-mini-app', arkElement: { bytesData: JSON.stringify({
@@ -1101,11 +1101,45 @@ describe('QQKernelBridge', () => {
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
 
     await expect(bridge.getHistory(bridge.getConversation('uid-1715311957'))).resolves.toMatchObject({
-      messages: [{ parts: [{
-        type: 'text', text: '[小程序] 腾讯文档\n项目排期\nhttps://docs.qq.com/sheet/example',
-      }, {
-        type: 'text', text: '[小程序] 示例小程序\n分享标题\n分享描述\nhttps://m.q.qq.com/a/s/example',
-      }] }],
+      messages: [{ parts: [{ type: 'card', card: {
+        kind: 'mini-app', source: '腾讯文档', title: '项目排期',
+        url: 'https://docs.qq.com/sheet/example',
+      } }, { type: 'card', card: {
+        kind: 'mini-app', source: '示例小程序', title: '分享标题', description: '分享描述',
+        url: 'https://m.q.qq.com/a/s/example',
+      } }] }],
+    })
+  })
+
+  it('parses generic Ark shares and legacy XML structure messages into structured cards', async () => {
+    const f = fixture()
+    f.message.elements = [{
+      elementType: 10, elementId: 'news-card', arkElement: { bytesData: JSON.stringify({
+        app: 'com.tencent.structmsg', prompt: '[分享] 新闻', meta: { news: {
+          tag: '示例资讯', title: '结构化分享标题', desc: '结构化分享摘要',
+          jumpUrl: 'https://example.com/articles/42',
+          preview: 'https://cdn.example.com/cover.jpg',
+        } },
+      }) },
+    }, {
+      elementType: 12, elementId: 'xml-card', structMsgElement: { xmlContent:
+        '<msg serviceID="1" brief="[分享] XML 摘要" url="https://example.com/xml">'
+        + '<item><picture cover="https://cdn.example.com/xml.jpg"/>'
+        + '<title><![CDATA[XML 分享标题]]></title><summary>XML 分享描述</summary></item>'
+        + '<source name="XML 来源"/></msg>',
+      },
+    }]
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.getHistory(bridge.getConversation('uid-1715311957'))).resolves.toMatchObject({
+      messages: [{ parts: [{ type: 'card', card: {
+        kind: 'link', source: '示例资讯', title: '结构化分享标题', description: '结构化分享摘要',
+        url: 'https://example.com/articles/42', thumbnailUrl: 'https://cdn.example.com/cover.jpg',
+      } }, { type: 'card', card: {
+        kind: 'link', source: 'XML 来源', title: 'XML 分享标题', description: 'XML 分享描述',
+        url: 'https://example.com/xml', thumbnailUrl: 'https://cdn.example.com/xml.jpg',
+      } }] }],
     })
   })
 
@@ -2273,6 +2307,59 @@ describe('QQKernelBridge', () => {
       },
     })
   })
+
+  it('uses a reaction gray-tip target sequence to publish an immediate authoritative snapshot', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const conversation = await bridge.resolveConversation(2, '1058754719')
+    const target = {
+      ...f.message,
+      msgId: 'reaction-target', msgSeq: '9001', chatType: 2 as const,
+      peerUid: '1058754719', peerUin: '1058754719', peerName: 'Test Group',
+      sendType: 1, senderUid: 'self', senderUin: '10000', emojiLikesList: [],
+    }
+    f.msg.getLatestDbMsgs.mockResolvedValue({ result: 0, errMsg: '', msgList: [target] })
+    await bridge.getHistory(conversation)
+    f.msg.getMsgsByMsgId.mockResolvedValue({
+      result: 0, errMsg: '', msgList: [{
+        ...target,
+        emojiLikesList: [{ emojiType: '1', emojiId: '14', likesCnt: '1', isClicked: false }],
+      }],
+    })
+    const events = bridge.subscribe()[Symbol.asyncIterator]()
+    const startedAt = Math.floor(Date.now() / 1000)
+
+    f.emitReceived([{
+      ...target,
+      msgId: 'reaction-graytip', msgSeq: 'notice-seq', sendType: 0,
+      senderUid: 'alice', senderUin: '42', sendNickName: 'Alice', emojiLikesList: undefined,
+      elements: [{ elementType: 8, elementId: 'reaction-notice', grayTipElement: {
+        xmlElement: {
+          templId: '10382',
+          content: '<gtip><qq jp="Alice"/><nor txt="回应了你的消息："/><url msgseq="9001"/><face id="14"/></gtip>',
+        },
+      } }],
+    }])
+
+    await expect(events.next()).resolves.toMatchObject({
+      value: {
+        type: 'message',
+        message: { id: 'reaction-graytip', serviceAction: { text: 'Alice回应了你的消息：' } },
+      },
+    })
+    const reaction = await events.next()
+    expect(reaction).toMatchObject({ value: {
+      type: 'message-reactions', timestamp: expect.any(Number),
+      target: { messageId: 'reaction-target', targetId: 'reaction-target' },
+      context: { reactions: [{ key: '1:14', count: 1 }] },
+    } })
+    expect(reaction.value?.type === 'message-reactions' ? reaction.value.timestamp : 0)
+      .toBeGreaterThanOrEqual(startedAt)
+    expect(f.msg.getMsgsByMsgId).toHaveBeenCalledWith(
+      expect.objectContaining({ chatType: 2, peerUid: '1058754719' }), ['reaction-target'],
+    )
+  })
 })
 
 describe('QQBridgeServer', () => {
@@ -2409,6 +2496,54 @@ describe('QQBridgeServer', () => {
     resumedSocket.close()
     await once(resumedSocket, 'close')
     await vi.waitFor(() => expect(bridge.events.size).toBe(0))
+  })
+
+  it('streams a gray-tip-triggered reaction refresh over WebSocket without waiting for an info update', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const conversation = await bridge.resolveConversation(2, '1058754719')
+    const target = {
+      ...f.message,
+      msgId: 'ws-reaction-target', msgSeq: '7001', chatType: 2 as const,
+      peerUid: '1058754719', peerUin: '1058754719', peerName: 'Test Group',
+      emojiLikesList: [],
+    }
+    f.msg.getLatestDbMsgs.mockResolvedValue({ result: 0, errMsg: '', msgList: [target] })
+    await bridge.getHistory(conversation)
+    f.msg.getMsgsByMsgId.mockResolvedValue({
+      result: 0, errMsg: '', msgList: [{
+        ...target,
+        emojiLikesList: [{ emojiType: '2', emojiId: '128522', likesCnt: '2', isClicked: false }],
+      }],
+    })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const socket = new WebSocket(`ws://127.0.0.1:${server.address().port}/v1/events/ws`)
+    await once(socket, 'open')
+
+    const frames: unknown[] = []
+    socket.on('message', (raw) => frames.push(JSON.parse(raw.toString())))
+    f.emitReceived([{
+      ...target,
+      msgId: 'ws-reaction-graytip', sendType: 0, senderUid: 'alice', senderUin: '42',
+      emojiLikesList: undefined,
+      elements: [{ elementType: 8, elementId: 'reaction-notice', grayTipElement: {
+        xmlElement: {
+          templId: '10382',
+          content: '<gtip><nor txt="Alice回应了你的消息："/><url msgseq="7001"/></gtip>',
+        },
+      } }],
+    }])
+
+    await vi.waitFor(() => expect(frames).toHaveLength(2))
+    expect(frames[1]).toMatchObject({ event: {
+      type: 'message-reactions',
+      target: { messageId: 'ws-reaction-target' },
+      context: { reactions: [{ key: '2:128522', count: 2 }] },
+    } })
+    socket.close()
+    await once(socket, 'close')
   })
 
   it('can listen for WebSocket events on a separately configured address', async () => {

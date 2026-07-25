@@ -145,9 +145,22 @@ export interface QQMessage {
     | { type: 'media', media: QQMedia }
     | { type: 'sticker', sticker: QQSticker }
     | { type: 'multi-forward', title: string, locator: QQMultiForwardLocator }
+    | { type: 'card', card: QQCard }
   >
   /** Per-message state only. The shared definition catalog has its own endpoint. */
   reactionContext?: QQReactionState
+}
+
+/** Structured QQ Ark/XML share rendered as a native preview by the relay. */
+export interface QQCard {
+  kind: 'mini-app' | 'link' | 'music' | 'contact' | 'location' | 'application'
+  title: string
+  description?: string
+  source?: string
+  /** Browser-compatible jump target. QQ-only deep links stay in the native payload. */
+  url?: string
+  /** Remote cover retained for clients that can materialize preview artwork. */
+  thumbnailUrl?: string
 }
 
 export interface QQMultiForwardLocator {

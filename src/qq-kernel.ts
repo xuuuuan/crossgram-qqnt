@@ -14,7 +14,7 @@ import type {
   MarketStickerPackInfo, MemberInfo, MsgElement, MsgRecord, ProfileSimpleInfo, RecentContactInfo, SearchMsgKeywordsResult,
 } from './kernel-types.js'
 import {
-  conversationId, parseConversationId, type HistoryQuery, type MemberPage, type QQConversation, type QQEvent,
+  conversationId, parseConversationId, type HistoryQuery, type MemberPage, type QQCard, type QQConversation, type QQEvent,
   type QQMedia, type QQMediaLocator, type QQMessage, type QQMultiForwardLocator, type QQReactionContext, type QQReactionDefinition, type QQReactionState,
   type QQSticker, type QQStickerPack, type QQStickerPackSummary, type QQStickerReference, type QQTextPart, type SearchPage, type SearchQuery, type SendManifest,
 } from './protocol.js'
@@ -1761,7 +1761,7 @@ export class QQKernelBridge {
         conversation,
         target: { conversationId: conversation.id, messageId: message.id, targetId: message.id },
         context: message.reactionContext,
-        timestamp: message.timestamp,
+        timestamp: Math.floor(Date.now() / 1000),
       })
       return message.reactionContext
     } finally {
@@ -2376,12 +2376,64 @@ export class QQKernelBridge {
           conversation,
           target: { conversationId: conversation.id, messageId: message.id, targetId: message.id },
           context: message.reactionContext ?? { reactions: [], maxSelected: 20 },
-          timestamp: message.timestamp,
+          timestamp: Math.floor(Date.now() / 1000),
         })
       } else {
         log('info', `native message duplicate suppressed source=${source} id=${message.id} peer=${record.peerUid} status=${record.sendStatus}`)
       }
+      const reactionGrayTipSeq = reactionGrayTipSequence(record)
+      if (reactionGrayTipSeq) {
+        await this.refreshReactionsFromGrayTip(conversation, reactionGrayTipSeq).catch((error) => {
+          log('error', `reaction gray-tip refresh failed conversation=${conversation.id} seq=${reactionGrayTipSeq}`, error)
+        })
+      }
     }
+  }
+
+  private async refreshReactionsFromGrayTip(
+    conversation: QQConversation,
+    msgSeq: string,
+  ): Promise<void> {
+    const cached = (this.messages.get(conversation.id) ?? [])
+      .find((message) => message.msgSeq === msgSeq && !message.serviceAction)
+    const service = this.requireMsgService()
+    let record: MsgRecord | undefined
+    if (cached) {
+      const response = await retryTransientInvalidArgument(() =>
+        service.getMsgsByMsgId(contact(conversation), [cached.id]))
+      record = response.msgList.find((item) => item.msgId === cached.id)
+    } else if (service.getMsgsBySeqAndCount) {
+      const peer = contact(conversation)
+      const responses = await Promise.all([true, false].map((queryOrder) =>
+        retryHistoryCall(() => service.getMsgsBySeqAndCount!(peer, msgSeq, 4, queryOrder, true))))
+      record = responses.flatMap((response) => response.msgList)
+        .find((item) => item.msgSeq === msgSeq && !isGrayTipRecord(item) && !isRecalledRecord(item))
+    }
+    if (!record) {
+      log('warn', `reaction gray-tip target lookup failed conversation=${conversation.id} seq=${msgSeq}`)
+      return
+    }
+
+    const targetRecord = record
+    const previous = cached
+      ?? (this.messages.get(conversation.id) ?? []).find((message) => message.id === targetRecord.msgId)
+    const refreshed = this.mapMessage(targetRecord)
+    if (targetRecord.emojiLikesList === undefined && previous?.reactionContext) {
+      refreshed.reactionContext = previous.reactionContext
+    }
+    this.rememberMessage(refreshed)
+    if (JSON.stringify(previous?.reactionContext?.reactions)
+      === JSON.stringify(refreshed.reactionContext?.reactions)) return
+    if (!refreshed.reactionContext) return
+
+    this.dispatch({
+      type: 'message-reactions',
+      eventId: `reaction-graytip:${refreshed.id}:${Date.now()}:${++this.reactionEventSequence}`,
+      conversation,
+      target: { conversationId: conversation.id, messageId: refreshed.id, targetId: refreshed.id },
+      context: refreshed.reactionContext,
+      timestamp: Math.floor(Date.now() / 1000),
+    })
   }
 
   private onDelete(chatType: number, peerUid: string, ids: string[]): void {
@@ -2795,6 +2847,11 @@ export class QQKernelBridge {
           },
         })
       } else {
+        const card = structuredCard(element)
+        if (card) {
+          parts.push({ type: 'card', card })
+          continue
+        }
         if (element.grayTipElement) {
           const action = grayTipAction(
             element.grayTipElement,
@@ -4425,8 +4482,8 @@ function structuredContentSummary(value: string | undefined): string {
   if (!value) return ''
   try {
     const parsed = JSON.parse(value) as unknown
-    const miniApp = miniAppContentSummary(parsed)
-    if (miniApp) return miniApp
+    const card = arkCard(parsed)
+    if (card) return cardFallbackText(card)
     const preferred = findStructuredString(parsed, new Set([
       'prompt', 'desc', 'description', 'summary', 'title', 'text', 'content', 'brief',
     ]))
@@ -4436,35 +4493,131 @@ function structuredContentSummary(value: string | undefined): string {
   }
 }
 
-function miniAppContentSummary(value: unknown): string {
-  const root = recordValue(value)
-  const app = stringValue(root?.app)
-  if (!root || !(app === 'com.tencent.miniapp.lua' || app.startsWith('com.tencent.miniapp_'))) return ''
-
-  const meta = recordValue(root.meta)
-  const legacy = recordValue(meta?.detail_1)
-  const rich = recordValue(meta?.miniapp)
-  const source = stringValue(rich?.source) || stringValue(legacy?.title)
-  const title = stringValue(rich?.title) || stringValue(legacy?.desc)
-  const description = stringValue(rich?.desc)
-  const lines = [
-    source ? `[小程序] ${source}` : '[小程序]',
-    title !== source ? title : '',
-    description !== title && description !== source ? description : '',
-  ]
-
-  const urls = [
-    legacy?.qqdocurl, legacy?.pcJumpUrl, legacy?.jumpUrl, legacy?.url,
-    rich?.qqdocurl, rich?.pcJumpUrl, rich?.jumpUrl, rich?.url,
-  ].map(stringValue).filter((item) => /^https?:\/\/\S+$/i.test(item))
-  lines.push(...urls)
-
-  const unique = lines.filter((item, index) => item && lines.indexOf(item) === index)
-  if (unique.length === 1) {
-    const prompt = stringValue(root.prompt)
-    if (prompt) unique.push(prompt)
+function structuredCard(element: MsgElement): QQCard | undefined {
+  if (element.arkElement?.bytesData) {
+    try {
+      const card = arkCard(JSON.parse(element.arkElement.bytesData) as unknown)
+      if (card) return card
+    } catch {
+      // Malformed Ark payloads keep using the conservative text fallback.
+    }
   }
-  return unique.join('\n')
+  const xml = element.structLongMsgElement?.xmlContent || element.structMsgElement?.xmlContent
+  return xml ? xmlCard(xml) : undefined
+}
+
+function arkCard(value: unknown): QQCard | undefined {
+  const root = recordValue(value)
+  if (!root) return
+  const app = stringValue(root.app)
+  const meta = recordValue(root.meta)
+  if (!meta) return
+  const candidates = Object.entries(meta).flatMap(([key, item]) => {
+    const record = recordValue(item)
+    return record ? [{ key: key.toLowerCase(), record }] : []
+  })
+  if (!candidates.length) return
+
+  const miniApp = app === 'com.tencent.miniapp.lua' || app.startsWith('com.tencent.miniapp_')
+  const selected = candidates.find(({ key }) => key === 'miniapp')
+    ?? candidates.find(({ key }) => key === 'detail_1')
+    ?? candidates.find(({ key }) => key === 'news')
+    ?? candidates[0]!
+  const { key, record } = selected
+  const legacyMiniApp = miniApp && key === 'detail_1'
+  const source = firstString(record, ['source', 'tag', 'site_name', 'appName'])
+    || (legacyMiniApp ? stringValue(record.title) : '')
+  const title = (legacyMiniApp ? stringValue(record.desc) : stringValue(record.title))
+    || firstString(record, ['name', 'summary', 'desc'])
+    || stripCardPrompt(stringValue(root.prompt))
+    || source
+  if (!title) return
+  const description = legacyMiniApp ? '' : firstString(record, ['desc', 'description', 'summary', 'brief'])
+  const url = firstWebUrl(record, [
+    'qqdocurl', 'pcJumpUrl', 'jumpUrl', 'url', 'webUrl', 'shareUrl',
+  ]) || firstWebUrl(root, ['jumpUrl', 'url'])
+  const thumbnailUrl = firstWebUrl(record, [
+    'preview', 'previewUrl', 'imageUrl', 'image', 'cover', 'coverUrl', 'icon', 'iconUrl', 'avatar',
+  ])
+  const kind: QQCard['kind'] = miniApp ? 'mini-app'
+    : key.includes('music') ? 'music'
+      : key.includes('contact') ? 'contact'
+        : key.includes('location') ? 'location'
+          : url ? 'link' : 'application'
+  return compactCard({ kind, title, description, source, url, thumbnailUrl })
+}
+
+function xmlCard(xml: string): QQCard | undefined {
+  const title = xmlTagText(xml, ['title'])
+  const description = xmlTagText(xml, ['summary', 'desc'])
+  const sourceTag = /<source\b([^>]*)>/i.exec(xml)
+  const source = sourceTag ? xmlAttribute(sourceTag[1] ?? '', 'name') : ''
+  const msg = /<msg\b([^>]*)>/i.exec(xml)
+  const msgAttributes = msg?.[1] ?? ''
+  const brief = xmlAttribute(msgAttributes, 'brief').replace(/^\[[^\]]+\]\s*/, '')
+  const url = firstHttpUrl([
+    xmlAttribute(msgAttributes, 'url'), xmlAttribute(msgAttributes, 'actionData'),
+    xmlAttribute(msgAttributes, 'actiondata'),
+  ])
+  const picture = /<(?:picture|img)\b([^>]*)>/i.exec(xml)
+  const thumbnailUrl = picture
+    ? firstHttpUrl(['cover', 'src', 'url'].map((name) => xmlAttribute(picture[1] ?? '', name)))
+    : undefined
+  const resolvedTitle = title || brief || source
+  if (!resolvedTitle) return
+  return compactCard({
+    kind: url ? 'link' : 'application', title: resolvedTitle,
+    description, source, url, thumbnailUrl,
+  })
+}
+
+function compactCard(card: QQCard): QQCard {
+  return {
+    kind: card.kind,
+    title: card.title,
+    ...(card.description && card.description !== card.title ? { description: card.description } : {}),
+    ...(card.source && card.source !== card.title ? { source: card.source } : {}),
+    ...(card.url ? { url: card.url } : {}),
+    ...(card.thumbnailUrl ? { thumbnailUrl: card.thumbnailUrl } : {}),
+  }
+}
+
+function cardFallbackText(card: QQCard): string {
+  const label = card.kind === 'mini-app' ? '[小程序]' : '[卡片]'
+  return [card.source ? `${label} ${card.source}` : label, card.title, card.description, card.url]
+    .filter((item, index, values) => item && values.indexOf(item) === index)
+    .join('\n')
+}
+
+function stripCardPrompt(value: string): string {
+  return value.replace(/^\[[^\]]+\]\s*/, '').trim()
+}
+
+function firstString(record: Record<string, unknown>, keys: string[]): string {
+  for (const key of keys) {
+    const found = Object.entries(record).find(([candidate]) => candidate.toLowerCase() === key.toLowerCase())
+    const value = stringValue(found?.[1])
+    if (value) return value
+  }
+  return ''
+}
+
+function firstWebUrl(record: Record<string, unknown>, keys: string[]): string | undefined {
+  return firstHttpUrl(keys.map((key) => firstString(record, [key])))
+}
+
+function firstHttpUrl(values: string[]): string | undefined {
+  return values.find((value) => /^https?:\/\/\S+$/i.test(value))
+}
+
+function xmlTagText(xml: string, tags: string[]): string {
+  for (const tag of tags) {
+    const match = new RegExp(`<${tag}\\b[^>]*>(?:<!\\[CDATA\\[([\\s\\S]*?)\\]\\]>|([\\s\\S]*?))<\\/${tag}>`, 'i').exec(xml)
+    const value = decodeXmlText((match?.[1] ?? match?.[2] ?? '').replace(/<[^>]+>/g, ' '))
+      .replace(/\s+/g, ' ').trim()
+    if (value) return value
+  }
+  return ''
 }
 
 function recordValue(value: unknown): Record<string, unknown> | undefined {
@@ -4528,7 +4681,11 @@ function receivedMessageSummary(conversation: QQConversation, message: QQMessage
       ? JSON.stringify(truncateLogText(part.text))
       : part.type === 'sticker'
         ? `[sticker id=${JSON.stringify(part.sticker.stickerId)}]`
-        : `[${part.media.kind === 'image' ? 'image' : 'file'} name=${JSON.stringify(part.media.name || '')} size=${part.media.size ?? '?'}]`)
+        : part.type === 'card'
+          ? `[card kind=${part.card.kind} title=${JSON.stringify(truncateLogText(part.card.title))}]`
+          : part.type === 'multi-forward'
+            ? `[multi-forward title=${JSON.stringify(truncateLogText(part.title))}]`
+            : `[${part.media.kind === 'image' ? 'image' : 'file'} name=${JSON.stringify(part.media.name || '')} size=${part.media.size ?? '?'}]`)
       .join(' ')
     : '[empty]'
   return `received message conversation=${JSON.stringify(conversation.title)}(${conversation.id}) sender=${JSON.stringify(sender)}(${senderId}) seq=${message.msgSeq ?? ''} id=${message.id} content=${content}`
@@ -4721,6 +4878,23 @@ function telegramMessageId(value?: string): number | undefined {
   if (!value || !/^\d+$/.test(value)) return
   const id = Number(value)
   return Number.isSafeInteger(id) && id > 0 && id <= 0x7fffffff ? id : undefined
+}
+
+function reactionGrayTipSequence(record: MsgRecord): string | undefined {
+  if (record.chatType !== CHAT_GROUP) return
+  const xml = record.elements.find((element) =>
+    element.grayTipElement?.xmlElement?.templId === '10382')?.grayTipElement?.xmlElement
+  if (!xml) return
+  return xmlTagAttribute(xml.content, 'url', 'msgseq') || record.msgSeq
+}
+
+function xmlTagAttribute(xml: string, tag: string, attribute: string): string {
+  const match = new RegExp(`<${tag}\\b([^>]*)`, 'i').exec(xml)
+  return match ? xmlAttribute(match[1] ?? '', attribute) : ''
+}
+
+function isGrayTipRecord(record: MsgRecord): boolean {
+  return record.elements.some((element) => Boolean(element.grayTipElement))
 }
 
 function isMultiForwardRecord(record: MsgRecord): boolean {
