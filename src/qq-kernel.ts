@@ -93,8 +93,12 @@ export class QQKernelBridge {
   private readonly recentContactIds = new Map<string, string>()
   private readonly recentTopMessages = new Map<string, MessagePosition>()
   private recentContactOrder: string[] = []
-  private readonly users = new Map<string, { id: string, numericId?: string, name: string, avatarUrl?: string }>()
-  private readonly seenUsers = new Map<string, { id: string, numericId?: string, name: string, avatarUrl?: string }>()
+  private readonly users = new Map<string, {
+    id: string, numericId?: string, name: string, avatarUrl?: string, signature?: string
+  }>()
+  private readonly seenUsers = new Map<string, {
+    id: string, numericId?: string, name: string, avatarUrl?: string, signature?: string
+  }>()
   private readonly groups = new Map<string, {
     name: string
     avatarUrl?: string
@@ -409,7 +413,7 @@ export class QQKernelBridge {
   }
 
   async getContacts(cursor?: string, limit = 500): Promise<{
-    users: Array<{ id: string, numericId?: string, name: string, avatar?: QQMedia }>
+    users: Array<{ id: string, numericId?: string, name: string, signature?: string, avatar?: QQMedia }>
     nextCursor?: string
   }> {
     // getBuddyList delivers the full address book through onBuddyListChange.
@@ -1559,7 +1563,7 @@ export class QQKernelBridge {
 
   async getUser(uid: string) {
     let cached = this.seenUsers.get(uid) ?? this.users.get(uid)
-    if (cached && isFallbackUserName(cached)) {
+    if (cached && (isFallbackUserName(cached) || cached.signature === undefined)) {
       await this.ensureUserProfiles([uid]).catch((error) =>
         log('error', `QQ profile resolve failed uid=${uid}; using cached fallback`, error))
       cached = this.seenUsers.get(uid) ?? this.users.get(uid)
@@ -2247,6 +2251,29 @@ export class QQKernelBridge {
         if (result.result !== 0) {
           const error = new Error(`getUserSimpleInfo: ${result.errMsg} (${result.result})`)
           for (const uid of created) this.pendingUserProfiles.get(uid)?.reject(error)
+        } else if (service.getCoreAndBaseInfo) {
+          log('info', `native API start name=getCoreAndBaseInfo users=${created.join(',')}`)
+          try {
+            const profiles = await withTimeout(
+              service.getCoreAndBaseInfo('nodeStore', created),
+              this.userResolveTimeoutMs,
+              'QQ core/base profile request timed out',
+            )
+            for (const [uid, profile] of profiles) {
+              this.upsertProfile({
+                uid: profile.uid || uid,
+                uin: profile.uin || '',
+                nick: profile.coreInfo?.nick || '',
+                remark: '',
+                avatarUrl: profile.coreInfo?.avatarUrl || '',
+                coreInfo: profile.coreInfo,
+                baseInfo: profile.baseInfo,
+              })
+            }
+            log('info', `native API complete name=getCoreAndBaseInfo users=${profiles.size}`)
+          } catch (error) {
+            log('error', `getCoreAndBaseInfo failed users=${created.join(',')}; using simple profile`, error)
+          }
         }
       }
       await withTimeout(Promise.all(waits).then(() => undefined), 1_500, 'QQ user profile listener timed out')
@@ -2677,8 +2704,11 @@ export class QQKernelBridge {
   }
 
   private upsertBuddy(buddy: ProfileSimpleInfo): void {
+    const previous = this.users.get(buddy.uid) ?? this.seenUsers.get(buddy.uid)
+    const signature = buddy.baseInfo?.longNick ?? buddy.coreInfo?.longNick ?? buddy.longNick
     const user = {
       id: buddy.uid, numericId: buddy.uin, name: buddy.remark || buddy.nick || buddy.uin, avatarUrl: buddy.avatarUrl,
+      signature: signature !== undefined ? signature : previous?.signature,
     }
     this.users.set(buddy.uid, user)
     this.rememberSeenUser({
@@ -2703,12 +2733,14 @@ export class QQKernelBridge {
     const previous = this.seenUsers.get(profile.uid) ?? this.users.get(profile.uid)
     const profileName = profile.coreInfo?.nick || profile.nick
     const profileAvatarUrl = profile.coreInfo?.avatarUrl || profile.avatarUrl
+    const profileSignature = profile.baseInfo?.longNick ?? profile.coreInfo?.longNick ?? profile.longNick
     const user = {
       ...previous,
       id: profile.uid,
       numericId: profile.uin || previous?.numericId,
       name: profileName || previous?.name || profile.uin || profile.uid,
       avatarUrl: profileAvatarUrl || previous?.avatarUrl,
+      signature: profileSignature !== undefined ? profileSignature : previous?.signature,
     }
     // ProfileService is authoritative for the global QQ nickname. Message
     // records and buddy remarks must not make the same user oscillate between
@@ -2825,7 +2857,7 @@ export class QQKernelBridge {
   }
 
   private rememberSeenUser(
-    candidate: { id: string, numericId?: string, name: string, avatarUrl?: string },
+    candidate: { id: string, numericId?: string, name: string, avatarUrl?: string, signature?: string },
   ): void {
     if (!candidate.id) return
     const current = this.seenUsers.get(candidate.id)
@@ -2840,6 +2872,7 @@ export class QQKernelBridge {
         ? current.name
         : !candidateFallback || currentFallback ? candidate.name : current!.name,
       avatarUrl: candidate.avatarUrl || current?.avatarUrl,
+      signature: candidate.signature !== undefined ? candidate.signature : current?.signature,
     })
   }
 

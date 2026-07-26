@@ -10,10 +10,27 @@ export interface ProfileSimpleInfo {
   nick: string
   remark: string
   avatarUrl: string
+  longNick?: string
   /** QQNT 6.9.99 moved global profile fields under coreInfo. */
   coreInfo?: {
     nick?: string
     avatarUrl?: string
+    longNick?: string
+  }
+  baseInfo?: {
+    longNick?: string
+  }
+}
+
+export interface ProfileCoreAndBaseInfo {
+  uid?: string
+  uin?: string
+  coreInfo?: {
+    nick?: string
+    avatarUrl?: string
+  }
+  baseInfo?: {
+    longNick?: string
   }
 }
 
@@ -572,6 +589,7 @@ export interface KernelProfileService {
   addKernelProfileListener(listener: unknown): string
   removeKernelProfileListener(listenerId: string): void
   getUserSimpleInfo(force: boolean, uids: string[]): Promise<{ result: number, errMsg: string }>
+  getCoreAndBaseInfo?(callFrom: string, uids: string[]): Promise<Map<string, ProfileCoreAndBaseInfo>>
 }
 
 export interface KernelGroupService {
