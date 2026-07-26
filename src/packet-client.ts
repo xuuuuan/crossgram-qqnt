@@ -77,7 +77,6 @@ export class QQPacketClient {
     source: AsyncIterable<Uint8Array>,
     signal?: AbortSignal,
   ): Promise<PreparedImageUpload> {
-    this.assertPacketSupport()
     const addon = this.loadAddon()
     const request = encodeImageUploadRequest(chatType, peerUid, spec)
     const upload = decodeImageUploadResponse(await this.sendPacket(addon, request))
@@ -110,7 +109,6 @@ export class QQPacketClient {
     source: AsyncIterable<Uint8Array>,
     signal?: AbortSignal,
   ): Promise<PreparedFileUpload> {
-    this.assertPacketSupport()
     const addon = this.loadAddon()
     const request = encodeFileUploadRequest(chatType, peerUid, selfUid, spec)
     const upload = decodeFileUploadResponse(
@@ -152,7 +150,6 @@ export class QQPacketClient {
     parts: DirectMessagePart[],
     selfUid: string,
   ): Promise<DirectMessageSendResponse> {
-    this.assertPacketSupport()
     const addon = this.loadAddon()
     const request = encodeDirectMessageRequest(chatType, peerUid, peerUin, parts, { selfUid })
     const response = decodeDirectMessageResponse(await this.sendPacket(addon, request))
