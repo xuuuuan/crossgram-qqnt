@@ -229,13 +229,13 @@ function fixture() {
   return {
     kernel, session, msg, recent, profile, group, search, richMedia, uix, message, sentBodies,
     emitMessages(records: MsgRecord[]) {
-      msgHandlers.onMsgInfoListUpdate?.(records)
+      return msgHandlers.onMsgInfoListUpdate?.(records)
     },
     emitReceived(records: MsgRecord[]) {
       msgHandlers.onRecvMsg?.(records)
     },
     emitSent(record: MsgRecord) {
-      msgHandlers.onAddSendMsg?.(record)
+      return msgHandlers.onAddSendMsg?.(record)
     },
     emitRecall(chatType: number, peerUid: string, msgSeq: string) {
       msgHandlers.onMsgRecall?.(chatType, peerUid, msgSeq)
@@ -325,6 +325,62 @@ describe('QQKernelBridge', () => {
     expect(sent.sourceIds).toBeUndefined()
     expect(f.msg.getMsgUniqueId).toHaveBeenCalledWith(expect.stringMatching(/^\d{13}$/))
     expect(f.msg.sendMsg).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    {
+      kind: 'image',
+      manifest: (png: Buffer) => ({
+        conversationId: 'uid-1715311957', originRequestId: 'relay-image-send',
+        media: [{ kind: 'image' as const, name: 'echo.png', size: png.length }],
+      }),
+      body: (png: Buffer) => Readable.from([png]),
+    },
+    {
+      kind: 'sticker',
+      manifest: () => ({
+        conversationId: 'uid-1715311957', originRequestId: 'relay-sticker-send',
+        sticker: {
+          kind: 'sysface' as const, faceId: '476', faceType: 3, name: '/不是吧',
+          packId: '3', stickerId: '476', sourceType: 1, stickerType: 2,
+          resultId: 'result-476', imageType: 1, animated: true as const,
+        },
+      }),
+      body: () => Readable.from([]),
+    },
+  ])('correlates an incomplete $kind add callback before publishing its local echo', async ({ kind, manifest, body }) => {
+    const f = fixture()
+    f.msg.getMsgUniqueId.mockReturnValue('0')
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const png = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+      'base64',
+    )
+    const messageId = `${kind}-native-id`
+    f.msg.sendMsg.mockImplementationOnce(async (_id, _peer, elements) => {
+      queueMicrotask(async () => {
+        await f.emitSent({
+          ...f.message, msgId: messageId, sendStatus: 1,
+          // QQ's first media callback can expose only a renderer placeholder.
+          elements: [{ elementType: 1, elementId: 'placeholder', textElement: { content: `[${kind}]` } }],
+        })
+        await f.emitMessages([{ ...f.message, msgId: messageId, sendStatus: 2, elements }])
+      })
+      return { result: 0, errMsg: '' }
+    })
+    const subscription = bridge.subscribe()
+    const nextEvent = subscription[Symbol.asyncIterator]().next()
+
+    const sent = await bridge.send(manifest(png), body(png))
+    const event = await nextEvent
+    bridge.unsubscribe(subscription)
+
+    expect(sent).toMatchObject({ id: messageId, originRequestId: `relay-${kind}-send` })
+    expect(event.value).toMatchObject({
+      type: 'message',
+      message: { id: messageId, originRequestId: `relay-${kind}-send`, outgoing: true },
+    })
   })
 
   it('loads the authoritative self profile before exposing the account and keeps it stable', async () => {
@@ -2491,6 +2547,74 @@ describe('QQBridgeServer', () => {
     expect(f.msg.setSpecificMsgReadAndReport).toHaveBeenCalledWith(
       expect.objectContaining({ chatType: 1, peerUid: 'uid-1715311957' }), 'm1',
     )
+  })
+
+  it('keeps image and sticker origin IDs across the HTTP-to-WebSocket send pipeline', async () => {
+    const f = fixture()
+    f.msg.getMsgUniqueId.mockReturnValue('0')
+    let sendIndex = 0
+    f.msg.sendMsg.mockImplementation(async (_id, _peer, elements) => {
+      const messageId = `media-http-${++sendIndex}`
+      queueMicrotask(async () => {
+        await f.emitSent({
+          ...f.message, msgId: messageId, sendStatus: 1,
+          elements: [{ elementType: 1, elementId: 'placeholder', textElement: { content: '[媒体]' } }],
+        })
+        await f.emitMessages([{ ...f.message, msgId: messageId, sendStatus: 2, elements }])
+      })
+      return { result: 0, errMsg: '' }
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const base = `http://127.0.0.1:${server.address().port}/v1`
+    const socket = new WebSocket(base.replace('http:', 'ws:') + '/events/ws')
+    await once(socket, 'open')
+    const png = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+      'base64',
+    )
+    const cases = [
+      {
+        kind: 'image', originRequestId: 'http-image-origin', body: png,
+        manifest: {
+          conversationId: 'uid-1715311957', originRequestId: 'http-image-origin',
+          media: [{ kind: 'image', name: 'http-echo.png', size: png.length }],
+        },
+      },
+      {
+        kind: 'sticker', originRequestId: 'http-sticker-origin', body: new Uint8Array(),
+        manifest: {
+          conversationId: 'uid-1715311957', originRequestId: 'http-sticker-origin',
+          sticker: {
+            kind: 'sysface', faceId: '476', faceType: 3, name: '/不是吧', animated: true,
+            packId: '3', stickerId: '476', sourceType: 1, stickerType: 2,
+          },
+        },
+      },
+    ]
+
+    for (const item of cases) {
+      const nextFrame = once(socket, 'message')
+      const response = await fetch(`${base}/messages`, {
+        method: 'POST',
+        headers: { 'x-qqnt-manifest': Buffer.from(JSON.stringify(item.manifest)).toString('base64url') },
+        body: item.body,
+      })
+      const responseMessage = await response.json() as { id: string, originRequestId?: string }
+      const [raw] = await nextFrame
+      const frame = JSON.parse(raw.toString())
+
+      expect(response.status).toBe(200)
+      expect(responseMessage).toMatchObject({ originRequestId: item.originRequestId })
+      expect(frame).toMatchObject({ event: {
+        type: 'message',
+        message: { id: responseMessage.id, originRequestId: item.originRequestId, outgoing: true },
+      } })
+    }
+    socket.close()
+    await once(socket, 'close')
   })
 
   it('serves a hydrated image as the dialog top message instead of QQ recent abstract text', async () => {

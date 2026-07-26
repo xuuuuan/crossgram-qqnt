@@ -128,6 +128,7 @@ export class QQKernelBridge {
     expectedMediaName?: string
     expectedMediaKind?: 'image' | 'file' | 'sticker'
     originRequestId?: string
+    assignedMessageId?: string
   }> = []
   private readonly pendingReactions = new Map<string, ReturnType<typeof deferred<QQReactionState>>>()
   private readonly pendingGroupProfiles = new Map<string, ReturnType<typeof deferred<void>>>()
@@ -2368,8 +2369,10 @@ export class QQKernelBridge {
         pending.resolve(record)
       } else if (record.msgId !== '0') {
         const id = conversationId(record.chatType as 1 | 2, record.peerUid)
-        const index = this.pendingUnassigned.findIndex((item) =>
-          item.conversationId === id
+        let index = this.pendingUnassigned.findIndex((item) => item.assignedMessageId === record.msgId)
+        if (index < 0) index = this.pendingUnassigned.findIndex((item) =>
+          !item.assignedMessageId
+          && item.conversationId === id
           && Number(record.msgTime) >= item.startedAt - 2
           && (!item.expectedText || recordTextContent(record) === item.expectedText)
           && (!item.expectedMediaKind || record.elements.some((element) =>
@@ -2378,7 +2381,23 @@ export class QQKernelBridge {
             element.fileElement?.fileName === item.expectedMediaName
             || element.picElement?.fileName === item.expectedMediaName)
             || item.expectedMediaKind === 'image'))
-        if (index >= 0) this.rememberMessageOrigin(record.msgId, this.pendingUnassigned[index].originRequestId)
+        // Current QQNT builds can return no usable ID from getMsgUniqueId().
+        // Their first onAddSendMsg callback for images and stickers also omits
+        // the completed media element, so content matching cannot identify the
+        // pending send yet. Claim the oldest same-conversation send while this
+        // authoritative add callback is in flight; later status updates then
+        // keep using the assigned native ID instead of publishing an originless
+        // local echo before the HTTP send response completes.
+        if (index < 0 && outgoing && source === 'onAddSendMsg' && record.sendStatus >= 1) {
+          index = this.pendingUnassigned.findIndex((item) =>
+            !item.assignedMessageId
+            && item.conversationId === id
+            && Number(record.msgTime) >= item.startedAt - 2)
+        }
+        if (index >= 0) {
+          this.pendingUnassigned[index].assignedMessageId ??= record.msgId
+          this.rememberMessageOrigin(record.msgId, this.pendingUnassigned[index].originRequestId)
+        }
         if (index >= 0 && record.sendStatus >= 1) this.pendingUnassigned[index].accepted.resolve()
         if (index >= 0 && record.sendStatus === 0) {
           this.pendingUnassigned.splice(index, 1)[0].pending.reject(new Error('QQ send failed'))
