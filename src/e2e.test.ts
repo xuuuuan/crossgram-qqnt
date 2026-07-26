@@ -8,8 +8,8 @@ import { describe, expect, it } from 'vitest'
 const enabled = process.env.QQNT_BRIDGE_E2E === '1'
 const base = process.env.QQNT_BRIDGE_URL ?? 'http://127.0.0.1:18767/v1'
 const token = process.env.QQNT_BRIDGE_TOKEN
-const allowedDirect = '1715311957'
-const allowedGroups = new Set(['1058754719', '1084013940'])
+const allowedDirect = '2426125592'
+const allowedGroups = new Set(['1084013940'])
 const testPng = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
   'base64',
@@ -112,7 +112,6 @@ describe.skipIf(!enabled)('live QQNT bridge E2E', () => {
   it('sends and reads back private and group text messages only in the approved chats', async () => {
     for (const [kind, numericId] of [
       ['direct', allowedDirect],
-      ['group', '1058754719'],
       ['group', '1084013940'],
     ] as const) {
       const conversation = await resolve(kind, numericId)
@@ -137,7 +136,7 @@ describe.skipIf(!enabled)('live QQNT bridge E2E', () => {
   }, 180_000)
 
   it('shows the QQ users behind a reaction in an approved group', async () => {
-    const conversation = await resolve('group', '1058754719')
+    const conversation = await resolve('group', '1084013940')
     const catalogResponse = await fetch(`${base}/reactions/catalog`, { headers: headers() })
     expect(catalogResponse.status, await catalogResponse.clone().text()).toBe(200)
     const catalog = await catalogResponse.json() as { available: Array<{ key: string }> }
