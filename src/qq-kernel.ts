@@ -34,6 +34,9 @@ const MEMBER_ADMIN = 3
 const MEMBER_OWNER = 4
 const MEMBER_SCENE_TTL_MS = 5 * 60_000
 const MEMBER_SCENE_LIMIT = 64
+const DELETE_DEDUP_TTL_MS = 60_000
+const STICKER_MISSING_CACHE_TTL_MS = 30_000
+const STALE_CURSOR_REPLAY_LIMIT = 512
 // Keep this in sync with Telegram's account-level reaction catalog. QQ emoji
 // outside this set are exposed as custom reactions backed by QQ's own icon.
 const TELEGRAM_STANDARD_REACTIONS = new Set([
@@ -49,6 +52,15 @@ export interface QQKernelOptions {
   sendTimeoutMs?: number
   userResolveTimeoutMs?: number
   packetClient?: QQPacketClientOptions
+  deleteDedupTtlMs?: number
+  stickerMissingCacheTtlMs?: number
+}
+
+export class QQStickerAssetNotFoundError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'QQStickerAssetNotFoundError'
+  }
 }
 
 interface SearchContext {
@@ -77,6 +89,7 @@ export class QQKernelBridge {
   readonly events = new Set<AsyncQueue<QQEvent>>()
   private readonly recentEvents: Array<{ id: string, event: QQEvent }> = []
   private readonly eventIds = new WeakMap<object, string>()
+  private readonly replayStates = new WeakMap<AsyncQueue<QQEvent>, { remaining: number, total: number }>()
   private eventSequence = 0
   private session?: KernelSession
   private kernel?: KernelModule
@@ -144,6 +157,8 @@ export class QQKernelBridge {
   }>>>()
   private readonly memberScenes = new Map<string, { conversationId: string, lastUsed: number }>()
   private readonly groupProfileAttempts = new Map<string, number>()
+  private readonly recentDeletes = new Map<string, number>()
+  private readonly missingStickerAssets = new Map<string, number>()
   private unreadBatchState = ''
   private unreadBatchPromise?: Promise<void>
   private listenerId?: string
@@ -161,12 +176,16 @@ export class QQKernelBridge {
   private readonly sendTimeoutMs: number
   private readonly userResolveTimeoutMs: number
   private readonly packetClientOptions: QQPacketClientOptions
+  private readonly deleteDedupTtlMs: number
+  private readonly stickerMissingCacheTtlMs: number
 
   constructor(options: QQKernelOptions = {}) {
     this.tempPath = options.tempPath ?? join(process.env.TMPDIR ?? '/tmp', 'qqnt-mtproto-bridge')
     this.sendTimeoutMs = options.sendTimeoutMs ?? 60_000
     this.userResolveTimeoutMs = options.userResolveTimeoutMs ?? 2_000
     this.packetClientOptions = options.packetClient ?? {}
+    this.deleteDedupTtlMs = options.deleteDedupTtlMs ?? DELETE_DEDUP_TTL_MS
+    this.stickerMissingCacheTtlMs = options.stickerMissingCacheTtlMs ?? STICKER_MISSING_CACHE_TTL_MS
     mkdirSync(this.tempPath, { recursive: true })
   }
 
@@ -193,6 +212,8 @@ export class QQKernelBridge {
     this.avatarCache.clear()
     this.resolvedReplyTargets.clear()
     this.groupProfileAttempts.clear()
+    this.recentDeletes.clear()
+    this.missingStickerAssets.clear()
     this.unreadBatchState = ''
     this.unreadBatchPromise = undefined
     this.messages.clear()
@@ -271,6 +292,8 @@ export class QQKernelBridge {
     this.packetClient = undefined
     this.session = undefined
     this.recentEvents.splice(0)
+    this.recentDeletes.clear()
+    this.missingStickerAssets.clear()
     for (const pending of this.pendingMessages.values()) pending.reject(new Error('QQNT session detached'))
     for (const accepted of this.pendingAcceptances.values()) accepted.resolve()
     for (const item of this.pendingUnassigned) {
@@ -301,8 +324,11 @@ export class QQKernelBridge {
     this.events.add(queue)
     if (lastEventId) {
       const cursor = this.recentEvents.findIndex((item) => item.id === lastEventId)
-      const replay = cursor >= 0 ? this.recentEvents.slice(cursor + 1) : this.recentEvents
-      log(cursor >= 0 ? 'info' : 'warn', `event replay requested lastEventId=${JSON.stringify(lastEventId)} cursorFound=${cursor >= 0} replay=${replay.length} buffered=${this.recentEvents.length}`)
+      const available = cursor >= 0 ? this.recentEvents.slice(cursor + 1) : this.recentEvents
+      const replay = cursor >= 0 ? available : available.slice(-STALE_CURSOR_REPLAY_LIMIT)
+      const dropped = available.length - replay.length
+      log(cursor >= 0 ? 'info' : 'warn', `event replay requested lastEventId=${JSON.stringify(lastEventId)} cursorFound=${cursor >= 0} replay=${replay.length} dropped=${dropped} buffered=${this.recentEvents.length}`)
+      if (replay.length) this.replayStates.set(queue, { remaining: replay.length, total: replay.length })
       for (const item of replay) queue.push(item.event)
     }
     return queue
@@ -312,8 +338,19 @@ export class QQKernelBridge {
     return this.eventIds.get(event)
   }
 
+  consumeReplayEvent(queue: AsyncQueue<QQEvent>): { index: number, total: number, last: boolean } | undefined {
+    const replay = this.replayStates.get(queue)
+    if (!replay?.remaining) return undefined
+    const index = replay.total - replay.remaining + 1
+    replay.remaining--
+    const last = replay.remaining === 0
+    if (last) this.replayStates.delete(queue)
+    return { index, total: replay.total, last }
+  }
+
   unsubscribe(queue: AsyncQueue<QQEvent>): void {
     this.events.delete(queue)
+    this.replayStates.delete(queue)
     queue.close()
   }
 
@@ -645,6 +682,10 @@ export class QQKernelBridge {
       5_000,
       'QQ mark-read request timed out',
     )
+    if (result.result === 4 && /Data Not Existed/i.test(result.errMsg)) {
+      log('info', `native API idempotent name=setSpecificMsgReadAndReport conversation=${conversation.id} message=${messageId} result=${result.result} err=${JSON.stringify(result.errMsg)}`)
+      return
+    }
     if (result.result !== 0) {
       throw new Error(`setSpecificMsgReadAndReport: ${result.errMsg} (${result.result})`)
     }
@@ -1080,6 +1121,12 @@ export class QQKernelBridge {
       }
     }
     if (reference.kind === 'favorite') {
+      const cacheKey = favoriteStickerAssetKey(reference)
+      const missingUntil = this.missingStickerAssets.get(cacheKey) ?? 0
+      if (missingUntil > Date.now()) {
+        throw new QQStickerAssetNotFoundError(`QQ favorite sticker asset is temporarily unavailable: ${reference.resId}`)
+      }
+      this.missingStickerAssets.delete(cacheKey)
       if (reference.path && existsSync(reference.path)) {
         return {
           stream: fileStream(reference.path, false),
@@ -1089,9 +1136,16 @@ export class QQKernelBridge {
       }
       if (reference.locator) {
         const direct = await this.getDirectUrl(reference.locator)
-        if (!direct) throw new Error(`QQ favorite sticker direct URL is unavailable: ${reference.resId}`)
+        if (!direct) {
+          this.missingStickerAssets.set(cacheKey, Date.now() + this.stickerMissingCacheTtlMs)
+          throw new QQStickerAssetNotFoundError(`QQ favorite sticker direct URL is unavailable: ${reference.resId}`)
+        }
         const response = await fetch(direct.url)
         if (!response.ok || !response.body) {
+          if (response.status === 404 || response.status === 410) {
+            this.missingStickerAssets.set(cacheKey, Date.now() + this.stickerMissingCacheTtlMs)
+            throw new QQStickerAssetNotFoundError(`QQ favorite sticker download failed: ${response.status}`)
+          }
           throw new Error(`QQ favorite sticker download failed: ${response.status}`)
         }
         return {
@@ -1100,7 +1154,8 @@ export class QQKernelBridge {
           size: reference.size,
         }
       }
-      throw new Error(`QQ favorite sticker file is missing: ${reference.resId}`)
+      this.missingStickerAssets.set(cacheKey, Date.now() + this.stickerMissingCacheTtlMs)
+      throw new QQStickerAssetNotFoundError(`QQ favorite sticker file is missing: ${reference.resId}`)
     }
     const resolved = await this.resolveMarketStickerPath(reference)
     return {
@@ -2616,8 +2671,21 @@ export class QQKernelBridge {
 
   private onDelete(chatType: number, peerUid: string, ids: string[]): void {
     if (chatType !== CHAT_C2C && chatType !== CHAT_GROUP) return
-    const uniqueIds = [...new Set(ids.filter(Boolean))]
+    const uniqueIds = [...new Set(ids.filter(Boolean))].sort()
     if (!uniqueIds.length) return
+    const now = Date.now()
+    const dedupKey = `${chatType}\u0000${peerUid}\u0000${uniqueIds.join('\u0000')}`
+    const previous = this.recentDeletes.get(dedupKey)
+    if (previous !== undefined && now - previous < this.deleteDedupTtlMs) {
+      log('info', `native message delete duplicate suppressed chatType=${chatType} peer=${peerUid} messages=${uniqueIds.join(',')}`)
+      return
+    }
+    this.recentDeletes.set(dedupKey, now)
+    if (this.recentDeletes.size > 1_024) {
+      for (const [key, timestamp] of this.recentDeletes) {
+        if (now - timestamp >= this.deleteDedupTtlMs) this.recentDeletes.delete(key)
+      }
+    }
     log('info', `native message delete chatType=${chatType} peer=${peerUid} messages=${ids.join(',')}`)
     const id = conversationId(chatType, peerUid)
     const conversation = this.contacts.get(id) ?? this.getConversation(id)
@@ -2630,7 +2698,7 @@ export class QQKernelBridge {
     }
     this.dispatch({
       type: 'message-delete',
-      eventId: `delete:${chatType}:${peerUid}:${uniqueIds.join(',')}:${Date.now()}`,
+      eventId: `delete:${chatType}:${peerUid}:${uniqueIds.join(',')}:${now}`,
       conversation,
       messageIds: uniqueIds,
       timestamp: Math.floor(Date.now() / 1000),
@@ -5130,6 +5198,15 @@ function imagePicType(name: string): number {
     jpg: 0, jpeg: 1000, png: 1001, webp: 1002, sharpp: 1004,
     bmp: 1005, gif: 2000, apng: 2001,
   } as Record<string, number | undefined>)[extension ?? ''] ?? 4
+}
+
+function favoriteStickerAssetKey(reference: Extract<QQStickerReference, { kind: 'favorite' }>): string {
+  return [
+    reference.resId,
+    reference.locator?.messageId ?? '',
+    reference.locator?.elementId ?? '',
+    reference.locator?.fileUuid ?? '',
+  ].join('\u0000')
 }
 
 function ascii(bytes: Uint8Array, offset: number, length: number): string {

@@ -329,6 +329,9 @@ function fixture() {
     emitRecall(chatType: number, peerUid: string, msgSeq: string) {
       msgHandlers.onMsgRecall?.(chatType, peerUid, msgSeq)
     },
+    emitDelete(chatType: number, peerUid: string, ids: string[]) {
+      msgHandlers.onMsgDelete?.({ chatType, peerUid }, ids)
+    },
     emitBuddyList(categories: Array<{ buddyList: unknown[] }>) {
       buddyHandlers.onBuddyListChange?.(categories)
     },
@@ -676,6 +679,19 @@ describe('QQKernelBridge', () => {
     await expect(bridge.markRead(conversation, 'denied')).rejects.toThrow(
       'setSpecificMsgReadAndReport: denied (5)',
     )
+  })
+
+  it('treats QQ Data Not Existed mark-read responses as idempotent success', async () => {
+    const f = fixture()
+    f.msg.setSpecificMsgReadAndReport.mockResolvedValueOnce({
+      result: 4, errMsg: 'Data Not Existed!',
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.markRead(
+      bridge.getConversation('uid-1715311957'), 'already-gone',
+    )).resolves.toBeUndefined()
   })
 
   it('keeps the newest real message when an older info update arrives later', async () => {
@@ -1289,6 +1305,45 @@ describe('QQKernelBridge', () => {
     await expect(events.next()).resolves.toMatchObject({
       value: { type: 'message-delete', messageIds: ['m1'] },
     })
+  })
+
+  it('deduplicates repeated native deletes by conversation and sorted message IDs until the TTL expires', async () => {
+    const f = fixture()
+    let now = 1_000
+    vi.spyOn(Date, 'now').mockImplementation(() => now)
+    const bridge = new QQKernelBridge({ deleteDedupTtlMs: 100 })
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const queue = bridge.subscribe()
+    const events = queue[Symbol.asyncIterator]()
+
+    for (let index = 0; index < 6; index++) {
+      f.emitDelete(2, 'group-a', index % 2 ? ['message-b', 'message-a'] : ['message-a', 'message-b'])
+    }
+    const first = await events.next()
+    expect(first).toMatchObject({ value: {
+      type: 'message-delete', conversation: { id: 'group-a' }, messageIds: ['message-a', 'message-b'],
+    } })
+    const noReplay = bridge.subscribe(bridge.eventId(first.value!)!)
+    expect(bridge.consumeReplayEvent(noReplay)).toBeUndefined()
+    bridge.unsubscribe(noReplay)
+
+    f.emitDelete(2, 'group-b', ['message-a', 'message-b'])
+    await expect(events.next()).resolves.toMatchObject({
+      value: { type: 'message-delete', conversation: { id: 'group-b' } },
+    })
+    now += 101
+    f.emitDelete(2, 'group-a', ['message-b', 'message-a'])
+    await expect(events.next()).resolves.toMatchObject({
+      value: { type: 'message-delete', conversation: { id: 'group-a' } },
+    })
+
+    bridge.detach()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.emitDelete(2, 'group-a', ['message-a', 'message-b'])
+    await expect(events.next()).resolves.toMatchObject({
+      value: { type: 'message-delete', conversation: { id: 'group-a' } },
+    })
+    bridge.unsubscribe(queue)
   })
 
   it('hides recalled records, maps native videos, and renders unsupported elements as text fallbacks', async () => {
@@ -2873,6 +2928,49 @@ describe('QQBridgeServer', () => {
     expect(f.msg.setSpecificMsgReadAndReport).toHaveBeenCalledWith(
       expect.objectContaining({ chatType: 1, peerUid: 'uid-1715311957' }), 'm1',
     )
+    f.msg.setSpecificMsgReadAndReport.mockResolvedValueOnce({
+      result: 4, errMsg: 'Data Not Existed!',
+    })
+    const repeatedRead = await fetch(`${base}/messages/read`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ conversationId: 'uid-1715311957', messageId: 'already-gone' }),
+    })
+    expect(repeatedRead.status).toBe(200)
+    await expect(repeatedRead.json()).resolves.toEqual({ ok: true })
+  })
+
+  it('returns and negatively caches missing favorite sticker assets as HTTP 404', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge({ stickerMissingCacheTtlMs: 10_000 })
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    vi.spyOn(bridge, 'getDirectUrl').mockResolvedValue({
+      url: 'https://cdn.invalid/missing-favorite.png', expiresAt: Date.now() + 60_000,
+    })
+    const originalFetch = globalThis.fetch
+    const fetchAsset = vi.fn(async () => new Response(null, { status: 404 }))
+    vi.stubGlobal('fetch', (input: string | URL | Request, init?: RequestInit) =>
+      String(input).startsWith('https://cdn.invalid/')
+        ? fetchAsset()
+        : originalFetch(input, init))
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const base = `http://127.0.0.1:${server.address().port}/v1`
+    const body = JSON.stringify({
+      kind: 'favorite', resId: 'missing-favorite', path: '', name: 'missing.png', animated: false,
+      locator: {
+        messageId: 'sticker-message', elementId: 'sticker-element', chatType: 2,
+        peerUid: 'group', kind: 'image', fileName: 'missing.png', fileUuid: 'missing-uuid',
+      },
+    })
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const response = await fetch(`${base}/stickers/asset`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body,
+      })
+      expect(response.status).toBe(404)
+      await expect(response.json()).resolves.toMatchObject({ error: expect.stringContaining('favorite sticker') })
+    }
+    expect(fetchAsset).toHaveBeenCalledOnce()
   })
 
   it('keeps image and sticker origin IDs across the HTTP-to-WebSocket send pipeline', async () => {
@@ -3023,6 +3121,56 @@ describe('QQBridgeServer', () => {
     expect(second).toMatchObject({ id: '2', event: { type: 'message', message: { id: 'ws-second' } } })
     resumedSocket.close()
     await once(resumedSocket, 'close')
+    await vi.waitFor(() => expect(bridge.events.size).toBe(0))
+  })
+
+  it('bounds stale-cursor replay, yields in batches, samples logs, and keeps the subscriber live', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const observation = bridge.subscribe()
+    const observed = observation[Symbol.asyncIterator]()
+    const records = Array.from({ length: 600 }, (_, index) => ({
+      ...f.message,
+      msgId: `buffered-${index}`,
+      msgSeq: String(index + 1),
+      sendType: 0,
+      senderUid: 'friend',
+      senderUin: '42',
+      sendNickName: 'Friend',
+    }))
+    f.emitReceived(records)
+    for (let index = 0; index < records.length; index++) await observed.next()
+    bridge.unsubscribe(observation)
+
+    const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => {})
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const socket = new WebSocket(
+      `ws://127.0.0.1:${server.address().port}/v1/events/ws?lastEventId=evicted-cursor`,
+    )
+    const frames: Array<{ id: string, event: { message?: { id?: string } } }> = []
+    socket.on('message', (raw) => frames.push(JSON.parse(raw.toString())))
+
+    await once(socket, 'open')
+    await vi.waitFor(() => expect(frames).toHaveLength(512), { timeout: 5_000 })
+    expect(frames[0]?.event.message?.id).toBe('buffered-88')
+    expect(frames.at(-1)?.event.message?.id).toBe('buffered-599')
+    expect(socket.readyState).toBe(WebSocket.OPEN)
+    expect(bridge.events.size).toBe(1)
+
+    f.emitReceived([{
+      ...f.message, msgId: 'after-replay', msgSeq: '601', sendType: 0,
+      senderUid: 'friend', senderUin: '42', sendNickName: 'Friend',
+    }])
+    await vi.waitFor(() => expect(frames).toHaveLength(513))
+    expect(frames.at(-1)?.event.message?.id).toBe('after-replay')
+    const writes = consoleLog.mock.calls.filter(([message]) =>
+      String(message).includes('WebSocket event write request='))
+    expect(writes.length).toBeLessThanOrEqual(7)
+
+    socket.close()
+    await once(socket, 'close')
     await vi.waitFor(() => expect(bridge.events.size).toBe(0))
   })
 

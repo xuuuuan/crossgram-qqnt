@@ -1,4 +1,4 @@
-import { appendFileSync, mkdirSync, readFileSync } from 'node:fs'
+import { appendFileSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { inspect } from 'node:util'
@@ -14,6 +14,9 @@ export const slowHttpLogPath = process.env.QQNT_BRIDGE_SLOW_HTTP_LOG
 
 const slowHttpKeys = new Map<string, Set<string>>()
 const guardedConsoleStreams = new WeakSet<object>()
+const rotatingLogSizes = new Map<string, number>()
+const DEFAULT_LOG_MAX_BYTES = 64 * 1024 * 1024
+const DEFAULT_LOG_BACKUPS = 3
 
 // Electron keeps stdout/stderr inherited from the process that launched QQ.
 // Once a short-lived launcher closes its pipe, console.* emits EPIPE on the
@@ -49,8 +52,7 @@ export function log(level: 'info' | 'warn' | 'error', message: string, ...detail
     ...details.map((detail) => typeof detail === 'string' ? detail : inspect(detail, { depth: 8 })),
   ].join(' ')
   try {
-    mkdirSync(dirname(logPath), { recursive: true })
-    appendFileSync(logPath, `${rendered}\n`)
+    appendRotatingLog(logPath, `${rendered}\n`)
   } catch {
     // QQ logging must never make the host process fail.
   }
@@ -63,6 +65,67 @@ export function log(level: 'info' | 'warn' | 'error', message: string, ...detail
     // Some console implementations throw synchronously instead of emitting an
     // error event when their backing pipe has already closed.
   }
+}
+
+export function appendRotatingLog(path: string, content: string, options: {
+  maxBytes?: number
+  backups?: number
+} = {}): void {
+  const maxBytes = options.maxBytes ?? positiveInteger(process.env.QQNT_BRIDGE_LOG_MAX_BYTES)
+    ?? DEFAULT_LOG_MAX_BYTES
+  const backups = options.backups ?? positiveInteger(process.env.QQNT_BRIDGE_LOG_BACKUPS)
+    ?? DEFAULT_LOG_BACKUPS
+  const bytes = Buffer.byteLength(content, 'utf8')
+  mkdirSync(dirname(path), { recursive: true })
+  let size = rotatingLogSizes.get(path)
+  if (size === undefined) {
+    try {
+      size = statSync(path).size
+    } catch {
+      size = 0
+    }
+  }
+  if (size > 0 && size + bytes > maxBytes) {
+    rotateLog(path, backups)
+    size = 0
+  }
+  appendFileSync(path, content, 'utf8')
+  rotatingLogSizes.set(path, size + bytes)
+}
+
+function rotateLog(path: string, backups: number): void {
+  rotatingLogSizes.delete(path)
+  if (backups <= 0) {
+    removeIfExists(path)
+    return
+  }
+  removeIfExists(`${path}.${backups}`)
+  for (let index = backups - 1; index >= 1; index--) {
+    renameIfExists(`${path}.${index}`, `${path}.${index + 1}`)
+  }
+  renameIfExists(path, `${path}.1`)
+}
+
+function renameIfExists(source: string, destination: string): void {
+  try {
+    renameSync(source, destination)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  }
+}
+
+function removeIfExists(path: string): void {
+  try {
+    unlinkSync(path)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  }
+}
+
+function positiveInteger(value: string | undefined): number | undefined {
+  if (!value) return undefined
+  const parsed = Number(value)
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined
 }
 
 function consoleOutput(level: 'info' | 'warn' | 'error', message: string): string {

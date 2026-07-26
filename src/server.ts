@@ -6,7 +6,7 @@ import WebSocket, { WebSocketServer } from 'ws'
 import {
   PROTOCOL_VERSION, type QQMediaLocator, type QQMultiForwardLocator, type QQSendMediaSpec, type QQStickerReference, type SendManifest,
 } from './protocol.js'
-import { QQKernelBridge } from './qq-kernel.js'
+import { QQKernelBridge, QQStickerAssetNotFoundError } from './qq-kernel.js'
 import { log, recordSlowHttpRequest, slowHttpLogPath } from './log.js'
 
 export interface BridgeServerOptions {
@@ -262,7 +262,16 @@ export class QQBridgeServer {
     }
     if (request.method === 'POST' && path === '/v1/stickers/asset') {
       const reference = await readJson<QQStickerReference>(request)
-      const asset = await this.bridge.openSticker(reference)
+      let asset
+      try {
+        asset = await this.bridge.openSticker(reference)
+      } catch (error) {
+        if (error instanceof QQStickerAssetNotFoundError) {
+          json(response, 404, { error: error.message })
+          return
+        }
+        throw error
+      }
       response.writeHead(200, {
         'content-type': asset.mimeType,
         'x-qqnt-size': String(asset.size ?? ''),
@@ -477,18 +486,31 @@ export class QQBridgeServer {
     const close = () => this.bridge.unsubscribe(queue)
     webSocket.once('close', close)
     webSocket.once('error', close)
+    let replayWritten = 0
+    let replayTotal = 0
     try {
       for await (const event of queue) {
         if (webSocket.readyState !== WebSocket.OPEN) break
         const eventId = this.bridge.eventId(event)
-        log('info', `WebSocket event write request=${requestId} ${wireEventSummary(event)} streamEventId=${eventId ?? ''}`)
+        const replay = this.bridge.consumeReplayEvent(queue)
+        if (replay) {
+          replayWritten = replay.index
+          replayTotal = replay.total
+        }
+        if (!replay || replay.index === 1 || replay.last || replay.index % 100 === 0) {
+          log('info', `WebSocket event write request=${requestId} replay=${replay ? `${replay.index}/${replay.total}` : 'live'} ${wireEventSummary(event)} streamEventId=${eventId ?? ''}`)
+        }
         await sendWebSocket(webSocket, JSON.stringify({ id: eventId, event }))
+        if (replay && !replay.last && replay.index % 50 === 0) await yieldEventLoop()
       }
     } finally {
       clearInterval(heartbeat)
       webSocket.off('close', close)
       webSocket.off('error', close)
       this.bridge.unsubscribe(queue)
+      if (replayTotal) {
+        log('info', `WebSocket replay complete request=${requestId} written=${replayWritten} total=${replayTotal} completed=${replayWritten === replayTotal}`)
+      }
       log('info', `WebSocket subscriber disconnected request=${requestId} subscribers=${this.bridge.events.size}`)
       if (webSocket.readyState === WebSocket.OPEN) webSocket.close()
     }
@@ -516,6 +538,10 @@ function sendWebSocket(webSocket: WebSocket, data: string): Promise<void> {
   return new Promise((resolve, reject) => {
     webSocket.send(data, (error) => error ? reject(error) : resolve())
   })
+}
+
+function yieldEventLoop(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve))
 }
 
 function wireEventSummary(event: { type: string, conversation?: { id?: string }, message?: { id?: string }, eventId?: string }): string {

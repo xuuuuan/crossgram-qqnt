@@ -3,7 +3,7 @@ import { EventEmitter } from 'node:events'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { guardConsoleStream, log, recordSlowHttpRequest } from './log.js'
+import { appendRotatingLog, guardConsoleStream, log, recordSlowHttpRequest } from './log.js'
 
 describe('host-safe logging', () => {
   afterEach(() => vi.restoreAllMocks())
@@ -56,5 +56,25 @@ describe('slow HTTP request records', () => {
       route: '/v1/conversations/:id/history?beforeId&limit',
       durationMs: 700,
     })
+  })
+})
+
+describe('rotating bridge log', () => {
+  const paths: string[] = []
+  afterEach(async () => Promise.all(paths.splice(0).map((path) => rm(path, { recursive: true, force: true }))))
+
+  it('rotates by UTF-8 byte size and retains only the configured backups', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'qqnt-bridge-log-rotation-'))
+    paths.push(directory)
+    const path = join(directory, 'bridge.log')
+
+    appendRotatingLog(path, '第一行\n', { maxBytes: 12, backups: 2 })
+    appendRotatingLog(path, 'second\n', { maxBytes: 12, backups: 2 })
+    appendRotatingLog(path, 'third\n', { maxBytes: 12, backups: 2 })
+    appendRotatingLog(path, 'fourth\n', { maxBytes: 12, backups: 2 })
+
+    await expect(readFile(path, 'utf8')).resolves.toBe('fourth\n')
+    await expect(readFile(`${path}.1`, 'utf8')).resolves.toBe('third\n')
+    await expect(readFile(`${path}.2`, 'utf8')).resolves.toBe('second\n')
   })
 })
