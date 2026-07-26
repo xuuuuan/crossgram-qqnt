@@ -3167,7 +3167,9 @@ describe('QQBridgeServer', () => {
     expect(frames.at(-1)?.event.message?.id).toBe('after-replay')
     const writes = consoleLog.mock.calls.filter(([message]) =>
       String(message).includes('WebSocket event write request='))
-    expect(writes.length).toBeLessThanOrEqual(7)
+    // 512 replay frames are sampled at 1, 100, 200, 300, 400, 500 and 512;
+    // the following live frame is intentionally logged normally.
+    expect(writes).toHaveLength(8)
 
     socket.close()
     await once(socket, 'close')
