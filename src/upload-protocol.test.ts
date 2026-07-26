@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto'
+import { fromBinary, toBinary } from '@bufbuild/protobuf'
 import { describe, expect, it, vi } from 'vitest'
+import * as generated from './generated/qqnt/packet_pb.js'
 import type { KernelMsgService } from './kernel-types.js'
 import type { PacketAddon } from './packet-addon.js'
 import { QQPacketClient } from './packet-client.js'
@@ -27,6 +29,14 @@ describe('direct QQ upload protocol', () => {
     expect(direct.payload.includes(Buffer.from(spec.sha1.toUpperCase()))).toBe(true)
     expect(direct.payload.includes(Buffer.from('u_friend'))).toBe(true)
     expect(group.payload.includes(Buffer.from('u_friend'))).toBe(false)
+
+    const favorite = encodeImageUploadRequest(1, 'u_friend', { ...spec, picSubType: 1 })
+    const envelope = fromBinary(generated.OidbEnvelopeSchema, favorite.payload)
+    const decoded = fromBinary(generated.ImageUploadRequestSchema, envelope.body)
+    expect(decoded.upload?.message?.picture).toMatchObject({
+      subtype: 1, summary: '[图片]', c2c: { subtype: 1 },
+    })
+    expect(decoded.upload?.message?.picture?.group).toBeUndefined()
   })
 
   it('decodes Highway tickets, upload servers, fast-upload UUIDs, and protocol failures', () => {
@@ -140,6 +150,38 @@ describe('direct QQ upload protocol', () => {
     })
     expect(() => decodeDirectMessageResponse(pb([u(1, 7), field(2, Buffer.from('denied'))])))
       .toThrow('denied (7)')
+  })
+
+  it('keeps stable PbSendMsg vectors for text, mentions, faces, market stickers, and replies', () => {
+    const request = encodeDirectMessageRequest(1, 'u_friend', '42', [
+      { kind: 'text', text: 'hello' },
+      { kind: 'mention', text: '@Alice', userUid: 'u_alice', userUin: '12345' },
+      { kind: 'face', face: { faceId: 14, faceType: 1 } },
+      { kind: 'face', face: {
+        faceId: 476, faceType: 3, packId: '3', stickerId: '476',
+        sourceType: 1, stickerType: 2, resultId: 'result-476',
+      } },
+      { kind: 'face', face: { faceId: 260, faceType: 1 } },
+      { kind: 'market-face', face: {
+        name: 'Wave', emojiId: '0a0b', packageId: 7, key: 'key', width: 320, height: 180,
+      } },
+      { kind: 'reply', reply: {
+        messageId: '99', sequence: '10', clientSequence: '11', senderUin: '12',
+        senderUid: 'u_sender', receiverUid: 'u_friend', time: 13,
+      } },
+    ], { clientSequence: 1n, random: 2 })
+    const decoded = fromBinary(generated.SendMessageRequestSchema, request.payload)
+    const elements = decoded.body?.richText?.elements ?? []
+    expect(elements.map((element) => Buffer.from(toBinary(generated.ElemSchema, element)).toString('hex')))
+      .toEqual([
+        '0a070a0568656c6c6f',
+        '0a1a0a0640416c6963656210180220b96028004a07755f616c696365',
+        '1202080e',
+        'aa03250825121f0a0133120334373618dc0320012802320a726573756c742d3437363a0048011801',
+        'aa030d0821120708840212001a001801',
+        '32230a065b576176655d1006180122020a0b280730033a036b657950c00258b4016a024001',
+        'ea02230a010b100c180d421818633208755f73656e6465723a08755f667269656e64400b5000',
+      ])
   })
 
   it('fetches private-file message metadata and builds the 0x211 file send route', () => {

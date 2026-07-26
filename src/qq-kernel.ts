@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { createReadStream, createWriteStream, existsSync, mkdirSync, statSync } from 'node:fs'
-import { copyFile, open as openFile, readFile, rename, rm, stat } from 'node:fs/promises'
+import { open as openFile, readFile, rm, stat } from 'node:fs/promises'
 import { basename, dirname, extname, join } from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { Readable } from 'node:stream'
@@ -1137,17 +1137,12 @@ export class QQKernelBridge {
 
   async send(manifest: SendManifest, body: Readable): Promise<QQMessage> {
     const conversation = this.getConversation(manifest.conversationId)
-    const directProtocol = canSendMediaViaProtocol(manifest, conversation.chatType)
+    const peerUin = await this.requireProtocolPeerUin(conversation)
     const protocolParts: DirectMessagePart[] = []
-    if (directProtocol) {
-      const text = manifest.textParts?.map((part) => part.text).join('') || manifest.text
-      if (text) protocolParts.push({ kind: 'text', text })
-    }
-    const elements: MsgElement[] = []
-    if (manifest.replyToId) elements.push(replyElement(manifest.replyToId))
+    if (manifest.replyToId) protocolParts.push(await this.directReplyPart(conversation, manifest.replyToId))
     if (manifest.textParts?.length) {
-      for (const part of manifest.textParts) elements.push(...textPartElements(part))
-    } else if (manifest.text) elements.push(textElement(manifest.text))
+      for (const part of manifest.textParts) protocolParts.push(...directTextParts(part))
+    } else if (manifest.text) protocolParts.push({ kind: 'text', text: manifest.text })
     const cleanup: string[] = []
     const sentMediaPaths: Array<string | undefined> = []
     let preserveUntil: number | undefined
@@ -1155,12 +1150,21 @@ export class QQKernelBridge {
       if (manifest.sticker && manifest.media?.length) throw new Error('a message cannot contain both sticker and media')
       if (manifest.sticker?.kind === 'sysface') {
         this.stickers.set(sysFaceStickerId(manifest.sticker.faceId), stickerFromReference(manifest.sticker))
-        elements.push(sysFaceElement(manifest.sticker))
+        protocolParts.push({ kind: 'face', face: {
+          faceId: Number(manifest.sticker.faceId), faceType: manifest.sticker.faceType,
+          packId: manifest.sticker.packId, stickerId: manifest.sticker.stickerId,
+          sourceType: manifest.sticker.sourceType, stickerType: manifest.sticker.stickerType,
+          resultId: manifest.sticker.resultId,
+        } })
       } else if (manifest.sticker?.kind === 'market') {
         this.stickers.set(marketStickerId(
           manifest.sticker.packageId, manifest.sticker.stickerId,
         ), stickerFromReference(manifest.sticker))
-        elements.push(marketFaceElement(manifest.sticker))
+        protocolParts.push({ kind: 'market-face', face: {
+          name: manifest.sticker.name, emojiId: manifest.sticker.stickerId,
+          packageId: Number(manifest.sticker.packageId), key: manifest.sticker.key,
+          width: manifest.sticker.width, height: manifest.sticker.height,
+        } })
       } else if (manifest.sticker?.kind === 'favorite') {
         this.stickers.set(favoriteStickerId(manifest.sticker.resId), stickerFromReference(manifest.sticker))
         const stickerPath = manifest.sticker.path && existsSync(manifest.sticker.path)
@@ -1170,14 +1174,21 @@ export class QQKernelBridge {
           throw new Error(`QQ favorite sticker file is missing: ${manifest.sticker.resId}`)
         }
         const size = statSync(stickerPath).size
-        const prepared = await this.prepareImageElement(
-          stickerPath, manifest.sticker.name, size,
-          { width: manifest.sticker.width, height: manifest.sticker.height },
-          1,
-          false,
+        const [md5, sha1] = await Promise.all([
+          hashFile(stickerPath, 'md5'), hashFile(stickerPath, 'sha1'),
+        ])
+        const uploaded = await this.packetClientForSession().uploadImage(
+          conversation.chatType as 1 | 2,
+          conversation.peerUid,
+          this.requireConfig().selfUin,
+          {
+            name: manifest.sticker.name, size, md5, sha1,
+            width: manifest.sticker.width, height: manifest.sticker.height,
+            picType: imagePicType(manifest.sticker.name), picSubType: 1,
+          },
+          createReadStream(stickerPath),
         )
-        if (prepared.owned) cleanup.push(prepared.path)
-        elements.push(prepared.element)
+        protocolParts.push({ kind: 'image', upload: uploaded })
       }
       if (manifest.media?.length) {
         if (manifest.media.length > 1 && manifest.mediaFraming !== 'length-prefixed-v1') {
@@ -1186,91 +1197,80 @@ export class QQKernelBridge {
         const reader = manifest.mediaFraming === 'length-prefixed-v1' ? new FramedUploadReader(body) : undefined
         for (const [index, spec] of manifest.media.entries()) {
           const mediaBody = reader ? reader.media(index) : body
-          if (directProtocol && spec.kind === 'image' && spec.size !== undefined && spec.md5 && spec.sha1) {
+          let path: string | undefined
+          let size = spec.size
+          let md5 = spec.md5
+          let sha1 = spec.sha1
+          let file10MMd5 = spec.file10MMd5
+          let dimensions = spec.width && spec.height
+            ? { width: spec.width, height: spec.height }
+            : undefined
+          let uploadBody: AsyncIterable<Uint8Array> = mediaBody
+          const requiresStaging = size === undefined || !md5 || !sha1
+            || (spec.kind === 'file' && !file10MMd5)
+          if (requiresStaging) {
+            const stagingRoot = this.stagingPath(spec.kind)
+            mkdirSync(stagingRoot, { recursive: true })
+            path = join(stagingRoot, `${randomUUID()}${safeExtension(spec.name)}`)
+            cleanup.push(path)
+            await pipeline(mediaBody, createWriteStream(path, { flags: 'wx' }))
+            const actualSize = statSync(path).size
+            if (size !== undefined && actualSize !== size) {
+              throw new Error(`incomplete upload ${index}: expected ${size} bytes, received ${actualSize}`)
+            }
+            size = actualSize
+            const hashes = await Promise.all([
+              md5 ? Promise.resolve(md5) : hashFile(path, 'md5'),
+              sha1 ? Promise.resolve(sha1) : hashFile(path, 'sha1'),
+              spec.kind === 'file' && !file10MMd5 ? hashFilePrefix(path, 'md5', 10 * 1024 * 1024) : Promise.resolve(file10MMd5),
+              spec.kind === 'image' && !dimensions ? imageFileDimensions(path) : Promise.resolve(dimensions),
+            ])
+            ;[md5, sha1, file10MMd5, dimensions] = hashes
+            uploadBody = createReadStream(path)
+          }
+          if (size === undefined || !md5 || !sha1) throw new Error(`media ${index} metadata is incomplete`)
+          if (spec.kind === 'image') {
             const uploaded = await this.packetClientForSession().uploadImage(
               conversation.chatType as 1 | 2,
               conversation.peerUid,
               this.requireConfig().selfUin,
               {
-                name: spec.name, size: spec.size, md5: spec.md5, sha1: spec.sha1,
-                width: spec.width, height: spec.height, picType: imagePicType(spec.name),
+                name: spec.name, size, md5, sha1,
+                width: dimensions?.width, height: dimensions?.height, picType: imagePicType(spec.name),
               },
-              mediaBody,
+              uploadBody,
             )
-            sentMediaPaths.push(undefined)
+            sentMediaPaths.push(path)
             protocolParts.push({ kind: 'image', upload: uploaded })
             continue
           }
-          if (directProtocol && spec.kind === 'file' && spec.size !== undefined && spec.md5 && spec.sha1 && spec.file10MMd5) {
-            const config = this.requireConfig()
-            const uploaded = await this.packetClientForSession().uploadFile(
-              conversation.chatType as 1 | 2,
-              conversation.peerUid,
-              config.selfUin,
-              config.selfUid,
-              {
-                name: spec.name, size: spec.size, md5: spec.md5,
-                sha1: spec.sha1, file10MMd5: spec.file10MMd5,
-              },
-              mediaBody,
-            )
-            sentMediaPaths.push(undefined)
-            protocolParts.push({
-              kind: 'file',
-              upload: uploaded,
-              spec: {
-                name: spec.name, size: spec.size, md5: spec.md5,
-                sha1: spec.sha1, file10MMd5: spec.file10MMd5,
-              },
-            })
-            continue
-          }
-          const stagingRoot = this.stagingPath(spec.kind)
-          mkdirSync(stagingRoot, { recursive: true })
-          const path = join(stagingRoot, `${randomUUID()}${safeExtension(spec.name)}`)
-          cleanup.push(path)
-          await pipeline(mediaBody, createWriteStream(path, { flags: 'wx' }))
-          const size = statSync(path).size
-          if (spec.size !== undefined && size !== spec.size) {
-            throw new Error(`incomplete upload ${index}: expected ${spec.size} bytes, received ${size}`)
-          }
-          if (spec.kind === 'image') {
-            const prepared = await this.prepareImageElement(path, spec.name, size, {
-              width: spec.width,
-              height: spec.height,
-            })
-            if (prepared.path !== path) {
-              cleanup.splice(cleanup.indexOf(path), 1)
-              if (prepared.owned) cleanup.push(prepared.path)
-            }
-            sentMediaPaths.push(prepared.path)
-            elements.push(prepared.element)
-          } else {
-            sentMediaPaths.push(path)
-            elements.push(await fileElement(path, spec.name, size))
-          }
+          if (!file10MMd5) throw new Error(`file ${index} metadata is incomplete`)
+          const config = this.requireConfig()
+          const uploaded = await this.packetClientForSession().uploadFile(
+            conversation.chatType as 1 | 2,
+            conversation.peerUid,
+            config.selfUin,
+            config.selfUid,
+            { name: spec.name, size, md5, sha1, file10MMd5 },
+            uploadBody,
+          )
+          sentMediaPaths.push(path)
+          protocolParts.push({
+            kind: 'file', upload: uploaded,
+            spec: { name: spec.name, size, md5, sha1, file10MMd5 },
+          })
         }
         await reader?.finish()
       } else {
         body.resume()
       }
-      if (!elements.length && !protocolParts.length) throw new Error('message must contain text, media, or sticker')
-      const service = this.requireMsgService()
+      if (!protocolParts.length) throw new Error('message must contain text, media, or sticker')
       const startedAt = Math.floor(Date.now() / 1000)
-      let id = '0'
-      if (!directProtocol) {
-        try {
-          id = service.getMsgUniqueId?.(String(Date.now())) ?? id
-        } catch (error) {
-          log('error', 'getMsgUniqueId failed; matching send confirmation by content', error)
-        }
-      }
+      const id = '0'
       const pending = deferred<MsgRecord>()
       const accepted = deferred<void>()
       const minimumStatus = manifest.media?.length || manifest.sticker ? 2 : 1
-      let wasAccepted = false
-      void accepted.promise.then(() => { wasAccepted = true })
-      if (id === '0') this.pendingUnassigned.push({
+      this.pendingUnassigned.push({
         conversationId: conversation.id,
         pending,
         accepted,
@@ -1281,37 +1281,14 @@ export class QQKernelBridge {
         expectedMediaKind: manifest.sticker ? 'sticker' : manifest.media?.[0]?.kind,
         originRequestId: manifest.originRequestId,
       })
-      else {
-        this.rememberMessageOrigin(id, manifest.originRequestId)
-        this.pendingMessages.set(id, pending)
-        this.pendingAcceptances.set(id, accepted)
-        this.pendingMinimumStatuses.set(id, minimumStatus)
-      }
-      const peer = contact(conversation)
-      const sendRequest = directProtocol
-        ? (() => {
-            log('info', `protocol API start name=MessageSvc.PbSendMsg conversation=${conversation.id} parts=${protocolParts.length} minimumStatus=${minimumStatus}`)
-            return this.packetClientForSession().sendDirectMessage(
-              conversation.chatType as 1 | 2,
-              conversation.peerUid,
-              conversation.peerUin,
-              protocolParts,
-              this.requireConfig().selfUid,
-            ).then(() => ({ result: 0, errMsg: '' }))
-          })()
-        : (() => {
-            // This is the raw native service, not QQ's renderer-side generated
-            // object-parameter proxy. sendMsg uses four positional arguments.
-            log('info', `native API start name=sendMsg conversation=${conversation.id} message=${id} elements=${elements.length} minimumStatus=${minimumStatus}`)
-            return retryTransientInvalidArgumentResult(
-              () => withTimeout(
-                service.sendMsg(id, peer, elements, new Map()),
-                5_000,
-                'QQ sendMsg timed out',
-              ),
-              () => wasAccepted,
-            )
-          })()
+      log('info', `protocol API start name=MessageSvc.PbSendMsg conversation=${conversation.id} parts=${protocolParts.length} minimumStatus=${minimumStatus}`)
+      const sendRequest = this.packetClientForSession().sendDirectMessage(
+        conversation.chatType as 1 | 2,
+        conversation.peerUid,
+        peerUin,
+        protocolParts,
+        this.requireConfig().selfUid,
+      ).then(() => ({ result: 0, errMsg: '' }))
       const result = await Promise.race([
         sendRequest,
         pending.promise.then(() => ({ result: 0, errMsg: '' })),
@@ -1321,9 +1298,9 @@ export class QQKernelBridge {
         this.pendingAcceptances.delete(id)
         this.pendingMinimumStatuses.delete(id)
         removePending(this.pendingUnassigned, pending)
-        throw new Error(`${directProtocol ? 'MessageSvc.PbSendMsg' : 'sendMsg'}: ${result.errMsg} (${result.result})`)
+        throw new Error(`MessageSvc.PbSendMsg: ${result.errMsg} (${result.result})`)
       }
-      log('info', `${directProtocol ? 'protocol' : 'native'} API accepted name=${directProtocol ? 'MessageSvc.PbSendMsg' : 'sendMsg'} conversation=${conversation.id} message=${id} result=${result.result} err=${JSON.stringify(result.errMsg)}`)
+      log('info', `protocol API accepted name=MessageSvc.PbSendMsg conversation=${conversation.id} message=${id} result=${result.result} err=${JSON.stringify(result.errMsg)}`)
       const pollController = new AbortController()
       const confirmationPoll = this.pollSentMessage(
         conversation,
@@ -1347,7 +1324,7 @@ export class QQKernelBridge {
         })
       this.rememberMessageOrigin(record.msgId, manifest.originRequestId)
       const message = this.mapMessage(record)
-      log('info', `${directProtocol ? 'protocol' : 'native'} API confirmed name=${directProtocol ? 'MessageSvc.PbSendMsg' : 'sendMsg'} conversation=${conversation.id} requestedMessage=${id} confirmedMessage=${message.id} status=${record.sendStatus}`)
+      log('info', `protocol API confirmed name=MessageSvc.PbSendMsg conversation=${conversation.id} requestedMessage=${id} confirmedMessage=${message.id} status=${record.sendStatus}`)
       if (manifest.media?.length && sentMediaPaths.length) {
         const mediaParts = message.parts.filter((part) => part.type === 'media')
         for (const [index, media] of mediaParts.entries()) {
@@ -2393,6 +2370,14 @@ export class QQKernelBridge {
             !item.assignedMessageId
             && item.conversationId === id)
         }
+        // A failure callback can contain only a placeholder or no media
+        // element. Associate it with the oldest same-conversation request so
+        // the HTTP send fails immediately instead of waiting for a timeout.
+        if (index < 0 && outgoing && record.sendStatus === 0) {
+          index = this.pendingUnassigned.findIndex((item) =>
+            !item.assignedMessageId
+            && item.conversationId === id)
+        }
         if (index >= 0) {
           this.pendingUnassigned[index].assignedMessageId ??= record.msgId
           this.rememberMessageOrigin(record.msgId, this.pendingUnassigned[index].originRequestId)
@@ -3307,6 +3292,33 @@ export class QQKernelBridge {
     )
   }
 
+  private async directReplyPart(
+    conversation: QQConversation,
+    messageId: string,
+  ): Promise<DirectMessagePart> {
+    let source: MsgRecord | undefined
+    try {
+      const result = await this.requireMsgService().getMsgsByMsgId(contact(conversation), [messageId])
+      if (result.result === 0) source = result.msgList.find((record) => record.msgId === messageId)
+    } catch (error) {
+      log('warn', `QQ reply source lookup failed message=${messageId}`, error)
+    }
+    const config = this.requireConfig()
+    return { kind: 'reply', reply: {
+      messageId,
+      sequence: source?.msgSeq,
+      clientSequence: source?.msgSeq,
+      senderUin: source?.senderUin,
+      senderUid: source?.senderUid,
+      receiverUid: source
+        ? (SEND_FROM_SELF.has(source.sendType) || source.senderUid === config.selfUid
+            ? conversation.peerUid
+            : config.selfUid)
+        : undefined,
+      time: validTimestamp(source?.msgTime) || undefined,
+    } }
+  }
+
   private stagingPath(kind?: 'image' | 'file'): string {
     if (kind === 'image') {
       try {
@@ -3323,53 +3335,22 @@ export class QQKernelBridge {
       : this.tempPath
   }
 
-  private async prepareImageElement(
-    stagingPath: string,
-    originalName: string,
-    size: number,
-    declared: { width?: number, height?: number } = {},
-    picSubType = 0,
-    sourceOwned = true,
-  ): Promise<{ path: string, owned: boolean, element: MsgElement }> {
-    const [md5, dimensions] = await Promise.all([
-      hashFile(stagingPath, 'md5'),
-      declared.width && declared.height
-        ? Promise.resolve({ width: declared.width, height: declared.height })
-        : imageFileDimensions(stagingPath),
-    ])
-    const service = this.requireMsgService()
-    const fileName = `${md5}${safeExtension(originalName) || '.png'}`
-    let nativePath = ''
-    try {
-      nativePath = service.getRichMediaFilePath?.(
-        ELEMENT_IMAGE, picSubType, md5, fileName, 1, 0, true,
-      ) ?? service.getRichMediaFilePathForMobileQQSend?.({
-        elementType: ELEMENT_IMAGE, elementSubType: picSubType, md5HexStr: md5,
-        fileName, downloadType: 1, thumbSize: 0,
-        file_uuid: '', needCreate: true,
-      }) ?? ''
-    } catch (error) {
-      log('error', 'QQ image send path lookup failed; using native media staging path', error)
+  private async requireProtocolPeerUin(conversation: QQConversation): Promise<string> {
+    if (conversation.chatType === CHAT_GROUP) return conversation.peerUin || conversation.peerUid
+    if (conversation.peerUin) return conversation.peerUin
+    const cached = this.users.get(conversation.peerUid)?.numericId
+      ?? this.seenUsers.get(conversation.peerUid)?.numericId
+    if (cached) {
+      this.mergeConversation({ ...conversation, peerUin: cached })
+      return cached
     }
-    let path = stagingPath
-    let owned = sourceOwned
-    if (nativePath && nativePath !== stagingPath) {
-      mkdirSync(dirname(nativePath), { recursive: true })
-      const nativeFileMatches = existsSync(nativePath)
-        && statSync(nativePath).size === size
-        && await hashFile(nativePath, 'md5') === md5
-      if (nativeFileMatches) {
-        if (sourceOwned) await rm(stagingPath, { force: true })
-        owned = false
-      } else {
-        await rm(nativePath, { force: true })
-        if (sourceOwned) await rename(stagingPath, nativePath)
-        else await copyFile(stagingPath, nativePath)
-        owned = true
-      }
-      path = nativePath
-    }
-    return { path, owned, element: imageElement(path, size, md5, dimensions, originalName, picSubType) }
+    const converted = await retryTransientInvalidArgument(
+      () => this.requireSession().getUixConvertService().getUin(new Set([conversation.peerUid])),
+    )
+    const peerUin = converted.uinInfo.get(conversation.peerUid)
+    if (!peerUin) throw new Error(`QQ user ${conversation.peerUid} could not be resolved to a UIN`)
+    this.mergeConversation({ ...conversation, peerUin })
+    return peerUin
   }
 
   private rememberMessageOrigin(messageId: string, originRequestId?: string): void {
@@ -3738,201 +3719,33 @@ class FramedUploadReader {
   }
 }
 
-function textElement(text: string): MsgElement {
-  return {
-    elementType: ELEMENT_TEXT,
-    elementId: '',
-    textElement: { content: text, atType: 0, atUid: '', atTinyId: '', atNtUid: '' },
-  }
-}
-
-function textPartElements(part: QQTextPart): MsgElement[] {
+function directTextParts(part: QQTextPart): DirectMessagePart[] {
   const entities = (part.entities ?? [])
     .filter((entity) => entity.offset >= 0 && entity.length > 0
       && entity.offset + entity.length <= part.text.length)
     .sort((left, right) => left.offset - right.offset)
-  if (!entities.length) return part.text ? [textElement(part.text)] : []
-  const elements: MsgElement[] = []
+  if (!entities.length) return part.text ? [{ kind: 'text', text: part.text }] : []
+  const parts: DirectMessagePart[] = []
   let offset = 0
   for (const entity of entities) {
     if (entity.offset < offset) continue
-    if (entity.offset > offset) elements.push(textElement(part.text.slice(offset, entity.offset)))
+    if (entity.offset > offset) parts.push({ kind: 'text', text: part.text.slice(offset, entity.offset) })
     const content = part.text.slice(entity.offset, entity.offset + entity.length)
     if (entity.type === 'mention') {
-      elements.push({
-        elementType: ELEMENT_TEXT,
-        elementId: '',
-        textElement: {
-          content,
-          atType: 2,
-          atUid: entity.numericId ?? '',
-          atTinyId: '',
-          atNtUid: entity.userId,
-        },
+      parts.push({
+        kind: 'mention', text: content,
+        userUid: entity.userId, userUin: entity.numericId,
       })
     } else {
       const faceIndex = Number(entity.faceId)
-      if (!Number.isInteger(faceIndex) || faceIndex < 0) elements.push(textElement(content))
-      else elements.push({
-        elementType: ELEMENT_FACE,
-        elementId: '',
-        faceElement: { faceIndex, faceText: content, faceType: entity.faceType || 1 },
-      })
+      if (!Number.isInteger(faceIndex) || faceIndex < 0) parts.push({ kind: 'text', text: content })
+      else parts.push({ kind: 'face', face: { faceId: faceIndex, faceType: entity.faceType || 1 } })
     }
     offset = entity.offset + entity.length
   }
-  if (offset < part.text.length) elements.push(textElement(part.text.slice(offset)))
-  return elements
-}
 
-function replyElement(messageId: string): MsgElement {
-  return {
-    elementType: ELEMENT_REPLY,
-    elementId: '',
-    replyElement: {
-      replayMsgId: messageId,
-      sourceMsgTextElems: [],
-      replyMsgRevokeType: 0,
-      sourceMsgIsIncPic: false,
-      sourceMsgExpired: false,
-    },
-  }
-}
-
-function marketFaceElement(reference: Extract<QQStickerReference, { kind: 'market' }>): MsgElement {
-  return {
-    elementType: ELEMENT_MARKET_FACE,
-    elementId: '',
-    marketFaceElement: {
-      itemType: 6,
-      faceInfo: 1,
-      emojiPackageId: Number(reference.packageId),
-      subType: 3,
-      mediaType: 0,
-      imageWidth: reference.width,
-      imageHeight: reference.height,
-      faceName: reference.name.startsWith('[') ? reference.name : `[${reference.name}]`,
-      emojiId: reference.stickerId,
-      key: reference.key,
-      emojiType: reference.animated ? 2 : 1,
-      staticFacePath: reference.staticPath,
-      dynamicFacePath: reference.dynamicPath,
-    },
-  }
-}
-
-function sysFaceElement(reference: Extract<QQStickerReference, { kind: 'sysface' }>): MsgElement {
-  return {
-    elementType: ELEMENT_FACE,
-    elementId: '',
-    faceElement: {
-      faceIndex: Number(reference.faceId),
-      faceText: reference.name,
-      faceType: reference.faceType,
-      packId: reference.packId,
-      stickerId: reference.stickerId,
-      sourceType: reference.sourceType,
-      stickerType: reference.stickerType,
-      resultId: reference.resultId,
-      imageType: reference.imageType,
-    },
-  }
-}
-
-function imageElement(
-  path: string,
-  size: number,
-  md5: string,
-  dimensions?: { width: number, height: number },
-  originalName = basename(path),
-  picSubType = 0,
-): MsgElement {
-  return {
-    elementType: ELEMENT_IMAGE,
-    elementId: '',
-    picElement: {
-      picSubType,
-      fileName: basename(path),
-      fileSize: String(size),
-      picWidth: dimensions?.width ?? 0,
-      picHeight: dimensions?.height ?? 0,
-      original: true,
-      md5HexStr: md5,
-      originImageMd5: md5,
-      sourcePath: path,
-      fileUuid: '',
-      fileSubId: '',
-      thumbFileSize: 0,
-      picType: imagePicType(originalName),
-      storeID: 0,
-    } as never,
-  }
-}
-
-function canSendMediaViaProtocol(manifest: SendManifest, chatType: number): boolean {
-  if (!manifest.media?.length || manifest.replyToId || manifest.sticker) return false
-  if (manifest.textParts?.some((part) => part.entities?.length)) return false
-  if (!manifest.media.every((item) =>
-    item.size !== undefined && Boolean(item.md5 && item.sha1)
-    && (item.kind !== 'file' || Boolean(item.file10MMd5)))) return false
-  if (chatType === CHAT_C2C && manifest.media.some((item) => item.kind === 'file')) {
-    return manifest.media.length === 1 && manifest.media[0]?.kind === 'file'
-      && !manifest.text && !manifest.textParts?.some((part) => part.text)
-  }
-  return true
-}
-
-function uploadedImageElement(
-  spec: NonNullable<SendManifest['media']>[number],
-  fileUuid: string,
-): MsgElement {
-  if (spec.kind !== 'image' || spec.size === undefined || !spec.md5) {
-    throw new Error('invalid prepared image element')
-  }
-  return {
-    elementType: ELEMENT_IMAGE,
-    elementId: '',
-    picElement: {
-      picSubType: 0,
-      fileName: spec.name,
-      fileSize: String(spec.size),
-      picWidth: spec.width ?? 0,
-      picHeight: spec.height ?? 0,
-      original: true,
-      md5HexStr: spec.md5,
-      originImageMd5: spec.md5,
-      sourcePath: '',
-      fileUuid,
-      fileSubId: '',
-      thumbFileSize: 0,
-      picType: imagePicType(spec.name),
-      storeID: 0,
-    } as never,
-  }
-}
-
-function uploadedFileElement(
-  spec: NonNullable<SendManifest['media']>[number],
-  fileUuid: string,
-): MsgElement {
-  if (spec.kind !== 'file' || spec.size === undefined || !spec.md5 || !spec.sha1 || !spec.file10MMd5) {
-    throw new Error('invalid prepared file element')
-  }
-  return {
-    elementType: ELEMENT_FILE,
-    elementId: '',
-    fileElement: {
-      fileMd5: spec.md5,
-      fileName: spec.name,
-      filePath: '',
-      fileSize: String(spec.size),
-      file10MMd5: spec.file10MMd5,
-      fileSha: spec.sha1,
-      fileSha3: spec.sha1,
-      fileUuid,
-      fileSubId: '',
-    },
-  }
+  if (offset < part.text.length) parts.push({ kind: 'text', text: part.text.slice(offset) })
+  return parts
 }
 
 async function imageFileDimensions(path: string): Promise<{ width: number, height: number } | undefined> {
@@ -3946,28 +3759,16 @@ async function imageFileDimensions(path: string): Promise<{ width: number, heigh
   }
 }
 
-async function fileElement(path: string, name: string, size: number): Promise<MsgElement> {
-  const [md5, sha] = await Promise.all([hashFile(path, 'md5'), hashFile(path, 'sha1')])
-  return {
-    elementType: ELEMENT_FILE,
-    elementId: '',
-    fileElement: {
-      fileMd5: md5,
-      fileName: name,
-      filePath: path,
-      fileSize: String(size),
-      file10MMd5: md5,
-      fileSha: sha,
-      fileSha3: sha,
-      fileUuid: '',
-      fileSubId: '',
-    },
-  }
-}
-
 async function hashFile(path: string, algorithm: string): Promise<string> {
   const hash = createHash(algorithm)
   for await (const chunk of createReadStream(path)) hash.update(chunk)
+  return hash.digest('hex')
+}
+
+async function hashFilePrefix(path: string, algorithm: string, limit: number): Promise<string> {
+  const hash = createHash(algorithm)
+  if (limit <= 0) return hash.digest('hex')
+  for await (const chunk of createReadStream(path, { start: 0, end: limit - 1 })) hash.update(chunk)
   return hash.digest('hex')
 }
 
@@ -4971,27 +4772,6 @@ async function retryHistoryCall<T>(operation: () => Promise<T>): Promise<T> {
 function isTransientNativeError(error: unknown): boolean {
   const message = String(error)
   return message.includes('Invalid argument') || message.includes('timed out')
-}
-
-async function retryTransientInvalidArgumentResult(
-  operation: () => Promise<{ result: number, errMsg: string }>,
-  isAccepted: () => boolean = () => false,
-): Promise<{ result: number, errMsg: string }> {
-  for (let attempt = 0; attempt < 10; attempt++) {
-    if (isAccepted()) return { result: 0, errMsg: '' }
-    let result: { result: number, errMsg: string }
-    try {
-      result = await operation()
-    } catch (error) {
-      if (isAccepted()) return { result: 0, errMsg: '' }
-      if (!isTransientNativeError(error) || attempt === 9) throw error
-      await new Promise((resolve) => setTimeout(resolve, 200 * (attempt + 1)))
-      continue
-    }
-    if (result.result === 0 || !result.errMsg.includes('Invalid argument') || attempt === 9) return result
-    await new Promise((resolve) => setTimeout(resolve, 200 * (attempt + 1)))
-  }
-  throw new Error('unreachable')
 }
 
 function avatarMedia(id: string, filePath?: string): QQMedia {

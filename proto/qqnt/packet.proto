@@ -1,0 +1,605 @@
+edition = "2023";
+
+package qqnt.packet;
+
+// This schema intentionally declares only fields read or written by the bridge.
+// Unknown QQ fields remain preserved by protobuf-es when a message is decoded
+// and encoded again.
+
+message OidbEnvelope {
+  uint32 command = 1;
+  uint32 sub_command = 2;
+  int32 result = 3;
+  bytes body = 4;
+  string error = 5;
+  uint32 reserved = 12;
+}
+
+message HttpConnRequest {
+  HttpConnBody body = 1281;
+}
+
+message HttpConnBody {
+  uint32 field3 = 3;
+  uint32 field4 = 4;
+  uint32 field6 = 6;
+  repeated uint32 commands = 7 [features.repeated_field_encoding = EXPANDED];
+  uint32 field9 = 9;
+  uint32 field10 = 10;
+  uint32 field11 = 11;
+  string version = 15;
+}
+
+message HttpConnResponse {
+  HighwaySession session = 1281;
+}
+
+message HighwaySession {
+  bytes ticket = 1;
+  repeated HighwayServerGroup server_groups = 3;
+}
+
+message HighwayServerGroup {
+  uint32 kind = 1;
+  repeated HighwayAddress addresses = 2;
+}
+
+message HighwayAddress {
+  fixed32 host = 2;
+  uint32 port = 3;
+}
+
+message ImageUploadRequest {
+  ImageRequestHead head = 1;
+  ImageUploadBody upload = 2;
+}
+
+message ImageRequestHead {
+  ImageBusinessHead business = 1;
+  ImageScene scene = 2;
+  ImageClient client = 3;
+}
+
+message ImageBusinessHead {
+  uint32 field1 = 1;
+  uint32 field2 = 2;
+}
+
+message ImageClient {
+  uint32 field1 = 1;
+}
+
+message ImageScene {
+  uint32 request_type = 101;
+  uint32 business_type = 102;
+  uint32 chat_type = 200;
+  ImageC2cTarget c2c = 201;
+  ImageGroupTarget group = 202;
+}
+
+message ImageC2cTarget {
+  uint32 field1 = 1;
+  string peer_uid = 2;
+}
+
+message ImageGroupTarget {
+  uint32 group_uin = 1;
+}
+
+message ImageUploadBody {
+  ImageUploadFile file = 1;
+  bool field2 = 2;
+  bool field3 = 3;
+  uint64 upload_id = 4;
+  uint32 chat_type = 5;
+  ImageUploadMessage message = 6;
+  uint32 field7 = 7;
+  bool field8 = 8;
+}
+
+message ImageUploadFile {
+  ImageFileInfo info = 1;
+  uint32 field2 = 2;
+}
+
+message ImageFileInfo {
+  uint64 size = 1;
+  string md5 = 2;
+  string sha1 = 3;
+  string name = 4;
+  ImageTypeInfo type = 5;
+  uint32 width = 6;
+  uint32 height = 7;
+  uint32 field9 = 9;
+}
+
+message ImageTypeInfo {
+  uint32 field1 = 1;
+  uint32 pic_type = 2;
+}
+
+message ImageUploadMessage {
+  ImagePicture picture = 1;
+  ImageUploadEmpty field2 = 2;
+  ImageUploadEmpty field3 = 3;
+}
+
+message ImagePicture {
+  uint32 subtype = 1;
+  string summary = 2;
+  ImageSubtype c2c = 11;
+  ImageSubtype group = 12;
+}
+
+message ImageSubtype {
+  uint32 subtype = 1;
+}
+
+message ImageUploadEmpty {
+  bytes field3 = 3;
+  bytes field11 = 11;
+  bytes field12 = 12;
+  bytes field13 = 13;
+}
+
+message ImageUploadResponse {
+  ImageResponseHead head = 1;
+  ImageUploadResult upload = 2;
+}
+
+message ImageResponseHead {
+  int32 code = 2;
+  string message = 3;
+}
+
+message ImageUploadResult {
+  string ukey = 1;
+  repeated ImageUploadAddress addresses = 3;
+  bytes msg_info = 6;
+  bytes compat_qmsg = 8;
+}
+
+message ImageUploadAddress {
+  uint32 host = 1;
+  uint32 port = 2;
+}
+
+message ImageMsgInfo {
+  repeated bytes bodies = 1;
+}
+
+message ImageMsgInfoBody {
+  ImageIndex index = 1;
+}
+
+message ImageIndex {
+  string file_uuid = 2;
+}
+
+message PrivateFileMetadataRequest {
+  uint32 command = 1;
+  uint32 field2 = 2;
+  PrivateFileMetadataQuery query = 10;
+  uint32 field101 = 101;
+  uint32 field102 = 102;
+  uint32 chat_type = 200;
+}
+
+message PrivateFileMetadataQuery {
+  string self_uid = 10;
+  string peer_uid = 20;
+  string file_uuid = 30;
+  string file_hash = 40;
+}
+
+message PrivateFileMetadataResponse {
+  PrivateFileMetadataResult result = 10;
+}
+
+message PrivateFileMetadataResult {
+  int32 code = 10;
+  PrivateFileMetadata metadata = 30;
+}
+
+message PrivateFileMetadata {
+  uint32 field6 = 3;
+  bytes field8 = 100;
+  bytes field7 = 101;
+  uint32 field1 = 110;
+  uint32 timestamp1 = 130;
+}
+
+message GroupFileUploadRequest {
+  GroupFileUploadBody upload = 1;
+}
+
+message GroupFileUploadBody {
+  uint32 group_uin = 1;
+  uint32 field2 = 2;
+  uint32 field3 = 3;
+  uint32 field4 = 4;
+  string parent = 5;
+  string name = 6;
+  string path = 7;
+  uint64 size = 8;
+  bytes sha1 = 9;
+  bytes field10 = 10;
+  bytes md5 = 11;
+  bool field15 = 15;
+}
+
+message GroupFileUploadResponse {
+  GroupFileUploadResult upload = 1;
+}
+
+message GroupFileUploadResult {
+  int32 code = 1;
+  string error = 2;
+  string message = 3;
+  string host = 4;
+  string file_uuid = 7;
+  bytes check_key = 8;
+  bytes upload_key = 9;
+  uint32 exists = 10;
+  uint32 port = 14;
+}
+
+message PrivateFileUploadRequest {
+  uint32 command = 1;
+  uint32 field2 = 2;
+  PrivateFileUploadBody upload = 19;
+  uint32 field101 = 101;
+  uint32 field102 = 102;
+  uint32 chat_type = 200;
+}
+
+message PrivateFileUploadBody {
+  string self_uid = 10;
+  string peer_uid = 20;
+  uint64 size = 30;
+  string name = 40;
+  bytes first_10m_md5 = 50;
+  bytes sha1 = 60;
+  string parent = 70;
+  bytes md5 = 110;
+  bytes field120 = 120;
+}
+
+message PrivateFileUploadResponse {
+  PrivateFileUploadResult upload = 19;
+}
+
+message PrivateFileUploadResult {
+  int32 code = 10;
+  string error = 20;
+  string host = 60;
+  uint32 port = 80;
+  string file_uuid = 90;
+  uint32 exists = 110;
+  string file_hash = 200;
+  repeated PrivateFileMediaAddress addresses = 210;
+  bytes upload_key = 220;
+}
+
+message PrivateFileMediaAddress {
+  uint32 host1 = 1;
+  uint32 port1 = 2;
+  uint32 host2 = 3;
+  uint32 port2 = 4;
+}
+
+message ImageHighwayExt {
+  string file_uuid = 1;
+  string ukey = 2;
+  ImageHighwayNetwork network = 5;
+  repeated bytes msg_info_bodies = 6;
+  uint32 block_size = 10;
+  ImageHighwayHash hash = 11;
+}
+
+message ImageHighwayNetwork {
+  repeated ImageHighwayEndpoint endpoints = 1;
+}
+
+message ImageHighwayEndpoint {
+  ImageHighwayHost host = 1;
+  uint32 port = 2;
+}
+
+message ImageHighwayHost {
+  bool enabled = 1;
+  string host = 2;
+}
+
+message ImageHighwayHash {
+  bytes sha1 = 1;
+}
+
+message FileHighwayExt {
+  uint32 field1 = 1;
+  uint32 field2 = 2;
+  uint32 field3 = 3;
+  FileHighwayEntry entry = 100;
+  uint32 private_file = 200;
+}
+
+message FileHighwayEntry {
+  FileHighwayBusiness business = 100;
+  FileHighwayFile file = 200;
+  FileHighwayClient client = 300;
+  FileHighwayName name = 400;
+  FileHighwayNetwork network = 500;
+}
+
+message FileHighwayBusiness {
+  uint64 self_uin = 100;
+  uint64 peer_uin = 200;
+  uint64 group_uin = 400;
+}
+
+message FileHighwayFile {
+  uint64 size = 100;
+  bytes md5 = 200;
+  bytes check_key = 300;
+  bytes md5_again = 400;
+  string file_uuid = 600;
+  bytes upload_key = 700;
+}
+
+message FileHighwayClient {
+  uint32 field100 = 100;
+  string field200 = 200;
+  uint32 field300 = 300;
+  string version = 400;
+  uint32 field600 = 600;
+}
+
+message FileHighwayName {
+  string name = 100;
+}
+
+message FileHighwayNetwork {
+  FileHighwayEndpoint endpoint = 200;
+}
+
+message FileHighwayEndpoint {
+  FileHighwayHost host = 1;
+  uint32 port = 2;
+}
+
+message FileHighwayHost {
+  uint32 kind = 1;
+  string host = 2;
+}
+
+message HighwayRequestHead {
+  HighwayBaseHead base = 1;
+  HighwaySegmentHead segment = 2;
+  bytes extend_info = 3;
+  uint32 field4 = 4;
+  HighwayLoginSigHead login_sig = 5;
+}
+
+message HighwayResponseHead {
+  HighwaySegmentHead segment = 2;
+  int32 error_code = 3;
+}
+
+message HighwayBaseHead {
+  uint32 version = 1;
+  string self_uin = 2;
+  string command = 3;
+  uint32 sequence = 4;
+  uint32 app_id = 6;
+  uint32 data_flag = 7;
+  uint32 command_id = 8;
+}
+
+message HighwaySegmentHead {
+  uint64 file_size = 2;
+  uint64 offset = 3;
+  uint32 length = 4;
+  int32 return_code = 5;
+  bytes ticket = 6;
+  bytes chunk_md5 = 8;
+  bytes file_md5 = 9;
+}
+
+message HighwayLoginSigHead {
+  uint32 field1 = 1;
+  uint32 app_id = 3;
+}
+
+message SendMessageRequest {
+  RoutingHead routing = 1;
+  ContentHead content = 2;
+  MessageBody body = 3;
+  uint64 client_sequence = 4;
+  uint32 random = 5;
+}
+
+message RoutingHead {
+  C2cRoute c2c = 1;
+  GroupRoute group = 2;
+  PrivateFileRoute private_file = 15;
+}
+
+message C2cRoute {
+  uint64 peer_uin = 1;
+  string peer_uid = 2;
+}
+
+message GroupRoute {
+  uint64 group_uin = 1;
+}
+
+message PrivateFileRoute {
+  uint64 peer_uin = 1;
+  uint32 field2 = 2;
+  string peer_uid = 8;
+}
+
+message ContentHead {
+  uint32 field1 = 1;
+  uint32 field2 = 2;
+  uint32 field3 = 3;
+  uint32 field4 = 4;
+}
+
+message MessageBody {
+  RichText rich_text = 1;
+  PrivateFileContent private_file = 2;
+}
+
+message RichText {
+  repeated Elem elements = 2;
+}
+
+message Elem {
+  TextElem text = 1;
+  FaceElem face = 2;
+  bytes c2c_image = 4;
+  TransElem trans = 5;
+  MarketFaceElem market_face = 6;
+  bytes group_image = 8;
+  SourceMsgElem source = 45;
+  CommonElem common = 53;
+}
+
+message TextElem {
+  string text = 1;
+  bytes mention = 12;
+}
+
+message MentionExtra {
+  uint32 type = 3;
+  uint32 uin = 4;
+  uint32 field5 = 5;
+  string uid = 9;
+}
+
+message FaceElem {
+  uint32 index = 1;
+}
+
+message CommonElem {
+  uint32 service_type = 1;
+  bytes payload = 2;
+  uint32 business_type = 3;
+}
+
+message BigFaceExtra {
+  string pack_id = 1;
+  string sticker_id = 2;
+  uint32 face_id = 3;
+  uint32 source_type = 4;
+  uint32 sticker_type = 5;
+  string result_id = 6;
+  string preview = 7;
+  uint32 random_type = 9;
+}
+
+message SmallFaceExtra {
+  uint32 face_id = 1;
+  string preview = 2;
+  string preview2 = 3;
+}
+
+message MarketFaceElem {
+  string name = 1;
+  uint32 item_type = 2;
+  uint32 face_info = 3;
+  bytes face_id = 4;
+  uint32 package_id = 5;
+  uint32 subtype = 6;
+  string key = 7;
+  uint32 width = 10;
+  uint32 height = 11;
+  MarketFaceReserve reserve = 13;
+}
+
+message MarketFaceReserve {
+  uint32 field8 = 8;
+}
+
+message SourceMsgElem {
+  repeated uint32 original_sequences = 1;
+  uint64 sender_uin = 2;
+  uint32 time = 3;
+  SourceMsgReserve reserve = 8;
+  uint64 to_uin = 10;
+}
+
+message SourceMsgReserve {
+  uint64 message_id = 3;
+  string sender_uid = 6;
+  string receiver_uid = 7;
+  uint32 friend_sequence = 8;
+}
+
+message TransElem {
+  uint32 type = 1;
+  bytes value = 2;
+}
+
+message GroupFileExtra {
+  uint32 type = 1;
+  string name = 2;
+  GroupFileExtraBody body = 7;
+}
+
+message GroupFileExtraBody {
+  GroupFileInfo info = 2;
+}
+
+message GroupFileInfo {
+  uint32 type = 1;
+  string file_uuid = 2;
+  uint64 size = 3;
+  string name = 4;
+  bytes sha1 = 6;
+  string field7 = 7;
+  bytes md5 = 8;
+}
+
+message PrivateFileContent {
+  PrivateFileInfo file = 1;
+  PrivateFileDetailsContainer details = 6;
+}
+
+message PrivateFileInfo {
+  uint32 field1 = 1;
+  string file_uuid = 3;
+  bytes first_10m_md5 = 4;
+  string name = 5;
+  uint64 size = 6;
+  uint32 field9 = 9;
+  uint32 field50 = 50;
+  uint32 expires_at = 55;
+  string file_hash = 57;
+}
+
+message PrivateFileDetailsContainer {
+  PrivateFileDetails details = 2;
+}
+
+message PrivateFileDetails {
+  uint32 field1 = 1;
+  string file_uuid = 4;
+  string name = 5;
+  uint32 field6 = 6;
+  bytes field7 = 7;
+  bytes field8 = 8;
+  uint32 timestamp1 = 9;
+  string file_hash = 14;
+  string self_uid = 15;
+  string peer_uid = 16;
+}
+
+message SendMessageResponse {
+  int32 result = 1;
+  string error = 2;
+  uint32 send_time = 3;
+  uint64 sequence = 11;
+  uint64 client_sequence = 14;
+}

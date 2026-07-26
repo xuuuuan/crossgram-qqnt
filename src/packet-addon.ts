@@ -89,6 +89,10 @@ export interface PacketAddon {
 
 let loadedAddon: PacketAddon | undefined
 const moduleFilename = typeof __filename === 'string' ? __filename : fileURLToPath(import.meta.url)
+declare const __QQNT_BRIDGE_BUILD_DIST_DIR__: string | undefined
+const buildDistDir = typeof __QQNT_BRIDGE_BUILD_DIST_DIR__ === 'string'
+  ? __QQNT_BRIDGE_BUILD_DIST_DIR__
+  : undefined
 
 export function loadPacketAddon(): PacketAddon {
   if (loadedAddon) return loadedAddon
@@ -110,8 +114,11 @@ export function loadPacketAddon(): PacketAddon {
   return loadedAddon = required as PacketAddon
 }
 
-function packetAddonCandidates(): string[] {
-  const sourceDir = dirname(moduleFilename)
+export function packetAddonCandidates(
+  filename = moduleFilename,
+  bundledDistDir = buildDistDir,
+): string[] {
+  const sourceDir = dirname(filename)
   const artifactDir = join(sourceDir, '..', 'native', 'packet-addon', 'artifacts')
   const artifact = existsSync(artifactDir)
     ? readdirSync(artifactDir).find((name) => name.endsWith('.node'))
@@ -122,8 +129,10 @@ function packetAddonCandidates(): string[] {
   return [
     process.env.QQNT_BRIDGE_PACKET_ADDON,
     join(sourceDir, `qqnt_packet.${platformSuffix}.node`),
+    bundledDistDir ? join(bundledDistDir, `qqnt_packet.${platformSuffix}.node`) : undefined,
     artifact ? join(artifactDir, artifact) : undefined,
-  ].filter((candidate): candidate is string => Boolean(candidate))
+  ].filter((candidate, index, candidates): candidate is string =>
+    Boolean(candidate) && candidates.indexOf(candidate) === index)
 }
 
 export function createPacketBindingProber(

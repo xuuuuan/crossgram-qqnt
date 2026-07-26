@@ -5,12 +5,13 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import WebSocket from 'ws'
-import type { ContactMsgBoxInfo, KernelModule, KernelSession, MsgRecord } from './kernel-types.js'
+import type { ContactMsgBoxInfo, KernelModule, KernelSession, MsgElement, MsgRecord } from './kernel-types.js'
 import type { PacketAddon } from './packet-addon.js'
 import { PROTOCOL_VERSION } from './protocol.js'
 import { QQKernelBridge } from './qq-kernel.js'
 import { QQBridgeServer } from './server.js'
 import { QQPacketClient } from './packet-client.js'
+import type { DirectMessagePart } from './upload-protocol.js'
 
 const avatarFixturePath = process.platform === 'win32' ? process.execPath : '/dev/null'
 
@@ -44,6 +45,57 @@ function packetAddonFixture(): PacketAddon {
     locateSendBinding: vi.fn(() => binding),
     installSendHook: vi.fn(() => binding),
   }
+}
+
+function testProtocolElements(part: DirectMessagePart): MsgElement[] {
+  if (part.kind === 'text') return [{
+    elementType: 1, elementId: '',
+    textElement: { content: part.text, atType: 0, atUid: '', atTinyId: '', atNtUid: '' },
+  }]
+  if (part.kind === 'mention') return [{
+    elementType: 1, elementId: '',
+    textElement: {
+      content: part.text, atType: 2, atUid: part.userUin ?? '', atTinyId: '', atNtUid: part.userUid,
+    },
+  }]
+  if (part.kind === 'face') return [{
+    elementType: 6, elementId: '', faceElement: {
+      faceIndex: part.face.faceId, faceText: '[表情]', faceType: part.face.faceType,
+      packId: part.face.packId, stickerId: part.face.stickerId,
+      sourceType: part.face.sourceType, stickerType: part.face.stickerType,
+      resultId: part.face.resultId,
+    },
+  }]
+  if (part.kind === 'market-face') return [{
+    elementType: 11, elementId: '', marketFaceElement: {
+      itemType: 6, faceInfo: 1, emojiPackageId: part.face.packageId,
+      subType: 3, mediaType: 0, imageWidth: part.face.width ?? 300,
+      imageHeight: part.face.height ?? 300, faceName: part.face.name,
+      emojiId: part.face.emojiId, key: part.face.key,
+    },
+  }]
+  if (part.kind === 'reply') return [{
+    elementType: 7, elementId: '', replyElement: {
+      replayMsgId: part.reply.messageId, replayMsgSeq: part.reply.sequence,
+      replyMsgClientSeq: part.reply.clientSequence, replyMsgTime: part.reply.time ? String(part.reply.time) : undefined,
+      senderUin: part.reply.senderUin, senderUidStr: part.reply.senderUid,
+      sourceMsgTextElems: [], replyMsgRevokeType: 0,
+      sourceMsgIsIncPic: false, sourceMsgExpired: false,
+    },
+  }]
+  if (part.kind === 'image') return [{
+    elementType: 2, elementId: 'image-element', picElement: {
+      fileName: part.upload.fileUuid, fileSize: '0', fileUuid: part.upload.fileUuid,
+      fileSubId: '', md5HexStr: '', picWidth: 0, picHeight: 0,
+    },
+  }]
+  return [{
+    elementType: 3, elementId: 'file-element', fileElement: {
+      fileName: part.spec.name, fileSize: String(part.spec.size), filePath: '',
+      fileUuid: part.upload.fileUuid, fileSubId: '', fileMd5: part.spec.md5,
+      fileSha: part.spec.sha1, file10MMd5: part.spec.file10MMd5,
+    },
+  }]
 }
 
 function fixture() {
@@ -226,8 +278,33 @@ function fixture() {
     }),
     getUixConvertService: () => uix,
   } as unknown as KernelSession
+  const imageUpload = vi.spyOn(QQPacketClient.prototype, 'uploadImage')
+    .mockImplementation(async (_chat, _peer, _self, spec, source) => {
+      const chunks: Buffer[] = []
+      for await (const chunk of source) chunks.push(Buffer.from(chunk))
+      sentBodies.push(Buffer.concat(chunks))
+      return {
+        fileUuid: spec.name, ipv4s: [], msgInfo: Buffer.from('msg-info'), msgInfoBodies: [],
+      }
+    })
+  const fileUpload = vi.spyOn(QQPacketClient.prototype, 'uploadFile')
+    .mockImplementation(async (_chat, _peer, _selfUin, _selfUid, spec, source) => {
+      const chunks: Buffer[] = []
+      for await (const chunk of source) chunks.push(Buffer.from(chunk))
+      sentBodies.push(Buffer.concat(chunks))
+      return { fileUuid: spec.name, fileHash: 'file-hash', exists: true, commandId: 95 }
+    })
+  const protocolSend = vi.spyOn(QQPacketClient.prototype, 'sendDirectMessage')
+    .mockImplementation(async (chatType, peerUid, peerUin, parts) => {
+      const elements = parts.flatMap(testProtocolElements)
+      queueMicrotask(() => msgHandlers.onAddSendMsg?.({
+        ...message, chatType, peerUid, peerUin, sendStatus: 2, elements,
+      }))
+      return { sequence: 1n, clientSequence: 2n, sendTime: 3 }
+    })
   return {
     kernel, session, msg, recent, profile, group, search, richMedia, uix, message, sentBodies,
+    imageUpload, fileUpload, protocolSend,
     emitMessages(records: MsgRecord[]) {
       return msgHandlers.onMsgInfoListUpdate?.(records)
     },
@@ -288,6 +365,7 @@ describe('QQKernelBridge', () => {
   const tempPaths: string[] = []
   afterEach(async () => {
     vi.unstubAllGlobals()
+    vi.restoreAllMocks()
     await Promise.all(tempPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })))
   })
 
@@ -310,21 +388,16 @@ describe('QQKernelBridge', () => {
     expect(f.msg.getLatestDbMsgs).toHaveBeenCalledWith(expect.objectContaining({
       chatType: 1, peerUid: 'uid-1715311957',
     }), 50)
-    f.msg.sendMsg.mockImplementationOnce(async () => {
-      queueMicrotask(() => f.emitMessages([{ ...f.message, sendStatus: 2, elements: [{
-        elementType: 6, elementId: 'large-face-echo', faceElement: {
-          faceIndex: 476, faceText: '/不是吧', faceType: 3,
-        },
-      }] }]))
-      return { result: 0, errMsg: '' }
-    })
     const sent = await bridge.send({
       conversationId: dialogs.conversations[0].id, text: 'hello', originRequestId: 'relay-send-1',
     }, Readable.from([]))
     expect(sent).toMatchObject({ id: 'm1', originRequestId: 'relay-send-1' })
     expect(sent.sourceIds).toBeUndefined()
-    expect(f.msg.getMsgUniqueId).toHaveBeenCalledWith(expect.stringMatching(/^\d{13}$/))
-    expect(f.msg.sendMsg).toHaveBeenCalledOnce()
+    expect(f.msg.getMsgUniqueId).not.toHaveBeenCalled()
+    expect(f.protocolSend).toHaveBeenCalledWith(
+      1, 'uid-1715311957', '1715311957', [{ kind: 'text', text: 'hello' }], 'self',
+    )
+    expect(f.msg.sendMsg).not.toHaveBeenCalled()
   })
 
   it.each([
@@ -358,7 +431,8 @@ describe('QQKernelBridge', () => {
       'base64',
     )
     const messageId = `${kind}-native-id`
-    f.msg.sendMsg.mockImplementationOnce(async (_id, _peer, elements) => {
+    f.protocolSend.mockImplementationOnce(async (_chat, _peerUid, _peerUin, parts) => {
+      const elements = parts.flatMap(testProtocolElements)
       queueMicrotask(async () => {
         await f.emitSent({
           ...f.message, msgId: messageId, msgTime: '0', sendStatus: 1,
@@ -367,7 +441,7 @@ describe('QQKernelBridge', () => {
         })
         await f.emitMessages([{ ...f.message, msgId: messageId, sendStatus: 2, elements }])
       })
-      return { result: 0, errMsg: '' }
+      return { sequence: 1n, clientSequence: 2n, sendTime: 3 }
     })
     const subscription = bridge.subscribe()
     const nextEvent = subscription[Symbol.asyncIterator]().next()
@@ -757,23 +831,6 @@ describe('QQKernelBridge', () => {
       }, { type: 'text', text: ' hello' }],
     })
 
-    f.msg.sendMsg.mockImplementationOnce(async () => {
-      queueMicrotask(() => f.emitMessages([{ ...f.message, sendStatus: 2, elements: [
-        { elementType: 7, elementId: 'reply', replyElement: {
-          replayMsgId: 'opaque-original', sourceMsgTextElems: [], replyMsgRevokeType: 0,
-          sourceMsgIsIncPic: false, sourceMsgExpired: false,
-        } },
-        { elementType: 1, elementId: 'prefix', textElement: { content: 'hi ' } },
-        { elementType: 1, elementId: 'mention', textElement: {
-          content: '@Alice', atType: 2, atUid: '12345', atTinyId: '', atNtUid: 'u_opaque_alice',
-        } },
-        { elementType: 6, elementId: 'face', faceElement: {
-          faceIndex: 14, faceText: '[微笑]', faceType: 1,
-        } },
-        { elementType: 1, elementId: 'suffix', textElement: { content: '!' } },
-      ] }]))
-      return { result: 0, errMsg: '' }
-    })
     f.msg.getMsgUniqueId.mockReturnValueOnce('0')
     await bridge.send({
       conversationId: 'uid-1715311957', replyToId: 'opaque-original',
@@ -785,18 +842,16 @@ describe('QQKernelBridge', () => {
         ],
       }],
     }, Readable.from([]))
-    expect(f.msg.sendMsg).toHaveBeenCalledWith('0', expect.anything(), [
-      expect.objectContaining({ elementType: 7, replyElement: expect.objectContaining({ replayMsgId: 'opaque-original' }) }),
-      expect.objectContaining({ elementType: 1, textElement: expect.objectContaining({ content: 'hi ', atType: 0 }) }),
-      expect.objectContaining({
-        elementType: 1,
-        textElement: expect.objectContaining({ content: '@Alice', atType: 2, atUid: '12345', atNtUid: 'u_opaque_alice' }),
-      }),
-      expect.objectContaining({
-        elementType: 6, faceElement: expect.objectContaining({ faceIndex: 14, faceText: '[微笑]', faceType: 1 }),
-      }),
-      expect.objectContaining({ elementType: 1, textElement: expect.objectContaining({ content: '!', atType: 0 }) }),
-    ], expect.any(Map))
+    expect(f.protocolSend).toHaveBeenCalledWith(
+      1, 'uid-1715311957', '1715311957', [
+        expect.objectContaining({ kind: 'reply', reply: expect.objectContaining({ messageId: 'opaque-original' }) }),
+        { kind: 'text', text: 'hi ' },
+        { kind: 'mention', text: '@Alice', userUid: 'u_opaque_alice', userUin: '12345' },
+        { kind: 'face', face: { faceId: 14, faceType: 1 } },
+        { kind: 'text', text: '!' },
+      ], 'self',
+    )
+    expect(f.msg.sendMsg).not.toHaveBeenCalled()
   })
 
   it('maps QQ animated system faces as stickers, opens their catalog asset, and round-trips metadata', async () => {
@@ -849,19 +904,15 @@ describe('QQKernelBridge', () => {
       'OidbSvcTrpcTcp.0x9154_1', Buffer.from('catalog-request'),
     )
 
-    f.msg.sendMsg.mockImplementationOnce(async () => {
-      queueMicrotask(() => f.emitMessages([{ ...f.message, sendStatus: 2 }]))
-      return { result: 0, errMsg: '' }
-    })
     f.msg.getMsgUniqueId.mockReturnValueOnce('0')
     const sent = await bridge.send({ conversationId: 'uid-1715311957', sticker: reference! }, Readable.from([]))
-    expect(f.msg.sendMsg).toHaveBeenCalledWith('0', expect.anything(), [{
-      elementType: 6, elementId: '', faceElement: {
-        faceIndex: 476, faceText: '/不是吧', faceType: 3,
-        packId: '3', stickerId: '476', sourceType: 1, stickerType: 2,
-        resultId: 'result-476', imageType: 1,
-      },
-    }], expect.any(Map))
+    expect(f.protocolSend).toHaveBeenCalledWith(
+      1, 'uid-1715311957', '1715311957', [{ kind: 'face', face: {
+        faceId: 476, faceType: 3, packId: '3', stickerId: '476',
+        sourceType: 1, stickerType: 2, resultId: 'result-476',
+      } }], 'self',
+    )
+    expect(f.msg.sendMsg).not.toHaveBeenCalled()
     expect(sent.parts).toMatchObject([{ type: 'sticker', sticker: {
       stickerId: 'sysface:476', reference: {
         kind: 'sysface', faceId: '476', packId: '3', stickerId: '476',
@@ -1476,22 +1527,20 @@ describe('QQKernelBridge', () => {
       'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
       'base64',
     )
-    f.msg.sendMsg.mockImplementation(async () => {
+    f.protocolSend.mockImplementation(async () => {
       setTimeout(() => f.emitMessages([{ ...f.message, sendStatus: 0 }]), 5)
-      return { result: 0, errMsg: '' }
+      return { sequence: 1n, clientSequence: 2n, sendTime: 3 }
     })
 
     await expect(bridge.send({
       conversationId: 'uid-1715311957',
       media: [{ kind: 'image', name: 'tiny.png', size: png.length }],
     }, Readable.from([png]))).rejects.toThrow('QQ send failed')
-    expect(f.msg.sendMsg).toHaveBeenCalledWith(
-      'm1', expect.objectContaining({ peerUid: 'uid-1715311957' }), [expect.objectContaining({
-        picElement: expect.objectContaining({
-          fileSize: String(png.length), picWidth: 1, picHeight: 1,
-          md5HexStr: 'e44e7ecfec99356632c13cd3eaa3e250',
-        }),
-      })], expect.any(Map),
+    expect(f.imageUpload).toHaveBeenCalledWith(
+      1, 'uid-1715311957', '10000', expect.objectContaining({
+        name: 'tiny.png', size: png.length, width: 1, height: 1,
+        md5: 'e44e7ecfec99356632c13cd3eaa3e250',
+      }), expect.anything(),
     )
   })
 
@@ -1500,20 +1549,15 @@ describe('QQKernelBridge', () => {
     const bridge = new QQKernelBridge()
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
     const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xd9])
-    f.msg.sendMsg.mockImplementation(async () => {
-      queueMicrotask(() => f.emitMessages([{ ...f.message, sendStatus: 2 }]))
-      return { result: 0, errMsg: '' }
-    })
-
     await bridge.send({
       conversationId: 'uid-1715311957',
       media: [{ kind: 'image', name: 'wide.jpeg', size: jpeg.length, width: 1096, height: 892 }],
     }, Readable.from([jpeg]))
 
-    expect(f.msg.sendMsg).toHaveBeenCalledWith(
-      'm1', expect.objectContaining({ peerUid: 'uid-1715311957' }), [expect.objectContaining({
-        picElement: expect.objectContaining({ picWidth: 1096, picHeight: 892, picType: 1000 }),
-      })], expect.any(Map),
+    expect(f.imageUpload).toHaveBeenCalledWith(
+      1, 'uid-1715311957', '10000', expect.objectContaining({
+        name: 'wide.jpeg', width: 1096, height: 892, picType: 1000,
+      }), expect.anything(),
     )
   })
 
@@ -1530,11 +1574,6 @@ describe('QQKernelBridge', () => {
     const frame = (bytes: Buffer) => [
       Buffer.from([0, 0, 0, bytes.length]), bytes, Buffer.alloc(4),
     ]
-    f.msg.sendMsg.mockImplementationOnce(async (_id, _peer, elements) => {
-      queueMicrotask(() => f.emitMessages([{ ...f.message, sendStatus: 2, elements }]))
-      return { result: 0, errMsg: '' }
-    })
-
     const sent = await bridge.send({
       conversationId: 'uid-1715311957', mediaFraming: 'length-prefixed-v1',
       media: [
@@ -1543,12 +1582,17 @@ describe('QQKernelBridge', () => {
       ],
     }, Readable.from([...frame(first), ...frame(second)]))
 
-    expect(f.msg.sendMsg).toHaveBeenCalledWith(
-      'm1', expect.anything(), [
-        expect.objectContaining({ picElement: expect.objectContaining({ md5HexStr: 'e44e7ecfec99356632c13cd3eaa3e250' }) }),
-        expect.objectContaining({ picElement: expect.objectContaining({ md5HexStr: '5b118909b999cf913eb2ab9e8972fbe0' }) }),
-      ], expect.any(Map),
+    expect(f.imageUpload).toHaveBeenNthCalledWith(
+      1, 1, 'uid-1715311957', '10000',
+      expect.objectContaining({ name: 'first.png', md5: 'e44e7ecfec99356632c13cd3eaa3e250' }),
+      expect.anything(),
     )
+    expect(f.imageUpload).toHaveBeenNthCalledWith(
+      2, 1, 'uid-1715311957', '10000',
+      expect.objectContaining({ name: 'second.png', md5: '5b118909b999cf913eb2ab9e8972fbe0' }),
+      expect.anything(),
+    )
+    expect(f.protocolSend.mock.calls.at(-1)?.[3]).toHaveLength(2)
     expect(sent.parts.filter((part) => part.type === 'media')).toHaveLength(2)
   })
 
@@ -1677,19 +1721,19 @@ describe('QQKernelBridge', () => {
         },
       }],
     } satisfies MsgRecord
-    f.msg.sendMsg.mockImplementation(async () => {
+    f.protocolSend.mockImplementation(async () => {
       queueMicrotask(() => f.emitMessages([record]))
-      return { result: 0, errMsg: '' }
+      return { sequence: 1n, clientSequence: 2n, sendTime: 3 }
     })
     const sent = await bridge.send({
       conversationId: 'uid-1715311957', sticker: pack!.stickers[0].reference,
     }, Readable.from([]))
-    expect(f.msg.sendMsg).toHaveBeenCalledWith(
-      'm1', expect.anything(), [expect.objectContaining({
-        elementType: 11,
-        marketFaceElement: expect.objectContaining({ emojiPackageId: 42, emojiId: 'emoji-a', key: 'secret' }),
-      })], expect.any(Map),
+    expect(f.protocolSend).toHaveBeenCalledWith(
+      1, 'uid-1715311957', '1715311957', [{ kind: 'market-face', face: expect.objectContaining({
+        packageId: 42, emojiId: 'emoji-a', key: 'secret',
+      }) }], 'self',
     )
+    expect(f.msg.sendMsg).not.toHaveBeenCalled()
     expect(sent.parts).toMatchObject([{ type: 'sticker', sticker: {
       stickerId: 'market:42:emoji-a', format: 'animated', mimeType: 'image/gif',
       reference: { animated: true, key: 'secret', dynamicPath },
@@ -1903,17 +1947,17 @@ describe('QQKernelBridge', () => {
       },
     }, Readable.from([]))
 
-    expect(f.msg.getRichMediaFilePath).toHaveBeenCalledWith(
-      2, 1, 'e44e7ecfec99356632c13cd3eaa3e250',
-      'e44e7ecfec99356632c13cd3eaa3e250.png', 1, 0, true,
+    expect(f.msg.getRichMediaFilePath).not.toHaveBeenCalled()
+    expect(f.imageUpload).toHaveBeenCalledWith(
+      1, 'uid-1715311957', '10000', expect.objectContaining({
+        name: 'favorite.png', size: png.length, picSubType: 1,
+        md5: 'e44e7ecfec99356632c13cd3eaa3e250',
+      }), expect.anything(),
     )
-    expect(f.msg.sendMsg).toHaveBeenCalledWith(
-      'm1', expect.anything(), [expect.objectContaining({
-        picElement: expect.objectContaining({
-          picSubType: 1, md5HexStr: 'e44e7ecfec99356632c13cd3eaa3e250', sourcePath: nativePath,
-        }),
-      })], expect.any(Map),
+    expect(f.protocolSend).toHaveBeenCalledWith(
+      1, 'uid-1715311957', '1715311957', [expect.objectContaining({ kind: 'image' })], 'self',
     )
+    expect(f.msg.sendMsg).not.toHaveBeenCalled()
     expect(f.sentBodies).toEqual([png])
     await expect(readFile(sourcePath)).resolves.toEqual(png)
   })
@@ -2559,7 +2603,8 @@ describe('QQBridgeServer', () => {
     const f = fixture()
     f.msg.getMsgUniqueId.mockReturnValue('0')
     let sendIndex = 0
-    f.msg.sendMsg.mockImplementation(async (_id, _peer, elements) => {
+    f.protocolSend.mockImplementation(async (_chatType, _peerUid, _peerUin, parts) => {
+      const elements = parts.flatMap(testProtocolElements)
       const messageId = `media-http-${++sendIndex}`
       queueMicrotask(async () => {
         await f.emitSent({
@@ -2568,7 +2613,7 @@ describe('QQBridgeServer', () => {
         })
         await f.emitMessages([{ ...f.message, msgId: messageId, sendStatus: 2, elements }])
       })
-      return { result: 0, errMsg: '' }
+      return { sequence: BigInt(sendIndex), clientSequence: BigInt(sendIndex), sendTime: 0 }
     })
     const bridge = new QQKernelBridge()
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })

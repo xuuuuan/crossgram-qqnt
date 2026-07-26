@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { createPacketBindingProber, createPacketHookInstaller, loadPacketAddon, type NativeSendBindingLocation, type PacketBindingProbe } from './packet-addon.js'
+import { dirname, join } from 'node:path'
+import { createPacketBindingProber, createPacketHookInstaller, loadPacketAddon, packetAddonCandidates, type NativeSendBindingLocation, type PacketBindingProbe } from './packet-addon.js'
 
 describe('native packet addon', () => {
   afterEach(() => {
@@ -35,6 +36,20 @@ describe('native packet addon', () => {
     const request = loadPacketAddon().encodeFetchSysFacesRequest()
     expect(request.command).toBe('OidbSvcTrpcTcp.0x9154_1')
     expect(request.payload.toString('hex')).toBe('08d4a2021001220510071a01306001')
+  })
+
+  it('keeps the build dist addon candidate when the bundle is evaled from QQ app.asar', () => {
+    const filename = join('qq', 'versions', '9.9.33', 'resources', 'app.asar')
+    const dist = join('workspace', 'qqnt-bridge', 'dist')
+    const suffix = process.platform === 'win32'
+      ? `${process.platform}-${process.arch}-msvc`
+      : `${process.platform}-${process.arch}-gnu`
+    const candidates = packetAddonCandidates(
+      filename,
+      dist,
+    )
+    expect(candidates[0]).toBe(join(dirname(filename), `qqnt_packet.${suffix}.node`))
+    expect(candidates).toContain(join(dist, `qqnt_packet.${suffix}.node`))
   })
 
   it('prevents synchronous recursive probes and restores the prober state', () => {
