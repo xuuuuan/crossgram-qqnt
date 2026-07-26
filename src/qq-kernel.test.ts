@@ -414,6 +414,27 @@ describe('QQKernelBridge', () => {
     expect(f.msg.sendMsg).not.toHaveBeenCalled()
   })
 
+  it('confirms private packet sends by the returned client sequence without a listener callback', async () => {
+    const f = fixture()
+    f.protocolSend.mockResolvedValueOnce({ sequence: 0n, clientSequence: 1684n, sendTime: 3 })
+    f.msg.getMsgsBySeqAndCount.mockResolvedValueOnce({
+      result: 0, errMsg: '', msgList: [{ ...f.message, msgSeq: '1684' }],
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    const sent = await bridge.send({
+      conversationId: 'uid-1715311957', text: 'hello', originRequestId: 'relay-private-sequence',
+    }, Readable.from([]))
+
+    expect(sent).toMatchObject({ id: 'm1', originRequestId: 'relay-private-sequence' })
+    expect(f.msg.getMsgsBySeqAndCount).toHaveBeenCalledWith(expect.objectContaining({
+      chatType: 1, peerUid: 'uid-1715311957',
+    }), '1684', 1, true, true)
+    expect(f.msg.getLatestDbMsgs).not.toHaveBeenCalled()
+    expect(f.msg.sendMsg).not.toHaveBeenCalled()
+  })
+
   it.each([
     {
       kind: 'image',

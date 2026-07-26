@@ -1292,19 +1292,15 @@ export class QQKernelBridge {
         peerUin,
         protocolParts,
         this.requireConfig().selfUid,
-      ).then(() => ({ result: 0, errMsg: '' }))
-      const result = await Promise.race([
+      )
+      const sendResponse = await Promise.race([
         sendRequest,
-        pending.promise.then(() => ({ result: 0, errMsg: '' })),
+        pending.promise.then(() => undefined),
       ])
-      if (result.result !== 0) {
-        this.pendingMessages.delete(id)
-        this.pendingAcceptances.delete(id)
-        this.pendingMinimumStatuses.delete(id)
-        removePending(this.pendingUnassigned, pending)
-        throw new Error(`MessageSvc.PbSendMsg: ${result.errMsg} (${result.result})`)
+      if (!sendResponse) {
+        log('info', `protocol API callback arrived before response name=MessageSvc.PbSendMsg conversation=${conversation.id}`)
       }
-      log('info', `protocol API accepted name=MessageSvc.PbSendMsg conversation=${conversation.id} message=${id} result=${result.result} err=${JSON.stringify(result.errMsg)}`)
+      log('info', `protocol API accepted name=MessageSvc.PbSendMsg conversation=${conversation.id} message=${id}`)
       const pollController = new AbortController()
       const confirmationPoll = this.pollSentMessage(
         conversation,
@@ -1314,6 +1310,11 @@ export class QQKernelBridge {
         manifest.media?.[0]?.name,
         minimumStatus,
         pollController.signal,
+        sendResponse
+          ? String(conversation.chatType === CHAT_C2C
+              ? sendResponse.clientSequence || sendResponse.sequence
+              : sendResponse.sequence || sendResponse.clientSequence)
+          : undefined,
       )
       const record = await withTimeout(Promise.race([
         pending.promise,
@@ -2611,6 +2612,7 @@ export class QQKernelBridge {
     expectedMediaName: string | undefined,
     minimumStatus: number,
     signal: AbortSignal,
+    sequenceHint?: string,
   ): Promise<MsgRecord> {
     // Some QQ groups omit the final listener notification. Text sends are
     // accepted at kSending=1, while media must reach kSuccess=2 so an upload
@@ -2619,6 +2621,22 @@ export class QQKernelBridge {
     const service = this.requireMsgService()
     while (true) {
       if (signal.aborted) throw signal.reason ?? new Error('send confirmation polling aborted')
+      if (sequenceHint && sequenceHint !== '0' && service.getMsgsBySeqAndCount) {
+        const hinted = await withTimeout(
+          Promise.resolve().then(() => service.getMsgsBySeqAndCount!(
+            contact(conversation), sequenceHint, 1, true, true,
+          )),
+          2_000,
+          'QQ sequence confirmation timed out',
+        ).catch((error) => {
+          log('error', `send sequence confirmation failed conversation=${conversation.id} seq=${sequenceHint}`, error)
+          return { result: -1, errMsg: '', msgList: [] as MsgRecord[] }
+        })
+        const found = hinted.msgList.find((record) =>
+          record.senderUid === this.config?.selfUid || SEND_FROM_SELF.has(record.sendType))
+        if (found?.sendStatus === 0) throw new Error(`QQ send failed: ${found.msgId}`)
+        if (found && found.sendStatus >= minimumStatus) return found
+      }
       const response = await withTimeout(
         Promise.resolve().then(() => service.getLatestDbMsgs
           ? service.getLatestDbMsgs(contact(conversation), 20)
