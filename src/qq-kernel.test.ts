@@ -1294,6 +1294,7 @@ describe('QQKernelBridge', () => {
         elementType: 10, elementId: 'merged',
         arkElement: { bytesData: JSON.stringify({
           app: 'com.tencent.multimsg', prompt: 'Alice & Bob 的聊天记录',
+          meta: { detail: { news: [{ text: 'Alice: hello' }, { text: 'Bob: world' }] } },
         }) },
       }],
     }
@@ -1322,6 +1323,7 @@ describe('QQKernelBridge', () => {
     await expect(bridge.forwardMessages(conversation, ['m1', 'm2'], conversation, true)).resolves.toMatchObject([
       { id: 'merged-1', parts: [{
         type: 'multi-forward', title: 'Alice & Bob 的聊天记录',
+        preview: 'Alice: hello\nBob: world',
         locator: { conversationId: 'uid-1715311957', rootMessageId: 'merged-1' },
       }] },
     ])
@@ -1338,7 +1340,10 @@ describe('QQKernelBridge', () => {
       ...f.message, msgId: 'nested-1', chatType: 1, peerUid: 'archived-direct-peer',
       elements: [{
         elementType: 16, elementId: 'nested',
-        multiForwardMsgElement: { fileName: '嵌套聊天记录', resId: 'nested-res' },
+        multiForwardMsgElement: {
+          fileName: '嵌套聊天记录', resId: 'nested-res',
+          xmlContent: '<msg><item><summary><![CDATA[Carol: 图片\nDave: 收到]]></summary></item></msg>',
+        },
       }],
     }
     f.msg.getMultiMsg.mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [nested] })
@@ -1347,6 +1352,7 @@ describe('QQKernelBridge', () => {
     })).resolves.toMatchObject([{
       id: 'nested-1', parts: [{
         type: 'multi-forward', title: '嵌套聊天记录',
+        preview: 'Carol: 图片\nDave: 收到',
         locator: {
           // Nested archive records retain their original peer. The locator must
           // keep using the physical conversation that contains the outer card.
