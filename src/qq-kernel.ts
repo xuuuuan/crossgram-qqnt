@@ -2391,8 +2391,7 @@ export class QQKernelBridge {
         if (index < 0 && outgoing && source === 'onAddSendMsg' && record.sendStatus >= 1) {
           index = this.pendingUnassigned.findIndex((item) =>
             !item.assignedMessageId
-            && item.conversationId === id
-            && Number(record.msgTime) >= item.startedAt - 2)
+            && item.conversationId === id)
         }
         if (index >= 0) {
           this.pendingUnassigned[index].assignedMessageId ??= record.msgId

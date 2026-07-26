@@ -361,7 +361,7 @@ describe('QQKernelBridge', () => {
     f.msg.sendMsg.mockImplementationOnce(async (_id, _peer, elements) => {
       queueMicrotask(async () => {
         await f.emitSent({
-          ...f.message, msgId: messageId, sendStatus: 1,
+          ...f.message, msgId: messageId, msgTime: '0', sendStatus: 1,
           // QQ's first media callback can expose only a renderer placeholder.
           elements: [{ elementType: 1, elementId: 'placeholder', textElement: { content: `[${kind}]` } }],
         })
@@ -2557,7 +2557,7 @@ describe('QQBridgeServer', () => {
       const messageId = `media-http-${++sendIndex}`
       queueMicrotask(async () => {
         await f.emitSent({
-          ...f.message, msgId: messageId, sendStatus: 1,
+          ...f.message, msgId: messageId, msgTime: '0', sendStatus: 1,
           elements: [{ elementType: 1, elementId: 'placeholder', textElement: { content: '[媒体]' } }],
         })
         await f.emitMessages([{ ...f.message, msgId: messageId, sendStatus: 2, elements }])
