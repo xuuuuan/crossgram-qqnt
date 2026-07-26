@@ -2908,6 +2908,7 @@ export class QQKernelBridge {
         parts.push({
           type: 'multi-forward',
           title: multiForwardTitle(element.multiForwardMsgElement),
+          preview: multiForwardPreview(element.multiForwardMsgElement),
           locator: {
             conversationId: context.multiForwardConversationId
               ?? conversationId(record.chatType as 1 | 2, record.peerUid),
@@ -2919,6 +2920,7 @@ export class QQKernelBridge {
         parts.push({
           type: 'multi-forward',
           title: arkMultiForwardTitle(element.arkElement.bytesData),
+          preview: arkMultiForwardPreview(element.arkElement.bytesData),
           locator: {
             conversationId: context.multiForwardConversationId
               ?? conversationId(record.chatType as 1 | 2, record.peerUid),
@@ -4445,6 +4447,22 @@ function multiForwardTitle(element: NonNullable<MsgElement['multiForwardMsgEleme
   return '聊天记录'
 }
 
+function multiForwardPreview(
+  element: NonNullable<MsgElement['multiForwardMsgElement']>,
+): string | undefined {
+  const match = element.xmlContent
+    ?.match(/<summary\b[^>]*>(?:<!\[CDATA\[([\s\S]*?)\]\]>|([\s\S]*?))<\/summary>/i)
+  return normalizeMultiForwardPreview(match?.[1] ?? match?.[2] ?? '') || undefined
+}
+
+function normalizeMultiForwardPreview(value: string): string {
+  return decodeXmlText(value.replace(/<br\s*\/?\s*>/gi, '\n').replace(/<[^>]+>/g, ' '))
+    .split(/\r?\n/)
+    .map((line) => line.replace(/[\t ]+/g, ' ').trim())
+    .filter(Boolean)
+    .join('\n')
+}
+
 function decodeXmlText(text: string): string {
   return text.replace(/&(amp|lt|gt|quot|apos|#\d+|#x[\da-f]+);/gi, (entity, code: string) => {
     if (code[0] === '#') {
@@ -5089,6 +5107,26 @@ function arkMultiForwardTitle(bytesData: string): string {
     // Keep an addressable card even if a future QQ build changes the payload.
   }
   return '聊天记录'
+}
+
+function arkMultiForwardPreview(bytesData: string): string | undefined {
+  try {
+    const root = recordValue(JSON.parse(bytesData) as unknown)
+    const meta = recordValue(root?.meta)
+    for (const value of Object.values(meta ?? {})) {
+      const detail = recordValue(value)
+      const news = detail?.news
+      if (!Array.isArray(news)) continue
+      const lines = news.map((item) => {
+        const record = recordValue(item)
+        return record ? firstString(record, ['text', 'summary', 'desc', 'title']) : ''
+      }).filter(Boolean)
+      if (lines.length) return lines.join('\n')
+    }
+  } catch {
+    // Future QQ payloads can omit or reshape the native preview list.
+  }
+  return undefined
 }
 
 function pngDimensions(bytes: Uint8Array): { width: number, height: number } | undefined {

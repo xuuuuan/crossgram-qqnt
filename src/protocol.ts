@@ -144,7 +144,7 @@ export interface QQMessage {
     | QQTextPart
     | { type: 'media', media: QQMedia }
     | { type: 'sticker', sticker: QQSticker }
-    | { type: 'multi-forward', title: string, locator: QQMultiForwardLocator }
+    | { type: 'multi-forward', title: string, preview?: string, locator: QQMultiForwardLocator }
     | { type: 'card', card: QQCard }
   >
   /** Per-message state only. The shared definition catalog has its own endpoint. */
