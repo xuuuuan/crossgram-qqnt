@@ -8,16 +8,16 @@ import { AsyncQueue, deferred } from './async.js'
 import { markBridgeListener } from './listener-tee.js'
 import { log } from './log.js'
 import { resolveMultiForwardParticipants } from './multi-forward-participants.js'
-import { QQPacketClient, type QQPacketClientOptions } from './packet-client.js'
-import type { DirectMessagePart } from './upload-protocol.js'
+import { QQPacketClient, type DirectHighwayUpload, type QQPacketClientOptions } from './packet-client.js'
+import { HIGHWAY_BLOCK_SIZE, type DirectMessagePart } from './upload-protocol.js'
 import type {
   CustomEmotionData, EmojiLikesUserInfo, FileTransNotifyInfo, GroupProfileInfo, InitSessionConfig, KernelModule, KernelSession,
   MarketStickerPackInfo, MemberInfo, MsgElement, MsgRecord, ProfileSimpleInfo, RecentContactInfo, SearchMsgKeywordsResult,
 } from './kernel-types.js'
 import {
   conversationId, parseConversationId, type HistoryQuery, type MemberPage, type QQCard, type QQConversation, type QQEvent,
-  type QQMedia, type QQMediaLocator, type QQMessage, type QQMultiForwardLocator, type QQReactionContext, type QQReactionDefinition, type QQReactionState,
-  type QQSticker, type QQStickerPack, type QQStickerPackSummary, type QQStickerReference, type QQTextPart, type SearchPage, type SearchQuery, type SendManifest,
+  type QQMedia, type QQMediaLocator, type QQMediaUploadPlan, type QQMessage, type QQMultiForwardLocator, type QQReactionContext, type QQReactionDefinition, type QQReactionState,
+  type QQSendMediaSpec, type QQSticker, type QQStickerPack, type QQStickerPackSummary, type QQStickerReference, type QQTextPart, type SearchPage, type SearchQuery, type SendManifest,
 } from './protocol.js'
 
 const CHAT_C2C = 1
@@ -1139,6 +1139,48 @@ export class QQKernelBridge {
     if (result.result !== 0) throw new Error(`addFavEmoji: ${result.errMsg} (${result.result})`)
   }
 
+  async prepareMediaUpload(conversationId: string, spec: QQSendMediaSpec): Promise<QQMediaUploadPlan> {
+    const conversation = this.getConversation(conversationId)
+    if (spec.kind !== 'image' && spec.kind !== 'file') throw new Error('media upload kind must be image or file')
+    if (!spec.name) throw new Error('media upload name is required')
+    const size = spec.size
+    const md5 = spec.md5
+    const sha1 = spec.sha1
+    if (size === undefined || !md5 || !sha1) throw new Error('media upload preparation requires size, MD5, and SHA-1')
+    const packet = this.packetClientForSession()
+    const config = this.requireConfig()
+    if (spec.kind === 'image') {
+      const plan = await packet.prepareImageUpload(conversation.chatType as 1 | 2, conversation.peerUid, {
+        name: spec.name, size, md5, sha1, width: spec.width, height: spec.height,
+        picType: imagePicType(spec.name),
+      })
+      return {
+        prepared: {
+          kind: 'image' as const,
+          fileUuid: plan.upload.fileUuid,
+          msgInfo: plan.upload.msgInfo.toString('base64url'),
+          ...(plan.upload.compatQMsg ? { compatQMsg: plan.upload.compatQMsg.toString('base64url') } : {}),
+        },
+        ...(plan.highway ? { highway: wireHighwayUpload(plan.highway, config.selfUin, size, md5) } : {}),
+      }
+    }
+    if (!spec.file10MMd5) throw new Error('file upload preparation requires 10 MiB MD5')
+    const plan = await packet.prepareFileUpload(
+      conversation.chatType as 1 | 2, conversation.peerUid, config.selfUin, config.selfUid,
+      { name: spec.name, size, md5, sha1, file10MMd5: spec.file10MMd5 },
+    )
+    return {
+      prepared: {
+        kind: 'file' as const,
+        fileUuid: plan.upload.fileUuid,
+        fileHash: plan.upload.fileHash,
+        exists: plan.upload.exists,
+        commandId: plan.upload.commandId,
+      },
+      ...(plan.highway ? { highway: wireHighwayUpload(plan.highway, config.selfUin, size, md5) } : {}),
+    }
+  }
+
   async send(manifest: SendManifest, body: Readable): Promise<QQMessage> {
     const conversation = this.getConversation(manifest.conversationId)
     const peerUin = await this.requireProtocolPeerUin(conversation)
@@ -1151,6 +1193,9 @@ export class QQKernelBridge {
     const sentMediaPaths: Array<string | undefined> = []
     let preserveUntil: number | undefined
     try {
+      if (manifest.uploadedMedia && !manifest.media?.length) {
+        throw new Error('uploaded media requires matching media metadata')
+      }
       if (manifest.sticker && manifest.media?.length) throw new Error('a message cannot contain both sticker and media')
       if (manifest.sticker?.kind === 'sysface') {
         this.stickers.set(sysFaceStickerId(manifest.sticker.faceId), stickerFromReference(manifest.sticker))
@@ -1195,11 +1240,51 @@ export class QQKernelBridge {
         protocolParts.push({ kind: 'image', upload: uploaded })
       }
       if (manifest.media?.length) {
-        if (manifest.media.length > 1 && manifest.mediaFraming !== 'length-prefixed-v1') {
+        if (manifest.uploadedMedia && manifest.uploadedMedia.length !== manifest.media.length) {
+          throw new Error('uploaded media count does not match media metadata')
+        }
+        if (!manifest.uploadedMedia && manifest.media.length > 1 && manifest.mediaFraming !== 'length-prefixed-v1') {
           throw new Error('multiple media items require length-prefixed-v1 framing')
         }
-        const reader = manifest.mediaFraming === 'length-prefixed-v1' ? new FramedUploadReader(body) : undefined
+        const reader = !manifest.uploadedMedia && manifest.mediaFraming === 'length-prefixed-v1'
+          ? new FramedUploadReader(body)
+          : undefined
+        if (manifest.uploadedMedia) body.resume()
         for (const [index, spec] of manifest.media.entries()) {
+          const prepared = manifest.uploadedMedia?.[index]
+          if (prepared) {
+            if (prepared.kind !== spec.kind) throw new Error(`uploaded media ${index} kind does not match`)
+            const size = spec.size
+            const md5 = spec.md5
+            const sha1 = spec.sha1
+            if (size === undefined || !md5 || !sha1) throw new Error(`uploaded media ${index} metadata is incomplete`)
+            if (prepared.kind === 'image') {
+              const msgInfo = Buffer.from(prepared.msgInfo, 'base64url')
+              if (!prepared.fileUuid || !msgInfo.length) throw new Error(`uploaded image ${index} metadata is incomplete`)
+              protocolParts.push({ kind: 'image', upload: {
+                fileUuid: prepared.fileUuid, ipv4s: [], msgInfo, msgInfoBodies: [],
+                ...(prepared.compatQMsg ? { compatQMsg: Buffer.from(prepared.compatQMsg, 'base64url') } : {}),
+              } })
+              continue
+            }
+            if (!spec.file10MMd5) throw new Error(`uploaded file ${index} metadata is incomplete`)
+            const expectedCommand = conversation.chatType === CHAT_GROUP ? 71 : 95
+            if (!prepared.fileUuid || prepared.commandId !== expectedCommand) {
+              throw new Error(`uploaded file ${index} protocol metadata is invalid`)
+            }
+            const uploaded = {
+              fileUuid: prepared.fileUuid, fileHash: prepared.fileHash,
+              exists: prepared.exists, commandId: prepared.commandId,
+            }
+            await this.packetClientForSession().completeFileUpload(
+              conversation.chatType as 1 | 2, conversation.peerUid, this.requireConfig().selfUid, uploaded,
+            )
+            protocolParts.push({
+              kind: 'file', upload: uploaded,
+              spec: { name: spec.name, size, md5, sha1, file10MMd5: spec.file10MMd5 },
+            })
+            continue
+          }
           const mediaBody = reader ? reader.media(index) : body
           let path: string | undefined
           let size = spec.size
@@ -5014,6 +5099,25 @@ function webpDimensions(bytes: Uint8Array): { width: number, height: number } | 
 
 function positiveDimensions(width: number, height: number): { width: number, height: number } | undefined {
   return width > 0 && height > 0 ? { width, height } : undefined
+}
+
+function wireHighwayUpload(
+  highway: DirectHighwayUpload,
+  selfUin: string,
+  fileSize: number,
+  fileMd5: string,
+) {
+  return {
+    servers: highway.session.servers,
+    ticket: highway.session.ticket.toString('base64url'),
+    extendInfo: highway.extendInfo.toString('base64url'),
+    selfUin,
+    commandId: highway.commandId,
+    sequenceStart: highway.sequenceStart,
+    blockSize: HIGHWAY_BLOCK_SIZE,
+    fileSize,
+    fileMd5,
+  }
 }
 
 function imagePicType(name: string): number {

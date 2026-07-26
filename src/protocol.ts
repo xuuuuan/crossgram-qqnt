@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 18
+export const PROTOCOL_VERSION = 19
 
 export type QQChatType = 1 | 2
 
@@ -268,6 +268,54 @@ export interface QQReactionSummary {
   recentActors?: Array<{ userId: string }>
 }
 
+export interface QQSendMediaSpec {
+  kind: 'image' | 'file'
+  name: string
+  mimeType?: string
+  size?: number
+  /** Full-file hashes supplied by the relay so protocol upload needs no local staging pass. */
+  md5?: string
+  sha1?: string
+  /** MD5 of the first min(10 MiB, file size), used by private-file upload. */
+  file10MMd5?: string
+  width?: number
+  height?: number
+  duration?: number
+}
+
+export type QQPreparedMedia =
+  | {
+      kind: 'image'
+      fileUuid: string
+      msgInfo: string
+      compatQMsg?: string
+    }
+  | {
+      kind: 'file'
+      fileUuid: string
+      fileHash?: string
+      exists: boolean
+      commandId: 71 | 95
+    }
+
+export interface QQHighwayUpload {
+  servers: Array<{ host: string, port: number }>
+  ticket: string
+  extendInfo: string
+  selfUin: string
+  commandId: number
+  sequenceStart: number
+  blockSize: number
+  fileSize: number
+  fileMd5: string
+}
+
+export interface QQMediaUploadPlan {
+  prepared: QQPreparedMedia
+  /** Absent when QQ reports that the bytes already exist on its CDN. */
+  highway?: QQHighwayUpload
+}
+
 export interface SendManifest {
   conversationId: string
   text?: string
@@ -277,20 +325,9 @@ export interface SendManifest {
   sticker?: QQStickerReference
   /** Length-prefixed chunks terminated by a zero-length frame for each media item. */
   mediaFraming?: 'length-prefixed-v1'
-  media?: Array<{
-    kind: 'image' | 'file'
-    name: string
-    mimeType?: string
-    size?: number
-    /** Full-file hashes supplied by the relay so protocol upload needs no local staging pass. */
-    md5?: string
-    sha1?: string
-    /** MD5 of the first min(10 MiB, file size), used by private-file upload. */
-    file10MMd5?: string
-    width?: number
-    height?: number
-    duration?: number
-  }>
+  media?: QQSendMediaSpec[]
+  /** CDN metadata returned by /uploads/prepare after the platform uploaded Highway bytes directly. */
+  uploadedMedia?: QQPreparedMedia[]
 }
 
 export interface HistoryQuery {

@@ -11,7 +11,7 @@ import { PROTOCOL_VERSION } from './protocol.js'
 import { QQKernelBridge } from './qq-kernel.js'
 import { QQBridgeServer } from './server.js'
 import { QQPacketClient } from './packet-client.js'
-import type { DirectMessagePart } from './upload-protocol.js'
+import { HIGHWAY_BLOCK_SIZE, type DirectMessagePart } from './upload-protocol.js'
 
 const avatarFixturePath = process.platform === 'win32' ? process.execPath : '/dev/null'
 
@@ -1805,6 +1805,90 @@ describe('QQKernelBridge', () => {
     expect(f.sentBodies).toEqual([])
   })
 
+  it('returns a direct Highway plan and sends its uploaded image metadata with an empty body', async () => {
+    const f = fixture()
+    const prepare = vi.spyOn(QQPacketClient.prototype, 'prepareImageUpload').mockResolvedValue({
+      upload: {
+        fileUuid: 'prepared-image', ipv4s: [{ host: '127.0.0.1', port: 8080 }],
+        msgInfo: Buffer.from('prepared-msg-info'), msgInfoBodies: [Buffer.from('body')],
+        compatQMsg: Buffer.from('compat'), ukey: 'ukey',
+      },
+      highway: {
+        session: { ticket: Buffer.from('ticket'), servers: [{ host: '127.0.0.1', port: 8080 }] },
+        extendInfo: Buffer.from('extend'), commandId: 1003, sequenceStart: 41,
+      },
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const media = {
+      kind: 'image' as const, name: 'direct.png', size: 3,
+      md5: '5289df737df57326fcdd22597afb1fac', sha1: '7037807198c22a7d2b0807371d763779a84fdfcf',
+      width: 1, height: 1,
+    }
+
+    const plan = await bridge.prepareMediaUpload('uid-1715311957', media)
+    expect(plan).toEqual({
+      prepared: {
+        kind: 'image', fileUuid: 'prepared-image',
+        msgInfo: Buffer.from('prepared-msg-info').toString('base64url'),
+        compatQMsg: Buffer.from('compat').toString('base64url'),
+      },
+      highway: {
+        servers: [{ host: '127.0.0.1', port: 8080 }],
+        ticket: Buffer.from('ticket').toString('base64url'),
+        extendInfo: Buffer.from('extend').toString('base64url'),
+        selfUin: '10000', commandId: 1003, sequenceStart: 41,
+        blockSize: HIGHWAY_BLOCK_SIZE, fileSize: 3,
+        fileMd5: '5289df737df57326fcdd22597afb1fac',
+      },
+    })
+    const sent = await bridge.send({
+      conversationId: 'uid-1715311957', media: [media], uploadedMedia: [plan.prepared],
+    }, Readable.from([]))
+
+    expect(sent).toMatchObject({ id: 'm1', parts: [{ type: 'media', media: { kind: 'image' } }] })
+    expect(prepare).toHaveBeenCalledWith(1, 'uid-1715311957', expect.objectContaining({
+      name: 'direct.png', size: 3, picType: 1001,
+    }))
+    expect(f.imageUpload).not.toHaveBeenCalled()
+    expect(f.protocolSend).toHaveBeenCalledWith(
+      1, 'uid-1715311957', '1715311957', [expect.objectContaining({
+        kind: 'image', upload: expect.objectContaining({
+          fileUuid: 'prepared-image', msgInfo: Buffer.from('prepared-msg-info'),
+        }),
+      })], 'self',
+    )
+    expect(f.msg.sendMsg).not.toHaveBeenCalled()
+  })
+
+  it('finalizes private preuploaded file metadata before PbSendMsg', async () => {
+    const f = fixture()
+    const complete = vi.spyOn(QQPacketClient.prototype, 'completeFileUpload')
+      .mockImplementation(async (_chatType, _peerUid, _selfUid, upload) => {
+        upload.privateMetadata = {
+          field1: 1, field6: 6, field7: Buffer.from('seven'), field8: Buffer.from('eight'), timestamp1: 9,
+        }
+      })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const media = {
+      kind: 'file' as const, name: 'direct.bin', size: 4,
+      md5: 'a6b8537b97d58b417d3dfdd1030b15d2', sha1: '13a936c521299ecb9702d0b63e6458171f926bba',
+      file10MMd5: 'a6b8537b97d58b417d3dfdd1030b15d2',
+    }
+    await bridge.send({
+      conversationId: 'uid-1715311957', media: [media], uploadedMedia: [{
+        kind: 'file', fileUuid: 'prepared-file', fileHash: 'file-hash', exists: false, commandId: 95,
+      }],
+    }, Readable.from([]))
+
+    expect(complete).toHaveBeenCalledWith(1, 'uid-1715311957', 'self', expect.objectContaining({
+      fileUuid: 'prepared-file', fileHash: 'file-hash', commandId: 95,
+    }))
+    expect(f.fileUpload).not.toHaveBeenCalled()
+    expect(f.msg.sendMsg).not.toHaveBeenCalled()
+  })
+
   it('lists, decrypts, sends, and maps QQ market stickers', async () => {
     const f = fixture()
     const directory = await mkdtemp(join(tmpdir(), 'qqnt-market-sticker-'))
@@ -2723,6 +2807,23 @@ describe('QQBridgeServer', () => {
       .then((response) => response.json())).resolves.toMatchObject({
       messages: [{ id: 'http-search' }],
     })
+    const prepare = vi.spyOn(bridge, 'prepareMediaUpload').mockResolvedValueOnce({
+      prepared: { kind: 'image', fileUuid: 'http-prepared', msgInfo: 'bXNn' },
+    })
+    const uploadPlan = await fetch(`${base}/uploads/prepare`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ conversationId: 'uid-1715311957', media: {
+        kind: 'image', name: 'http.png', size: 3,
+        md5: '5289df737df57326fcdd22597afb1fac', sha1: '7037807198c22a7d2b0807371d763779a84fdfcf',
+      } }),
+    })
+    expect(uploadPlan.status).toBe(200)
+    await expect(uploadPlan.json()).resolves.toEqual({
+      prepared: { kind: 'image', fileUuid: 'http-prepared', msgInfo: 'bXNn' },
+    })
+    expect(prepare).toHaveBeenCalledWith('uid-1715311957', expect.objectContaining({
+      kind: 'image', name: 'http.png', size: 3,
+    }))
     const manifest = Buffer.from(JSON.stringify({
       conversationId: 'uid-1715311957', text: 'via HTTP',
     })).toString('base64url')

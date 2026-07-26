@@ -42,6 +42,18 @@ export interface QQDirectUrl {
   expiresAt: number
 }
 
+export interface DirectHighwayUpload {
+  session: HighwaySession
+  extendInfo: Buffer
+  commandId: number
+  sequenceStart: number
+}
+
+export interface PreparedDirectUpload<T> {
+  upload: T
+  highway?: DirectHighwayUpload
+}
+
 /** Sends OIDB packets through QQNT's native message-service binding. */
 export class QQPacketClient {
   private readonly loadAddon: () => PacketAddon
@@ -77,27 +89,45 @@ export class QQPacketClient {
     source: AsyncIterable<Uint8Array>,
     signal?: AbortSignal,
   ): Promise<PreparedImageUpload> {
-    const addon = this.loadAddon()
-    const request = encodeImageUploadRequest(chatType, peerUid, spec)
-    const upload = decodeImageUploadResponse(await this.sendPacket(addon, request))
+    const plan = await this.prepareImageUpload(chatType, peerUid, spec)
+    const upload = plan.upload
     const chunks = exactBlocks(source, spec.size, HIGHWAY_BLOCK_SIZE, signal)
-    if (!upload.ukey) {
+    if (!plan.highway) {
       for await (const _chunk of chunks) { /* drain a fast-upload request body */ }
       return upload
     }
-    const session = await this.getHighwaySession(addon)
-    const extendInfo = encodeImageHighwayExt(upload, spec.sha1)
+    const { session, extendInfo, commandId, sequenceStart } = plan.highway
     let offset = 0
+    let blockIndex = 0
     for await (const chunk of chunks) {
       const frame = encodeHighwayFrame({
-        selfUin, commandId: chatType === 2 ? 1004 : 1003,
-        sequence: ++this.highwaySequence, ticket: session.ticket,
+        selfUin, commandId, sequence: sequenceStart + blockIndex++, ticket: session.ticket,
         fileSize: spec.size, offset, fileMd5: spec.md5, extendInfo, body: chunk,
       })
       await this.uploadHighwayBlock(session, selfUin, frame, signal)
       offset += chunk.length
     }
     return upload
+  }
+
+  async prepareImageUpload(
+    chatType: 1 | 2,
+    peerUid: string,
+    spec: DirectImageSpec,
+  ): Promise<PreparedDirectUpload<PreparedImageUpload>> {
+    const addon = this.loadAddon()
+    const request = encodeImageUploadRequest(chatType, peerUid, spec)
+    const upload = decodeImageUploadResponse(await this.sendPacket(addon, request))
+    if (!upload.ukey) return { upload }
+    return {
+      upload,
+      highway: {
+        session: await this.getHighwaySession(addon),
+        extendInfo: encodeImageHighwayExt(upload, spec.sha1),
+        commandId: chatType === 2 ? 1004 : 1003,
+        sequenceStart: this.reserveHighwaySequences(spec.size),
+      },
+    }
   }
 
   async uploadFile(
@@ -109,38 +139,68 @@ export class QQPacketClient {
     source: AsyncIterable<Uint8Array>,
     signal?: AbortSignal,
   ): Promise<PreparedFileUpload> {
-    const addon = this.loadAddon()
-    const request = encodeFileUploadRequest(chatType, peerUid, selfUid, spec)
-    const upload = decodeFileUploadResponse(
-      chatType, await this.sendPacket(addon, request), selfUin, peerUid, spec,
-    )
+    const plan = await this.prepareFileUpload(chatType, peerUid, selfUin, selfUid, spec)
+    const upload = plan.upload
     const chunks = exactBlocks(source, spec.size, HIGHWAY_BLOCK_SIZE, signal)
-    if (upload.exists) {
+    if (!plan.highway) {
       for await (const _chunk of chunks) { /* drain a fast-upload request body */ }
     } else {
-      if (!upload.extendInfo) throw new Error('file upload response has no Highway metadata')
-      const session = await this.getHighwaySession(addon)
+      const { session, extendInfo, commandId, sequenceStart } = plan.highway
       let offset = 0
+      let blockIndex = 0
       for await (const chunk of chunks) {
         const frame = encodeHighwayFrame({
-          selfUin, commandId: upload.commandId, sequence: ++this.highwaySequence,
+          selfUin, commandId, sequence: sequenceStart + blockIndex++,
           ticket: session.ticket, fileSize: spec.size, offset,
-          fileMd5: spec.md5, extendInfo: upload.extendInfo, body: chunk,
+          fileMd5: spec.md5, extendInfo, body: chunk,
         })
         await this.uploadHighwayBlock(session, selfUin, frame, signal)
         offset += chunk.length
       }
     }
-    if (chatType === 1) {
-      if (!upload.fileHash) throw new Error('private file upload response contained no file hash')
-      const metadataRequest = encodePrivateFileMetadataRequest(
-        selfUid, peerUid, upload.fileUuid, upload.fileHash,
-      )
-      upload.privateMetadata = decodePrivateFileMetadataResponse(
-        await this.sendPacket(addon, metadataRequest),
-      )
-    }
+    await this.completeFileUpload(chatType, peerUid, selfUid, upload)
     return upload
+  }
+
+  async prepareFileUpload(
+    chatType: 1 | 2,
+    peerUid: string,
+    selfUin: string,
+    selfUid: string,
+    spec: DirectFileSpec,
+  ): Promise<PreparedDirectUpload<PreparedFileUpload>> {
+    const addon = this.loadAddon()
+    const request = encodeFileUploadRequest(chatType, peerUid, selfUid, spec)
+    const upload = decodeFileUploadResponse(
+      chatType, await this.sendPacket(addon, request), selfUin, peerUid, spec,
+    )
+    if (upload.exists) return { upload }
+    if (!upload.extendInfo) throw new Error('file upload response has no Highway metadata')
+    return {
+      upload,
+      highway: {
+        session: await this.getHighwaySession(addon),
+        extendInfo: upload.extendInfo,
+        commandId: upload.commandId,
+        sequenceStart: this.reserveHighwaySequences(spec.size),
+      },
+    }
+  }
+
+  async completeFileUpload(
+    chatType: 1 | 2,
+    peerUid: string,
+    selfUid: string,
+    upload: PreparedFileUpload,
+  ): Promise<void> {
+    if (chatType !== 1) return
+    if (!upload.fileHash) throw new Error('private file upload response contained no file hash')
+    const metadataRequest = encodePrivateFileMetadataRequest(
+      selfUid, peerUid, upload.fileUuid, upload.fileHash,
+    )
+    upload.privateMetadata = decodePrivateFileMetadataResponse(
+      await this.sendPacket(this.loadAddon(), metadataRequest),
+    )
   }
 
   async sendDirectMessage(
@@ -318,6 +378,14 @@ export class QQPacketClient {
         .finally(() => { this.highwaySessionRefresh = undefined })
     }
     return this.highwaySessionRefresh
+  }
+
+  private reserveHighwaySequences(fileSize: number): number {
+    const blocks = Math.max(1, Math.ceil(fileSize / HIGHWAY_BLOCK_SIZE))
+    if (this.highwaySequence + blocks >= 0x7fff_ffff) this.highwaySequence = 0
+    const sequenceStart = this.highwaySequence + 1
+    this.highwaySequence += blocks
+    return sequenceStart
   }
 
   private async uploadHighwayBlock(

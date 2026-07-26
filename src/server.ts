@@ -4,7 +4,7 @@ import type { Duplex } from 'node:stream'
 import type { Readable } from 'node:stream'
 import WebSocket, { WebSocketServer } from 'ws'
 import {
-  PROTOCOL_VERSION, type QQMediaLocator, type QQMultiForwardLocator, type QQStickerReference, type SendManifest,
+  PROTOCOL_VERSION, type QQMediaLocator, type QQMultiForwardLocator, type QQSendMediaSpec, type QQStickerReference, type SendManifest,
 } from './protocol.js'
 import { QQKernelBridge } from './qq-kernel.js'
 import { log, recordSlowHttpRequest, slowHttpLogPath } from './log.js'
@@ -324,6 +324,17 @@ export class QQBridgeServer {
         log('info', `HTTP API members id=${requestId} conversation=${conversation.id} count=${page.members.length} total=${page.total ?? ''} next=${page.nextCursor ?? ''}`)
         json(response, 200, page)
       }
+      return
+    }
+    if (request.method === 'POST' && path === '/v1/uploads/prepare') {
+      const body = await readJson<{ conversationId: string, media: QQSendMediaSpec }>(request)
+      if (!body || typeof body.conversationId !== 'string' || !body.media) {
+        throw new Error('invalid media upload preparation request')
+      }
+      log('info', `HTTP API upload prepare start id=${requestId} conversation=${body.conversationId} kind=${body.media.kind} name=${JSON.stringify(body.media.name)} size=${body.media.size ?? '?'}`)
+      const plan = await this.bridge.prepareMediaUpload(body.conversationId, body.media)
+      log('info', `HTTP API upload prepare complete id=${requestId} conversation=${body.conversationId} kind=${body.media.kind} highway=${Boolean(plan.highway)} servers=${plan.highway?.servers.length ?? 0}`)
+      json(response, 200, plan)
       return
     }
     if (request.method === 'POST' && path === '/v1/messages') {
