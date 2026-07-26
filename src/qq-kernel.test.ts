@@ -106,7 +106,9 @@ function fixture() {
   let searchHandlers: Record<string, (...args: unknown[]) => unknown> = {}
   const profileInfos = new Map<string, {
     uid: string, uin: string, nick: string, remark: string, avatarUrl: string
-    coreInfo?: { nick?: string, avatarUrl?: string }
+    longNick?: string
+    coreInfo?: { nick?: string, avatarUrl?: string, longNick?: string }
+    baseInfo?: { longNick?: string }
   }>([['self', { uid: 'self', uin: '10000', nick: 'Self', remark: '', avatarUrl: '' }]])
   let avatarPath = avatarFixturePath
   const sentBodies: Buffer[] = []
@@ -205,12 +207,22 @@ function fixture() {
     }),
     removeKernelProfileListener: vi.fn(),
     getUserSimpleInfo: vi.fn(async (_force: boolean, uids: string[]) => {
-      queueMicrotask(() => profileHandlers.onProfileSimpleChanged?.(new Map(uids.map((uid) => [
-        uid,
-        profileInfos.get(uid) ?? { uid, uin: '', nick: '', remark: '', avatarUrl: '' },
-      ]))))
+      queueMicrotask(() => profileHandlers.onProfileSimpleChanged?.(new Map(uids.map((uid) => {
+        const { baseInfo: _baseInfo, ...simple } = profileInfos.get(uid)
+          ?? { uid, uin: '', nick: '', remark: '', avatarUrl: '' }
+        return [uid, simple]
+      }))))
       return { result: 0, errMsg: '' }
     }),
+    getCoreAndBaseInfo: vi.fn(async (_callFrom: string, uids: string[]) => new Map(uids.map((uid) => {
+      const info = profileInfos.get(uid) ?? { uid, uin: '', nick: '', remark: '', avatarUrl: '' }
+      return [uid, {
+        uid: info.uid,
+        uin: info.uin,
+        coreInfo: { nick: info.coreInfo?.nick || info.nick, avatarUrl: info.coreInfo?.avatarUrl || info.avatarUrl },
+        baseInfo: info.baseInfo,
+      }]
+    }))),
   }
   const group = {
     addKernelGroupListener: vi.fn((listener: { handlers?: typeof groupHandlers }) => {
@@ -325,7 +337,9 @@ function fixture() {
     },
     setProfile(info: {
       uid: string, uin: string, nick: string, remark: string, avatarUrl: string
-      coreInfo?: { nick?: string, avatarUrl?: string }
+      longNick?: string
+      coreInfo?: { nick?: string, avatarUrl?: string, longNick?: string }
+      baseInfo?: { longNick?: string }
     }) {
       profileInfos.set(info.uid, info)
     },
@@ -472,6 +486,114 @@ describe('QQKernelBridge', () => {
     })
     f.emitMessages([{ ...f.message, sendNickName: 'A transient message name' }])
     await expect(bridge.getUser('self')).resolves.toMatchObject({ name: 'Canonical Self' })
+  })
+
+  it('loads a root longNick for an already named buddy and preserves it across partial updates', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.emitBuddyList([{ buddyList: [{
+      uid: 'friend', uin: '10001', nick: 'Friend', remark: '', avatarUrl: '',
+    }] }])
+    f.setProfile({
+      uid: 'friend', uin: '10001', nick: 'Friend', remark: '', avatarUrl: '', longNick: 'Root signature',
+    })
+
+    await expect(bridge.getUser('friend')).resolves.toMatchObject({
+      name: 'Friend', signature: 'Root signature',
+    })
+    expect(f.profile.getUserSimpleInfo).toHaveBeenCalledWith(false, ['friend'])
+    await expect(bridge.getContacts()).resolves.toMatchObject({
+      users: expect.arrayContaining([expect.objectContaining({ id: 'friend', signature: 'Root signature' })]),
+    })
+    await bridge.getUser('friend')
+    expect(f.profile.getUserSimpleInfo.mock.calls.filter(([, uids]) => uids[0] === 'friend')).toHaveLength(1)
+
+    f.emitBuddyInfo(new Map([['friend', {
+      uid: 'friend', uin: '10001', nick: 'Friend', remark: '', avatarUrl: '',
+    }]]))
+    await expect(bridge.getUser('friend')).resolves.toMatchObject({ signature: 'Root signature' })
+    f.emitBuddyInfo(new Map([['friend', {
+      uid: 'friend', uin: '10001', nick: 'Friend', remark: '', avatarUrl: '', longNick: '',
+    }]]))
+    await expect(bridge.getUser('friend')).resolves.toMatchObject({ signature: '' })
+    expect(f.profile.getUserSimpleInfo.mock.calls.filter(([, uids]) => uids[0] === 'friend')).toHaveLength(1)
+  })
+
+  it('preserves a profile signature when the buddy snapshot arrives later without longNick', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.setProfile({
+      uid: 'late-buddy', uin: '10003', nick: 'Profile Friend', remark: '', avatarUrl: '', longNick: 'Early signature',
+    })
+
+    await expect(bridge.getUser('late-buddy')).resolves.toMatchObject({ signature: 'Early signature' })
+    f.emitBuddyList([{ buddyList: [{
+      uid: 'late-buddy', uin: '10003', nick: 'Buddy Friend', remark: '', avatarUrl: '',
+    }] }])
+    await expect(bridge.getContacts()).resolves.toMatchObject({
+      users: expect.arrayContaining([expect.objectContaining({ id: 'late-buddy', signature: 'Early signature' })]),
+    })
+  })
+
+  it('loads longNick from coreInfo profiles', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.setProfile({
+      uid: 'core', uin: '10002', nick: '', remark: '', avatarUrl: '',
+      coreInfo: { nick: 'Core Friend', longNick: 'Core signature' },
+    })
+
+    await expect(bridge.getUser('core')).resolves.toMatchObject({
+      name: 'Core Friend', signature: 'Core signature',
+    })
+  })
+
+  it('loads the real QQNT signature from getCoreAndBaseInfo baseInfo', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.setProfile({
+      uid: 'base', uin: '10004', nick: 'Base Friend', remark: '', avatarUrl: '',
+      baseInfo: { longNick: 'Base signature' },
+    })
+
+    await expect(bridge.getUser('base')).resolves.toMatchObject({
+      name: 'Base Friend', signature: 'Base signature',
+    })
+    expect(f.profile.getCoreAndBaseInfo).toHaveBeenCalledWith('nodeStore', ['base'])
+  })
+
+  it('keeps simple-profile signatures when core/base enrichment fails or times out', async () => {
+    const rejected = fixture()
+    rejected.profile.getCoreAndBaseInfo.mockRejectedValue(new Error('unsupported'))
+    rejected.setProfile({
+      uid: 'root-fallback', uin: '10005', nick: 'Root Fallback', remark: '', avatarUrl: '',
+      longNick: 'Root fallback signature',
+    })
+    const rejectedBridge = new QQKernelBridge({ userResolveTimeoutMs: 20 })
+    rejectedBridge.attach(rejected.kernel, rejected.session, {
+      selfUin: '10000', selfUid: 'self', userPath: '/tmp',
+    })
+    await expect(rejectedBridge.getUser('root-fallback')).resolves.toMatchObject({
+      signature: 'Root fallback signature',
+    })
+
+    const timedOut = fixture()
+    timedOut.profile.getCoreAndBaseInfo.mockImplementation(() => new Promise(() => {}))
+    timedOut.setProfile({
+      uid: 'core-fallback', uin: '10006', nick: '', remark: '', avatarUrl: '',
+      coreInfo: { nick: 'Core Fallback', longNick: 'Core fallback signature' },
+    })
+    const timedOutBridge = new QQKernelBridge({ userResolveTimeoutMs: 20 })
+    timedOutBridge.attach(timedOut.kernel, timedOut.session, {
+      selfUin: '10000', selfUid: 'self', userPath: '/tmp',
+    })
+    await expect(timedOutBridge.getUser('core-fallback')).resolves.toMatchObject({
+      signature: 'Core fallback signature',
+    })
   })
 
   it('hydrates a recent image abstract from the real message and bounds a missing UID lookup', async () => {
