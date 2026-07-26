@@ -184,6 +184,17 @@ describe('direct QQ upload protocol', () => {
       ])
   })
 
+  it('uses the QQNT client-sequence range for live PbSendMsg requests', () => {
+    for (let index = 0; index < 32; index++) {
+      const request = encodeDirectMessageRequest(
+        1, 'u_friend', '42', [{ kind: 'text', text: 'hello' }],
+      )
+      const decoded = fromBinary(generated.SendMessageRequestSchema, request.payload)
+      expect(decoded.clientSequence).toBeGreaterThanOrEqual(10_000n)
+      expect(decoded.clientSequence).toBeLessThan(99_999n)
+    }
+  })
+
   it('fetches private-file message metadata and builds the 0x211 file send route', () => {
     const metadataRequest = encodePrivateFileMetadataRequest('u_self', 'u_friend', 'file-uuid', 'file-hash')
     expect(metadataRequest.command).toBe('OidbSvcTrpcTcp.0xe37_800')

@@ -448,7 +448,11 @@ export function encodeDirectMessageRequest(
       routing,
       content: { field1: 1, field2: 0, field3: 0, field4: 0 },
       body,
-      clientSequence: options.clientSequence ?? randomPositiveInt64(),
+      // QQNT uses a short per-send client sequence (the official/Lagrange
+      // clients use 10000..99998). Arbitrary int64 values are parsed by SSO
+      // but PbSendMsg then returns no usable sequence and never publishes the
+      // outgoing message.
+      clientSequence: options.clientSequence ?? randomClientSequence(),
       random: options.random ?? randomBytes(4).readUInt32BE(),
     }),
   }
@@ -652,4 +656,8 @@ function assertHash(value: string, name: string, length: number): void {
 
 function randomPositiveInt64(): bigint {
   return randomBytes(8).readBigUInt64BE() & 0x7fff_ffff_ffff_ffffn
+}
+
+function randomClientSequence(): bigint {
+  return BigInt(10_000 + randomBytes(4).readUInt32BE() % 89_999)
 }
