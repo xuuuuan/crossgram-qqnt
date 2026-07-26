@@ -4387,9 +4387,13 @@ function multiForwardTitle(element: NonNullable<MsgElement['multiForwardMsgEleme
 function multiForwardPreview(
   element: NonNullable<MsgElement['multiForwardMsgElement']>,
 ): string | undefined {
-  const match = element.xmlContent
-    ?.match(/<summary\b[^>]*>(?:<!\[CDATA\[([\s\S]*?)\]\]>|([\s\S]*?))<\/summary>/i)
-  return normalizeMultiForwardPreview(match?.[1] ?? match?.[2] ?? '') || undefined
+  const summaries = [...(element.xmlContent ?? '')
+    .matchAll(/<summary\b[^>]*>(?:<!\[CDATA\[([\s\S]*?)\]\]>|([\s\S]*?))<\/summary>/gi)]
+    .map((match) => normalizeMultiForwardPreview(match[1] ?? match[2] ?? ''))
+    .filter(Boolean)
+  const detailed = summaries.filter((summary) =>
+    !/^(?:点击)?查看(?:\s*\d+\s*条)?转发消息$/.test(summary))
+  return [...new Set(detailed.length ? detailed : summaries)].join('\n') || undefined
 }
 
 function normalizeMultiForwardPreview(value: string): string {

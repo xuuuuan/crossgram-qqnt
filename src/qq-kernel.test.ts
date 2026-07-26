@@ -1566,6 +1566,38 @@ describe('QQKernelBridge', () => {
     expect(f.msg.getMultiMsg).toHaveBeenNthCalledWith(3, expect.anything(), 'nested-1', 'nested-1')
   })
 
+  it('prefers detailed XML merged-forward summaries over the generic message count', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    await bridge.getDialogs()
+    const forwarded = {
+      ...f.message, msgId: 'xml-forward',
+      elements: [{
+        elementType: 16, elementId: 'xml-forward-element',
+        multiForwardMsgElement: {
+          fileName: 'QQ用户的聊天记录', resId: 'xml-forward-resource',
+          xmlContent: '<msg><item>'
+            + '<title><![CDATA[QQ用户的聊天记录]]></title>'
+            + '<summary><![CDATA[查看7条转发消息]]></summary>'
+            + '<summary><![CDATA[Alice: 第一条<br/>Bob: 第二条 &amp; 回复]]></summary>'
+            + '<summary>Carol: 第三条</summary>'
+            + '</item></msg>',
+        },
+      }],
+    }
+    f.msg.getMultiMsg.mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [forwarded] })
+
+    await expect(bridge.getMultiForwardMessages({
+      conversationId: 'uid-1715311957', rootMessageId: 'xml-forward',
+    })).resolves.toMatchObject([{
+      id: 'xml-forward', parts: [{
+        type: 'multi-forward', title: 'QQ用户的聊天记录',
+        preview: 'Alice: 第一条\nBob: 第二条 & 回复\nCarol: 第三条',
+      }],
+    }])
+  })
+
   it('creates transcript-scoped virtual participants from forwarded names and avatars', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
