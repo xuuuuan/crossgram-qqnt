@@ -4,6 +4,7 @@ import { open as openFile, readFile, rm, stat } from 'node:fs/promises'
 import { basename, dirname, extname, join } from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { Readable } from 'node:stream'
+import { types } from 'node:util'
 import { AsyncQueue, deferred } from './async.js'
 import { markBridgeListener } from './listener-tee.js'
 import { log } from './log.js'
@@ -11,12 +12,12 @@ import { resolveMultiForwardParticipants } from './multi-forward-participants.js
 import { QQPacketClient, type DirectHighwayUpload, type QQPacketClientOptions } from './packet-client.js'
 import { HIGHWAY_BLOCK_SIZE, type DirectMessagePart } from './upload-protocol.js'
 import type {
-  CustomEmotionData, EmojiLikesUserInfo, FileTransNotifyInfo, GroupProfileInfo, InitSessionConfig, KernelModule, KernelSession,
+  CustomEmotionData, EmojiLikesUserInfo, FileTransNotifyInfo, GroupProfileInfo, InitSessionConfig, KernelAVSDKService, KernelModule, KernelSession,
   MarketStickerPackInfo, MemberInfo, MsgElement, MsgRecord, ProfileSimpleInfo, RecentContactInfo, SearchMsgKeywordsResult,
 } from './kernel-types.js'
 import {
-  conversationId, parseConversationId, type HistoryQuery, type MemberPage, type QQCard, type QQConversation, type QQEvent,
-  type QQMedia, type QQMediaLocator, type QQMediaUploadPlan, type QQMessage, type QQMultiForwardLocator, type QQReactionContext, type QQReactionDefinition, type QQReactionState,
+  conversationId, parseConversationId, type HistoryQuery, type MemberPage, type QQCallSignalEvent, type QQCard, type QQConversation, type QQEvent,
+  type QQJsonValue, type QQMedia, type QQMediaLocator, type QQMediaUploadPlan, type QQMessage, type QQMultiForwardLocator, type QQReactionContext, type QQReactionDefinition, type QQReactionState,
   type QQSendMediaSpec, type QQSticker, type QQStickerPack, type QQStickerPackSummary, type QQStickerReference, type QQTextPart, type SearchPage, type SearchQuery, type SendManifest,
 } from './protocol.js'
 
@@ -37,6 +38,38 @@ const MEMBER_SCENE_LIMIT = 64
 const DELETE_DEDUP_TTL_MS = 60_000
 const STICKER_MISSING_CACHE_TTL_MS = 30_000
 const STALE_CURSOR_REPLAY_LIMIT = 512
+const AVSDK_EVENT_WINDOW_MS = 1_000
+const AVSDK_MAX_EVENTS_PER_WINDOW = 100
+const AVSDK_MAX_EVENTS_PER_CALLBACK = 20
+const AVSDK_MAX_ARGS = 16
+const AVSDK_MAX_DEPTH = 8
+const AVSDK_MAX_NODES = 64
+const AVSDK_MAX_COLLECTION_ITEMS = 16
+const AVSDK_MAX_STRING_LENGTH = 256
+const AVSDK_MAX_BINARY_PREVIEW_BYTES = 64
+const AVSDK_MAX_BINARY_BYTES = 1_024
+const AVSDK_MAX_OUTPUT_BYTES = 16 * 1024
+const AVSDK_SUBSCRIBER_QUEUE_LIMIT = 64
+const CALL_SIGNAL_EVENT_WINDOW_MS = 60_000
+const CALL_SIGNAL_MAX_EVENTS_PER_WINDOW = 10
+const CALL_SIGNAL_ID_SCAN_BYTES = 4_096
+const CALL_SIGNAL_ID_MAX_LENGTH = 128
+const CALL_SIGNAL_RELATION_ID_MAX_LENGTH = 32
+const CALL_SIGNAL_NONTERMINAL_QUEUE_LIMIT = 16
+const CALL_SIGNAL_TERMINAL_QUEUE_LIMIT = 3
+const CALL_SIGNAL_QUEUE_LIMIT = CALL_SIGNAL_NONTERMINAL_QUEUE_LIMIT + CALL_SIGNAL_TERMINAL_QUEUE_LIMIT
+const AVSDK_DIAGNOSTIC_WINDOW_MS = 60_000
+const AVSDK_DIAGNOSTIC_MAX_PER_WINDOW = 24
+const AVSDK_DIAGNOSTIC_MAX_PER_KIND = 4
+const AVSDK_DIAGNOSTIC_MAX_ARGS = 4
+const AVSDK_DIAGNOSTIC_ADMISSION_MAX_PER_WINDOW = 64
+const AVSDK_DIAGNOSTIC_ADMISSION_MAX_PER_CALLBACK = 16
+const AVSDK_ACCEPT_INVITE = 'trpc.qqrtc.av_appsvr.AvAppsvr.SsoAcceptInvite'
+const AVSDK_REFUSE_INVITE = 'trpc.qqrtc.av_appsvr.AvAppsvr.SsoRefuseInvite'
+const AVSDK_LOG_OUT = 'trpc.qqrtc.av_appsvr.AvAppsvr.SsoLogOut'
+const AVSDK_ACCEPT_INVITE_BYTES = Buffer.from(AVSDK_ACCEPT_INVITE, 'ascii')
+const AVSDK_REFUSE_INVITE_BYTES = Buffer.from(AVSDK_REFUSE_INVITE, 'ascii')
+const AVSDK_LOG_OUT_BYTES = Buffer.from(AVSDK_LOG_OUT, 'ascii')
 // Keep this in sync with Telegram's account-level reaction catalog. QQ emoji
 // outside this set are exposed as custom reactions backed by QQ's own icon.
 const TELEGRAM_STANDARD_REACTIONS = new Set([
@@ -85,12 +118,60 @@ interface MessagePosition {
   msgSeq?: string
 }
 
+interface CallSignalState {
+  callId: string
+  conversation: QQConversation
+  media: QQCallSignalEvent['media']
+  signal: QQCallSignalEvent['signal']
+}
+
+type AVSDKDiagnosticSource = 'listener-tap' | 'action-intercept'
+type CallSignalJob =
+  | {
+      kind: 'invite'
+      generation: number
+      source: AVSDKDiagnosticSource
+      invite: { relationId: string, media: QQCallSignalEvent['media'], bytes: Uint8Array, truncated?: boolean }
+    }
+  | { kind: 'accept' | 'refuse' | 'logout' | 'ended', generation: number, source: AVSDKDiagnosticSource }
+
+type AVSDKDiagnosticCallback = 'OnInviteActionToAVSDK' | 'setActionFromAVSDK' | 'onS2CActionToAVSDK'
+type AVSDKDiagnosticDrop =
+  | 'invalid-invite'
+  | 'missing-call-id'
+  | 'unresolved-conversation'
+  | 'stale-session'
+  | 'duplicate-transition'
+  | 'no-active-call'
+  | 'uncorrelated-transition'
+  | 'rate-limited'
+  | 'queue-coalesced'
+type CallSignalEnqueueResult =
+  | { outcome: 'enqueued' | 'coalesced' }
+  | { outcome: 'replaced', replaced: CallSignalJob }
+
 export class QQKernelBridge {
   readonly events = new Set<AsyncQueue<QQEvent>>()
   private readonly recentEvents: Array<{ id: string, event: QQEvent }> = []
   private readonly eventIds = new WeakMap<object, string>()
   private readonly replayStates = new WeakMap<AsyncQueue<QQEvent>, { remaining: number, total: number }>()
   private eventSequence = 0
+  private avsdkEventWindowStartedAt = 0
+  private avsdkEventCount = 0
+  private readonly avsdkCallbackEventCounts = new Map<string, number>()
+  private callSignalEventWindowStartedAt = 0
+  private callSignalEventCount = 0
+  private avsdkDiagnosticWindowStartedAt = 0
+  private avsdkDiagnosticCount = 0
+  private readonly avsdkDiagnosticCounts = new Map<string, number>()
+  private avsdkDiagnosticAdmissionWindowStartedAt = 0
+  private avsdkDiagnosticAdmissionCount = 0
+  private readonly avsdkDiagnosticAdmissionCounts = new Map<AVSDKDiagnosticCallback, number>()
+  private readonly callSignalJobs: CallSignalJob[] = []
+  private readonly pendingCallSignalKinds = new Map<CallSignalJob['kind'], number>()
+  private callSignalQueueRunning = false
+  private callSignalGeneration = 0
+  private callSignalState?: CallSignalState
   private session?: KernelSession
   private kernel?: KernelModule
   private config?: InitSessionConfig
@@ -100,6 +181,7 @@ export class QQKernelBridge {
   private groupService?: ReturnType<KernelSession['getGroupService']>
   private recentService?: ReturnType<KernelSession['getRecentContactService']>
   private searchService?: NonNullable<ReturnType<NonNullable<KernelSession['getSearchService']>>>
+  private avsdkService?: KernelAVSDKService
   private avatarService?: NonNullable<ReturnType<NonNullable<KernelSession['getAvatarService']>>>
   private packetClient?: QQPacketClient
   private readonly contacts = new Map<string, QQConversation>()
@@ -167,11 +249,13 @@ export class QQKernelBridge {
   private groupListenerId?: string
   private recentListenerId?: string
   private searchListenerId?: string
+  private avsdkListenerId?: string
   private readonly pendingRecentListUpdates = new Set<() => void>()
   private readonly pendingSearchPages = new Map<number, ReturnType<typeof deferred<SearchMsgKeywordsResult>>>()
   private readonly earlySearchPages = new Map<number, SearchMsgKeywordsResult>()
   private readonly searchContexts = new Map<string, SearchContext>()
   private listenerRetry?: NodeJS.Timeout
+  private avsdkListenerRetry?: NodeJS.Timeout
   private readonly tempPath: string
   private readonly sendTimeoutMs: number
   private readonly userResolveTimeoutMs: number
@@ -213,6 +297,21 @@ export class QQKernelBridge {
     this.resolvedReplyTargets.clear()
     this.groupProfileAttempts.clear()
     this.recentDeletes.clear()
+    this.avsdkEventWindowStartedAt = 0
+    this.avsdkEventCount = 0
+    this.avsdkCallbackEventCounts.clear()
+    this.callSignalEventWindowStartedAt = 0
+    this.callSignalEventCount = 0
+    this.avsdkDiagnosticWindowStartedAt = 0
+    this.avsdkDiagnosticCount = 0
+    this.avsdkDiagnosticCounts.clear()
+    this.avsdkDiagnosticAdmissionWindowStartedAt = 0
+    this.avsdkDiagnosticAdmissionCount = 0
+    this.avsdkDiagnosticAdmissionCounts.clear()
+    this.callSignalJobs.splice(0)
+    this.pendingCallSignalKinds.clear()
+    this.callSignalQueueRunning = false
+    this.callSignalState = undefined
     this.missingStickerAssets.clear()
     this.unreadBatchState = ''
     this.unreadBatchPromise = undefined
@@ -251,8 +350,15 @@ export class QQKernelBridge {
   }
 
   detach(): void {
+    this.callSignalGeneration++
+    this.callSignalJobs.splice(0)
+    this.pendingCallSignalKinds.clear()
+    this.callSignalQueueRunning = false
+    this.callSignalState = undefined
     if (this.listenerRetry) clearTimeout(this.listenerRetry)
+    if (this.avsdkListenerRetry) clearTimeout(this.avsdkListenerRetry)
     this.listenerRetry = undefined
+    this.avsdkListenerRetry = undefined
     this.resolveRecentListUpdates()
     const msgService = this.msgService
     const buddyService = this.buddyService
@@ -260,8 +366,9 @@ export class QQKernelBridge {
     const groupService = this.groupService
     const recentService = this.recentService
     const searchService = this.searchService
-    if (this.listenerId || this.buddyListenerId || this.profileListenerId || this.groupListenerId || this.recentListenerId || this.searchListenerId) {
-      log('info', `bridge detach listeners msg=${this.listenerId ?? ''} buddy=${this.buddyListenerId ?? ''} profile=${this.profileListenerId ?? ''} group=${this.groupListenerId ?? ''} recent=${this.recentListenerId ?? ''} search=${this.searchListenerId ?? ''}`)
+    const avsdkService = this.avsdkService
+    if (this.listenerId || this.buddyListenerId || this.profileListenerId || this.groupListenerId || this.recentListenerId || this.searchListenerId || this.avsdkListenerId) {
+      log('info', `bridge detach listeners msg=${this.listenerId ?? ''} buddy=${this.buddyListenerId ?? ''} profile=${this.profileListenerId ?? ''} group=${this.groupListenerId ?? ''} recent=${this.recentListenerId ?? ''} search=${this.searchListenerId ?? ''} avsdk=${this.avsdkListenerId ?? ''}`)
     }
     if (msgService && this.listenerId) safeRemoveListener('message', this.listenerId, () => msgService.removeKernelMsgListener(this.listenerId!))
     if (buddyService && this.buddyListenerId) safeRemoveListener('buddy', this.buddyListenerId, () => buddyService.removeKernelBuddyListener(this.buddyListenerId!))
@@ -273,6 +380,9 @@ export class QQKernelBridge {
     if (searchService && this.searchListenerId) {
       safeRemoveListener('search', this.searchListenerId, () => searchService.removeKernelSearchListener(this.searchListenerId!))
     }
+    if (avsdkService && this.avsdkListenerId) {
+      safeRemoveListener('avsdk', this.avsdkListenerId, () => avsdkService.removeKernelAVSDKListener(this.avsdkListenerId!))
+    }
     for (const context of this.searchContexts.values()) {
       safeCancelSearch(searchService, context.searchId, 'session detached')
     }
@@ -281,13 +391,14 @@ export class QQKernelBridge {
     }
     this.memberScenes.clear()
     this.listenerId = this.buddyListenerId = this.profileListenerId = this.groupListenerId = undefined
-    this.searchListenerId = undefined
+    this.searchListenerId = this.avsdkListenerId = undefined
     this.msgService = undefined
     this.buddyService = undefined
     this.profileService = undefined
     this.groupService = undefined
     this.recentService = undefined
     this.searchService = undefined
+    this.avsdkService = undefined
     this.avatarService = undefined
     this.packetClient = undefined
     this.session = undefined
@@ -320,7 +431,7 @@ export class QQKernelBridge {
   }
 
   subscribe(lastEventId?: string): AsyncQueue<QQEvent> {
-    const queue = new AsyncQueue<QQEvent>()
+    const queue = new AsyncQueue<QQEvent>(AVSDK_SUBSCRIBER_QUEUE_LIMIT)
     this.events.add(queue)
     if (lastEventId) {
       const cursor = this.recentEvents.findIndex((item) => item.id === lastEventId)
@@ -2263,6 +2374,356 @@ export class QQKernelBridge {
       this.searchListenerId = this.searchService.addKernelSearchListener(searchListener)
       log('info', `native listener registered service=search id=${this.searchListenerId || '<empty>'}`)
     }
+    if (isAVSDKTapEnabled()) {
+      try {
+        if (!this.registerAVSDKListener()) this.scheduleAVSDKListenerRegistration(2)
+      } catch (error) {
+        log('error', 'initial AVSDK listener registration failed; scheduling retry', error)
+        this.scheduleAVSDKListenerRegistration(2)
+      }
+    }
+  }
+
+  private registerAVSDKListener(): boolean {
+    if (!isAVSDKTapEnabled() || this.avsdkListenerId) return true
+    const session = this.requireSession()
+    const service = this.avsdkService ?? session.getAVSDKService?.()
+    if (!service) return false
+    this.avsdkService = service
+    const listener = markBridgeListener(makeAVSDKListener(
+      this.kernel!.NodeIAVSDKListener,
+      (callback, args) => this.onAVSDKCallback(callback, args, 'listener-tap'),
+    ))
+    this.avsdkListenerId = service.addKernelAVSDKListener(listener)
+    log('info', `native listener registered service=avsdk id=${this.avsdkListenerId || '<empty>'}`)
+    return true
+  }
+
+  private scheduleAVSDKListenerRegistration(attempt = 1): void {
+    if (!isAVSDKTapEnabled() || this.avsdkListenerRetry || this.avsdkListenerId) return
+    this.avsdkListenerRetry = setTimeout(() => {
+      this.avsdkListenerRetry = undefined
+      if (!this.session || this.avsdkListenerId) return
+      try {
+        if (!this.registerAVSDKListener()) {
+          if (attempt >= 120) return
+          this.scheduleAVSDKListenerRegistration(attempt + 1)
+        }
+      } catch (error) {
+        if (attempt >= 120) {
+          log('error', 'QQNT AVSDK listener did not become ready', error)
+          return
+        }
+        this.scheduleAVSDKListenerRegistration(attempt + 1)
+      }
+    }, attempt === 1 ? 0 : 250)
+  }
+
+  observeAVSDKAction(action: number, bytes: Uint8Array): void {
+    this.onAVSDKCallback('setActionFromAVSDK', [action, bytes], 'action-intercept')
+  }
+
+  private onAVSDKCallback(callback: string, args: unknown[], source: AVSDKDiagnosticSource): void {
+    if (!isAVSDKTapEnabled()) return
+    const callCallback = isAVSDKDiagnosticCallback(callback) ? callback : undefined
+    const diagnosticAdmitted = callCallback ? this.acceptAVSDKDiagnosticAdmission(callCallback) : false
+    if (callCallback) this.observeCallSignal(callCallback, args, source, diagnosticAdmitted)
+    if (isAVSDKRawEnabled() && this.acceptAVSDKEvent(callback)) {
+      this.dispatch({ type: 'native-avsdk', version: 1, callback, args: normalizeAVSDKArgs(args) })
+    }
+  }
+
+  private observeCallSignal(
+    callback: AVSDKDiagnosticCallback,
+    args: unknown[],
+    source: AVSDKDiagnosticSource,
+    diagnosticAdmitted: boolean,
+  ): void {
+    if (diagnosticAdmitted) this.observeAVSDKReceipt(callback, args, source)
+    const generation = this.callSignalGeneration
+    if (callback === 'OnInviteActionToAVSDK') {
+      const invite = parseAVSDKInvite(args)
+      if (!invite) {
+        this.observeAVSDKDrop(callback, source, 'invalid-invite')
+        return
+      }
+      const enqueued = this.enqueueCallSignal({ kind: 'invite', generation, source, invite })
+      if (enqueued.outcome === 'replaced') {
+        this.observeAVSDKObservation(callback, enqueued.replaced.source, 'queue-replaced')
+      } else if (enqueued.outcome === 'coalesced') {
+        this.observeAVSDKDrop(callback, source, 'queue-coalesced')
+      }
+      return
+    }
+    if (callback === 'setActionFromAVSDK') {
+      const kind = callSignalActionKind(args[1])
+      if (!kind) return
+      const enqueued = this.enqueueCallSignal({ kind, generation, source })
+      if (enqueued.outcome === 'coalesced') this.observeAVSDKDrop(callback, source, 'queue-coalesced', false, kind)
+      return
+    }
+    if (!hasDestroyReason(args[0])) return
+    const enqueued = this.enqueueCallSignal({ kind: 'ended', generation, source })
+    if (enqueued.outcome === 'coalesced') this.observeAVSDKDrop(callback, source, 'queue-coalesced', false, 'unknown', true)
+  }
+
+  private observeAVSDKReceipt(callback: AVSDKDiagnosticCallback, args: unknown[], source: AVSDKDiagnosticSource): void {
+    try {
+      const values = args.slice(0, AVSDK_DIAGNOSTIC_MAX_ARGS)
+      const invite = callback === 'OnInviteActionToAVSDK' ? parseAVSDKInvite(args) : undefined
+      const action = callback === 'setActionFromAVSDK' ? callSignalActionKind(args[1]) ?? 'unknown' : 'unknown'
+      const terminal = callback === 'onS2CActionToAVSDK' && hasDestroyReason(args[0])
+      const callIdFound = Boolean(invite && this.config && scanCallId(invite.bytes, invite.relationId, this.config.selfUin, invite.truncated))
+      const inviteRelation = callback === 'OnInviteActionToAVSDK' && hasAVSDKInviteRelation(args[0])
+      this.logAVSDKDiagnostic(
+        `receipt:${source}:${callback}`,
+        `avsdk-call receipt source=${source} callback=${callback} args=${Math.min(args.length, AVSDK_MAX_ARGS)} types=${values.map(diagnosticAVSDKArgType).join(',')} binaryBytes=${values.map(diagnosticAVSDKBinaryBytes).join(',')} inviteRelation=${inviteRelation} media=${invite?.media ?? 'unknown'} callIdFound=${callIdFound} action=${action} terminal=${terminal}`,
+      )
+    } catch {
+      // Diagnostics must never alter native callback handling.
+    }
+  }
+
+  private observeAVSDKDrop(
+    callback: AVSDKDiagnosticCallback,
+    source: AVSDKDiagnosticSource,
+    reason: AVSDKDiagnosticDrop,
+    callIdFound = false,
+    action: 'accept' | 'refuse' | 'logout' | 'unknown' = 'unknown',
+    terminal = false,
+  ): void {
+    try {
+      this.logAVSDKDiagnostic(
+        `drop:${source}:${callback}:${reason}`,
+        `avsdk-call drop source=${source} callback=${callback} reason=${reason} callIdFound=${callIdFound} action=${action} terminal=${terminal}`,
+      )
+    } catch {
+      // Diagnostics must never alter native callback handling.
+    }
+  }
+
+  private observeAVSDKObservation(
+    callback: AVSDKDiagnosticCallback,
+    source: AVSDKDiagnosticSource,
+    outcome: 'queue-replaced',
+  ): void {
+    this.logAVSDKDiagnostic(
+      `observation:${source}:${callback}:${outcome}`,
+      `avsdk-call observation source=${source} callback=${callback} outcome=${outcome} action=unknown terminal=false`,
+    )
+  }
+
+  private acceptAVSDKDiagnosticAdmission(callback: AVSDKDiagnosticCallback): boolean {
+    const now = Date.now()
+    if (now < this.avsdkDiagnosticAdmissionWindowStartedAt || now - this.avsdkDiagnosticAdmissionWindowStartedAt >= AVSDK_DIAGNOSTIC_WINDOW_MS) {
+      this.avsdkDiagnosticAdmissionWindowStartedAt = now
+      this.avsdkDiagnosticAdmissionCount = 0
+      this.avsdkDiagnosticAdmissionCounts.clear()
+    }
+    const count = this.avsdkDiagnosticAdmissionCounts.get(callback) ?? 0
+    if (this.avsdkDiagnosticAdmissionCount >= AVSDK_DIAGNOSTIC_ADMISSION_MAX_PER_WINDOW || count >= AVSDK_DIAGNOSTIC_ADMISSION_MAX_PER_CALLBACK) return false
+    this.avsdkDiagnosticAdmissionCount++
+    this.avsdkDiagnosticAdmissionCounts.set(callback, count + 1)
+    return true
+  }
+
+  private logAVSDKDiagnostic(kind: string, message: string): void {
+    const now = Date.now()
+    if (now < this.avsdkDiagnosticWindowStartedAt || now - this.avsdkDiagnosticWindowStartedAt >= AVSDK_DIAGNOSTIC_WINDOW_MS) {
+      this.avsdkDiagnosticWindowStartedAt = now
+      this.avsdkDiagnosticCount = 0
+      this.avsdkDiagnosticCounts.clear()
+    }
+    const count = this.avsdkDiagnosticCounts.get(kind) ?? 0
+    if (this.avsdkDiagnosticCount >= AVSDK_DIAGNOSTIC_MAX_PER_WINDOW || count >= AVSDK_DIAGNOSTIC_MAX_PER_KIND) return
+    this.avsdkDiagnosticCount++
+    this.avsdkDiagnosticCounts.set(kind, count + 1)
+    try {
+      log('info', message)
+    } catch {
+      // Diagnostics must never alter native callback handling.
+    }
+  }
+
+  private hasCallSignalQueueCapacity(): boolean {
+    return [...this.pendingCallSignalKinds.values()].reduce((total, count) => total + count, 0) < CALL_SIGNAL_QUEUE_LIMIT
+  }
+
+  private enqueueCallSignal(job: CallSignalJob): CallSignalEnqueueResult {
+    if (job.kind === 'invite') {
+      const queued = this.callSignalJobs.findIndex((item) => item.kind === 'invite')
+      if (queued >= 0) {
+        const replaced = this.callSignalJobs[queued]!
+        this.callSignalJobs[queued] = job
+        return { outcome: 'replaced', replaced }
+      }
+    }
+    const pending = this.pendingCallSignalKinds.get(job.kind) ?? 0
+    if (job.kind === 'accept' && pending) return { outcome: 'coalesced' }
+    if ((job.kind === 'refuse' || job.kind === 'logout' || job.kind === 'ended') && pending) return { outcome: 'coalesced' }
+    const nonterminal = (this.pendingCallSignalKinds.get('invite') ?? 0) + (this.pendingCallSignalKinds.get('accept') ?? 0)
+    if ((job.kind === 'invite' || job.kind === 'accept') && nonterminal >= CALL_SIGNAL_NONTERMINAL_QUEUE_LIMIT) return { outcome: 'coalesced' }
+    if (!this.hasCallSignalQueueCapacity()) return { outcome: 'coalesced' }
+    this.callSignalJobs.push(job)
+    this.pendingCallSignalKinds.set(job.kind, pending + 1)
+    this.drainCallSignalQueue()
+    return { outcome: 'enqueued' }
+  }
+
+  private drainCallSignalQueue(): void {
+    if (this.callSignalQueueRunning) return
+    const generation = this.callSignalGeneration
+    this.callSignalQueueRunning = true
+    queueMicrotask(() => void (async () => {
+      while (generation === this.callSignalGeneration) {
+        const job = this.callSignalJobs.shift()
+        if (!job) break
+        try {
+          if (job.generation !== this.callSignalGeneration) continue
+          if (job.kind === 'invite') await this.onCallInvite(job.invite, job.generation, job.source)
+          else if (job.kind === 'ended') this.onCallEnded(job.source)
+          else this.onCallAction(job.kind, job.source)
+        } catch {
+          log('error', 'QQ call signal observation failed')
+        } finally {
+          if (job.generation === this.callSignalGeneration) {
+            const pending = this.pendingCallSignalKinds.get(job.kind) ?? 0
+            if (pending <= 1) this.pendingCallSignalKinds.delete(job.kind)
+            else this.pendingCallSignalKinds.set(job.kind, pending - 1)
+          }
+        }
+      }
+      if (generation !== this.callSignalGeneration) return
+      this.callSignalQueueRunning = false
+      if (this.callSignalJobs.length) this.drainCallSignalQueue()
+    })())
+  }
+
+  private async onCallInvite(
+    invite: { relationId: string, media: QQCallSignalEvent['media'], bytes: Uint8Array, truncated?: boolean },
+    generation: number,
+    source: AVSDKDiagnosticSource = 'listener-tap',
+  ): Promise<void> {
+    const session = this.session
+    const config = this.config
+    if (!session || !config || !this.isCurrentCallGeneration(generation, session, config)) {
+      this.observeAVSDKDrop('OnInviteActionToAVSDK', source, 'stale-session')
+      return
+    }
+    const callId = scanCallId(invite.bytes, invite.relationId, config.selfUin, invite.truncated)
+    if (!callId) {
+      this.observeAVSDKDrop('OnInviteActionToAVSDK', source, 'missing-call-id')
+      return
+    }
+    const conversation = await this.resolveCallConversation(invite.relationId, session, config, generation)
+    if (!this.isCurrentCallGeneration(generation, session, config)) {
+      this.observeAVSDKDrop('OnInviteActionToAVSDK', source, 'stale-session', true)
+      return
+    }
+    if (!conversation) {
+      this.observeAVSDKDrop('OnInviteActionToAVSDK', source, 'unresolved-conversation', true)
+      return
+    }
+    const previous = this.callSignalState
+    if (
+      previous?.callId === callId
+      && previous.conversation.id === conversation.id
+      && previous.media === invite.media
+    ) {
+      this.observeAVSDKDrop('OnInviteActionToAVSDK', source, 'duplicate-transition', true)
+      return
+    }
+    this.callSignalState = { callId, conversation, media: invite.media, signal: 'incoming' }
+    this.dispatchCallSignal('incoming', source)
+  }
+
+  private isCurrentCallGeneration(generation: number, session: KernelSession, config: InitSessionConfig): boolean {
+    return generation === this.callSignalGeneration && this.session === session && this.config === config
+  }
+
+  private async resolveCallConversation(
+    numericId: string,
+    session: KernelSession,
+    config: InitSessionConfig,
+    generation: number,
+  ): Promise<QQConversation | undefined> {
+    const known = [...this.contacts.values()].find((item) => item.chatType === CHAT_C2C && item.peerUin === numericId)
+    if (known) return known
+    const buddy = [...this.users.values()].find((user) => user.numericId === numericId)
+    if (buddy) {
+      if (!this.isCurrentCallGeneration(generation, session, config)) return undefined
+      const created: QQConversation = {
+        id: conversationId(CHAT_C2C, buddy.id), kind: 'direct', title: buddy.name,
+        peerUid: buddy.id, peerUin: numericId, chatType: CHAT_C2C,
+      }
+      this.mergeConversation(created)
+      return created
+    }
+    const converted = await retryTransientInvalidArgument(
+      () => session.getUixConvertService().getUid(new Set([numericId])),
+    )
+    if (!this.isCurrentCallGeneration(generation, session, config)) return undefined
+    const peerUid = converted.uidInfo.get(numericId)
+    if (!peerUid) return undefined
+    const created: QQConversation = {
+      id: conversationId(CHAT_C2C, peerUid), kind: 'direct', title: numericId,
+      peerUid, peerUin: numericId, chatType: CHAT_C2C,
+    }
+    this.mergeConversation(created)
+    return created
+  }
+
+  private onCallAction(
+    kind: Extract<CallSignalJob['kind'], 'accept' | 'refuse' | 'logout'>,
+    source: AVSDKDiagnosticSource = 'listener-tap',
+  ): void {
+    const signal = kind === 'accept' ? 'accept-requested' : kind === 'refuse' ? 'refuse-requested' : 'logout-requested'
+    const state = this.callSignalState
+    if (!state) {
+      this.observeAVSDKDrop('setActionFromAVSDK', source, 'no-active-call', false, kind)
+      return
+    }
+    if (state.signal === signal) {
+      this.observeAVSDKDrop('setActionFromAVSDK', source, 'duplicate-transition', false, kind)
+      return
+    }
+    if (state.signal === 'logout-requested') {
+      this.observeAVSDKDrop('setActionFromAVSDK', source, 'uncorrelated-transition', false, kind)
+      return
+    }
+    state.signal = signal
+    this.dispatchCallSignal(signal, source)
+    if (signal === 'refuse-requested') this.callSignalState = undefined
+  }
+
+  private onCallEnded(source: AVSDKDiagnosticSource = 'listener-tap'): void {
+    const state = this.callSignalState
+    if (!state) {
+      this.observeAVSDKDrop('onS2CActionToAVSDK', source, 'no-active-call', false, 'unknown', true)
+      return
+    }
+    state.signal = 'ended'
+    this.dispatchCallSignal('ended', source)
+    this.callSignalState = undefined
+  }
+
+  private dispatchCallSignal(signal: QQCallSignalEvent['signal'], source: AVSDKDiagnosticSource = 'listener-tap'): void {
+    const state = this.callSignalState
+    if (!state) return
+    if ((signal === 'incoming' || signal === 'accept-requested') && !this.acceptCallSignalEvent()) {
+      this.observeAVSDKDrop(
+        signal === 'incoming' ? 'OnInviteActionToAVSDK' : 'setActionFromAVSDK',
+        source,
+        'rate-limited',
+        signal === 'incoming',
+        signal === 'accept-requested' ? 'accept' : 'unknown',
+      )
+      return
+    }
+    this.dispatch({
+      type: 'call-signal', version: 1, signal, media: state.media,
+      callId: state.callId, conversation: state.conversation, timestamp: Math.floor(Date.now() / 1_000),
+    })
   }
 
   private scheduleListenerRegistration(attempt = 1): void {
@@ -2732,12 +3193,41 @@ export class QQKernelBridge {
   }
 
   private dispatch(event: QQEvent): void {
+    if (event.type === 'native-avsdk') {
+      for (const queue of this.events) queue.push(event, true)
+      return
+    }
     const eventId = String(++this.eventSequence)
     this.eventIds.set(event, eventId)
     this.recentEvents.push({ id: eventId, event })
     if (this.recentEvents.length > 2_048) this.recentEvents.splice(0, this.recentEvents.length - 2_048)
     log('info', `bridge event dispatch ${eventSummary(event)} eventId=${eventId} subscribers=${this.events.size}`)
     for (const queue of this.events) queue.push(event)
+  }
+
+  private acceptAVSDKEvent(callback: string): boolean {
+    const now = Date.now()
+    if (now - this.avsdkEventWindowStartedAt >= AVSDK_EVENT_WINDOW_MS) {
+      this.avsdkEventWindowStartedAt = now
+      this.avsdkEventCount = 0
+      this.avsdkCallbackEventCounts.clear()
+    }
+    const callbackCount = this.avsdkCallbackEventCounts.get(callback) ?? 0
+    if (this.avsdkEventCount >= AVSDK_MAX_EVENTS_PER_WINDOW || callbackCount >= AVSDK_MAX_EVENTS_PER_CALLBACK) return false
+    this.avsdkEventCount++
+    this.avsdkCallbackEventCounts.set(callback, callbackCount + 1)
+    return true
+  }
+
+  private acceptCallSignalEvent(): boolean {
+    const now = Date.now()
+    if (now - this.callSignalEventWindowStartedAt >= CALL_SIGNAL_EVENT_WINDOW_MS) {
+      this.callSignalEventWindowStartedAt = now
+      this.callSignalEventCount = 0
+    }
+    if (this.callSignalEventCount >= CALL_SIGNAL_MAX_EVENTS_PER_WINDOW) return false
+    this.callSignalEventCount++
+    return true
   }
 
   private rememberMessage(message: QQMessage): void {
@@ -4398,6 +4888,326 @@ async function mapConcurrent<T, R>(items: readonly T[], concurrency: number, map
   return results
 }
 
+function makeAVSDKListener(
+  Constructor: (new (handlers: Record<string, (...args: never[]) => unknown>) => unknown) | undefined,
+  handle: (callback: string, args: unknown[]) => void,
+): unknown {
+  const handlers = new Proxy({} as Record<string, (...args: never[]) => unknown>, {
+    get(target, property) {
+      if (typeof property !== 'string') return undefined
+      return target[property] ??= (...args: unknown[]) => {
+        try {
+          handle(property, args)
+        } catch {
+          log('error', 'native AVSDK callback handling failed')
+        }
+      }
+    },
+  })
+  return Constructor ? new Constructor(handlers) : handlers
+}
+
+function normalizeAVSDKArgs(args: unknown[]): QQJsonValue[] {
+  const state = { ancestors: new WeakSet<object>(), nodes: 0, binaryBytes: 0 }
+  const normalized: QQJsonValue[] = []
+  let outputBytes = 0
+  for (const value of args.slice(0, AVSDK_MAX_ARGS)) {
+    let safe: QQJsonValue
+    try {
+      safe = jsonSafeValue(value, state, 0)
+    } catch {
+      safe = { type: 'unreadable' }
+    }
+    const size = Buffer.byteLength(JSON.stringify(safe))
+    if (outputBytes + size > AVSDK_MAX_OUTPUT_BYTES) {
+      normalized.push({ type: 'truncated', reason: 'output-budget' })
+      break
+    }
+    normalized.push(safe)
+    outputBytes += size
+  }
+  return normalized
+}
+
+function jsonSafeValue(
+  value: unknown,
+  state: { ancestors: WeakSet<object>, nodes: number, binaryBytes: number },
+  depth: number,
+): QQJsonValue {
+  if (depth > AVSDK_MAX_DEPTH || state.nodes++ >= AVSDK_MAX_NODES) return { type: 'truncated', reason: 'node-budget' }
+  if (value === null || typeof value === 'boolean') return value
+  if (typeof value === 'string') return truncateAVSDKString(value)
+  if (typeof value === 'number') return Number.isFinite(value) ? value : String(value)
+  if (typeof value === 'bigint') return { type: 'bigint', value: String(value) }
+  if (typeof value === 'undefined') return { type: 'undefined' }
+  if (typeof value === 'symbol') return { type: 'symbol', value: String(value) }
+  if (isAVSDKProxy(value) || typeof value === 'function') return { type: 'opaque' }
+  if (typeof value !== 'object') return { type: 'opaque' }
+  if (types.isNativeError(value) || types.isDate(value) || types.isMap(value) || types.isSet(value)) return { type: 'opaque' }
+  if (types.isAnyArrayBuffer(value)) return jsonSafeBinary(new Uint8Array(value), state)
+  if (ArrayBuffer.isView(value)) {
+    return jsonSafeBinary(new Uint8Array(value.buffer, value.byteOffset, value.byteLength), state)
+  }
+  if (Array.isArray(value)) return jsonSafeArray(value, state, depth)
+  if (!isPlainAVSDKObject(value)) return { type: 'opaque' }
+  return jsonSafeObject(value, state, depth)
+}
+
+function jsonSafeArray(
+  value: unknown[],
+  state: { ancestors: WeakSet<object>, nodes: number, binaryBytes: number },
+  depth: number,
+): QQJsonValue {
+  return withAVSDKAncestor(value, state, () => {
+    const output: QQJsonValue[] = []
+    let keys: string[]
+    try {
+      keys = Object.keys(value)
+    } catch {
+      return { type: 'unreadable' }
+    }
+    for (const key of keys) {
+      if (output.length >= AVSDK_MAX_COLLECTION_ITEMS) {
+        output.push({ type: 'truncated', reason: 'collection-budget' })
+        break
+      }
+      if (!/^(?:0|[1-9]\d*)$/.test(key)) continue
+      try {
+        const descriptor = Object.getOwnPropertyDescriptor(value, key)
+        output.push(!descriptor ? { type: 'unreadable' } : 'value' in descriptor
+          ? jsonSafeValue(descriptor.value, state, depth + 1)
+          : { type: 'accessor' })
+      } catch {
+        output.push({ type: 'unreadable' })
+      }
+    }
+    return output
+  })
+}
+
+function jsonSafeObject(
+  value: object,
+  state: { ancestors: WeakSet<object>, nodes: number, binaryBytes: number },
+  depth: number,
+): QQJsonValue {
+  return withAVSDKAncestor(value, state, () => {
+    let keys: string[]
+    try {
+      keys = Object.keys(value)
+    } catch {
+      return { type: 'unreadable' }
+    }
+    const object: { [key: string]: QQJsonValue } = {}
+    let count = 0
+    for (const key of keys) {
+      if (count++ >= AVSDK_MAX_COLLECTION_ITEMS) {
+        object.truncated = true
+        break
+      }
+      const safeKey = truncateAVSDKString(key)
+      try {
+        const descriptor = Object.getOwnPropertyDescriptor(value, key)
+        if (!descriptor) continue
+        object[safeKey] = 'value' in descriptor
+          ? jsonSafeValue(descriptor.value, state, depth + 1)
+          : { type: 'accessor' }
+      } catch {
+        object[safeKey] = { type: 'unreadable' }
+      }
+    }
+    return object
+  })
+}
+
+function isPlainAVSDKObject(value: object): boolean {
+  try {
+    const prototype = Object.getPrototypeOf(value)
+    return prototype === Object.prototype || prototype === null
+  } catch {
+    return false
+  }
+}
+
+function isAVSDKProxy(value: unknown): boolean {
+  try {
+    return types.isProxy(value)
+  } catch {
+    return true
+  }
+}
+
+function withAVSDKAncestor<T extends QQJsonValue>(
+  value: object,
+  state: { ancestors: WeakSet<object> },
+  map: () => T,
+): T | { type: 'circular' } {
+  if (state.ancestors.has(value)) return { type: 'circular' }
+  state.ancestors.add(value)
+  try {
+    return map()
+  } finally {
+    state.ancestors.delete(value)
+  }
+}
+
+function jsonSafeBinary(
+  value: Uint8Array,
+  state: { binaryBytes: number },
+): QQJsonValue {
+  const previewLength = Math.min(
+    value.byteLength,
+    AVSDK_MAX_BINARY_PREVIEW_BYTES,
+    Math.max(0, AVSDK_MAX_BINARY_BYTES - state.binaryBytes),
+  )
+  state.binaryBytes += previewLength
+  return {
+    type: 'binary',
+    length: value.byteLength,
+    ...(previewLength ? { base64: Buffer.from(value.subarray(0, previewLength)).toString('base64') } : {}),
+    ...(previewLength < value.byteLength ? { truncated: true } : {}),
+  }
+}
+
+function truncateAVSDKString(value: string): string {
+  return value.length > AVSDK_MAX_STRING_LENGTH ? value.slice(0, AVSDK_MAX_STRING_LENGTH) : value
+}
+
+function parseAVSDKInvite(args: unknown[]): {
+  relationId: string
+  media: QQCallSignalEvent['media']
+  bytes: Uint8Array
+  truncated?: boolean
+} | undefined {
+  const invite = args[0]
+  const binary = asUint8Array(args[2])
+  const string = typeof args[2] === 'string' ? boundedAVSDKStringBytes(args[2]) : undefined
+  const bytes = binary ?? string?.bytes
+  if (!invite || typeof invite !== 'object' || !bytes) return undefined
+  const relationId = ownAVSDKDataProperty(invite, 'relation_id')
+  const inviteType = ownAVSDKDataProperty(invite, 'invite_type')
+  if (typeof relationId !== 'string' || !isCallSignalNumericId(relationId) || !Number.isSafeInteger(inviteType)) return undefined
+  return { relationId, media: inviteType === 1 ? 'voice' : 'unknown', bytes, ...(string?.truncated ? { truncated: true } : {}) }
+}
+
+function hasAVSDKInviteRelation(value: unknown): boolean {
+  const relationId = ownAVSDKDataProperty(value, 'relation_id')
+  return typeof relationId === 'string' && Boolean(relationId)
+}
+
+function ownAVSDKDataProperty(value: unknown, key: string): unknown {
+  if (!value || typeof value !== 'object' || isAVSDKProxy(value)) return undefined
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)
+    return descriptor && 'value' in descriptor && isAVSDKPrimitive(descriptor.value) ? descriptor.value : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function isAVSDKPrimitive(value: unknown): boolean {
+  return value === null || (typeof value !== 'object' && typeof value !== 'function')
+}
+
+function callSignalActionKind(value: unknown): Extract<CallSignalJob['kind'], 'accept' | 'refuse' | 'logout'> | undefined {
+  const bytes = asUint8Array(value)
+  if (!bytes) return undefined
+  if (hasCompleteASCIIToken(bytes, AVSDK_ACCEPT_INVITE_BYTES)) return 'accept'
+  if (hasCompleteASCIIToken(bytes, AVSDK_REFUSE_INVITE_BYTES)) return 'refuse'
+  if (hasCompleteASCIIToken(bytes, AVSDK_LOG_OUT_BYTES)) return 'logout'
+  return undefined
+}
+
+function hasDestroyReason(value: unknown): boolean {
+  return hasAVSDKPrimitiveDataProperty(value, 'destroyReason')
+}
+
+function hasAVSDKPrimitiveDataProperty(value: unknown, key: string): boolean {
+  if (!value || typeof value !== 'object' || isAVSDKProxy(value)) return false
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)
+    return Boolean(descriptor && 'value' in descriptor && isAVSDKPrimitive(descriptor.value))
+  } catch {
+    return false
+  }
+}
+
+function isAVSDKDiagnosticCallback(value: string): value is AVSDKDiagnosticCallback {
+  return value === 'OnInviteActionToAVSDK' || value === 'setActionFromAVSDK' || value === 'onS2CActionToAVSDK'
+}
+
+function diagnosticAVSDKArgType(value: unknown): 'null' | 'number' | 'string' | 'object' | 'binary' {
+  if (value === null) return 'null'
+  if (typeof value === 'number') return 'number'
+  if (typeof value === 'string') return 'string'
+  return asUint8Array(value) ? 'binary' : 'object'
+}
+
+function diagnosticAVSDKBinaryBytes(value: unknown): number {
+  return Math.min(asUint8Array(value)?.byteLength ?? 0, CALL_SIGNAL_ID_SCAN_BYTES)
+}
+
+function asUint8Array(value: unknown): Uint8Array | undefined {
+  if (isAVSDKProxy(value)) return undefined
+  if (types.isAnyArrayBuffer(value)) return new Uint8Array(value)
+  if (!ArrayBuffer.isView(value)) return undefined
+  return new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
+}
+
+function boundedAVSDKStringBytes(value: string): { bytes: Uint8Array, truncated: boolean } {
+  const bytes = new Uint8Array(CALL_SIGNAL_ID_SCAN_BYTES)
+  const { read, written } = new TextEncoder().encodeInto(value, bytes)
+  return { bytes: bytes.subarray(0, written), truncated: read < value.length }
+}
+
+function isCallSignalNumericId(value: string): boolean {
+  return value.length > 0 && value.length <= CALL_SIGNAL_RELATION_ID_MAX_LENGTH && /^[0-9]+$/.test(value)
+}
+
+function scanCallId(bytes: Uint8Array, relationId: string, selfUin: string, truncated = false): string | undefined {
+  if (!isCallSignalNumericId(relationId) || !isCallSignalNumericId(selfUin)) return undefined
+  const source = boundedAVSDKBuffer(bytes)
+  const prefix = Buffer.from(`${relationId}_${selfUin}_`, 'ascii')
+  for (let offset = source.indexOf(prefix); offset >= 0; offset = source.indexOf(prefix, offset + 1)) {
+    if (isASCIITokenByte(offset > 0 ? source[offset - 1] : undefined)) continue
+    let end = offset + prefix.length
+    const digitStart = end
+    while (end < source.length && source[end] >= 48 && source[end] <= 57) end++
+    if (end === digitStart || end - offset > CALL_SIGNAL_ID_MAX_LENGTH) continue
+    if (!isASCIITokenByte(source[end]) && (end < source.length || (!truncated && source.length === bytes.byteLength))) {
+      return source.subarray(offset, end).toString('ascii')
+    }
+  }
+  return undefined
+}
+
+function hasCompleteASCIIToken(bytes: Uint8Array, needle: Buffer): boolean {
+  const source = boundedAVSDKBuffer(bytes)
+  for (let offset = source.indexOf(needle); offset >= 0; offset = source.indexOf(needle, offset + 1)) {
+    const before = offset > 0 ? source[offset - 1] : undefined
+    const after = bytes[offset + needle.length]
+    if (!isASCIITokenByte(before) && !isASCIITokenByte(after)) return true
+  }
+  return false
+}
+
+function boundedAVSDKBuffer(bytes: Uint8Array): Buffer {
+  return Buffer.from(bytes.buffer, bytes.byteOffset, Math.min(bytes.byteLength, CALL_SIGNAL_ID_SCAN_BYTES))
+}
+
+function isASCIITokenByte(value: number | undefined): boolean {
+  return value !== undefined && (
+    value >= 48 && value <= 57 || value >= 65 && value <= 90 || value >= 97 && value <= 122 || value === 46 || value === 95
+  )
+}
+
+function isAVSDKTapEnabled(): boolean {
+  return process.env.QQNT_BRIDGE_AVSDK_TAP === '1'
+}
+
+function isAVSDKRawEnabled(): boolean {
+  return process.env.QQNT_BRIDGE_AVSDK_RAW === '1'
+}
+
 function makeListener(
   name: string,
   Constructor: (new (handlers: Record<string, (...args: never[]) => unknown>) => unknown) | undefined,
@@ -4917,6 +5727,12 @@ function eventSummary(event: QQEvent): string {
   }
   if (event.type === 'message-delete') {
     return `type=message-delete conversation=${event.conversation.id} title=${JSON.stringify(event.conversation.title)} avatar=${event.conversation.avatar?.id ?? '<none>'} messages=${event.messageIds.join(',')}`
+  }
+  if (event.type === 'native-avsdk') {
+    return `type=native-avsdk version=${event.version} callback=${event.callback} args=${event.args.length}`
+  }
+  if (event.type === 'call-signal') {
+    return `type=call-signal version=${event.version} signal=${event.signal} media=${event.media}`
   }
   return `type=message-reactions conversation=${event.conversation.id} title=${JSON.stringify(event.conversation.title)} avatar=${event.conversation.avatar?.id ?? '<none>'} message=${event.target.messageId} reactions=${event.context.reactions.length}`
 }

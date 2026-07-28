@@ -7,13 +7,28 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import WebSocket from 'ws'
 import type { ContactMsgBoxInfo, KernelModule, KernelSession, MsgElement, MsgRecord } from './kernel-types.js'
 import type { PacketAddon } from './packet-addon.js'
-import { PROTOCOL_VERSION } from './protocol.js'
+import type { QQEvent } from './protocol.js'
 import { QQKernelBridge } from './qq-kernel.js'
 import { QQBridgeServer } from './server.js'
 import { QQPacketClient } from './packet-client.js'
 import { HIGHWAY_BLOCK_SIZE, type DirectMessagePart } from './upload-protocol.js'
 
 const avatarFixturePath = process.platform === 'win32' ? process.execPath : '/dev/null'
+
+// QQNT 6.9.98 capture shape; identifiers and binary contents are sanitized.
+const qqnt698AVSDKFixture = {
+  version: 'QQNT 6.9.98',
+  invite: {
+    callback: 'OnInviteActionToAVSDK',
+    args: [{ relation_id: '1715311957', invite_type: 1 }, undefined, Buffer.from(
+      'capture-v1 1715311957_10000_20260728',
+    )] as const,
+  },
+  accept: { callback: 'setActionFromAVSDK', args: [2, Buffer.from('trpc.qqrtc.av_appsvr.AvAppsvr.SsoAcceptInvite')] as const },
+  refuse: { callback: 'setActionFromAVSDK', args: [2, Buffer.from('trpc.qqrtc.av_appsvr.AvAppsvr.SsoRefuseInvite')] as const },
+  logout: { callback: 'setActionFromAVSDK', args: [2, Buffer.from('trpc.qqrtc.av_appsvr.AvAppsvr.SsoLogOut')] as const },
+  destroy: { callback: 'onS2CActionToAVSDK', args: [{ destroyReason: 'capture-ended' }, 14] as const },
+}
 
 function packetAddonFixture(): PacketAddon {
   const binding = {
@@ -104,6 +119,8 @@ function fixture() {
   let profileHandlers: Record<string, (...args: unknown[]) => unknown> = {}
   let groupHandlers: Record<string, (...args: unknown[]) => unknown> = {}
   let searchHandlers: Record<string, (...args: unknown[]) => unknown> = {}
+  let avsdkHandlers: Record<string, (...args: unknown[]) => unknown> = {}
+  let avsdkAvailable = true
   const profileInfos = new Map<string, {
     uid: string, uin: string, nick: string, remark: string, avatarUrl: string
     longNick?: string
@@ -254,6 +271,13 @@ function fixture() {
     searchMoreChatMsgs: vi.fn((_searchId: number) => {}),
     cancelSearchChatMsgs: vi.fn((_searchId: number, _code: number, _reason: string) => {}),
   }
+  const avsdk = {
+    addKernelAVSDKListener: vi.fn((listener: { handlers?: typeof avsdkHandlers }) => {
+      avsdkHandlers = listener.handlers ?? listener as unknown as typeof avsdkHandlers
+      return 'avsdk-listener'
+    }),
+    removeKernelAVSDKListener: vi.fn(),
+  }
   const richMedia = {}
   const uix = {
     getUid: vi.fn(async (uins: Set<string>) => ({ uidInfo: new Map([...uins].flatMap((uin) => {
@@ -274,6 +298,7 @@ function fixture() {
     NodeIKernelProfileListener: Listener,
     NodeIKernelGroupListener: Listener,
     NodeIKernelSearchListener: Listener,
+    NodeIAVSDKListener: Listener,
   } as unknown as KernelModule
   const session = {
     getMsgService: () => msg,
@@ -282,6 +307,7 @@ function fixture() {
     getProfileService: () => profile,
     getGroupService: () => group,
     getSearchService: () => search,
+    getAVSDKService: vi.fn(() => avsdkAvailable ? avsdk : undefined),
     getRichMediaService: () => richMedia,
     getAvatarService: () => ({
       getAvatarPath: () => avatarPath, forceDownloadAvatar: async () => ({ result: 0, errMsg: '' }),
@@ -315,7 +341,7 @@ function fixture() {
       return { sequence: 1n, clientSequence: 2n, sendTime: 3 }
     })
   return {
-    kernel, session, msg, recent, profile, group, search, richMedia, uix, message, sentBodies,
+    kernel, session, msg, recent, profile, group, search, avsdk, richMedia, uix, message, sentBodies,
     imageUpload, fileUpload, protocolSend,
     emitMessages(records: MsgRecord[]) {
       return msgHandlers.onMsgInfoListUpdate?.(records)
@@ -366,6 +392,12 @@ function fixture() {
     emitSearch(result: import('./kernel-types.js').SearchMsgKeywordsResult) {
       searchHandlers.onSearchMsgKeywordsResult?.(result)
     },
+    emitAVSDK(callback: string, ...args: unknown[]) {
+      return avsdkHandlers[callback]?.(...args)
+    },
+    setAVSDKAvailable(value: boolean) {
+      avsdkAvailable = value
+    },
     setAvatarPath(path: string) {
       avatarPath = path
     },
@@ -378,10 +410,19 @@ async function readStream(stream: Readable): Promise<Buffer> {
   return Buffer.concat(chunks)
 }
 
+async function nextCallSignal(events: AsyncIterator<QQEvent>): Promise<Extract<QQEvent, { type: 'call-signal' }>> {
+  for (;;) {
+    const event = await events.next()
+    if (event.done) throw new Error('event subscription closed before call signal')
+    if (event.value.type === 'call-signal') return event.value
+  }
+}
+
 describe('QQKernelBridge', () => {
   const tempPaths: string[] = []
   afterEach(async () => {
     vi.unstubAllGlobals()
+    vi.unstubAllEnvs()
     vi.restoreAllMocks()
     await Promise.all(tempPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })))
   })
@@ -415,6 +456,1079 @@ describe('QQKernelBridge', () => {
       1, 'uid-1715311957', '1715311957', [{ kind: 'text', text: 'hello' }], 'self',
     )
     expect(f.msg.sendMsg).not.toHaveBeenCalled()
+  })
+
+  it('relays arbitrary AVSDK callbacks as JSON-safe native events', async () => {
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_TAP', '1')
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_RAW', '1')
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const subscription = bridge.subscribe()
+    const next = subscription[Symbol.asyncIterator]().next()
+    const circular: { self?: unknown } = {}
+    circular.self = circular
+    const circularArray: unknown[] = []
+    circularArray.push(circularArray)
+    const throwingGetter = {}
+    const proxyTraps = {
+      get: vi.fn(), getOwnPropertyDescriptor: vi.fn(), getPrototypeOf: vi.fn(), ownKeys: vi.fn(),
+    }
+    const descriptorFailure = new Proxy({}, proxyTraps)
+    const opaqueError = new Error('error-secret')
+    const opaqueDate = new Date(0)
+    const dateToJSON = vi.fn(() => 'date-secret')
+    opaqueDate.toJSON = dateToJSON
+    const opaqueMap = new Map([['map-secret', 'value-secret']])
+    const opaqueMapIterator = vi.fn()
+    Object.defineProperty(opaqueMap, Symbol.iterator, { value: opaqueMapIterator })
+    const opaqueSet = new Set(['set-secret'])
+    const opaqueSetIterator = vi.fn()
+    Object.defineProperty(opaqueSet, Symbol.iterator, { value: opaqueSetIterator })
+    const opaqueFunction = () => undefined
+    const functionName = vi.fn(() => 'function-secret')
+    Object.defineProperty(opaqueFunction, 'name', { get: functionName })
+    const shared = { state: 'shared' }
+    Object.defineProperty(throwingGetter, 'broken', {
+      enumerable: true,
+      get() { throw new Error('unavailable') },
+    })
+
+    f.emitAVSDK(
+      'onFutureCallState',
+      Buffer.from([1, 2, 3]),
+      new Map([['status', 7]]),
+      new Set(['connected']),
+      9n,
+      circular,
+      circularArray,
+      throwingGetter,
+      descriptorFailure,
+      opaqueError,
+      opaqueDate,
+      opaqueMap,
+      opaqueSet,
+      opaqueFunction,
+      { first: shared, second: shared },
+      Buffer.alloc(65, 4),
+    )
+
+    const event = await next
+    expect(event.value).toMatchObject({
+      type: 'native-avsdk',
+      version: 1,
+      callback: 'onFutureCallState',
+      args: [
+        { type: 'binary', base64: 'AQID', length: 3 },
+        { type: 'opaque' },
+        { type: 'opaque' },
+        { type: 'bigint', value: '9' },
+        { self: { type: 'circular' } },
+        [{ type: 'circular' }],
+        { broken: { type: 'accessor' } },
+        { type: 'opaque' },
+        { type: 'opaque' },
+        { type: 'opaque' },
+        { type: 'opaque' },
+        { type: 'opaque' },
+        { type: 'opaque' },
+        { first: { state: 'shared' }, second: { state: 'shared' } },
+        { type: 'binary', length: 65, truncated: true, base64: expect.any(String) },
+      ],
+    })
+    expect(() => JSON.stringify(event.value)).not.toThrow()
+    expect(dateToJSON).not.toHaveBeenCalled()
+    expect(opaqueMapIterator).not.toHaveBeenCalled()
+    expect(opaqueSetIterator).not.toHaveBeenCalled()
+    expect(functionName).not.toHaveBeenCalled()
+    for (const trap of Object.values(proxyTraps)) expect(trap).not.toHaveBeenCalled()
+    expect(JSON.stringify(event.value)).not.toContain('error-secret')
+    expect(JSON.stringify(event.value)).not.toContain('date-secret')
+    expect(JSON.stringify(event.value)).not.toContain('map-secret')
+    expect(JSON.stringify(event.value)).not.toContain('set-secret')
+    expect(JSON.stringify(event.value)).not.toContain('function-secret')
+    expect(bridge.eventId(event.value!)).toBeUndefined()
+    expect(f.avsdk.addKernelAVSDKListener).toHaveBeenCalledOnce()
+
+    bridge.unsubscribe(subscription)
+    bridge.detach()
+    expect(f.avsdk.removeKernelAVSDKListener).toHaveBeenCalledWith('avsdk-listener')
+  })
+
+  it(`observes the sanitized ${qqnt698AVSDKFixture.version} AVSDK callback fixture`, async () => {
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_TAP', '1')
+    const f = fixture()
+    f.uix.getUid.mockResolvedValueOnce({ uidInfo: new Map([['1715311957', 'capture-peer-uid']]) })
+    const bridge = new QQKernelBridge()
+    const subscription = bridge.subscribe()
+    const events = subscription[Symbol.asyncIterator]()
+    try {
+      bridge.attach(f.kernel, f.session, {
+        selfUin: '10000', selfUid: 'self', userPath: '/tmp',
+      })
+      f.emitAVSDK(qqnt698AVSDKFixture.invite.callback, ...qqnt698AVSDKFixture.invite.args)
+      const incoming = await nextCallSignal(events)
+      expect(incoming).toMatchObject({
+        signal: 'incoming', media: 'voice', callId: '1715311957_10000_20260728',
+      })
+
+      f.emitAVSDK(qqnt698AVSDKFixture.accept.callback, ...qqnt698AVSDKFixture.accept.args)
+      await expect(nextCallSignal(events)).resolves.toMatchObject({ signal: 'accept-requested', callId: incoming.callId })
+      f.emitAVSDK(qqnt698AVSDKFixture.refuse.callback, ...qqnt698AVSDKFixture.refuse.args)
+      await expect(nextCallSignal(events)).resolves.toMatchObject({ signal: 'refuse-requested', callId: incoming.callId })
+
+      f.emitAVSDK(qqnt698AVSDKFixture.invite.callback, ...qqnt698AVSDKFixture.invite.args)
+      await expect(nextCallSignal(events)).resolves.toMatchObject({ signal: 'incoming', callId: incoming.callId })
+      f.emitAVSDK(qqnt698AVSDKFixture.logout.callback, ...qqnt698AVSDKFixture.logout.args)
+      await expect(nextCallSignal(events)).resolves.toMatchObject({ signal: 'logout-requested', callId: incoming.callId })
+      f.emitAVSDK(qqnt698AVSDKFixture.destroy.callback, ...qqnt698AVSDKFixture.destroy.args)
+      await expect(nextCallSignal(events)).resolves.toMatchObject({ signal: 'ended', callId: incoming.callId })
+    } finally {
+      bridge.unsubscribe(subscription)
+      bridge.detach()
+    }
+  })
+
+  it('accepts QQNT string invite carriers without exposing their text', async () => {
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_TAP', '1')
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    const subscription = bridge.subscribe()
+    const events = subscription[Symbol.asyncIterator]()
+    const carrier = 'string-carrier-secret 1715311957_10000_20260728'
+    try {
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      f.emitAVSDK('OnInviteActionToAVSDK', { relation_id: '1715311957', invite_type: 1 }, 1, carrier)
+      const incoming = await nextCallSignal(events)
+      expect(incoming).toMatchObject({
+        signal: 'incoming', media: 'voice', callId: '1715311957_10000_20260728',
+      })
+      expect(JSON.stringify(incoming)).not.toContain('string-carrier-secret')
+    } finally {
+      bridge.unsubscribe(subscription)
+      bridge.detach()
+    }
+  })
+
+  it('drops composite call IDs that do not match the invite relation and current account', async () => {
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_TAP', '1')
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    const internals = bridge as unknown as {
+      callSignalQueueRunning: boolean
+      callSignalState?: unknown
+      onCallInvite(...args: unknown[]): Promise<void>
+    }
+    const onCallInvite = vi.spyOn(internals, 'onCallInvite')
+    const subscription = bridge.subscribe()
+    try {
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      f.emitAVSDK('OnInviteActionToAVSDK', { relation_id: '1715311957', invite_type: 1 }, undefined, Buffer.from('1715311958_10000_123456'))
+      await vi.waitFor(() => expect(onCallInvite).toHaveBeenCalledOnce())
+      await vi.waitFor(() => expect(internals.callSignalQueueRunning).toBe(false))
+      expect(f.uix.getUid).not.toHaveBeenCalled()
+      expect(internals.callSignalState).toBeUndefined()
+    } finally {
+      bridge.unsubscribe(subscription)
+      bridge.detach()
+    }
+  })
+
+  it('rejects oversized and nonnumeric invite relations before call-ID scanning', async () => {
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_TAP', '1')
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => {})
+    const internals = bridge as unknown as {
+      callSignalGeneration: number
+      callSignalJobs: unknown[]
+      onCallInvite(invite: { relationId: string, media: 'voice', bytes: Uint8Array }, generation: number): Promise<void>
+    }
+    const onCallInvite = vi.spyOn(internals, 'onCallInvite')
+    const oversizedRelation = '9'.repeat(2 * 1024 * 1024)
+    try {
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      f.emitAVSDK('OnInviteActionToAVSDK', { relation_id: oversizedRelation, invite_type: 1 }, undefined, Buffer.from('ignored'))
+      f.emitAVSDK('OnInviteActionToAVSDK', { relation_id: 'peer-not-numeric', invite_type: 1 }, undefined, Buffer.from('ignored'))
+      await Promise.resolve()
+      expect(onCallInvite).not.toHaveBeenCalled()
+      expect(internals.callSignalJobs).toHaveLength(0)
+      expect(f.uix.getUid).not.toHaveBeenCalled()
+
+      await internals.onCallInvite({
+        relationId: oversizedRelation, media: 'voice', bytes: Buffer.from('ignored'),
+      }, internals.callSignalGeneration)
+      expect(f.uix.getUid).not.toHaveBeenCalled()
+      const diagnostics = consoleLog.mock.calls.map(([message]) => String(message))
+        .filter((message) => message.includes('avsdk-call ')).join('\n')
+      expect(diagnostics).toContain('reason=invalid-invite')
+      expect(diagnostics).not.toContain(oversizedRelation)
+      expect(diagnostics).not.toContain('peer-not-numeric')
+    } finally {
+      bridge.detach()
+    }
+  })
+
+  it('does not make raw AVSDK callbacks checkpointable or replay them', async () => {
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_TAP', '1')
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_RAW', '1')
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    const subscription = bridge.subscribe()
+    const events = subscription[Symbol.asyncIterator]()
+    try {
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      f.emitAVSDK('OnInviteActionToAVSDK', { relation_id: '1715311957', invite_type: 1 }, undefined, Buffer.from('1715311957_10000_123456'))
+      await expect(events.next()).resolves.toMatchObject({ value: { type: 'native-avsdk' } })
+      const incoming = await nextCallSignal(events)
+      expect(bridge.eventId(incoming)).toBe('1')
+      f.emitAVSDK('onSanitizedRawFixture', Buffer.from([1, 2, 3]))
+      const raw = await events.next()
+      expect(raw.value).toMatchObject({ type: 'native-avsdk', callback: 'onSanitizedRawFixture' })
+      expect(bridge.eventId(raw.value!)).toBeUndefined()
+      bridge.unsubscribe(subscription)
+
+      const reconnect = bridge.subscribe(bridge.eventId(incoming))
+      const replay = reconnect[Symbol.asyncIterator]()
+      expect(bridge.consumeReplayEvent(reconnect)).toBeUndefined()
+      f.emitAVSDK('setActionFromAVSDK', 2, Buffer.from('trpc.qqrtc.av_appsvr.AvAppsvr.SsoAcceptInvite'))
+      const accepted = await nextCallSignal(replay)
+      expect(accepted).toMatchObject({ signal: 'accept-requested', callId: incoming.callId })
+      expect(bridge.eventId(accepted)).toBe('2')
+      bridge.unsubscribe(reconnect)
+    } finally {
+      bridge.detach()
+    }
+  })
+
+  it('leaves the AVSDK tap disabled unless explicitly enabled', () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    expect(f.avsdk.addKernelAVSDKListener).not.toHaveBeenCalled()
+    bridge.detach()
+  })
+
+  it('retries AVSDK listener registration after the other listeners are ready', async () => {
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_TAP', '1')
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_RAW', '1')
+    const f = fixture()
+    f.avsdk.addKernelAVSDKListener
+      .mockImplementationOnce(() => { throw new Error('not ready') })
+      .mockImplementationOnce(() => 'avsdk-listener')
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await vi.waitFor(() => expect(f.avsdk.addKernelAVSDKListener).toHaveBeenCalledTimes(2))
+    expect(f.msg.addKernelMsgListener).toHaveBeenCalledOnce()
+    bridge.detach()
+    expect(f.avsdk.removeKernelAVSDKListener).toHaveBeenCalledWith('avsdk-listener')
+  })
+
+  it('retries AVSDK registration when the service becomes available later', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(0))
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_TAP', '1')
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_RAW', '1')
+    const f = fixture()
+    f.setAVSDKAvailable(false)
+    const bridge = new QQKernelBridge()
+    try {
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      expect(f.avsdk.addKernelAVSDKListener).not.toHaveBeenCalled()
+
+      f.setAVSDKAvailable(true)
+      await vi.advanceTimersByTimeAsync(250)
+      expect(f.avsdk.addKernelAVSDKListener).toHaveBeenCalledOnce()
+    } finally {
+      bridge.detach()
+      vi.useRealTimers()
+    }
+  })
+
+  it('stops retrying permanently unavailable AVSDK service after 120 attempts', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(0))
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_TAP', '1')
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_RAW', '1')
+    const f = fixture()
+    f.setAVSDKAvailable(false)
+    const bridge = new QQKernelBridge()
+    try {
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      await vi.advanceTimersByTimeAsync(30_000)
+
+      expect(f.session.getAVSDKService).toHaveBeenCalledTimes(120)
+      expect(f.avsdk.addKernelAVSDKListener).not.toHaveBeenCalled()
+      expect((bridge as unknown as { avsdkListenerRetry?: NodeJS.Timeout }).avsdkListenerRetry).toBeUndefined()
+    } finally {
+      bridge.detach()
+      vi.useRealTimers()
+    }
+  })
+
+  it('rate-limits AVSDK events per callback and globally until the next window', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(0))
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_TAP', '1')
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_RAW', '1')
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    const subscription = bridge.subscribe()
+    const events = subscription[Symbol.asyncIterator]()
+    try {
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      const rejectedPayload = {}
+      const rejectedGetter = vi.fn(() => 'should not serialize')
+      Object.defineProperty(rejectedPayload, 'value', { enumerable: true, get: rejectedGetter })
+      for (let index = 0; index < 20; index++) f.emitAVSDK('onHotCallback')
+      f.emitAVSDK('onHotCallback', rejectedPayload)
+      for (let index = 0; index < 4; index++) f.emitAVSDK('onHotCallback')
+      expect(rejectedGetter).not.toHaveBeenCalled()
+
+      const perCallback = await Promise.all(Array.from({ length: 20 }, () => events.next()))
+      expect(perCallback).toHaveLength(20)
+      expect(perCallback.every((event) => event.value?.type === 'native-avsdk' && event.value.callback === 'onHotCallback')).toBe(true)
+      let perCallbackDropDelivered = false
+      const perCallbackDrop = events.next().then((event) => {
+        perCallbackDropDelivered = !event.done
+        return event
+      })
+      await Promise.resolve()
+      expect(perCallbackDropDelivered).toBe(false)
+
+      f.emitAVSDK('onOtherCallback')
+      await expect(perCallbackDrop).resolves.toMatchObject({ value: { callback: 'onOtherCallback' } })
+      const globalPending = Array.from({ length: 79 }, () => events.next())
+      for (let index = 0; index < 19; index++) f.emitAVSDK('onOtherCallback')
+      for (const callback of ['onThirdCallback', 'onFourthCallback', 'onFifthCallback']) {
+        for (let index = 0; index < 20; index++) f.emitAVSDK(callback)
+      }
+      const global = await Promise.all(globalPending)
+      expect(global).toHaveLength(79)
+      let globalDropDelivered = false
+      const globalDrop = events.next().then((event) => {
+        globalDropDelivered = !event.done
+        return event
+      })
+      f.emitAVSDK('onSixthCallback')
+      await Promise.resolve()
+      expect(globalDropDelivered).toBe(false)
+
+      await vi.advanceTimersByTimeAsync(1_000)
+      f.emitAVSDK('onHotCallback')
+      await expect(globalDrop).resolves.toMatchObject({ value: { callback: 'onHotCallback' } })
+    } finally {
+      bridge.unsubscribe(subscription)
+      bridge.detach()
+      vi.useRealTimers()
+    }
+  })
+
+  it('drops AVSDK frames for a slow subscriber without dropping ordinary events', async () => {
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_TAP', '1')
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_RAW', '1')
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    try {
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      const subscription = bridge.subscribe()
+      const events = subscription[Symbol.asyncIterator]()
+      for (const callback of ['onFirstCallback', 'onSecondCallback', 'onThirdCallback', 'onFourthCallback', 'onFifthCallback']) {
+        for (let index = 0; index < 20; index++) f.emitAVSDK(callback)
+      }
+      ;(bridge as unknown as { dispatch(event: QQEvent): void }).dispatch({
+        type: 'message',
+        conversation: bridge.getConversation('slow-subscriber'),
+        message: { id: 'ordinary-event' } as never,
+      })
+
+      const received = await Promise.all(Array.from({ length: 65 }, () => events.next()))
+      expect(received.filter((event) => event.value?.type === 'native-avsdk')).toHaveLength(64)
+      expect(received.filter((event) => event.value?.type === 'message')).toHaveLength(1)
+      bridge.unsubscribe(subscription)
+    } finally {
+      bridge.detach()
+    }
+  })
+
+  it('cancels a pending AVSDK listener retry when detached', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(0))
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_TAP', '1')
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_RAW', '1')
+    const f = fixture()
+    f.avsdk.addKernelAVSDKListener.mockImplementation(() => { throw new Error('not ready') })
+    const bridge = new QQKernelBridge()
+    try {
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      expect(f.avsdk.addKernelAVSDKListener).toHaveBeenCalledOnce()
+
+      bridge.detach()
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(f.avsdk.addKernelAVSDKListener).toHaveBeenCalledOnce()
+    } finally {
+      bridge.detach()
+      vi.useRealTimers()
+    }
+  })
+
+  it('projects AVSDK invites as replayable direct call signals without exposing native payloads', async () => {
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_TAP', '1')
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_RAW', '1')
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    const subscription = bridge.subscribe()
+    const events = subscription[Symbol.asyncIterator]()
+    try {
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      f.emitAVSDK('OnInviteActionToAVSDK', {
+        relation_id: '1715311957', invite_type: 1, from_uid: 'do-not-expose', roomId: 'do-not-expose',
+      }, undefined, Buffer.from('prefix 1715311957_10000_123456-session suffix'))
+      await expect(events.next()).resolves.toMatchObject({ value: { type: 'native-avsdk' } })
+      const incoming = await nextCallSignal(events)
+      expect(incoming).toMatchObject({
+        type: 'call-signal', version: 1, signal: 'incoming', media: 'voice',
+        callId: '1715311957_10000_123456', conversation: {
+          kind: 'direct', peerUid: 'uid-1715311957', peerUin: '1715311957', chatType: 1,
+        },
+      })
+      expect(Object.keys(incoming).sort()).toEqual(['callId', 'conversation', 'media', 'signal', 'timestamp', 'type', 'version'])
+      expect(JSON.stringify(incoming)).not.toContain('do-not-expose')
+      expect(f.uix.getUid).toHaveBeenCalledWith(new Set(['1715311957']))
+
+      f.emitAVSDK('setActionFromAVSDK', 999, Buffer.from('trpc.qqrtc.av_appsvr.AvAppsvr.SsoAcceptInvite'))
+      await expect(events.next()).resolves.toMatchObject({ value: { type: 'native-avsdk', callback: 'setActionFromAVSDK' } })
+      const accepted = await nextCallSignal(events)
+      expect(accepted).toMatchObject({ signal: 'accept-requested', callId: incoming.callId })
+      const replay = bridge.subscribe(bridge.eventId(incoming)!)
+      expect(bridge.consumeReplayEvent(replay)).toEqual({ index: 1, total: 1, last: true })
+      await expect(replay[Symbol.asyncIterator]().next()).resolves.toEqual({ value: accepted, done: false })
+      bridge.unsubscribe(replay)
+
+      f.emitAVSDK('onS2CActionToAVSDK', { destroyReason: 99 }, 14)
+      await expect(events.next()).resolves.toMatchObject({ value: { type: 'native-avsdk', callback: 'onS2CActionToAVSDK' } })
+      await expect(nextCallSignal(events)).resolves.toMatchObject({ signal: 'ended', callId: incoming.callId })
+    } finally {
+      bridge.unsubscribe(subscription)
+      bridge.detach()
+    }
+  })
+
+  it('accepts a binary call ID that ends exactly at the 4 KiB scan boundary', async () => {
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_TAP', '1')
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    const subscription = bridge.subscribe()
+    const events = subscription[Symbol.asyncIterator]()
+    const callId = '1715311957_10000_123'
+    const carrier = Buffer.concat([Buffer.alloc(4_096 - Buffer.byteLength(callId), ' '), Buffer.from(callId)])
+    try {
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      f.emitAVSDK('OnInviteActionToAVSDK', { relation_id: '1715311957', invite_type: 1 }, undefined, carrier)
+      await expect(nextCallSignal(events)).resolves.toMatchObject({ signal: 'incoming', callId })
+    } finally {
+      bridge.unsubscribe(subscription)
+      bridge.detach()
+    }
+  })
+
+  it('accepts complete and rejects truncated string call IDs at the 4 KiB scan boundary', async () => {
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_TAP', '1')
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    const internals = bridge as unknown as {
+      callSignalQueueRunning: boolean
+      dispatchCallSignal(signal: unknown): void
+      onCallInvite(...args: unknown[]): Promise<void>
+    }
+    const dispatchCallSignal = vi.spyOn(internals, 'dispatchCallSignal')
+    const onCallInvite = vi.spyOn(internals, 'onCallInvite')
+    const subscription = bridge.subscribe()
+    const events = subscription[Symbol.asyncIterator]()
+    const callId = '1715311957_10000_123'
+    const completeCarrier = `${' '.repeat(4_096 - callId.length)}${callId}`
+    try {
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      f.emitAVSDK('OnInviteActionToAVSDK', { relation_id: '1715311957', invite_type: 1 }, 1, completeCarrier)
+      await expect(nextCallSignal(events)).resolves.toMatchObject({ signal: 'incoming', callId })
+      dispatchCallSignal.mockClear()
+
+      f.emitAVSDK('OnInviteActionToAVSDK', { relation_id: '1715311957', invite_type: 1 }, 1, `${completeCarrier}x`)
+      await vi.waitFor(() => expect(onCallInvite).toHaveBeenCalledTimes(2))
+      await vi.waitFor(() => expect(internals.callSignalQueueRunning).toBe(false))
+      expect(dispatchCallSignal).not.toHaveBeenCalled()
+    } finally {
+      bridge.unsubscribe(subscription)
+      bridge.detach()
+    }
+  })
+
+  it('keeps ASCII call ID token boundaries stable next to UTF-8 characters', async () => {
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_TAP', '1')
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    const subscription = bridge.subscribe()
+    const events = subscription[Symbol.asyncIterator]()
+    const callId = '1715311957_10000_123'
+    try {
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      f.emitAVSDK('OnInviteActionToAVSDK', { relation_id: '1715311957', invite_type: 1 }, 1, `🚀${callId}🚀`)
+      await expect(nextCallSignal(events)).resolves.toMatchObject({ signal: 'incoming', callId })
+    } finally {
+      bridge.unsubscribe(subscription)
+      bridge.detach()
+    }
+  })
+
+  it('drops call IDs that continue past the shared 4 KiB scan window', async () => {
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_TAP', '1')
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    const internals = bridge as unknown as {
+      callSignalQueueRunning: boolean
+      callSignalState?: unknown
+      contacts: Map<string, unknown>
+      recentContactIds: Map<string, string>
+      recentContactOrder: string[]
+      dispatchCallSignal(signal: unknown): void
+      mergeConversation(...args: unknown[]): void
+      onCallInvite(...args: unknown[]): Promise<void>
+    }
+    const onCallInvite = vi.spyOn(internals, 'onCallInvite')
+    const dispatchCallSignal = vi.spyOn(internals, 'dispatchCallSignal')
+    const callIdPrefix = Buffer.from('1715311957_10000_', 'ascii')
+    const sharedWindow = Buffer.concat([
+      Buffer.alloc(4_096 - callIdPrefix.length - 3, 'x'), callIdPrefix, Buffer.from('123'),
+    ])
+    const emitInvite = (tail: string) => f.emitAVSDK(
+      'OnInviteActionToAVSDK', { relation_id: '1715311957', invite_type: 1 }, undefined,
+      Buffer.concat([sharedWindow, Buffer.from(tail)]),
+    )
+    try {
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      const dialogsBefore = await bridge.getDialogs()
+      const contactsBefore = [...internals.contacts]
+      const recentContactIdsBefore = [...internals.recentContactIds]
+      const recentContactOrderBefore = [...internals.recentContactOrder]
+      const mergeConversation = vi.spyOn(internals, 'mergeConversation')
+      f.uix.getUid.mockClear()
+
+      emitInvite('456')
+      await vi.waitFor(() => expect(onCallInvite).toHaveBeenCalledTimes(1))
+      emitInvite('457')
+      await vi.waitFor(() => expect(onCallInvite).toHaveBeenCalledTimes(2))
+      await vi.waitFor(() => expect(internals.callSignalQueueRunning).toBe(false))
+
+      expect(f.uix.getUid).not.toHaveBeenCalled()
+      expect(mergeConversation).not.toHaveBeenCalled()
+      expect(dispatchCallSignal).not.toHaveBeenCalled()
+      expect(internals.callSignalState).toBeUndefined()
+      expect([...internals.contacts]).toEqual(contactsBefore)
+      expect([...internals.recentContactIds]).toEqual(recentContactIdsBefore)
+      expect(internals.recentContactOrder).toEqual(recentContactOrderBefore)
+      mergeConversation.mockRestore()
+      await expect(bridge.getDialogs()).resolves.toMatchObject({
+        conversations: dialogsBefore.conversations.map(({ id }) => ({ id })),
+      })
+    } finally {
+      bridge.detach()
+    }
+  })
+
+  it('bounds string invite carrier scanning to 4 KiB and fails closed', async () => {
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_TAP', '1')
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    const internals = bridge as unknown as {
+      callSignalQueueRunning: boolean
+      callSignalState?: unknown
+      onCallInvite(...args: unknown[]): Promise<void>
+    }
+    const onCallInvite = vi.spyOn(internals, 'onCallInvite')
+    const bufferFrom = vi.spyOn(Buffer, 'from')
+    const encodeInto = vi.spyOn(TextEncoder.prototype, 'encodeInto')
+    const callId = '1715311957_10000_123'
+    const hugeCarrier = `${'x'.repeat(2 * 1024 * 1024)}${callId}`
+    const invalidCarriers = [
+      'no-call-id',
+      '1715311957_１００００_123',
+      `1715311957_10000_${'9'.repeat(129)}`,
+      `${'x'.repeat(4_096)}${callId}`,
+      `${'x'.repeat(4_096 - callId.length)}${callId}x`,
+      `${'🚀'.repeat(1_024)}${callId}`,
+      hugeCarrier,
+    ]
+    try {
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      for (const carrier of invalidCarriers) {
+        f.emitAVSDK('OnInviteActionToAVSDK', { relation_id: '1715311957', invite_type: 1 }, 1, carrier)
+        await vi.waitFor(() => expect(onCallInvite).toHaveBeenCalledTimes(invalidCarriers.indexOf(carrier) + 1))
+        await vi.waitFor(() => expect(internals.callSignalQueueRunning).toBe(false))
+      }
+
+      expect(f.uix.getUid).not.toHaveBeenCalled()
+      expect(internals.callSignalState).toBeUndefined()
+      expect(bufferFrom.mock.calls.some(([value]) => value === hugeCarrier)).toBe(false)
+      expect(encodeInto.mock.calls.find(([value]) => value === hugeCarrier)?.[1].byteLength).toBe(4_096)
+    } finally {
+      bridge.detach()
+    }
+  })
+
+  it('recognizes only complete AVSDK method tokens and serializes call state transitions', async () => {
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_TAP', '1')
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_RAW', '1')
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    const subscription = bridge.subscribe()
+    const events = subscription[Symbol.asyncIterator]()
+    try {
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      const invite = () => f.emitAVSDK('OnInviteActionToAVSDK', { relation_id: '1715311957', invite_type: 1 }, undefined, Buffer.from('1715311957_10000_123'))
+      invite()
+      await events.next()
+      const incoming = await nextCallSignal(events)
+      invite()
+      await events.next()
+      f.emitAVSDK('setActionFromAVSDK', 2, Buffer.from('xtrpc.qqrtc.av_appsvr.AvAppsvr.SsoAcceptInvite'))
+      await events.next()
+      f.emitAVSDK('setActionFromAVSDK', 2, Buffer.from('trpc.qqrtc.av_appsvr.AvAppsvr.SsoQueryInfo'))
+      await events.next()
+      f.emitAVSDK('setActionFromAVSDK', 2, Buffer.from('SharpQuality.Start'))
+      await events.next()
+      f.emitAVSDK('setActionFromAVSDK', 2, Buffer.concat([
+        Buffer.alloc(4_096, 'x'), Buffer.from('trpc.qqrtc.av_appsvr.AvAppsvr.SsoAcceptInvite'),
+      ]))
+      await events.next()
+      f.emitAVSDK('setActionFromAVSDK', 2, Buffer.from('trpc.qqrtc.av_appsvr.AvAppsvr.SsoAcceptInvite'))
+      await events.next()
+      const accepted = await nextCallSignal(events)
+      expect(accepted).toMatchObject({ signal: 'accept-requested', callId: incoming.callId })
+
+      invite()
+      await events.next()
+      f.emitAVSDK('setActionFromAVSDK', 2, Buffer.from('trpc.qqrtc.av_appsvr.AvAppsvr.SsoAcceptInvite'))
+      await expect(events.next()).resolves.toMatchObject({ value: { type: 'native-avsdk' } })
+      f.emitAVSDK('setActionFromAVSDK', 2, Buffer.from('trpc.qqrtc.av_appsvr.AvAppsvr.SsoRefuseInvite'))
+      await events.next()
+      await expect(nextCallSignal(events)).resolves.toMatchObject({ signal: 'refuse-requested', callId: incoming.callId })
+      f.emitAVSDK('onS2CActionToAVSDK', { destroyReason: 1 }, 14)
+      await expect(events.next()).resolves.toMatchObject({ value: { type: 'native-avsdk' } })
+
+      invite()
+      await events.next()
+      const secondIncoming = await nextCallSignal(events)
+      f.emitAVSDK('setActionFromAVSDK', 2, Buffer.from('trpc.qqrtc.av_appsvr.AvAppsvr.SsoLogOut'))
+      await events.next()
+      await expect(nextCallSignal(events)).resolves.toMatchObject({ signal: 'logout-requested', callId: secondIncoming.callId })
+      f.emitAVSDK('setActionFromAVSDK', 2, Buffer.from('trpc.qqrtc.av_appsvr.AvAppsvr.SsoLogOut'))
+      await events.next()
+      f.emitAVSDK('onS2CActionToAVSDK', { destroyReason: 123 }, 14)
+      await events.next()
+      await expect(nextCallSignal(events)).resolves.toMatchObject({ signal: 'ended', callId: secondIncoming.callId })
+    } finally {
+      bridge.unsubscribe(subscription)
+      bridge.detach()
+    }
+  })
+
+  it('rejects action tokens continued past the 4 KiB scan boundary', async () => {
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_TAP', '1')
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    const internals = bridge as unknown as { dispatchCallSignal(signal: unknown): void }
+    const dispatchCallSignal = vi.spyOn(internals, 'dispatchCallSignal')
+    const subscription = bridge.subscribe()
+    const events = subscription[Symbol.asyncIterator]()
+    const invite = () => f.emitAVSDK(
+      'OnInviteActionToAVSDK', { relation_id: '1715311957', invite_type: 1 }, undefined,
+      Buffer.from('1715311957_10000_123'),
+    )
+    const actionPayload = (token: string, suffix = '') => Buffer.concat([
+      Buffer.alloc(4_096 - Buffer.byteLength(token)), Buffer.from(token), Buffer.from(suffix),
+    ])
+    try {
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      invite()
+      const incoming = await nextCallSignal(events)
+      dispatchCallSignal.mockClear()
+
+      f.emitAVSDK('setActionFromAVSDK', 2, actionPayload('trpc.qqrtc.av_appsvr.AvAppsvr.SsoAcceptInvite', 'x'))
+      await Promise.resolve()
+      expect(dispatchCallSignal).not.toHaveBeenCalled()
+      f.emitAVSDK('setActionFromAVSDK', 2, actionPayload('trpc.qqrtc.av_appsvr.AvAppsvr.SsoAcceptInvite'))
+      await expect(nextCallSignal(events)).resolves.toMatchObject({ signal: 'accept-requested', callId: incoming.callId })
+      dispatchCallSignal.mockClear()
+
+      f.emitAVSDK('setActionFromAVSDK', 2, actionPayload('trpc.qqrtc.av_appsvr.AvAppsvr.SsoRefuseInvite', 'x'))
+      await Promise.resolve()
+      expect(dispatchCallSignal).not.toHaveBeenCalled()
+      f.emitAVSDK('setActionFromAVSDK', 2, actionPayload('trpc.qqrtc.av_appsvr.AvAppsvr.SsoRefuseInvite'))
+      await expect(nextCallSignal(events)).resolves.toMatchObject({ signal: 'refuse-requested', callId: incoming.callId })
+
+      invite()
+      await expect(nextCallSignal(events)).resolves.toMatchObject({ signal: 'incoming', callId: incoming.callId })
+      dispatchCallSignal.mockClear()
+      f.emitAVSDK('setActionFromAVSDK', 2, actionPayload('trpc.qqrtc.av_appsvr.AvAppsvr.SsoLogOut', 'x'))
+      await Promise.resolve()
+      expect(dispatchCallSignal).not.toHaveBeenCalled()
+      f.emitAVSDK('setActionFromAVSDK', 2, actionPayload('trpc.qqrtc.av_appsvr.AvAppsvr.SsoLogOut'))
+      await expect(nextCallSignal(events)).resolves.toMatchObject({ signal: 'logout-requested', callId: incoming.callId })
+    } finally {
+      bridge.unsubscribe(subscription)
+      bridge.detach()
+    }
+  })
+
+  it('serializes invitation resolution before an immediate accept request', async () => {
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_TAP', '1')
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_RAW', '1')
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    const subscription = bridge.subscribe()
+    const events = subscription[Symbol.asyncIterator]()
+    try {
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      f.emitAVSDK('OnInviteActionToAVSDK', { relation_id: '1715311957', invite_type: 1 }, undefined, Buffer.from('1715311957_10000_456'))
+      f.emitAVSDK('setActionFromAVSDK', 2, Buffer.from('trpc.qqrtc.av_appsvr.AvAppsvr.SsoAcceptInvite'))
+      await events.next()
+      await events.next()
+      await expect(nextCallSignal(events)).resolves.toMatchObject({ signal: 'incoming', callId: '1715311957_10000_456' })
+      await expect(nextCallSignal(events)).resolves.toMatchObject({ signal: 'accept-requested', callId: '1715311957_10000_456' })
+    } finally {
+      bridge.unsubscribe(subscription)
+      bridge.detach()
+    }
+  })
+
+  it('keeps call signals independent from the lossy raw AVSDK side channel', async () => {
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_TAP', '1')
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_RAW', '1')
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    const subscription = bridge.subscribe()
+    const events = subscription[Symbol.asyncIterator]()
+    try {
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      for (let index = 0; index < 100; index++) f.emitAVSDK(`onRaw${index}`)
+      f.emitAVSDK('OnInviteActionToAVSDK', { relation_id: '1715311957', invite_type: 1 }, undefined, Buffer.from('1715311957_10000_789'))
+      await expect(nextCallSignal(events)).resolves.toMatchObject({ signal: 'incoming', callId: '1715311957_10000_789' })
+    } finally {
+      bridge.unsubscribe(subscription)
+      bridge.detach()
+    }
+  })
+
+  it('does not merge stale call resolution results after an account switch', async () => {
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_TAP', '1')
+    const f = fixture()
+    let resolveUid!: (value: { uidInfo: Map<string, string> }) => void
+    f.uix.getUid.mockImplementationOnce(() => new Promise((resolve) => { resolveUid = resolve }))
+    const bridge = new QQKernelBridge()
+    try {
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      f.emitAVSDK('OnInviteActionToAVSDK', { relation_id: '1715311957', invite_type: 1 }, undefined, Buffer.from('1715311957_10000_123456'))
+      await vi.waitFor(() => expect(f.uix.getUid).toHaveBeenCalledWith(new Set(['1715311957'])))
+      bridge.attach(f.kernel, f.session, { selfUin: '20000', selfUid: 'self-2', userPath: '/tmp' })
+      resolveUid({ uidInfo: new Map([['1715311957', 'stale-uid']]) })
+      await vi.waitFor(() => expect((bridge as unknown as { contacts: Map<string, unknown> }).contacts.has('stale-uid')).toBe(false))
+    } finally {
+      bridge.detach()
+    }
+  })
+
+  it('rate-limits call signals independently while retaining state changes', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(0))
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_TAP', '1')
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_RAW', '1')
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    const subscription = bridge.subscribe()
+    const events = subscription[Symbol.asyncIterator]()
+    try {
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      for (let index = 0; index < 10; index++) {
+        f.emitAVSDK('OnInviteActionToAVSDK', { relation_id: '1715311957', invite_type: 1 }, undefined, Buffer.from(`1715311957_10000_${index}`))
+        await events.next()
+        await nextCallSignal(events)
+      }
+      f.emitAVSDK('OnInviteActionToAVSDK', { relation_id: '1715311957', invite_type: 1 }, undefined, Buffer.from('1715311957_10000_9001'))
+      await events.next()
+      await vi.waitFor(() => expect((bridge as unknown as { callSignalState?: { callId: string } }).callSignalState?.callId).toBe('1715311957_10000_9001'))
+      f.emitAVSDK('setActionFromAVSDK', 2, Buffer.from('trpc.qqrtc.av_appsvr.AvAppsvr.SsoRefuseInvite'))
+      await events.next()
+      await expect(nextCallSignal(events)).resolves.toMatchObject({ signal: 'refuse-requested', callId: '1715311957_10000_9001' })
+      await vi.waitFor(() => expect((bridge as unknown as { callSignalState?: unknown }).callSignalState).toBeUndefined())
+      await vi.advanceTimersByTimeAsync(60_000)
+      f.emitAVSDK('OnInviteActionToAVSDK', { relation_id: '1715311957', invite_type: 1 }, undefined, Buffer.from('1715311957_10000_9002'))
+      await events.next()
+      await expect(nextCallSignal(events)).resolves.toMatchObject({ signal: 'incoming', callId: '1715311957_10000_9002' })
+    } finally {
+      bridge.unsubscribe(subscription)
+      bridge.detach()
+      vi.useRealTimers()
+    }
+  })
+
+  it('emits bounded, identifier-free AVSDK diagnostics only for call callbacks', async () => {
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_TAP', '1')
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => {})
+    try {
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      f.emitAVSDK('onUnrelatedAVSDKCallback', 'not-observed')
+      f.emitAVSDK(
+        'OnInviteActionToAVSDK',
+        { relation_id: '1715311957', invite_type: 1, roomId: 'room-secret' },
+        null,
+        Buffer.from('1715311957_10000_123456 payload-secret'),
+        'ignored',
+        'also-ignored',
+      )
+      f.emitAVSDK('setActionFromAVSDK', 7, Buffer.from('trpc.qqrtc.av_appsvr.AvAppsvr.SsoAcceptInvite'))
+      f.emitAVSDK('setActionFromAVSDK', 7, Buffer.from('trpc.qqrtc.av_appsvr.AvAppsvr.SsoRefuseInvite'))
+      f.emitAVSDK('setActionFromAVSDK', 7, Buffer.from('trpc.qqrtc.av_appsvr.AvAppsvr.SsoLogOut'))
+      f.emitAVSDK('setActionFromAVSDK', 7, Buffer.from('trpc.qqrtc.av_appsvr.AvAppsvr.SsoQueryInfo'))
+      f.emitAVSDK('onS2CActionToAVSDK', { destroyReason: 'terminal-secret' }, 14)
+
+      const diagnostics = consoleLog.mock.calls.map(([message]) => String(message))
+        .filter((message) => message.includes('avsdk-call '))
+        .map((message) => message.replace(/^\[qqnt-bridge\] INFO /, ''))
+      expect(f.avsdk.addKernelAVSDKListener).toHaveBeenCalledOnce()
+      const hasReceipt = (expression: RegExp) => expect(diagnostics).toEqual(expect.arrayContaining([
+        expect.stringMatching(expression),
+      ]))
+      hasReceipt(/^avsdk-call receipt source=listener-tap callback=OnInviteActionToAVSDK args=5 types=object,null,binary,string binaryBytes=0,0,\d+,0 inviteRelation=true media=voice callIdFound=true action=unknown terminal=false$/)
+      for (const action of ['accept', 'refuse', 'logout', 'unknown']) {
+        hasReceipt(new RegExp(
+          `^avsdk-call receipt source=listener-tap callback=setActionFromAVSDK args=2 types=number,binary binaryBytes=0,\\d+ inviteRelation=false media=unknown callIdFound=false action=${action} terminal=false$`,
+        ))
+      }
+      hasReceipt(/^avsdk-call receipt source=listener-tap callback=onS2CActionToAVSDK args=2 types=object,number binaryBytes=0,0 inviteRelation=false media=unknown callIdFound=false action=unknown terminal=true$/)
+      const rendered = diagnostics.join('\n')
+      for (const value of ['1715311957', '10000', '123456', 'room-secret', 'payload-secret', 'terminal-secret', 'SsoAcceptInvite']) {
+        expect(rendered).not.toContain(value)
+      }
+      expect(rendered).not.toContain('onUnrelatedAVSDKCallback')
+    } finally {
+      bridge.detach()
+    }
+  })
+
+  it('reports AVSDK call drop reasons without changing call processing', async () => {
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_TAP', '1')
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => {})
+    const internals = bridge as unknown as {
+      callSignalGeneration: number
+      callSignalQueueRunning: boolean
+      onCallInvite(invite: { relationId: string, media: 'voice', bytes: Uint8Array }, generation: number): Promise<void>
+      onCallAction(kind: 'accept' | 'refuse' | 'logout'): void
+      dispatchCallSignal(signal: 'incoming'): void
+      drainCallSignalQueue(): void
+    }
+    const invite = (relationId = '1715311957', suffix = '123456') => ({
+      relationId, media: 'voice' as const, bytes: Buffer.from(`${relationId}_10000_${suffix}`),
+    })
+    try {
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      f.emitAVSDK('OnInviteActionToAVSDK', { invite_type: 1 }, undefined, Buffer.from('invalid'))
+      await internals.onCallInvite({ ...invite(), bytes: Buffer.from('no-call-id') }, internals.callSignalGeneration)
+      await internals.onCallInvite(invite('404'), internals.callSignalGeneration)
+      await internals.onCallInvite(invite(), internals.callSignalGeneration - 1)
+      await internals.onCallInvite(invite(), internals.callSignalGeneration)
+      await internals.onCallInvite(invite(), internals.callSignalGeneration)
+      internals.onCallAction('accept')
+      for (let index = 0; index < 11; index++) internals.dispatchCallSignal('incoming')
+      internals.callSignalQueueRunning = true
+      f.emitAVSDK('OnInviteActionToAVSDK', { relation_id: '1715311957', invite_type: 1 }, undefined, invite('1715311957', '789').bytes)
+      f.emitAVSDK('OnInviteActionToAVSDK', { relation_id: '1715311957', invite_type: 1 }, undefined, invite('1715311957', '790').bytes)
+      internals.callSignalQueueRunning = false
+      internals.drainCallSignalQueue()
+
+      const drops = consoleLog.mock.calls.map(([message]) => String(message))
+        .filter((message) => message.includes('avsdk-call drop'))
+        .join('\n')
+      for (const reason of [
+        'invalid-invite', 'missing-call-id', 'unresolved-conversation', 'stale-session',
+        'duplicate-transition', 'rate-limited',
+      ]) expect(drops).toContain(`reason=${reason}`)
+      expect(consoleLog.mock.calls.map(([message]) => String(message)).join('\n')).toContain(
+        'avsdk-call observation source=listener-tap callback=OnInviteActionToAVSDK outcome=queue-replaced action=unknown terminal=false',
+      )
+      expect(drops).not.toContain('queue-coalesced')
+      expect(drops).not.toContain('1715311957')
+      expect(drops).not.toContain('10000')
+    } finally {
+      bridge.detach()
+    }
+  })
+
+  it('distinguishes orphan and uncorrelated AVSDK transitions from duplicates', async () => {
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_TAP', '1')
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => {})
+    const subscription = bridge.subscribe()
+    const events = subscription[Symbol.asyncIterator]()
+    const action = (token: string) => f.emitAVSDK('setActionFromAVSDK', 2, Buffer.from(token))
+    try {
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      action('trpc.qqrtc.av_appsvr.AvAppsvr.SsoAcceptInvite')
+      f.emitAVSDK('onS2CActionToAVSDK', { destroyReason: 1 }, 14)
+      await vi.waitFor(() => {
+        const drops = consoleLog.mock.calls.map(([message]) => String(message)).join('\n')
+        expect(drops).toContain('callback=setActionFromAVSDK reason=no-active-call callIdFound=false action=accept terminal=false')
+        expect(drops).toContain('callback=onS2CActionToAVSDK reason=no-active-call callIdFound=false action=unknown terminal=true')
+      })
+
+      f.emitAVSDK('OnInviteActionToAVSDK', { relation_id: '1715311957', invite_type: 1 }, undefined, Buffer.from('1715311957_10000_333'))
+      await expect(nextCallSignal(events)).resolves.toMatchObject({ signal: 'incoming' })
+      action('trpc.qqrtc.av_appsvr.AvAppsvr.SsoAcceptInvite')
+      await expect(nextCallSignal(events)).resolves.toMatchObject({ signal: 'accept-requested' })
+      action('trpc.qqrtc.av_appsvr.AvAppsvr.SsoAcceptInvite')
+      action('trpc.qqrtc.av_appsvr.AvAppsvr.SsoLogOut')
+      await expect(nextCallSignal(events)).resolves.toMatchObject({ signal: 'logout-requested' })
+      action('trpc.qqrtc.av_appsvr.AvAppsvr.SsoAcceptInvite')
+      await vi.waitFor(() => {
+        const drops = consoleLog.mock.calls.map(([message]) => String(message)).join('\n')
+        expect(drops).toContain('reason=duplicate-transition')
+        expect(drops).toContain('reason=uncorrelated-transition')
+        expect(drops).toContain('source=listener-tap')
+      })
+    } finally {
+      bridge.unsubscribe(subscription)
+      bridge.detach()
+    }
+  })
+
+  it('uses own data properties and bounds AVSDK diagnostic admission before inspection', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(0))
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_TAP', '1')
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    const subscription = bridge.subscribe()
+    const events = subscription[Symbol.asyncIterator]()
+    const relationGetter = vi.fn(() => '1715311957')
+    const proxyTraps = {
+      get: vi.fn(), getOwnPropertyDescriptor: vi.fn(), getPrototypeOf: vi.fn(), ownKeys: vi.fn(),
+    }
+    const terminalProxyTraps = {
+      get: vi.fn(), getOwnPropertyDescriptor: vi.fn(), getPrototypeOf: vi.fn(), ownKeys: vi.fn(),
+    }
+    const accessorInvite = { invite_type: 1 }
+    Object.defineProperty(accessorInvite, 'relation_id', { enumerable: true, get: relationGetter })
+    const trappedInvite = new Proxy({ invite_type: 1 }, proxyTraps)
+    const trappedTerminal = new Proxy({}, terminalProxyTraps)
+    try {
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      f.emitAVSDK('OnInviteActionToAVSDK', accessorInvite, undefined, Buffer.from('1715311957_10000_111'))
+      f.emitAVSDK('OnInviteActionToAVSDK', trappedInvite, undefined, Buffer.from('1715311957_10000_112'))
+      await Promise.resolve()
+      expect(relationGetter).not.toHaveBeenCalled()
+      for (const trap of Object.values(proxyTraps)) expect(trap).not.toHaveBeenCalled()
+
+      f.emitAVSDK('OnInviteActionToAVSDK', { relation_id: '1715311957', invite_type: 1 }, undefined, Buffer.from('1715311957_10000_113'))
+      await expect(nextCallSignal(events)).resolves.toMatchObject({ signal: 'incoming' })
+      for (let index = 0; index < 61; index++) f.emitAVSDK('OnInviteActionToAVSDK', {}, undefined, Buffer.alloc(0))
+      f.emitAVSDK('OnInviteActionToAVSDK', trappedInvite, undefined, Buffer.from('1715311957_10000_114'))
+      f.emitAVSDK('onS2CActionToAVSDK', trappedTerminal, 14)
+      expect(relationGetter).not.toHaveBeenCalled()
+      for (const trap of Object.values(proxyTraps)) expect(trap).not.toHaveBeenCalled()
+      for (const trap of Object.values(terminalProxyTraps)) expect(trap).not.toHaveBeenCalled()
+
+      f.emitAVSDK('onS2CActionToAVSDK', { destroyReason: 1 }, 14)
+      await expect(nextCallSignal(events)).resolves.toMatchObject({ signal: 'ended' })
+    } finally {
+      bridge.unsubscribe(subscription)
+      bridge.detach()
+      vi.useRealTimers()
+    }
+  })
+
+  it('continues invite observation after 64 invalid AVSDK invites', async () => {
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_TAP', '1')
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    const subscription = bridge.subscribe()
+    const events = subscription[Symbol.asyncIterator]()
+    try {
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      for (let index = 0; index < 64; index++) f.emitAVSDK('OnInviteActionToAVSDK', {}, undefined, Buffer.alloc(0))
+      f.emitAVSDK('OnInviteActionToAVSDK', { relation_id: '1715311957', invite_type: 1 }, undefined, Buffer.from('1715311957_10000_701'))
+      await expect(nextCallSignal(events)).resolves.toMatchObject({ signal: 'incoming', callId: '1715311957_10000_701' })
+    } finally {
+      bridge.unsubscribe(subscription)
+      bridge.detach()
+    }
+  })
+
+  it('projects actions and terminal lifecycle after 64 non-action AVSDK payloads', async () => {
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_TAP', '1')
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    const subscription = bridge.subscribe()
+    const events = subscription[Symbol.asyncIterator]()
+    const invite = (suffix: string) => f.emitAVSDK(
+      'OnInviteActionToAVSDK', { relation_id: '1715311957', invite_type: 1 }, undefined,
+      Buffer.from(`1715311957_10000_${suffix}`),
+    )
+    const action = (token: string) => f.emitAVSDK('setActionFromAVSDK', 2, Buffer.from(token))
+    try {
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      invite('702')
+      await expect(nextCallSignal(events)).resolves.toMatchObject({ signal: 'incoming' })
+      for (let index = 0; index < 64; index++) action(`non-action-${index}`)
+      action('trpc.qqrtc.av_appsvr.AvAppsvr.SsoAcceptInvite')
+      await expect(nextCallSignal(events)).resolves.toMatchObject({ signal: 'accept-requested' })
+      action('trpc.qqrtc.av_appsvr.AvAppsvr.SsoRefuseInvite')
+      await expect(nextCallSignal(events)).resolves.toMatchObject({ signal: 'refuse-requested' })
+
+      invite('703')
+      await expect(nextCallSignal(events)).resolves.toMatchObject({ signal: 'incoming' })
+      action('trpc.qqrtc.av_appsvr.AvAppsvr.SsoLogOut')
+      await expect(nextCallSignal(events)).resolves.toMatchObject({ signal: 'logout-requested' })
+      f.emitAVSDK('onS2CActionToAVSDK', { destroyReason: 1 }, 14)
+      await expect(nextCallSignal(events)).resolves.toMatchObject({ signal: 'ended' })
+    } finally {
+      bridge.unsubscribe(subscription)
+      bridge.detach()
+    }
+  })
+
+  it('limits AVSDK diagnostics and ignores diagnostic logger failures', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(0))
+    vi.stubEnv('QQNT_BRIDGE_AVSDK_TAP', '1')
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => {})
+    const subscription = bridge.subscribe()
+    const events = subscription[Symbol.asyncIterator]()
+    try {
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      for (let index = 0; index < 8; index++) f.emitAVSDK('setActionFromAVSDK', index, Buffer.from('unknown-action'))
+      const receiptCount = () => consoleLog.mock.calls.map(([message]) => String(message))
+        .filter((message) => message.includes('avsdk-call receipt source=listener-tap callback=setActionFromAVSDK')).length
+      expect(receiptCount()).toBe(4)
+      await vi.advanceTimersByTimeAsync(60_000)
+      f.emitAVSDK('setActionFromAVSDK', 9, Buffer.from('unknown-action'))
+      expect(receiptCount()).toBe(5)
+
+      consoleLog.mockImplementation(() => { throw new Error('diagnostic sink unavailable') })
+      f.emitAVSDK('OnInviteActionToAVSDK', { relation_id: '1715311957', invite_type: 1 }, undefined, Buffer.from('1715311957_10000_654321'))
+      await expect(nextCallSignal(events)).resolves.toMatchObject({ signal: 'incoming', callId: '1715311957_10000_654321' })
+    } finally {
+      bridge.unsubscribe(subscription)
+      bridge.detach()
+      vi.useRealTimers()
+    }
   })
 
   it('confirms private packet sends by the returned client sequence without a listener callback', async () => {
@@ -2885,7 +3999,7 @@ describe('QQBridgeServer', () => {
     const { port } = server.address()
     const base = `http://127.0.0.1:${port}/v1`
     await expect(fetch(`${base}/status`).then((response) => response.json())).resolves.toMatchObject({
-      protocolVersion: PROTOCOL_VERSION, ready: true, selfUin: '10000',
+      protocolVersion: 20, ready: true, selfUin: '10000',
     })
     await expect(fetch(`${base}/dialogs`).then((response) => response.json())).resolves.toMatchObject({
       conversations: [{ peerUin: '1715311957' }],

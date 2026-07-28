@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 19
+export const PROTOCOL_VERSION = 20
 
 export type QQChatType = 1 | 2
 
@@ -214,6 +214,18 @@ export interface QQConversation {
   readInboxMaxMessage?: QQMessage
 }
 
+export type QQJsonValue = null | boolean | number | string | QQJsonValue[] | { [key: string]: QQJsonValue }
+
+export interface QQCallSignalEvent {
+  type: 'call-signal'
+  version: 1
+  signal: 'incoming' | 'accept-requested' | 'refuse-requested' | 'logout-requested' | 'ended'
+  media: 'voice' | 'unknown'
+  callId: string
+  conversation: QQConversation
+  timestamp: number
+}
+
 export type QQEvent =
   | { type: 'message', conversation: QQConversation, message: QQMessage }
   | { type: 'message-delete', eventId: string, conversation: QQConversation, messageIds: string[], timestamp: number }
@@ -225,6 +237,8 @@ export type QQEvent =
       context: QQReactionState
       timestamp: number
     }
+  | { type: 'native-avsdk', version: 1, callback: string, args: QQJsonValue[] }
+  | QQCallSignalEvent
 
 export interface QQReactionDefinition {
   key: string
