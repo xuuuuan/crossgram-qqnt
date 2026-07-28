@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto'
+import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto'
 import { createReadStream, createWriteStream, existsSync, mkdirSync, statSync } from 'node:fs'
 import { open as openFile, readFile, rm, stat } from 'node:fs/promises'
 import { basename, dirname, extname, join } from 'node:path'
@@ -52,9 +52,16 @@ const AVSDK_MAX_OUTPUT_BYTES = 16 * 1024
 const AVSDK_SUBSCRIBER_QUEUE_LIMIT = 64
 const CALL_SIGNAL_EVENT_WINDOW_MS = 60_000
 const CALL_SIGNAL_MAX_EVENTS_PER_WINDOW = 10
-const CALL_SIGNAL_ID_SCAN_BYTES = 4_096
-const CALL_SIGNAL_ID_MAX_LENGTH = 128
-const CALL_SIGNAL_RELATION_ID_MAX_LENGTH = 32
+const CALL_SIGNAL_RELATION_ID_MAX_BYTES = 32
+const CALL_SIGNAL_FROM_UID_MAX_BYTES = 128
+const CALL_SIGNAL_ARGUMENT_MAX_BYTES = 16 * 1024
+const CALL_SIGNAL_TUPLE_VERSION = 1
+const CALL_SIGNAL_SECRET_BYTES = 32
+const CALL_SIGNAL_PROCESS_EPOCH_BYTES = 16
+const CALL_SIGNAL_ACTION_SCAN_BYTES = 4_096
+const CALL_SIGNAL_TUPLE_DOMAIN = Buffer.from('qqnt-call-tuple-v1', 'ascii')
+const CALL_SIGNAL_ID_DOMAIN = Buffer.from('qqnt-call-id-v1', 'ascii')
+const U64_MAX = 0xffff_ffff_ffff_ffffn
 const CALL_SIGNAL_NONTERMINAL_QUEUE_LIMIT = 16
 const CALL_SIGNAL_TERMINAL_QUEUE_LIMIT = 3
 const CALL_SIGNAL_QUEUE_LIMIT = CALL_SIGNAL_NONTERMINAL_QUEUE_LIMIT + CALL_SIGNAL_TERMINAL_QUEUE_LIMIT
@@ -120,19 +127,25 @@ interface MessagePosition {
 
 interface CallSignalState {
   callId: string
+  fingerprint: string
   conversation: QQConversation
   media: QQCallSignalEvent['media']
   signal: QQCallSignalEvent['signal']
 }
 
+interface ParsedAVSDKInvite {
+  relationId: string
+  fromUid: string
+  inviteType: number
+  action: number
+  media: QQCallSignalEvent['media']
+  fingerprint: string
+  fingerprintDigest: Buffer
+}
+
 type AVSDKDiagnosticSource = 'listener-tap' | 'action-intercept'
 type CallSignalJob =
-  | {
-      kind: 'invite'
-      generation: number
-      source: AVSDKDiagnosticSource
-      invite: { relationId: string, media: QQCallSignalEvent['media'], bytes: Uint8Array, truncated?: boolean }
-    }
+  | { kind: 'invite', generation: number, source: AVSDKDiagnosticSource, invite: ParsedAVSDKInvite }
   | { kind: 'accept' | 'refuse' | 'logout' | 'ended', generation: number, source: AVSDKDiagnosticSource }
 
 type AVSDKDiagnosticCallback = 'OnInviteActionToAVSDK' | 'setActionFromAVSDK' | 'onS2CActionToAVSDK'
@@ -146,9 +159,10 @@ type AVSDKDiagnosticDrop =
   | 'uncorrelated-transition'
   | 'rate-limited'
   | 'queue-coalesced'
+  | 'concurrent-call'
+  | 'crypto-failure'
 type CallSignalEnqueueResult =
-  | { outcome: 'enqueued' | 'coalesced' }
-  | { outcome: 'replaced', replaced: CallSignalJob }
+  | { outcome: 'enqueued' | 'coalesced' | 'concurrent' }
 
 export class QQKernelBridge {
   readonly events = new Set<AsyncQueue<QQEvent>>()
@@ -171,6 +185,9 @@ export class QQKernelBridge {
   private readonly pendingCallSignalKinds = new Map<CallSignalJob['kind'], number>()
   private callSignalQueueRunning = false
   private callSignalGeneration = 0
+  private callSignalCounter = 0n
+  private readonly callSignalSecret?: Buffer
+  private callSignalProcessEpoch?: Buffer
   private callSignalState?: CallSignalState
   private session?: KernelSession
   private kernel?: KernelModule
@@ -270,6 +287,12 @@ export class QQKernelBridge {
     this.packetClientOptions = options.packetClient ?? {}
     this.deleteDedupTtlMs = options.deleteDedupTtlMs ?? DELETE_DEDUP_TTL_MS
     this.stickerMissingCacheTtlMs = options.stickerMissingCacheTtlMs ?? STICKER_MISSING_CACHE_TTL_MS
+    try {
+      this.callSignalSecret = randomBytes(CALL_SIGNAL_SECRET_BYTES)
+      this.callSignalProcessEpoch = randomBytes(CALL_SIGNAL_PROCESS_EPOCH_BYTES)
+    } catch {
+      // Incoming call projection fails closed when instance crypto is unavailable.
+    }
     mkdirSync(this.tempPath, { recursive: true })
   }
 
@@ -2442,17 +2465,26 @@ export class QQKernelBridge {
     if (diagnosticAdmitted) this.observeAVSDKReceipt(callback, args, source)
     const generation = this.callSignalGeneration
     if (callback === 'OnInviteActionToAVSDK') {
-      const invite = parseAVSDKInvite(args)
+      const config = this.config
+      const secret = this.callSignalSecret
+      if (!config || !secret) {
+        this.observeAVSDKDrop(callback, source, 'crypto-failure')
+        return
+      }
+      let invite: ParsedAVSDKInvite | undefined
+      try {
+        invite = parseAVSDKInvite(args, config, secret)
+      } catch {
+        this.observeAVSDKDrop(callback, source, 'crypto-failure')
+        return
+      }
       if (!invite) {
         this.observeAVSDKDrop(callback, source, 'invalid-invite')
         return
       }
       const enqueued = this.enqueueCallSignal({ kind: 'invite', generation, source, invite })
-      if (enqueued.outcome === 'replaced') {
-        this.observeAVSDKObservation(callback, enqueued.replaced.source, 'queue-replaced')
-      } else if (enqueued.outcome === 'coalesced') {
-        this.observeAVSDKDrop(callback, source, 'queue-coalesced')
-      }
+      if (enqueued.outcome === 'coalesced') this.observeAVSDKDrop(callback, source, 'queue-coalesced')
+      else if (enqueued.outcome === 'concurrent') this.observeAVSDKDrop(callback, source, 'concurrent-call')
       return
     }
     if (callback === 'setActionFromAVSDK') {
@@ -2470,10 +2502,12 @@ export class QQKernelBridge {
   private observeAVSDKReceipt(callback: AVSDKDiagnosticCallback, args: unknown[], source: AVSDKDiagnosticSource): void {
     try {
       const values = args.slice(0, AVSDK_DIAGNOSTIC_MAX_ARGS)
-      const invite = callback === 'OnInviteActionToAVSDK' ? parseAVSDKInvite(args) : undefined
+      const invite = callback === 'OnInviteActionToAVSDK' && this.config && this.callSignalSecret
+        ? parseAVSDKInvite(args, this.config, this.callSignalSecret)
+        : undefined
       const action = callback === 'setActionFromAVSDK' ? callSignalActionKind(args[1]) ?? 'unknown' : 'unknown'
       const terminal = callback === 'onS2CActionToAVSDK' && hasDestroyReason(args[0])
-      const callIdFound = Boolean(invite && this.config && scanCallId(invite.bytes, invite.relationId, this.config.selfUin, invite.truncated))
+      const callIdFound = Boolean(invite)
       const inviteRelation = callback === 'OnInviteActionToAVSDK' && hasAVSDKInviteRelation(args[0])
       this.logAVSDKDiagnostic(
         `receipt:${source}:${callback}`,
@@ -2551,12 +2585,10 @@ export class QQKernelBridge {
 
   private enqueueCallSignal(job: CallSignalJob): CallSignalEnqueueResult {
     if (job.kind === 'invite') {
-      const queued = this.callSignalJobs.findIndex((item) => item.kind === 'invite')
-      if (queued >= 0) {
-        const replaced = this.callSignalJobs[queued]!
-        this.callSignalJobs[queued] = job
-        return { outcome: 'replaced', replaced }
-      }
+      const queued = this.callSignalJobs.find((item): item is Extract<CallSignalJob, { kind: 'invite' }> => item.kind === 'invite')
+      if (queued) return queued.invite.fingerprint === job.invite.fingerprint
+        ? { outcome: 'coalesced' }
+        : { outcome: 'concurrent' }
     }
     const pending = this.pendingCallSignalKinds.get(job.kind) ?? 0
     if (job.kind === 'accept' && pending) return { outcome: 'coalesced' }
@@ -2600,7 +2632,7 @@ export class QQKernelBridge {
   }
 
   private async onCallInvite(
-    invite: { relationId: string, media: QQCallSignalEvent['media'], bytes: Uint8Array, truncated?: boolean },
+    invite: ParsedAVSDKInvite,
     generation: number,
     source: AVSDKDiagnosticSource = 'listener-tap',
   ): Promise<void> {
@@ -2610,30 +2642,30 @@ export class QQKernelBridge {
       this.observeAVSDKDrop('OnInviteActionToAVSDK', source, 'stale-session')
       return
     }
-    const callId = scanCallId(invite.bytes, invite.relationId, config.selfUin, invite.truncated)
-    if (!callId) {
-      this.observeAVSDKDrop('OnInviteActionToAVSDK', source, 'missing-call-id')
-      return
-    }
-    const conversation = await this.resolveCallConversation(invite.relationId, session, config, generation)
-    if (!this.isCurrentCallGeneration(generation, session, config)) {
-      this.observeAVSDKDrop('OnInviteActionToAVSDK', source, 'stale-session', true)
-      return
-    }
-    if (!conversation) {
-      this.observeAVSDKDrop('OnInviteActionToAVSDK', source, 'unresolved-conversation', true)
-      return
-    }
     const previous = this.callSignalState
-    if (
-      previous?.callId === callId
-      && previous.conversation.id === conversation.id
-      && previous.media === invite.media
-    ) {
-      this.observeAVSDKDrop('OnInviteActionToAVSDK', source, 'duplicate-transition', true)
+    if (previous?.fingerprint === invite.fingerprint) {
+      this.observeAVSDKDrop('OnInviteActionToAVSDK', source, 'duplicate-transition')
       return
     }
-    this.callSignalState = { callId, conversation, media: invite.media, signal: 'incoming' }
+    if (previous) {
+      this.observeAVSDKDrop('OnInviteActionToAVSDK', source, 'concurrent-call')
+      return
+    }
+    const conversation = this.resolveCallConversation(invite.fromUid, invite.relationId)
+    let callId: string | undefined
+    try {
+      callId = this.createCallId(invite.fingerprintDigest)
+    } catch {
+      this.observeAVSDKDrop('OnInviteActionToAVSDK', source, 'crypto-failure')
+      return
+    }
+    if (!this.isCurrentCallGeneration(generation, session, config)) {
+      this.observeAVSDKDrop('OnInviteActionToAVSDK', source, 'stale-session')
+      return
+    }
+    this.callSignalState = {
+      callId, fingerprint: invite.fingerprint, conversation, media: invite.media, signal: 'incoming',
+    }
     this.dispatchCallSignal('incoming', source)
   }
 
@@ -2641,36 +2673,31 @@ export class QQKernelBridge {
     return generation === this.callSignalGeneration && this.session === session && this.config === config
   }
 
-  private async resolveCallConversation(
-    numericId: string,
-    session: KernelSession,
-    config: InitSessionConfig,
-    generation: number,
-  ): Promise<QQConversation | undefined> {
-    const known = [...this.contacts.values()].find((item) => item.chatType === CHAT_C2C && item.peerUin === numericId)
+  private resolveCallConversation(fromUid: string, numericId: string): QQConversation {
+    const known = [...this.contacts.values()].find((item) => item.chatType === CHAT_C2C && item.peerUid === fromUid)
     if (known) return known
-    const buddy = [...this.users.values()].find((user) => user.numericId === numericId)
-    if (buddy) {
-      if (!this.isCurrentCallGeneration(generation, session, config)) return undefined
-      const created: QQConversation = {
-        id: conversationId(CHAT_C2C, buddy.id), kind: 'direct', title: buddy.name,
-        peerUid: buddy.id, peerUin: numericId, chatType: CHAT_C2C,
-      }
-      this.mergeConversation(created)
-      return created
-    }
-    const converted = await retryTransientInvalidArgument(
-      () => session.getUixConvertService().getUid(new Set([numericId])),
-    )
-    if (!this.isCurrentCallGeneration(generation, session, config)) return undefined
-    const peerUid = converted.uidInfo.get(numericId)
-    if (!peerUid) return undefined
+    const buddy = this.users.get(fromUid)
     const created: QQConversation = {
-      id: conversationId(CHAT_C2C, peerUid), kind: 'direct', title: numericId,
-      peerUid, peerUin: numericId, chatType: CHAT_C2C,
+      id: conversationId(CHAT_C2C, fromUid), kind: 'direct', title: buddy?.name ?? numericId,
+      peerUid: fromUid, peerUin: numericId, chatType: CHAT_C2C,
     }
     this.mergeConversation(created)
     return created
+  }
+
+  private createCallId(fingerprintDigest: Buffer): string {
+    if (!this.callSignalSecret || !this.callSignalProcessEpoch) throw new Error('call signal crypto unavailable')
+    if (this.callSignalCounter === U64_MAX) {
+      this.callSignalProcessEpoch = randomBytes(CALL_SIGNAL_PROCESS_EPOCH_BYTES)
+      this.callSignalCounter = 0n
+    }
+    const counter = ++this.callSignalCounter
+    return `qci1_${createHmac('sha256', this.callSignalSecret)
+      .update(CALL_SIGNAL_ID_DOMAIN)
+      .update(fingerprintDigest)
+      .update(this.callSignalProcessEpoch)
+      .update(u64be(counter))
+      .digest('base64url')}`
   }
 
   private onCallAction(
@@ -2683,17 +2710,17 @@ export class QQKernelBridge {
       this.observeAVSDKDrop('setActionFromAVSDK', source, 'no-active-call', false, kind)
       return
     }
-    if (state.signal === signal) {
-      this.observeAVSDKDrop('setActionFromAVSDK', source, 'duplicate-transition', false, kind)
-      return
-    }
-    if (state.signal === 'logout-requested') {
-      this.observeAVSDKDrop('setActionFromAVSDK', source, 'uncorrelated-transition', false, kind)
+    const allowed = state.signal === 'incoming'
+      || state.signal === 'accept-requested' && signal === 'logout-requested'
+    if (!allowed) {
+      this.observeAVSDKDrop(
+        'setActionFromAVSDK', source,
+        state.signal === signal ? 'duplicate-transition' : 'uncorrelated-transition', false, kind,
+      )
       return
     }
     state.signal = signal
     this.dispatchCallSignal(signal, source)
-    if (signal === 'refuse-requested') this.callSignalState = undefined
   }
 
   private onCallEnded(source: AVSDKDiagnosticSource = 'listener-tap'): void {
@@ -5072,33 +5099,61 @@ function truncateAVSDKString(value: string): string {
   return value.length > AVSDK_MAX_STRING_LENGTH ? value.slice(0, AVSDK_MAX_STRING_LENGTH) : value
 }
 
-function parseAVSDKInvite(args: unknown[]): {
-  relationId: string
-  media: QQCallSignalEvent['media']
-  bytes: Uint8Array
-  truncated?: boolean
-} | undefined {
+function parseAVSDKInvite(args: unknown[], config: InitSessionConfig, secret: Buffer): ParsedAVSDKInvite | undefined {
   const invite = args[0]
-  const binary = asUint8Array(args[2])
-  const string = typeof args[2] === 'string' ? boundedAVSDKStringBytes(args[2]) : undefined
-  const bytes = binary ?? string?.bytes
-  if (!invite || typeof invite !== 'object' || !bytes) return undefined
+  if (!isPlainAVSDKOwnDataObject(invite)) return undefined
   const relationId = ownAVSDKDataProperty(invite, 'relation_id')
   const inviteType = ownAVSDKDataProperty(invite, 'invite_type')
-  if (typeof relationId !== 'string' || !isCallSignalNumericId(relationId) || !Number.isSafeInteger(inviteType)) return undefined
-  return { relationId, media: inviteType === 1 ? 'voice' : 'unknown', bytes, ...(string?.truncated ? { truncated: true } : {}) }
+  const fromUid = ownAVSDKDataProperty(invite, 'from_uid')
+  const action = args[1]
+  const argument = args[2]
+  if (
+    typeof relationId !== 'string' || typeof fromUid !== 'string' || typeof argument !== 'string'
+    || !isSafeSignedInt32(inviteType) || !isSafeSignedInt32(action)
+  ) return undefined
+  const relationBytes = callSignalStringBytes(relationId, CALL_SIGNAL_RELATION_ID_MAX_BYTES, 1)
+  const fromUidBytes = callSignalStringBytes(fromUid, CALL_SIGNAL_FROM_UID_MAX_BYTES, 1)
+  const argumentBytes = callSignalStringBytes(argument, CALL_SIGNAL_ARGUMENT_MAX_BYTES, 0, false)
+  const selfUidBytes = callSignalStringBytes(config.selfUid, CALL_SIGNAL_FROM_UID_MAX_BYTES, 1)
+  const selfUinBytes = callSignalStringBytes(config.selfUin, CALL_SIGNAL_RELATION_ID_MAX_BYTES, 1)
+  if (!relationBytes || !fromUidBytes || !argumentBytes || !selfUidBytes || !selfUinBytes) return undefined
+  if (!isASCIIDigits(relationBytes) || !isASCIIDigits(selfUinBytes)) return undefined
+  try {
+    const digest = createHmac('sha256', secret)
+      .update(CALL_SIGNAL_TUPLE_DOMAIN)
+      .update(u32be(CALL_SIGNAL_TUPLE_VERSION))
+      .update(lengthFrame(selfUidBytes))
+      .update(lengthFrame(selfUinBytes))
+      .update(lengthFrame(relationBytes))
+      .update(i32be(inviteType))
+      .update(lengthFrame(fromUidBytes))
+      .update(i32be(action))
+      .update(lengthFrame(argumentBytes))
+      .digest()
+    return {
+      relationId, fromUid, inviteType, action, media: inviteType === 1 ? 'voice' : 'unknown',
+      fingerprint: digest.toString('base64url'), fingerprintDigest: digest,
+    }
+  } catch {
+    throw new Error('call signal crypto failed')
+  }
 }
 
 function hasAVSDKInviteRelation(value: unknown): boolean {
+  if (!isPlainAVSDKOwnDataObject(value)) return false
   const relationId = ownAVSDKDataProperty(value, 'relation_id')
-  return typeof relationId === 'string' && Boolean(relationId)
+  return typeof relationId === 'string' && Boolean(callSignalStringBytes(relationId, CALL_SIGNAL_RELATION_ID_MAX_BYTES, 1))
 }
 
-function ownAVSDKDataProperty(value: unknown, key: string): unknown {
-  if (!value || typeof value !== 'object' || isAVSDKProxy(value)) return undefined
+function isPlainAVSDKOwnDataObject(value: unknown): value is object {
+  if (!value || typeof value !== 'object' || isAVSDKProxy(value)) return false
+  return isPlainAVSDKObject(value)
+}
+
+function ownAVSDKDataProperty(value: object, key: string): unknown {
   try {
     const descriptor = Object.getOwnPropertyDescriptor(value, key)
-    return descriptor && 'value' in descriptor && isAVSDKPrimitive(descriptor.value) ? descriptor.value : undefined
+    return descriptor && 'value' in descriptor ? descriptor.value : undefined
   } catch {
     return undefined
   }
@@ -5122,7 +5177,7 @@ function hasDestroyReason(value: unknown): boolean {
 }
 
 function hasAVSDKPrimitiveDataProperty(value: unknown, key: string): boolean {
-  if (!value || typeof value !== 'object' || isAVSDKProxy(value)) return false
+  if (!isPlainAVSDKOwnDataObject(value)) return false
   try {
     const descriptor = Object.getOwnPropertyDescriptor(value, key)
     return Boolean(descriptor && 'value' in descriptor && isAVSDKPrimitive(descriptor.value))
@@ -5143,7 +5198,7 @@ function diagnosticAVSDKArgType(value: unknown): 'null' | 'number' | 'string' | 
 }
 
 function diagnosticAVSDKBinaryBytes(value: unknown): number {
-  return Math.min(asUint8Array(value)?.byteLength ?? 0, CALL_SIGNAL_ID_SCAN_BYTES)
+  return Math.min(asUint8Array(value)?.byteLength ?? 0, CALL_SIGNAL_ACTION_SCAN_BYTES)
 }
 
 function asUint8Array(value: unknown): Uint8Array | undefined {
@@ -5153,45 +5208,64 @@ function asUint8Array(value: unknown): Uint8Array | undefined {
   return new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
 }
 
-function boundedAVSDKStringBytes(value: string): { bytes: Uint8Array, truncated: boolean } {
-  const bytes = new Uint8Array(CALL_SIGNAL_ID_SCAN_BYTES)
-  const { read, written } = new TextEncoder().encodeInto(value, bytes)
-  return { bytes: bytes.subarray(0, written), truncated: read < value.length }
+function callSignalStringBytes(value: string, maxBytes: number, minBytes: number, rejectNul = true): Buffer | undefined {
+  // The UTF-16 guard is O(1); the fixed buffer prevents allocation from an
+  // untrusted string's full size before encodeInto validates it.
+  if (value.length > maxBytes) return undefined
+  const destination = new Uint8Array(maxBytes)
+  const { read, written } = new TextEncoder().encodeInto(value, destination)
+  if (read !== value.length || written < minBytes || written > maxBytes || rejectNul && value.includes('\0') || !isWellFormedUTF16(value)) return undefined
+  return Buffer.from(destination.buffer, destination.byteOffset, written)
 }
 
-function isCallSignalNumericId(value: string): boolean {
-  return value.length > 0 && value.length <= CALL_SIGNAL_RELATION_ID_MAX_LENGTH && /^[0-9]+$/.test(value)
-}
-
-function scanCallId(bytes: Uint8Array, relationId: string, selfUin: string, truncated = false): string | undefined {
-  if (!isCallSignalNumericId(relationId) || !isCallSignalNumericId(selfUin)) return undefined
-  const source = boundedAVSDKBuffer(bytes)
-  const prefix = Buffer.from(`${relationId}_${selfUin}_`, 'ascii')
-  for (let offset = source.indexOf(prefix); offset >= 0; offset = source.indexOf(prefix, offset + 1)) {
-    if (isASCIITokenByte(offset > 0 ? source[offset - 1] : undefined)) continue
-    let end = offset + prefix.length
-    const digitStart = end
-    while (end < source.length && source[end] >= 48 && source[end] <= 57) end++
-    if (end === digitStart || end - offset > CALL_SIGNAL_ID_MAX_LENGTH) continue
-    if (!isASCIITokenByte(source[end]) && (end < source.length || (!truncated && source.length === bytes.byteLength))) {
-      return source.subarray(offset, end).toString('ascii')
-    }
+function isWellFormedUTF16(value: string): boolean {
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index)
+    if (code >= 0xd800 && code <= 0xdbff) {
+      if (++index >= value.length || (value.charCodeAt(index) < 0xdc00 || value.charCodeAt(index) > 0xdfff)) return false
+    } else if (code >= 0xdc00 && code <= 0xdfff) return false
   }
-  return undefined
+  return true
+}
+
+function isSafeSignedInt32(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= -0x8000_0000 && value <= 0x7fff_ffff
+}
+
+function isASCIIDigits(value: Uint8Array): boolean {
+  return value.byteLength > 0 && value.every((byte) => byte >= 48 && byte <= 57)
+}
+
+function lengthFrame(value: Buffer): Buffer {
+  return Buffer.concat([u32be(value.byteLength), value])
+}
+
+function u32be(value: number): Buffer {
+  const frame = Buffer.allocUnsafe(4)
+  frame.writeUInt32BE(value)
+  return frame
+}
+
+function i32be(value: number): Buffer {
+  const frame = Buffer.allocUnsafe(4)
+  frame.writeInt32BE(value)
+  return frame
+}
+
+function u64be(value: bigint): Buffer {
+  const frame = Buffer.allocUnsafe(8)
+  frame.writeBigUInt64BE(value)
+  return frame
 }
 
 function hasCompleteASCIIToken(bytes: Uint8Array, needle: Buffer): boolean {
-  const source = boundedAVSDKBuffer(bytes)
+  const source = Buffer.from(bytes.buffer, bytes.byteOffset, Math.min(bytes.byteLength, CALL_SIGNAL_ACTION_SCAN_BYTES))
   for (let offset = source.indexOf(needle); offset >= 0; offset = source.indexOf(needle, offset + 1)) {
     const before = offset > 0 ? source[offset - 1] : undefined
     const after = bytes[offset + needle.length]
     if (!isASCIITokenByte(before) && !isASCIITokenByte(after)) return true
   }
   return false
-}
-
-function boundedAVSDKBuffer(bytes: Uint8Array): Buffer {
-  return Buffer.from(bytes.buffer, bytes.byteOffset, Math.min(bytes.byteLength, CALL_SIGNAL_ID_SCAN_BYTES))
 }
 
 function isASCIITokenByte(value: number | undefined): boolean {
