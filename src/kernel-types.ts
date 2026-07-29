@@ -618,6 +618,7 @@ export interface KernelSession {
   getGroupService(): KernelGroupService
   getSearchService?(): KernelSearchService
   getRichMediaService(): KernelRichMediaService
+  getSettingService?(): KernelSettingService
   getAvatarService?(): {
     getAvatarPath(uid: string, size: number): string
     forceDownloadAvatar(uid: string, size: number): Promise<{ result: number, errMsg: string }>
@@ -631,6 +632,53 @@ export interface KernelSession {
   }
 }
 
+export interface KernelSettingService {
+  getAutoLoginSwitch?(): Promise<{ result: number, errMsg: string, state: boolean }>
+  setAutoLoginSwitch(state: boolean): Promise<{ result: number, errMsg: string }>
+}
+
+export interface QRCodeInfo {
+  pngBase64QrcodeData: string
+  qrcodeUrl: string
+  expireTime: number
+  pollTimeInterval: number
+}
+
+export interface QRCodeLoginResult {
+  account: string
+  mainAccount: string
+  uin: string
+  uid: string
+  nickName: string
+  gender: number
+  age: number
+  faceUrl: string
+}
+
+export interface KernelLoginListener {
+  onLoginConnected?(): void
+  onLoginDisConnected?(): void
+  onLoginConnecting?(): void
+  onQRCodeGetPicture?(info: QRCodeInfo): void
+  onQRCodeLoginPollingStarted?(expireTime: number, pollTimeInterval: number): void
+  onQRCodeSessionUserScaned?(code: number, avatarUrl: string): void
+  onLoginState?(state: number): void
+  onQRCodeLoginSucceed?(result: QRCodeLoginResult): void
+  onQRCodeSessionFailed?(errorType: number, errorCode: number, errorMessage: string): void
+  onLoginFailed?(errorType: number, info: { title: string, message: string }): void
+  onUserLoggedIn?(uin: string): void
+  onQRCodeSessionQuickLoginFailed?(code: number, errorMessage: string, result: QRCodeInfo): void
+}
+
+export interface KernelLoginService {
+  get?(): KernelLoginService
+  addKernelLoginListener(listener: KernelLoginListener): void
+  removeKernelLoginListener?(listener: KernelLoginListener): void
+  getQRCodePicture(): boolean
+  startPolling(): boolean
+  abortPolling?(): boolean
+}
+
 export interface KernelModule {
   NodeIQQNTWrapperSession: { prototype: { init(config: InitSessionConfig, ...args: unknown[]): unknown } }
   NodeIKernelMsgListener?: new (handlers: Record<string, (...args: never[]) => unknown>) => unknown
@@ -639,6 +687,11 @@ export interface KernelModule {
   NodeIKernelGroupListener?: new (handlers: Record<string, (...args: never[]) => unknown>) => unknown
   NodeIKernelRecentContactListener?: new (handlers: Record<string, (...args: never[]) => unknown>) => unknown
   NodeIKernelSearchListener?: new (handlers: Record<string, (...args: never[]) => unknown>) => unknown
+  NodeIKernelLoginService?: (new (...args: unknown[]) => KernelLoginService) & {
+    get?(): KernelLoginService
+    create?(): KernelLoginService
+  }
+  NodeIKernelLoginListener?: new (handlers: KernelLoginListener) => KernelLoginListener
 }
 
 export interface InitSessionConfig {

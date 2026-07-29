@@ -8,6 +8,7 @@ import {
 } from './protocol.js'
 import { QQKernelBridge, QQStickerAssetNotFoundError } from './qq-kernel.js'
 import { log, recordSlowHttpRequest, slowHttpLogPath } from './log.js'
+import type { QQLoginController } from './login-controller.js'
 
 export interface BridgeServerOptions {
   host?: string
@@ -17,6 +18,7 @@ export interface BridgeServerOptions {
   token?: string
   slowRequestThresholdMs?: number
   slowRequestPath?: string
+  login?: QQLoginController
 }
 
 export class QQBridgeServer {
@@ -31,6 +33,7 @@ export class QQBridgeServer {
   readonly token?: string
   readonly slowRequestThresholdMs: number
   readonly slowRequestPath: string
+  readonly login?: QQLoginController
 
   constructor(readonly bridge: QQKernelBridge, options: BridgeServerOptions = {}) {
     this.host = options.host ?? '127.0.0.1'
@@ -40,6 +43,7 @@ export class QQBridgeServer {
     this.token = options.token
     this.slowRequestThresholdMs = options.slowRequestThresholdMs ?? 500
     this.slowRequestPath = options.slowRequestPath ?? slowHttpLogPath
+    this.login = options.login
   }
 
   async start(): Promise<void> {
@@ -188,9 +192,55 @@ export class QQBridgeServer {
     const path = url.pathname
 
     if (request.method === 'GET' && path === '/v1/status') {
-      const status = { protocolVersion: PROTOCOL_VERSION, ...this.bridge.status }
+      const status = { protocolVersion: PROTOCOL_VERSION, ...this.bridge.status, login: this.login?.status }
       log('info', `HTTP API status id=${requestId} ready=${status.ready} selfUin=${status.selfUin ?? ''}`)
       json(response, 200, status)
+      return
+    }
+    if (request.method === 'GET' && path === '/v1/login/status') {
+      if (!this.login) {
+        json(response, 503, { error: 'QQNT login controller is unavailable' })
+      } else {
+        json(response, 200, this.login.status)
+      }
+      return
+    }
+    if (request.method === 'GET' && path === '/v1/login/qrcode.png') {
+      const png = this.login?.qrCodePng
+      if (!png) {
+        json(response, 404, { error: 'QR code is not available' })
+      } else {
+        response.writeHead(200, {
+          'cache-control': 'no-store',
+          'content-length': png.length,
+          'content-type': 'image/png',
+        })
+        response.end(png)
+      }
+      return
+    }
+    if (request.method === 'GET' && path === '/v1/login/qrcode/url') {
+      const qrUrl = this.login?.qrcodeUrl
+      if (!qrUrl) {
+        json(response, 404, { error: 'QR code is not available' })
+      } else {
+        const body = Buffer.from(`${qrUrl}\n`)
+        response.writeHead(200, {
+          'cache-control': 'no-store',
+          'content-length': body.length,
+          'content-type': 'text/plain; charset=utf-8',
+        })
+        response.end(body)
+      }
+      return
+    }
+    if (request.method === 'POST' && path === '/v1/login/qrcode/refresh') {
+      if (!this.login) {
+        json(response, 503, { error: 'QQNT login controller is unavailable' })
+      } else {
+        await this.login.requestQRCode(true)
+        json(response, 202, this.login.status)
+      }
       return
     }
     if (!this.bridge.status.ready) {

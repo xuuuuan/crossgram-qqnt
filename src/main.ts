@@ -5,9 +5,12 @@ import type {
 } from './kernel-types.js'
 import { teeBuddyService, teeGroupService, teeMsgService, teeProfileService, teeRecentService } from './listener-tee.js'
 import { log, logPath } from './log.js'
+import { QQLoginController, wrapLoginServiceConstructor } from './login-controller.js'
 import { createPacketBindingProber, createPacketHookInstaller, type PacketBindingProbe } from './packet-addon.js'
 import { QQKernelBridge } from './qq-kernel.js'
 import { QQBridgeServer } from './server.js'
+
+declare const __QQNT_BRIDGE_BUILD_MODE__: string | undefined
 
 const processType = (process as NodeJS.Process & { type?: string }).type
 const bootstrapKey = Symbol.for('qqnt-bridge.bootstrap')
@@ -18,6 +21,10 @@ const bootstrapState = globalThis as typeof globalThis & { [bootstrapKey]?: bool
 if ((processType === undefined || processType === 'browser') && !bootstrapState[bootstrapKey]) {
   bootstrapState[bootstrapKey] = true
   const bridge = new QQKernelBridge()
+  const login = new QQLoginController({
+    autoRequestQRCode: process.env.QQNT_BRIDGE_MANAGE_LOGIN !== '0',
+    enableAutoLogin: process.env.QQNT_BRIDGE_AUTO_LOGIN !== '0',
+  })
   const server = new QQBridgeServer(bridge, {
     host: process.env.QQNT_BRIDGE_HOST ?? '127.0.0.1',
     port: Number(process.env.QQNT_BRIDGE_PORT ?? 18767),
@@ -26,11 +33,13 @@ if ((processType === undefined || processType === 'browser') && !bootstrapState[
       ? undefined
       : Number(process.env.QQNT_BRIDGE_WS_PORT),
     token: process.env.QQNT_BRIDGE_TOKEN,
+    login,
   })
 
-  installKernelRequireHook(bridge)
+  installKernelRequireHook(bridge, login)
   void startServer(server)
-  log('info', `injected processType=${processType ?? 'node'} pid=${process.pid}; log file: ${logPath}`)
+  const buildMode = typeof __QQNT_BRIDGE_BUILD_MODE__ === 'string' ? __QQNT_BRIDGE_BUILD_MODE__ : 'development'
+  log('info', `injected mode=${buildMode} processType=${processType ?? 'node'} pid=${process.pid}; log file: ${logPath}`)
 }
 
 async function startServer(server: QQBridgeServer): Promise<void> {
@@ -52,7 +61,7 @@ async function startServer(server: QQBridgeServer): Promise<void> {
  * session constructor is a construct proxy. The proxy wraps each new session
  * instance and observes init() without mutating the native object.
  */
-function installKernelRequireHook(bridge: QQKernelBridge): void {
+function installKernelRequireHook(bridge: QQKernelBridge, login: QQLoginController): void {
   type Loader = (request: string, parent: NodeModule | null, isMain: boolean) => unknown
   const moduleWithLoad = Module as unknown as { _load: Loader }
   const originalLoad = moduleWithLoad._load
@@ -66,7 +75,7 @@ function installKernelRequireHook(bridge: QQKernelBridge): void {
     if (!isKernelModule(loaded)) return loaded
     const cached = wrappedModules.get(loaded)
     if (cached) return cached
-    const wrapped = wrapKernelModule(loaded, bridge)
+    const wrapped = wrapKernelModule(loaded, bridge, login)
     wrappedModules.set(loaded, wrapped)
     log('info', `wrapped QQNT kernel module requested as ${request}`)
     return wrapped
@@ -83,7 +92,7 @@ function installKernelRequireHook(bridge: QQKernelBridge): void {
       const raw = nativeModule.exports
       let wrapped = wrappedModules.get(raw)
       if (!wrapped) {
-        wrapped = wrapKernelModule(raw, bridge)
+        wrapped = wrapKernelModule(raw, bridge, login)
         wrappedModules.set(raw, wrapped)
       }
       nativeModule.exports = wrapped
@@ -125,14 +134,15 @@ function isKernelModule(value: unknown): value is KernelModule & object {
   return typeof candidate.NodeIQQNTWrapperSession === 'function'
 }
 
-function wrapKernelModule(kernel: KernelModule, bridge: QQKernelBridge): KernelModule {
+function wrapKernelModule(kernel: KernelModule, bridge: QQKernelBridge, login: QQLoginController): KernelModule {
+  login.attachKernel(kernel)
   const NativeSession = kernel.NodeIQQNTWrapperSession as unknown as new (...args: unknown[]) => KernelSession
   const wrappedSessions = new WeakMap<object, KernelSession>()
   const wrapOnce = (session: KernelSession): KernelSession => {
     const object = session as object
     const cached = wrappedSessions.get(object)
     if (cached) return cached
-    const wrapped = wrapSession(kernel, session, bridge)
+    const wrapped = wrapSession(kernel, session, bridge, login)
     wrappedSessions.set(object, wrapped)
     return wrapped
   }
@@ -162,10 +172,21 @@ function wrapKernelModule(kernel: KernelModule, bridge: QQKernelBridge): KernelM
     ...descriptors.NodeIQQNTWrapperSession,
     value: SessionFacade,
   }
+  if (kernel.NodeIKernelLoginService && descriptors.NodeIKernelLoginService) {
+    descriptors.NodeIKernelLoginService = {
+      ...descriptors.NodeIKernelLoginService,
+      value: wrapLoginServiceConstructor(kernel.NodeIKernelLoginService, login, kernel),
+    }
+  }
   return Object.defineProperties({}, descriptors) as KernelModule
 }
 
-function wrapSession(kernel: KernelModule, nativeSession: KernelSession, bridge: QQKernelBridge): KernelSession {
+function wrapSession(
+  kernel: KernelModule,
+  nativeSession: KernelSession,
+  bridge: QQKernelBridge,
+  login: QQLoginController,
+): KernelSession {
   let attached = false
   let msgServiceFacade: KernelMsgService | undefined
   let buddyServiceFacade: KernelBuddyService | undefined
@@ -180,6 +201,7 @@ function wrapSession(kernel: KernelModule, nativeSession: KernelSession, bridge:
         return (config: InitSessionConfig, ...args: unknown[]) => {
           log('info', `QQNT session init invoked for ${config.selfUin}`)
           const result = Reflect.apply(value, target, [config, ...args])
+          login.attachSession(facade)
           if (!attached) {
             attached = true
             try {
