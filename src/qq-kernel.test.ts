@@ -11,7 +11,9 @@ import { PROTOCOL_VERSION } from './protocol.js'
 import { QQKernelBridge } from './qq-kernel.js'
 import { QQBridgeServer } from './server.js'
 import { QQPacketClient } from './packet-client.js'
-import { HIGHWAY_BLOCK_SIZE, type DirectMessagePart } from './upload-protocol.js'
+import {
+  HIGHWAY_BLOCK_SIZE, QQMessageSendRejectedError, type DirectMessagePart,
+} from './upload-protocol.js'
 
 const avatarFixturePath = process.platform === 'win32' ? process.execPath : '/dev/null'
 
@@ -3015,6 +3017,44 @@ describe('QQBridgeServer', () => {
     })
     expect(repeatedRead.status).toBe(200)
     await expect(repeatedRead.json()).resolves.toEqual({ ok: true })
+  })
+
+  it('returns HTTP 403 for permanent send rejection while keeping transient failures retryable', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const send = vi.spyOn(bridge, 'send')
+      .mockRejectedValueOnce(new QQMessageSendRejectedError(
+        16,
+        '发送失败，请先添加对方为好友',
+      ))
+      .mockRejectedValueOnce(new Error('QQ transport temporarily unavailable'))
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const base = `http://127.0.0.1:${server.address().port}/v1`
+    const headers = {
+      'x-qqnt-manifest': Buffer.from(JSON.stringify({
+        conversationId: 'uid-1715311957', text: 'via HTTP',
+      })).toString('base64url'),
+    }
+
+    const rejected = await fetch(`${base}/messages`, {
+      method: 'POST', headers, body: new Uint8Array(),
+    })
+    expect(rejected.status).toBe(403)
+    await expect(rejected.json()).resolves.toEqual({
+      error: 'QQ message send rejected: 发送失败，请先添加对方为好友 (16)',
+      result: 16,
+    })
+
+    const transient = await fetch(`${base}/messages`, {
+      method: 'POST', headers, body: new Uint8Array(),
+    })
+    expect(transient.status).toBe(500)
+    await expect(transient.json()).resolves.toEqual({
+      error: 'QQ transport temporarily unavailable',
+    })
+    expect(send).toHaveBeenCalledTimes(2)
   })
 
   it('passes reaction sequences through HTTP and distinguishes permanent from transient misses', async () => {

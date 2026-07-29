@@ -9,6 +9,7 @@ import {
 import {
   QQKernelBridge, QQReactionTargetNotFoundError, QQStickerAssetNotFoundError,
 } from './qq-kernel.js'
+import { QQMessageSendRejectedError } from './upload-protocol.js'
 import { log, recordSlowHttpRequest, slowHttpLogPath } from './log.js'
 import type { QQLoginController } from './login-controller.js'
 
@@ -401,7 +402,16 @@ export class QQBridgeServer {
     if (request.method === 'POST' && path === '/v1/messages') {
       const manifest = decodeManifest(request.headers['x-qqnt-manifest'])
       log('info', `HTTP API send start id=${requestId} conversation=${manifest.conversationId} textLength=${manifest.text?.length ?? 0} media=${manifest.media?.map((item) => `${item.kind}:${item.name}:${item.size ?? '?'}`).join(',') || '<none>'}`)
-      const message = await this.bridge.send(manifest, request)
+      let message
+      try {
+        message = await this.bridge.send(manifest, request)
+      } catch (error) {
+        if (error instanceof QQMessageSendRejectedError) {
+          json(response, 403, { error: error.message, result: error.result })
+          return
+        }
+        throw error
+      }
       log('info', `HTTP API send complete id=${requestId} conversation=${manifest.conversationId} message=${message.id} parts=${message.parts.length}`)
       json(response, 200, message)
       return

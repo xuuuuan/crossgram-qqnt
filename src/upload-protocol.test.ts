@@ -10,7 +10,7 @@ import {
   decodeImageUploadResponse, decodeFileUploadResponse, decodePrivateFileMetadataResponse,
   encodeDirectMessageRequest, encodeFileUploadRequest, encodeHighwayFrame,
   encodeHighwaySessionRequest, encodeImageUploadRequest, encodePrivateFileMetadataRequest,
-  HIGHWAY_BLOCK_SIZE,
+  HIGHWAY_BLOCK_SIZE, QQMessageSendRejectedError,
 } from './upload-protocol.js'
 
 describe('direct QQ upload protocol', () => {
@@ -150,6 +150,19 @@ describe('direct QQ upload protocol', () => {
     })
     expect(() => decodeDirectMessageResponse(pb([u(1, 7), field(2, Buffer.from('denied'))])))
       .toThrow('denied (7)')
+    try {
+      decodeDirectMessageResponse(pb([
+        u(1, 16), field(2, Buffer.from('add the recipient as a friend first')),
+      ]))
+      throw new Error('expected the permanent send rejection to throw')
+    } catch (error) {
+      expect(error).toBeInstanceOf(QQMessageSendRejectedError)
+      expect(error).toMatchObject({
+        result: 16,
+        detail: 'add the recipient as a friend first',
+        message: 'QQ message send rejected: add the recipient as a friend first (16)',
+      })
+    }
   })
 
   it('keeps stable PbSendMsg vectors for text, mentions, faces, market stickers, and replies', () => {

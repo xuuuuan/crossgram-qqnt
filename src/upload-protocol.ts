@@ -104,6 +104,13 @@ export interface DirectMessageSendResponse {
   sendTime: number
 }
 
+/** QQ permanently rejected a message that should not be retried unchanged. */
+export class QQMessageSendRejectedError extends Error {
+  constructor(readonly result: number, readonly detail: string) {
+    super(`QQ message send rejected: ${detail} (${result})`)
+  }
+}
+
 export function encodeHighwaySessionRequest(): PacketRequest {
   return {
     command: 'HttpConn.0x6ff_501',
@@ -460,6 +467,9 @@ export function encodeDirectMessageRequest(
 
 export function decodeDirectMessageResponse(payload: Uint8Array): DirectMessageSendResponse {
   const response = fromBinary(pb.SendMessageResponseSchema, payload)
+  if (response.result === 16) {
+    throw new QQMessageSendRejectedError(response.result, response.error)
+  }
   if (response.result) throw new Error(`QQ protocol send failed: ${response.error} (${response.result})`)
   return {
     sendTime: response.sendTime,
