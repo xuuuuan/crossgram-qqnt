@@ -1,6 +1,48 @@
 #!/bin/sh
 set -eu
 
+resolve_qq_binary() {
+  if [ -n "${QQNT_BINARY:-}" ]; then
+    if [ ! -x "$QQNT_BINARY" ]; then
+      echo "QQNT_BINARY is not executable: $QQNT_BINARY" >&2
+      return 1
+    fi
+    canonical_path "$QQNT_BINARY"
+    return
+  fi
+
+  search_root=${QQNT_SEARCH_ROOT:-}
+  for relative_path in /opt/QQ/qq /usr/local/bin/qq /usr/bin/qq; do
+    candidate=$search_root$relative_path
+    if [ -x "$candidate" ]; then
+      canonical_path "$candidate"
+      return
+    fi
+  done
+  if [ -z "$search_root" ] && command -v qq >/dev/null 2>&1; then
+    canonical_path "$(command -v qq)"
+    return
+  fi
+  return 1
+}
+
+canonical_path() {
+  if command -v readlink >/dev/null 2>&1; then
+    resolved=$(readlink -f "$1" 2>/dev/null || true)
+    if [ -n "$resolved" ]; then
+      printf '%s\n' "$resolved"
+      return
+    fi
+  fi
+  directory=$(CDPATH= cd -- "$(dirname -- "$1")" && pwd -P)
+  printf '%s/%s\n' "$directory" "$(basename -- "$1")"
+}
+
+if [ "${QQNT_BRIDGE_RESOLVE_ONLY:-0}" = 1 ]; then
+  resolve_qq_binary
+  exit
+fi
+
 if [ "$(id -u)" -ne 0 ]; then
   echo "run this installer as root: curl -fsSL .../install.sh | sudo sh" >&2
   exit 1
@@ -17,11 +59,50 @@ archive_url=${QQNT_BRIDGE_ARCHIVE_URL:-https://github.com/$repo/releases/latest/
 tmp=$(mktemp -d)
 trap 'rm -rf -- "$tmp"' EXIT HUP INT TERM
 
-export DEBIAN_FRONTEND=noninteractive
-apt-get update
-apt-get install -y --no-install-recommends ca-certificates curl dbus-x11 qrencode xvfb
+install_runtime_dependencies() {
+  if command -v apt-get >/dev/null 2>&1; then
+    package_manager=apt
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends ca-certificates curl dbus-x11 qrencode xvfb
+  elif command -v dnf >/dev/null 2>&1; then
+    package_manager=dnf
+    dnf install -y ca-certificates curl dbus-daemon qrencode xorg-x11-server-Xvfb shadow-utils
+  elif command -v yum >/dev/null 2>&1; then
+    package_manager=yum
+    yum install -y ca-certificates curl dbus-daemon qrencode xorg-x11-server-Xvfb shadow-utils
+  elif command -v pacman >/dev/null 2>&1; then
+    package_manager=pacman
+    pacman -Sy --needed --noconfirm ca-certificates curl dbus qrencode xorg-server-xvfb shadow
+  elif command -v zypper >/dev/null 2>&1; then
+    package_manager=zypper
+    zypper --non-interactive install ca-certificates curl dbus-1 qrencode xorg-x11-server-Xvfb shadow
+  else
+    package_manager=manual
+    echo "No supported package manager was found; checking preinstalled dependencies..." >&2
+  fi
+}
 
-if [ ! -x /opt/QQ/qq ]; then
+install_runtime_dependencies
+missing_commands=
+for command_name in curl tar Xvfb dbus-run-session qrencode systemctl getent groupadd useradd; do
+  if ! command -v "$command_name" >/dev/null 2>&1; then
+    missing_commands="$missing_commands $command_name"
+  fi
+done
+if [ -n "$missing_commands" ]; then
+  echo "missing required commands:$missing_commands" >&2
+  echo "install the matching Xvfb, D-Bus, qrencode, curl, tar, systemd and shadow-utils packages, then rerun" >&2
+  exit 1
+fi
+
+if ! qq_binary=$(resolve_qq_binary); then
+  if [ "$package_manager" != apt ]; then
+    echo "QQNT was not found on this distribution." >&2
+    echo "Install Linux QQ from https://im.qq.com/linuxqq/index.shtml and rerun this script." >&2
+    echo "If QQ is installed in a custom location, set QQNT_BINARY=/absolute/path/to/qq." >&2
+    exit 1
+  fi
   qq_url=${QQNT_PACKAGE_URL:-}
   if [ -z "$qq_url" ]; then
     config=$(curl -fsSL --retry 3 https://cdn-go.cn/qq-web/im.qq.com_new/latest/rainbow/linuxConfig.js)
@@ -34,6 +115,17 @@ if [ ! -x /opt/QQ/qq ]; then
   echo "Downloading official QQ Linux package..."
   curl -fL --retry 3 -o "$tmp/qq.deb" "$qq_url"
   apt-get install -y "$tmp/qq.deb"
+  if ! qq_binary=$(resolve_qq_binary); then
+    echo "QQ was installed but its executable could not be found; set QQNT_BINARY=/absolute/path/to/qq" >&2
+    exit 1
+  fi
+fi
+
+qq_resources=${QQNT_RESOURCES_DIR:-$(dirname -- "$qq_binary")/resources}
+if [ ! -d "$qq_resources" ]; then
+  echo "QQ resources directory was not found: $qq_resources" >&2
+  echo "Set QQNT_RESOURCES_DIR=/absolute/path/to/QQ/resources and rerun." >&2
+  exit 1
 fi
 
 echo "Downloading qqnt-bridge $mode package..."
@@ -44,20 +136,22 @@ test -f "$tmp/bridge/resources/app.asar"
 test -f "$tmp/bridge/systemd/qqnt-bridge.service"
 test -f "$tmp/bridge/bin/qqntctl"
 test -f "$tmp/bridge/bin/install.sh"
+test -f "$tmp/bridge/bin/run-headless.sh"
 
 install -d -m 0750 /var/lib/qqnt-bridge /var/lib/qqnt-bridge/log /var/lib/qqnt-bridge/backups
-if [ -f /opt/QQ/resources/app.asar ]; then
+if [ -f "$qq_resources/app.asar" ]; then
   stamp=$(date +%Y%m%d-%H%M%S)
-  cp -a /opt/QQ/resources/app.asar "/var/lib/qqnt-bridge/backups/app.asar.$stamp"
+  cp -a "$qq_resources/app.asar" "/var/lib/qqnt-bridge/backups/app.asar.$stamp"
 fi
-install -m 0644 "$tmp/bridge/resources/app.asar" /opt/QQ/resources/app.asar
+install -m 0644 "$tmp/bridge/resources/app.asar" "$qq_resources/app.asar"
 if [ -d "$tmp/bridge/resources/app.asar.unpacked" ]; then
-  cp -a "$tmp/bridge/resources/app.asar.unpacked" /opt/QQ/resources/
+  cp -a "$tmp/bridge/resources/app.asar.unpacked" "$qq_resources/"
 fi
 
 if ! getent group qqnt-bridge >/dev/null; then groupadd --system qqnt-bridge; fi
 if ! id qqnt-bridge >/dev/null 2>&1; then
-  useradd --system --gid qqnt-bridge --home-dir /var/lib/qqnt-bridge --shell /usr/sbin/nologin qqnt-bridge
+  nologin_shell=$(command -v nologin || printf '/sbin/nologin')
+  useradd --system --gid qqnt-bridge --home-dir /var/lib/qqnt-bridge --shell "$nologin_shell" qqnt-bridge
 fi
 chown -R qqnt-bridge:qqnt-bridge /var/lib/qqnt-bridge
 
@@ -78,11 +172,16 @@ if [ ! -f /etc/qqnt-bridge.env ]; then
 fi
 grep -q '^QQNT_BRIDGE_HEADLESS=' /etc/qqnt-bridge.env || echo 'QQNT_BRIDGE_HEADLESS=1' >> /etc/qqnt-bridge.env
 grep -q '^QQNT_BRIDGE_CLOSE_MAIN_WINDOW=' /etc/qqnt-bridge.env || echo 'QQNT_BRIDGE_CLOSE_MAIN_WINDOW=1' >> /etc/qqnt-bridge.env
+escaped_qq_binary=$(printf '%s' "$qq_binary" | sed 's/\\/\\\\/g; s/"/\\"/g')
+grep -v '^QQNT_BINARY=' /etc/qqnt-bridge.env > "$tmp/qqnt-bridge.env"
+printf 'QQNT_BINARY="%s"\n' "$escaped_qq_binary" >> "$tmp/qqnt-bridge.env"
+install -m 0600 "$tmp/qqnt-bridge.env" /etc/qqnt-bridge.env
 chmod 0600 /etc/qqnt-bridge.env
 
 install -m 0755 "$tmp/bridge/bin/qqntctl" /usr/local/bin/qqntctl
 install -d -m 0755 /usr/local/libexec/qqnt-bridge
 install -m 0755 "$tmp/bridge/bin/install.sh" /usr/local/libexec/qqnt-bridge/install.sh
+install -m 0755 "$tmp/bridge/bin/run-headless.sh" /usr/local/libexec/qqnt-bridge/run-headless.sh
 install -m 0644 "$tmp/bridge/systemd/qqnt-bridge.service" /etc/systemd/system/qqnt-bridge.service
 systemctl daemon-reload
 systemctl enable qqnt-bridge.service
@@ -94,3 +193,4 @@ echo "Show the login QR in this terminal: sudo qqntctl qr"
 echo "Save it as PNG: sudo qqntctl qr --png /tmp/qqnt-login.png"
 echo "Inspect status: sudo qqntctl status"
 echo "Install the latest bridge release later: sudo qqntctl update"
+echo "QQ executable: $qq_binary"

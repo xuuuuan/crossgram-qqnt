@@ -5,14 +5,30 @@ large Electron runtime; adding a container does not reduce that cost. The
 service runs QQ as an unprivileged user under `dbus-run-session` and Xvfb. Xvfb
 is the only always-on GUI helper and normally uses only a few MiB.
 
-## One-line install (Debian/Ubuntu x86_64)
+## One-line install (Linux x86_64 with systemd)
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/xuuuuan/crossgram-qqnt/master/deploy/install.sh | sudo sh
 ```
 
-The installer downloads Tencent's current official `.deb`, the latest bridge
-release, creates a dedicated `qqnt-bridge` user, and enables the systemd unit.
+On Debian/Ubuntu, the installer downloads Tencent's current official `.deb`.
+On Fedora/RHEL, Arch and openSUSE, install Linux QQ from
+<https://im.qq.com/linuxqq/index.shtml> first; the script installs the small
+runtime dependencies, finds QQ, creates a dedicated `qqnt-bridge` user, and
+enables the systemd unit.
+
+The usual `/opt/QQ/qq`, `/usr/local/bin/qq` and `/usr/bin/qq` locations are
+detected automatically. For a custom installation, specify the executable
+and, only when it is not beside the executable, its resources directory:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/xuuuuan/crossgram-qqnt/master/deploy/install.sh \
+  | sudo env QQNT_BINARY=/path/to/qq QQNT_RESOURCES_DIR=/path/to/resources sh
+```
+
+The QQ executable and resources must be readable by the dedicated
+`qqnt-bridge` service user. AppImages are not injectable in place; install an
+unpacked/native package or point the variables at an extracted QQ tree.
 The API listens on `127.0.0.1:18767` with a random bearer token by default.
 
 ```sh
