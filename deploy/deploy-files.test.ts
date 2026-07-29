@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { delimiter, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -112,6 +112,52 @@ describe('Linux deployment files', () => {
         },
       })
       expect(readFileSync(marker, 'utf8')).toBe('debug')
+    } finally {
+      rmSync(temp, { recursive: true, force: true })
+    }
+  })
+
+  it('switches accounts without the bridge API and prints the new terminal QR', () => {
+    const temp = mkdtempSync(join(tmpdir(), 'qqntctl-logout-'))
+    const envFile = join(temp, 'bridge.env')
+    const state = join(temp, 'state')
+    const authDir = join(state, '.config', 'qqnt-bridge-injection', 'auth')
+    const systemctlMarker = join(temp, 'systemctl-calls')
+    const qrMarker = join(temp, 'qr-input')
+    try {
+      mkdirSync(authDir, { recursive: true })
+      writeFileSync(join(authDir, 'login.enc'), 'encrypted-ticket')
+      writeFileSync(join(authDir, 'login.enc-wal'), 'ticket-wal')
+      writeFileSync(envFile, 'QQNT_BRIDGE_TOKEN=test-token\n')
+      writeFileSync(join(temp, 'systemctl'), '#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$QQNT_SYSTEMCTL_MARKER"\n')
+      writeFileSync(join(temp, 'curl'), '#!/bin/sh\ncase "$*" in *qrcode/url*) printf \'https://qr.test/new-account\\n\';; esac\n')
+      writeFileSync(join(temp, 'qrencode'), '#!/bin/sh\ncat > "$QQNT_QR_MARKER"\n')
+      for (const command of ['systemctl', 'curl', 'qrencode']) chmodSync(join(temp, command), 0o755)
+      execFileSync('sh', [join(root, 'deploy', 'qqntctl'), 'logout'], {
+        env: {
+          ...process.env,
+          PATH: `${temp}${delimiter}${process.env.PATH ?? ''}`,
+          QQNT_BRIDGE_ENV_FILE: envFile,
+          QQNT_BRIDGE_STATE_DIR: state,
+          QQNT_BRIDGE_SYSTEMCTL: join(temp, 'systemctl'),
+          QQNT_BRIDGE_CURL: join(temp, 'curl'),
+          QQNT_BRIDGE_QRENCODE: join(temp, 'qrencode'),
+          QQNT_SYSTEMCTL_MARKER: systemctlMarker,
+          QQNT_QR_MARKER: qrMarker,
+        },
+        timeout: 5_000,
+      })
+      expect(readFileSync(systemctlMarker, 'utf8').trim().split('\n')).toEqual([
+        'stop qqnt-bridge.service', 'start qqnt-bridge.service',
+      ])
+      expect(readFileSync(qrMarker, 'utf8')).toBe('https://qr.test/new-account\n')
+      expect(readdirSync(authDir)).toEqual([])
+      const backups = readdirSync(join(state, 'backups', 'login')).sort()
+      expect(backups).toHaveLength(2)
+      expect(backups).toEqual(expect.arrayContaining([
+        expect.stringMatching(/^login\.enc\.\d{8}-\d{6}-\d+$/),
+        expect.stringMatching(/^login\.enc-wal\.\d{8}-\d{6}-\d+$/),
+      ]))
     } finally {
       rmSync(temp, { recursive: true, force: true })
     }

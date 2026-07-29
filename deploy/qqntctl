@@ -10,12 +10,15 @@ fi
 
 base="http://${QQNT_BRIDGE_HOST:-127.0.0.1}:${QQNT_BRIDGE_PORT:-18767}"
 auth="Authorization: Bearer ${QQNT_BRIDGE_TOKEN}"
+systemctl_command=${QQNT_BRIDGE_SYSTEMCTL:-systemctl}
+curl_command=${QQNT_BRIDGE_CURL:-curl}
+qrencode_command=${QQNT_BRIDGE_QRENCODE:-qrencode}
 
 wait_for_qr_url() {
-  curl -fsS -X POST -H "$auth" "$base/v1/login/qrcode/refresh" >/dev/null 2>&1 || true
+  "$curl_command" -fsS -X POST -H "$auth" "$base/v1/login/qrcode/refresh" >/dev/null 2>&1 || true
   tries=0
   while [ "$tries" -lt 60 ]; do
-    if url=$(curl -fsS -H "$auth" "$base/v1/login/qrcode/url" 2>/dev/null); then
+    if url=$("$curl_command" -fsS -H "$auth" "$base/v1/login/qrcode/url" 2>/dev/null); then
       printf '%s\n' "$url"
       return 0
     fi
@@ -28,28 +31,53 @@ wait_for_qr_url() {
 
 case "${1:-status}" in
   status)
-    curl -fsS -H "$auth" "$base/v1/status"
+    "$curl_command" -fsS -H "$auth" "$base/v1/status"
     printf '\n'
     ;;
   qr)
     if [ "${2:-}" = "--png" ]; then
       output=${3:-qqnt-login.png}
       wait_for_qr_url >/dev/null
-      curl -fsS -H "$auth" "$base/v1/login/qrcode.png" -o "$output"
+      "$curl_command" -fsS -H "$auth" "$base/v1/login/qrcode.png" -o "$output"
       echo "saved QR code to $output"
     else
-      wait_for_qr_url | qrencode -t ANSIUTF8
+      wait_for_qr_url | "$qrencode_command" -t ANSIUTF8
     fi
     ;;
   refresh)
-    curl -fsS -X POST -H "$auth" "$base/v1/login/qrcode/refresh"
+    "$curl_command" -fsS -X POST -H "$auth" "$base/v1/login/qrcode/refresh"
     printf '\n'
     ;;
   logs)
     exec journalctl -u qqnt-bridge.service -f
     ;;
   restart)
-    exec systemctl restart qqnt-bridge.service
+    exec "$systemctl_command" restart qqnt-bridge.service
+    ;;
+  logout|switch-account)
+    state_dir=${QQNT_BRIDGE_STATE_DIR:-/var/lib/qqnt-bridge}
+    login_dir="$state_dir/.config/qqnt-bridge-injection/auth"
+    backup_dir="$state_dir/backups/login"
+    stamp=$(date +%Y%m%d-%H%M%S)-$$
+    "$systemctl_command" stop qqnt-bridge.service
+    mkdir -p "$backup_dir"
+    chmod 0700 "$backup_dir"
+    moved=0
+    for name in login.enc login.enc-wal login.enc-shm login.enc-journal; do
+      if [ -f "$login_dir/$name" ]; then
+        mv -- "$login_dir/$name" "$backup_dir/$name.$stamp"
+        chmod 0600 "$backup_dir/$name.$stamp"
+        moved=1
+      fi
+    done
+    "$systemctl_command" start qqnt-bridge.service
+    if [ "$moved" -eq 1 ]; then
+      echo "QQNT login session was removed; backup saved under $backup_dir"
+    else
+      echo "No saved QQNT login session was found; service restarted"
+    fi
+    echo "Scan the new account QR code:"
+    wait_for_qr_url | "$qrencode_command" -t ANSIUTF8
     ;;
   update)
     installer=${QQNT_BRIDGE_INSTALLER:-/usr/local/libexec/qqnt-bridge/install.sh}
@@ -65,7 +93,7 @@ case "${1:-status}" in
     esac
     ;;
   *)
-    echo "usage: qqntctl {status|qr [--png FILE]|refresh|logs|restart|update [release|debug]}" >&2
+    echo "usage: qqntctl {status|qr [--png FILE]|refresh|logs|restart|logout|switch-account|update [release|debug]}" >&2
     exit 2
     ;;
 esac

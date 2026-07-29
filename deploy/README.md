@@ -39,6 +39,17 @@ sudo qqntctl logs
 sudo qqntctl update
 ```
 
+`sudo qqntctl qr` prints the native QQ login QR directly in the terminal. A
+fresh installation does this automatically when no account is logged in; set
+`QQNT_BRIDGE_SHOW_QR=0` only for unattended provisioning.
+
+To switch QQ accounts, run `sudo qqntctl logout` (alias:
+`sudo qqntctl switch-account`). It does not depend on the bridge HTTP API to
+remove the old session: it stops the service, moves QQNT's encrypted
+`auth/login.enc*` ticket files into `/var/lib/qqnt-bridge/backups/login`, starts
+the service, and prints the new account QR. Chat databases and Crossgram data
+are not removed.
+
 After a successful scan, the bridge calls QQNT's native
 `setAutoLoginSwitch(true)` setting. QQ should then reuse its stored ticket on
 subsequent service restarts. In headless mode it closes the largest visible QQ

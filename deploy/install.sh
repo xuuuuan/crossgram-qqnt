@@ -192,6 +192,25 @@ echo
 echo "qqnt-bridge is installed and bound to localhost."
 echo "Show the login QR in this terminal: sudo qqntctl qr"
 echo "Save it as PNG: sudo qqntctl qr --png /tmp/qqnt-login.png"
+echo "Switch QQ accounts and print a new QR: sudo qqntctl logout"
 echo "Inspect status: sudo qqntctl status"
 echo "Install the latest bridge release later: sudo qqntctl update"
 echo "QQ executable: $qq_binary"
+
+if [ "${QQNT_BRIDGE_SHOW_QR:-1}" != 0 ]; then
+  tries=0
+  while [ "$tries" -lt 60 ]; do
+    status_json=$(qqntctl status 2>/dev/null || true)
+    case "$status_json" in
+      *'"ready":true'*) break ;;
+      *'"login":{'*)
+        echo
+        echo "QQ is not logged in. Scan this QR code:"
+        qqntctl qr || echo "Run 'sudo qqntctl qr' to retry." >&2
+        break
+        ;;
+    esac
+    tries=$((tries + 1))
+    sleep 1
+  done
+fi
