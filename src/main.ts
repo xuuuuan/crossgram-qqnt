@@ -140,7 +140,6 @@ function isKernelModule(value: unknown): value is KernelModule & object {
 }
 
 function wrapKernelModule(kernel: KernelModule, bridge: QQKernelBridge, login: QQLoginController): KernelModule {
-  login.attachKernel(kernel)
   const NativeSession = kernel.NodeIQQNTWrapperSession as unknown as new (...args: unknown[]) => KernelSession
   const wrappedSessions = new WeakMap<object, KernelSession>()
   const wrapOnce = (session: KernelSession): KernelSession => {
