@@ -143,6 +143,17 @@ interface ParsedAVSDKInvite {
   fingerprintDigest: Buffer
 }
 
+type AVSDKInviteParseFailure =
+  | 'invalid-object'
+  | 'invalid-relation'
+  | 'invalid-invite-type'
+  | 'invalid-from-uid'
+  | 'invalid-arg1'
+  | 'invalid-arg2'
+type AVSDKInviteParseResult =
+  | { ok: true, invite: ParsedAVSDKInvite }
+  | { ok: false, reason: AVSDKInviteParseFailure }
+
 type AVSDKDiagnosticSource = 'listener-tap' | 'action-intercept'
 type CallSignalJob =
   | { kind: 'invite', generation: number, source: AVSDKDiagnosticSource, invite: ParsedAVSDKInvite }
@@ -150,7 +161,7 @@ type CallSignalJob =
 
 type AVSDKDiagnosticCallback = 'OnInviteActionToAVSDK' | 'setActionFromAVSDK' | 'onS2CActionToAVSDK'
 type AVSDKDiagnosticDrop =
-  | 'invalid-invite'
+  | AVSDKInviteParseFailure
   | 'missing-call-id'
   | 'unresolved-conversation'
   | 'stale-session'
@@ -2450,7 +2461,15 @@ export class QQKernelBridge {
     if (!isAVSDKTapEnabled()) return
     const callCallback = isAVSDKDiagnosticCallback(callback) ? callback : undefined
     const diagnosticAdmitted = callCallback ? this.acceptAVSDKDiagnosticAdmission(callCallback) : false
-    if (callCallback) this.observeCallSignal(callCallback, args, source, diagnosticAdmitted)
+    let inviteResult: AVSDKInviteParseResult | undefined
+    if (callCallback === 'OnInviteActionToAVSDK' && this.config && this.callSignalSecret) {
+      try {
+        inviteResult = parseAVSDKInvite(args, this.config, this.callSignalSecret)
+      } catch {
+        // The call-signal observer reports the fixed crypto-failure outcome.
+      }
+    }
+    if (callCallback) this.observeCallSignal(callCallback, args, source, diagnosticAdmitted, inviteResult)
     if (isAVSDKRawEnabled() && this.acceptAVSDKEvent(callback)) {
       this.dispatch({ type: 'native-avsdk', version: 1, callback, args: normalizeAVSDKArgs(args) })
     }
@@ -2461,28 +2480,20 @@ export class QQKernelBridge {
     args: unknown[],
     source: AVSDKDiagnosticSource,
     diagnosticAdmitted: boolean,
+    inviteResult?: AVSDKInviteParseResult,
   ): void {
-    if (diagnosticAdmitted) this.observeAVSDKReceipt(callback, args, source)
+    if (diagnosticAdmitted) this.observeAVSDKReceipt(callback, args, source, inviteResult)
     const generation = this.callSignalGeneration
     if (callback === 'OnInviteActionToAVSDK') {
-      const config = this.config
-      const secret = this.callSignalSecret
-      if (!config || !secret) {
+      if (!inviteResult) {
         this.observeAVSDKDrop(callback, source, 'crypto-failure')
         return
       }
-      let invite: ParsedAVSDKInvite | undefined
-      try {
-        invite = parseAVSDKInvite(args, config, secret)
-      } catch {
-        this.observeAVSDKDrop(callback, source, 'crypto-failure')
+      if (!inviteResult.ok) {
+        this.observeAVSDKDrop(callback, source, inviteResult.reason)
         return
       }
-      if (!invite) {
-        this.observeAVSDKDrop(callback, source, 'invalid-invite')
-        return
-      }
-      const enqueued = this.enqueueCallSignal({ kind: 'invite', generation, source, invite })
+      const enqueued = this.enqueueCallSignal({ kind: 'invite', generation, source, invite: inviteResult.invite })
       if (enqueued.outcome === 'coalesced') this.observeAVSDKDrop(callback, source, 'queue-coalesced')
       else if (enqueued.outcome === 'concurrent') this.observeAVSDKDrop(callback, source, 'concurrent-call')
       return
@@ -2499,12 +2510,15 @@ export class QQKernelBridge {
     if (enqueued.outcome === 'coalesced') this.observeAVSDKDrop(callback, source, 'queue-coalesced', false, 'unknown', true)
   }
 
-  private observeAVSDKReceipt(callback: AVSDKDiagnosticCallback, args: unknown[], source: AVSDKDiagnosticSource): void {
+  private observeAVSDKReceipt(
+    callback: AVSDKDiagnosticCallback,
+    args: unknown[],
+    source: AVSDKDiagnosticSource,
+    inviteResult?: AVSDKInviteParseResult,
+  ): void {
     try {
       const values = args.slice(0, AVSDK_DIAGNOSTIC_MAX_ARGS)
-      const invite = callback === 'OnInviteActionToAVSDK' && this.config && this.callSignalSecret
-        ? parseAVSDKInvite(args, this.config, this.callSignalSecret)
-        : undefined
+      const invite = inviteResult?.ok ? inviteResult.invite : undefined
       const action = callback === 'setActionFromAVSDK' ? callSignalActionKind(args[1]) ?? 'unknown' : 'unknown'
       const terminal = callback === 'onS2CActionToAVSDK' && hasDestroyReason(args[0])
       const callIdFound = Boolean(invite)
@@ -2651,7 +2665,14 @@ export class QQKernelBridge {
       this.observeAVSDKDrop('OnInviteActionToAVSDK', source, 'concurrent-call')
       return
     }
-    const conversation = this.resolveCallConversation(invite.fromUid, invite.relationId)
+    const conversation = await this.resolveCallConversation(invite.fromUid, invite.relationId, generation, session, config)
+    if (!conversation) {
+      this.observeAVSDKDrop(
+        'OnInviteActionToAVSDK', source,
+        this.isCurrentCallGeneration(generation, session, config) ? 'unresolved-conversation' : 'stale-session',
+      )
+      return
+    }
     let callId: string | undefined
     try {
       callId = this.createCallId(invite.fingerprintDigest)
@@ -2673,13 +2694,37 @@ export class QQKernelBridge {
     return generation === this.callSignalGeneration && this.session === session && this.config === config
   }
 
-  private resolveCallConversation(fromUid: string, numericId: string): QQConversation {
-    const known = [...this.contacts.values()].find((item) => item.chatType === CHAT_C2C && item.peerUid === fromUid)
+  private async resolveCallConversation(
+    fromUid: string,
+    numericId: string,
+    generation: number,
+    session: KernelSession,
+    config: InitSessionConfig,
+  ): Promise<QQConversation | undefined> {
+    let peerUid = fromUid
+    if (!peerUid) {
+      const relationBytes = callSignalStringBytes(numericId, CALL_SIGNAL_RELATION_ID_MAX_BYTES, 1)
+      if (!relationBytes || !isASCIIDigits(relationBytes)) return undefined
+      try {
+        const converted = await retryTransientInvalidArgument(
+          () => session.getUixConvertService().getUid(new Set([numericId])),
+        )
+        const resolved = converted.uidInfo.get(numericId)
+        if (typeof resolved !== 'string' || !callSignalStringBytes(resolved, CALL_SIGNAL_FROM_UID_MAX_BYTES, 1)) return undefined
+        const parsed = parseConversationId(conversationId(CHAT_C2C, resolved))
+        if (parsed.chatType !== CHAT_C2C || parsed.peerUid !== resolved) return undefined
+        peerUid = resolved
+      } catch {
+        return undefined
+      }
+    }
+    if (!this.isCurrentCallGeneration(generation, session, config)) return undefined
+    const known = [...this.contacts.values()].find((item) => item.chatType === CHAT_C2C && item.peerUid === peerUid)
     if (known) return known
-    const buddy = this.users.get(fromUid)
+    const buddy = this.users.get(peerUid)
     const created: QQConversation = {
-      id: conversationId(CHAT_C2C, fromUid), kind: 'direct', title: buddy?.name ?? numericId,
-      peerUid: fromUid, peerUin: numericId, chatType: CHAT_C2C,
+      id: conversationId(CHAT_C2C, peerUid), kind: 'direct', title: buddy?.name ?? numericId,
+      peerUid, peerUin: numericId, chatType: CHAT_C2C,
     }
     this.mergeConversation(created)
     return created
@@ -5099,25 +5144,28 @@ function truncateAVSDKString(value: string): string {
   return value.length > AVSDK_MAX_STRING_LENGTH ? value.slice(0, AVSDK_MAX_STRING_LENGTH) : value
 }
 
-function parseAVSDKInvite(args: unknown[], config: InitSessionConfig, secret: Buffer): ParsedAVSDKInvite | undefined {
+function parseAVSDKInvite(args: unknown[], config: InitSessionConfig, secret: Buffer): AVSDKInviteParseResult {
   const invite = args[0]
-  if (!isPlainAVSDKOwnDataObject(invite)) return undefined
+  if (!isPlainAVSDKOwnDataObject(invite)) return { ok: false, reason: 'invalid-object' }
   const relationId = ownAVSDKDataProperty(invite, 'relation_id')
+  if (typeof relationId !== 'string') return { ok: false, reason: 'invalid-relation' }
   const inviteType = ownAVSDKDataProperty(invite, 'invite_type')
+  if (!isSafeSignedInt32(inviteType)) return { ok: false, reason: 'invalid-invite-type' }
   const fromUid = ownAVSDKDataProperty(invite, 'from_uid')
+  if (typeof fromUid !== 'string') return { ok: false, reason: 'invalid-from-uid' }
   const action = args[1]
+  if (!isSafeSignedInt32(action)) return { ok: false, reason: 'invalid-arg1' }
   const argument = args[2]
-  if (
-    typeof relationId !== 'string' || typeof fromUid !== 'string' || typeof argument !== 'string'
-    || !isSafeSignedInt32(inviteType) || !isSafeSignedInt32(action)
-  ) return undefined
+  if (typeof argument !== 'string') return { ok: false, reason: 'invalid-arg2' }
   const relationBytes = callSignalStringBytes(relationId, CALL_SIGNAL_RELATION_ID_MAX_BYTES, 1)
-  const fromUidBytes = callSignalStringBytes(fromUid, CALL_SIGNAL_FROM_UID_MAX_BYTES, 1)
+  if (!relationBytes || !isASCIIDigits(relationBytes)) return { ok: false, reason: 'invalid-relation' }
+  const fromUidBytes = callSignalStringBytes(fromUid, CALL_SIGNAL_FROM_UID_MAX_BYTES, 0)
+  if (!fromUidBytes) return { ok: false, reason: 'invalid-from-uid' }
   const argumentBytes = callSignalStringBytes(argument, CALL_SIGNAL_ARGUMENT_MAX_BYTES, 0, false)
+  if (!argumentBytes) return { ok: false, reason: 'invalid-arg2' }
   const selfUidBytes = callSignalStringBytes(config.selfUid, CALL_SIGNAL_FROM_UID_MAX_BYTES, 1)
   const selfUinBytes = callSignalStringBytes(config.selfUin, CALL_SIGNAL_RELATION_ID_MAX_BYTES, 1)
-  if (!relationBytes || !fromUidBytes || !argumentBytes || !selfUidBytes || !selfUinBytes) return undefined
-  if (!isASCIIDigits(relationBytes) || !isASCIIDigits(selfUinBytes)) return undefined
+  if (!selfUidBytes || !selfUinBytes || !isASCIIDigits(selfUinBytes)) throw new Error('call signal crypto failed')
   try {
     const digest = createHmac('sha256', secret)
       .update(CALL_SIGNAL_TUPLE_DOMAIN)
@@ -5131,8 +5179,11 @@ function parseAVSDKInvite(args: unknown[], config: InitSessionConfig, secret: Bu
       .update(lengthFrame(argumentBytes))
       .digest()
     return {
-      relationId, fromUid, inviteType, action, media: inviteType === 1 ? 'voice' : 'unknown',
-      fingerprint: digest.toString('base64url'), fingerprintDigest: digest,
+      ok: true,
+      invite: {
+        relationId, fromUid, inviteType, action, media: inviteType === 1 ? 'voice' : 'unknown',
+        fingerprint: digest.toString('base64url'), fingerprintDigest: digest,
+      },
     }
   } catch {
     throw new Error('call signal crypto failed')
