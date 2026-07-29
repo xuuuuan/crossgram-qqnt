@@ -43,6 +43,18 @@ pub enum ElfError {
     RelaTable,
     #[error("QQNT wrapper.node build is not an approved packet-binding profile")]
     UnsupportedProfile,
+    #[error("QQNT packet binding name scan did not produce exactly one read-only match")]
+    BindingNameScan,
+    #[error("QQNT packet binding name relocation scan did not produce exactly one writable slot")]
+    NameSlotScan,
+    #[error("QQNT packet N-API callback relocation scan failed")]
+    NapiCallbackScan,
+    #[error("QQNT packet response action relocation scan failed")]
+    ResponseActionScan,
+    #[error("QQNT packet converter scan did not produce exactly one executable match")]
+    ConverterScan,
+    #[error("QQNT packet symbol layout arithmetic overflowed")]
+    SymbolLayout,
     #[error("approved profile's binding name is not a read-only PT_LOAD address")]
     BindingNamePermissions,
     #[error("approved profile's N-API callback is not an executable PT_LOAD address")]
@@ -314,6 +326,46 @@ impl<'a> ElfImage<'a> {
         }
         Ok(entries)
     }
+
+    fn bytes_at(&self, address: u64, length: usize) -> Result<&'a [u8], ElfError> {
+        let offset = self.file_offset_for_range(
+            address,
+            u64::try_from(length).map_err(|_| ElfError::VirtualAddress)?,
+        )?;
+        let end = offset.checked_add(length).ok_or(ElfError::VirtualAddress)?;
+        self.bytes.get(offset..end).ok_or(ElfError::VirtualAddress)
+    }
+
+    fn unique_load_match(&self, needle: &[u8], flags: u32) -> Option<u64> {
+        if needle.is_empty() {
+            return None;
+        }
+        let mut found = None;
+        for header in self
+            .program_headers
+            .iter()
+            .filter(|header| header.kind == PT_LOAD && header.flags & (PF_R | PF_W | PF_X) == flags)
+        {
+            let start = usize::try_from(header.offset).ok()?;
+            let size = usize::try_from(header.file_size).ok()?;
+            let end = start
+                .checked_add(size)
+                .filter(|end| *end <= self.bytes.len())?;
+            for offset in self.bytes[start..end]
+                .windows(needle.len())
+                .enumerate()
+                .filter_map(|(offset, bytes)| (bytes == needle).then_some(offset))
+            {
+                let address = header
+                    .virtual_address
+                    .checked_add(u64::try_from(offset).ok()?)?;
+                if found.replace(address).is_some() {
+                    return None;
+                }
+            }
+        }
+        found
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -508,7 +560,11 @@ pub fn probe_packet_binding(profiles: &[Profile]) -> Result<PacketBindingProbe, 
     let image = ElfImage::parse(&bytes)?;
     let build_id = image.build_id()?;
     let sha256 = image.sha256();
-    let profile = select_profile(profiles, &build_id, sha256)?;
+    let profile = match select_profile(profiles, &build_id, sha256) {
+        Ok(profile) => profile,
+        Err(ElfError::UnsupportedProfile) => derive_profile(&image, profiles)?,
+        Err(error) => return Err(error),
+    };
 
     let name_slot = module
         .base
@@ -694,6 +750,117 @@ fn select_profile(
         .copied()
         .find(|profile| profile.build_id == build_id && profile.sha256 == sha256)
         .ok_or(ElfError::UnsupportedProfile)
+}
+
+fn derive_profile(image: &ElfImage<'_>, templates: &[Profile]) -> Result<Profile, ElfError> {
+    let mut last_error = ElfError::UnsupportedProfile;
+    for template in templates.iter().copied() {
+        match derive_profile_from_template(image, template) {
+            Ok(profile) => return Ok(profile),
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error)
+}
+
+fn derive_profile_from_template(
+    image: &ElfImage<'_>,
+    template: Profile,
+) -> Result<Profile, ElfError> {
+    let binding_name_rva = image
+        .unique_load_match(template.binding_name, PF_R)
+        .ok_or(ElfError::BindingNameScan)?;
+    let relocations = image.rela_entries()?;
+    let name_slot_rva = unique_relative_slot_for_target(&relocations, binding_name_rva)
+        .ok_or(ElfError::NameSlotScan)?;
+
+    let napi_slot_delta = template
+        .napi_callback_slot_rva
+        .checked_sub(template.name_slot_rva)
+        .ok_or(ElfError::SymbolLayout)?;
+    let response_slot_delta = template
+        .response_action_slot_rva
+        .checked_sub(template.name_slot_rva)
+        .ok_or(ElfError::SymbolLayout)?;
+    let resolve_action_delta = template
+        .resolve_action_rva
+        .checked_sub(template.response_action_rva)
+        .ok_or(ElfError::SymbolLayout)?;
+
+    let napi_callback_slot_rva = name_slot_rva
+        .checked_add(napi_slot_delta)
+        .ok_or(ElfError::SymbolLayout)?;
+    let napi_callback_rva = unique_relative_target_at(&relocations, napi_callback_slot_rva)
+        .ok_or(ElfError::NapiCallbackScan)?;
+    let response_action_slot_rva = name_slot_rva
+        .checked_add(response_slot_delta)
+        .ok_or(ElfError::SymbolLayout)?;
+    let response_action_rva = unique_relative_target_at(&relocations, response_action_slot_rva)
+        .ok_or(ElfError::ResponseActionScan)?;
+    let converter_rva = image
+        .unique_load_match(template.converter_fingerprint, PF_R | PF_X)
+        .ok_or(ElfError::ConverterScan)?;
+    let resolve_action_rva = response_action_rva
+        .checked_add(resolve_action_delta)
+        .ok_or(ElfError::SymbolLayout)?;
+
+    let profile = Profile {
+        name: "linux-symbol-scan-v1",
+        build_id: &[],
+        sha256: [0; 32],
+        name_slot_rva,
+        binding_name_rva,
+        binding_name: template.binding_name,
+        napi_callback_slot_rva,
+        napi_callback_rva,
+        napi_callback_fingerprint: template.napi_callback_fingerprint,
+        response_action_slot_rva,
+        response_action_rva,
+        response_action_fingerprint: template.response_action_fingerprint,
+        converter_rva,
+        converter_fingerprint: template.converter_fingerprint,
+        resolve_action_rva,
+        resolve_action_fingerprint: template.resolve_action_fingerprint,
+    };
+
+    verify_profile(
+        image,
+        profile,
+        binding_name_rva,
+        napi_callback_rva,
+        response_action_rva,
+        image.bytes_at(binding_name_rva, profile.binding_name.len())?,
+        image.bytes_at(napi_callback_rva, profile.napi_callback_fingerprint.len())?,
+        image.bytes_at(
+            response_action_rva,
+            profile.response_action_fingerprint.len(),
+        )?,
+        image.bytes_at(converter_rva, profile.converter_fingerprint.len())?,
+        image.bytes_at(resolve_action_rva, profile.resolve_action_fingerprint.len())?,
+    )?;
+    Ok(profile)
+}
+
+fn unique_relative_slot_for_target(relocations: &[Rela], target: u64) -> Option<u64> {
+    let mut matches = relocations.iter().filter(|rela| {
+        rela.info >> 32 == 0
+            && rela.info as u32 == R_X86_64_RELATIVE
+            && rela.addend >= 0
+            && rela.addend as u64 == target
+    });
+    let value = matches.next()?.offset;
+    matches.next().is_none().then_some(value)
+}
+
+fn unique_relative_target_at(relocations: &[Rela], slot: u64) -> Option<u64> {
+    let mut matches = relocations.iter().filter(|rela| {
+        rela.offset == slot
+            && rela.info >> 32 == 0
+            && rela.info as u32 == R_X86_64_RELATIVE
+            && rela.addend >= 0
+    });
+    let value = matches.next()?.addend as u64;
+    matches.next().is_none().then_some(value)
 }
 
 fn dynamic_value(entries: &[DynamicEntry], tag: i64) -> Option<u64> {
@@ -900,6 +1067,49 @@ mod tests {
         assert!(matches!(
             select_profile(&[PROFILE], &[0; 8], [0; 32]),
             Err(ElfError::UnsupportedProfile)
+        ));
+    }
+
+    #[test]
+    fn derives_an_unknown_build_from_unique_symbols_and_relocations() {
+        let image = image();
+        let elf = ElfImage::parse(&image).unwrap();
+        let derived = derive_profile(&elf, &[PROFILE]).unwrap();
+        assert_eq!(derived.name, "linux-symbol-scan-v1");
+        assert_eq!(derived.name_slot_rva, PROFILE.name_slot_rva);
+        assert_eq!(derived.binding_name_rva, PROFILE.binding_name_rva);
+        assert_eq!(
+            derived.napi_callback_slot_rva,
+            PROFILE.napi_callback_slot_rva
+        );
+        assert_eq!(derived.napi_callback_rva, PROFILE.napi_callback_rva);
+        assert_eq!(
+            derived.response_action_slot_rva,
+            PROFILE.response_action_slot_rva
+        );
+        assert_eq!(derived.response_action_rva, PROFILE.response_action_rva);
+        assert_eq!(derived.converter_rva, PROFILE.converter_rva);
+        assert_eq!(derived.resolve_action_rva, PROFILE.resolve_action_rva);
+    }
+
+    #[test]
+    fn rejects_ambiguous_dynamic_symbol_matches() {
+        let mut duplicate_name = image();
+        duplicate_name[0x250..0x250 + PROFILE.binding_name.len()]
+            .copy_from_slice(PROFILE.binding_name);
+        let elf = ElfImage::parse(&duplicate_name).unwrap();
+        assert!(matches!(
+            derive_profile_from_template(&elf, PROFILE),
+            Err(ElfError::BindingNameScan)
+        ));
+
+        let mut duplicate_converter = image();
+        duplicate_converter[0x1c0..0x1c0 + PROFILE.converter_fingerprint.len()]
+            .copy_from_slice(PROFILE.converter_fingerprint);
+        let elf = ElfImage::parse(&duplicate_converter).unwrap();
+        assert!(matches!(
+            derive_profile_from_template(&elf, PROFILE),
+            Err(ElfError::ConverterScan)
         ));
     }
 
