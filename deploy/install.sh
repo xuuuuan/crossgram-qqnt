@@ -43,6 +43,7 @@ tar -xzf "$tmp/bridge.tar.gz" -C "$tmp/bridge"
 test -f "$tmp/bridge/resources/app.asar"
 test -f "$tmp/bridge/systemd/qqnt-bridge.service"
 test -f "$tmp/bridge/bin/qqntctl"
+test -f "$tmp/bridge/bin/install.sh"
 
 install -d -m 0750 /var/lib/qqnt-bridge /var/lib/qqnt-bridge/log /var/lib/qqnt-bridge/backups
 if [ -f /opt/QQ/resources/app.asar ]; then
@@ -80,12 +81,16 @@ grep -q '^QQNT_BRIDGE_CLOSE_MAIN_WINDOW=' /etc/qqnt-bridge.env || echo 'QQNT_BRI
 chmod 0600 /etc/qqnt-bridge.env
 
 install -m 0755 "$tmp/bridge/bin/qqntctl" /usr/local/bin/qqntctl
+install -d -m 0755 /usr/local/libexec/qqnt-bridge
+install -m 0755 "$tmp/bridge/bin/install.sh" /usr/local/libexec/qqnt-bridge/install.sh
 install -m 0644 "$tmp/bridge/systemd/qqnt-bridge.service" /etc/systemd/system/qqnt-bridge.service
 systemctl daemon-reload
-systemctl enable --now qqnt-bridge.service
+systemctl enable qqnt-bridge.service
+systemctl restart qqnt-bridge.service
 
 echo
 echo "qqnt-bridge is installed and bound to localhost."
 echo "Show the login QR in this terminal: sudo qqntctl qr"
 echo "Save it as PNG: sudo qqntctl qr --png /tmp/qqnt-login.png"
 echo "Inspect status: sudo qqntctl status"
+echo "Install the latest bridge release later: sudo qqntctl update"

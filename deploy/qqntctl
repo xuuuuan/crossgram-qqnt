@@ -51,8 +51,21 @@ case "${1:-status}" in
   restart)
     exec systemctl restart qqnt-bridge.service
     ;;
+  update)
+    installer=${QQNT_BRIDGE_INSTALLER:-/usr/local/libexec/qqnt-bridge/install.sh}
+    if [ ! -x "$installer" ]; then
+      echo "update installer is missing: $installer" >&2
+      echo "run the one-line installer again to repair this installation" >&2
+      exit 1
+    fi
+    case "${2:-}" in
+      '') exec "$installer" ;;
+      release|debug) exec env QQNT_BRIDGE_MODE="$2" "$installer" ;;
+      *) echo "usage: qqntctl update [release|debug]" >&2; exit 2 ;;
+    esac
+    ;;
   *)
-    echo "usage: qqntctl {status|qr [--png FILE]|refresh|logs|restart}" >&2
+    echo "usage: qqntctl {status|qr [--png FILE]|refresh|logs|restart|update [release|debug]}" >&2
     exit 2
     ;;
 esac

@@ -20,6 +20,7 @@ sudo qqntctl qr
 sudo qqntctl qr --png /tmp/qqnt-login.png
 sudo qqntctl status
 sudo qqntctl logs
+sudo qqntctl update
 ```
 
 After a successful scan, the bridge calls QQNT's native
@@ -32,9 +33,12 @@ background/kernel processes alive. This behavior is gated by
 The systemd unit restarts QQ every seven days (`RuntimeMaxSec=7d`) and also
 restarts it if the whole service cgroup exceeds 800 MiB (`MemoryMax=800M`).
 
-The installer keeps existing `/etc/qqnt-bridge.env` values on upgrades. Set
-`QQNT_BRIDGE_ARCHIVE_URL` to install a local/debug build or
-`QQNT_PACKAGE_URL` to pin an official QQ package.
+`sudo qqntctl update` downloads the latest release, preserves the existing
+`/etc/qqnt-bridge.env`, login data and backups, then restarts the service.
+Running the one-line installer again performs the same in-place upgrade. Use
+`sudo qqntctl update debug` to switch to the latest debug package. Set
+`QQNT_BRIDGE_ARCHIVE_URL` when running the installer to use a local/custom
+build, or `QQNT_PACKAGE_URL` to pin an official QQ package.
 
 ## HTTP login endpoints
 

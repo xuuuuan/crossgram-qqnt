@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process'
-import { readFileSync } from 'node:fs'
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
@@ -25,5 +26,30 @@ describe('Linux deployment files', () => {
     expect(installer).toContain('QQNT_BRIDGE_HOST:-127.0.0.1')
     expect(installer).toContain('QQNT_BRIDGE_AUTO_LOGIN=1')
     expect(installer).toContain('QQNT_BRIDGE_HEADLESS=1')
+    expect(installer).toContain('systemctl restart qqnt-bridge.service')
+    expect(installer).toContain('/usr/local/libexec/qqnt-bridge/install.sh')
+  })
+
+  it('runs the packaged installer for in-place updates', () => {
+    const temp = mkdtempSync(join(tmpdir(), 'qqntctl-update-'))
+    const envFile = join(temp, 'bridge.env')
+    const updater = join(temp, 'installer.sh')
+    const marker = join(temp, 'updated')
+    try {
+      writeFileSync(envFile, 'QQNT_BRIDGE_TOKEN=test-token\n')
+      writeFileSync(updater, '#!/bin/sh\nprintf \'%s\' "$QQNT_BRIDGE_MODE" > "$QQNT_BRIDGE_UPDATE_MARKER"\n')
+      chmodSync(updater, 0o755)
+      execFileSync('sh', [join(root, 'deploy', 'qqntctl'), 'update', 'debug'], {
+        env: {
+          ...process.env,
+          QQNT_BRIDGE_ENV_FILE: envFile,
+          QQNT_BRIDGE_INSTALLER: updater,
+          QQNT_BRIDGE_UPDATE_MARKER: marker,
+        },
+      })
+      expect(readFileSync(marker, 'utf8')).toBe('debug')
+    } finally {
+      rmSync(temp, { recursive: true, force: true })
+    }
   })
 })
