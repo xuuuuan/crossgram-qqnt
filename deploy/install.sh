@@ -101,6 +101,7 @@ if ! qq_binary=$(resolve_qq_binary); then
     echo "QQNT was not found on this distribution." >&2
     echo "Install Linux QQ from https://im.qq.com/linuxqq/index.shtml and rerun this script." >&2
     echo "If QQ is installed in a custom location, set QQNT_BINARY=/absolute/path/to/qq." >&2
+    echo "Example: curl -fsSL <installer-url> | sudo env QQNT_BINARY=/absolute/path/to/qq sh" >&2
     exit 1
   fi
   qq_url=${QQNT_PACKAGE_URL:-}

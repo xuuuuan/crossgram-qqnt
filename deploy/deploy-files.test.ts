@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process'
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { delimiter, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 
@@ -62,6 +62,33 @@ describe('Linux deployment files', () => {
       expect(() => execFileSync('sh', [script], {
         env: { ...process.env, QQNT_BRIDGE_RESOLVE_ONLY: '1', QQNT_SEARCH_ROOT: join(temp, 'missing') },
       })).toThrow()
+    } finally {
+      rmSync(temp, { recursive: true, force: true })
+    }
+  })
+
+  it('launches a custom QQ path through portable Xvfb and D-Bus helpers', () => {
+    const temp = mkdtempSync(join(tmpdir(), 'qqnt-launch-'))
+    const qq = join(temp, 'custom QQ', 'qq')
+    const marker = join(temp, 'qq-arguments')
+    try {
+      mkdirSync(join(temp, 'custom QQ'), { recursive: true })
+      writeFileSync(join(temp, 'Xvfb'), '#!/bin/sh\ntrap \'exit 0\' TERM INT\nwhile :; do sleep 1; done\n')
+      writeFileSync(join(temp, 'dbus-run-session'), '#!/bin/sh\n[ "$1" = -- ] && shift\nexec "$@"\n')
+      writeFileSync(qq, '#!/bin/sh\nprintf \'%s\\n\' "$@" > "$QQNT_LAUNCH_MARKER"\n')
+      for (const file of ['Xvfb', 'dbus-run-session', join('custom QQ', 'qq')]) chmodSync(join(temp, file), 0o755)
+      execFileSync('sh', [join(root, 'deploy', 'run-headless.sh')], {
+        env: {
+          ...process.env,
+          PATH: `${temp}${delimiter}${process.env.PATH ?? ''}`,
+          QQNT_BINARY: qq,
+          QQNT_LAUNCH_MARKER: marker,
+        },
+        timeout: 5_000,
+      })
+      expect(readFileSync(marker, 'utf8').trim().split('\n')).toEqual([
+        '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage',
+      ])
     } finally {
       rmSync(temp, { recursive: true, force: true })
     }
