@@ -6,7 +6,9 @@ import WebSocket, { WebSocketServer } from 'ws'
 import {
   PROTOCOL_VERSION, type QQMediaLocator, type QQMultiForwardLocator, type QQSendMediaSpec, type QQStickerReference, type SendManifest,
 } from './protocol.js'
-import { QQKernelBridge, QQStickerAssetNotFoundError } from './qq-kernel.js'
+import {
+  QQKernelBridge, QQReactionTargetNotFoundError, QQStickerAssetNotFoundError,
+} from './qq-kernel.js'
 import { log, recordSlowHttpRequest, slowHttpLogPath } from './log.js'
 import type { QQLoginController } from './login-controller.js'
 
@@ -438,18 +440,35 @@ export class QQBridgeServer {
     if (request.method === 'GET' && path === '/v1/messages/reactions') {
       const conversation = this.bridge.getConversation(requiredParam(url, 'conversationId'))
       const messageId = requiredParam(url, 'messageId')
-      const context = await this.bridge.getMessageReactions(conversation, messageId)
+      const context = await this.bridge.getMessageReactions(
+        conversation, messageId, url.searchParams.get('messageSequence') ?? undefined,
+      )
       log('info', `HTTP API get reactions id=${requestId} conversation=${conversation.id} message=${messageId} reactions=${context.reactions.length}`)
       json(response, 200, context)
       return
     }
     if (request.method === 'POST' && path === '/v1/messages/reactions') {
-      const body = await readJson<{ conversationId: string, messageId: string, reactionKeys: string[] }>(request)
-      const context = await this.bridge.setMessageReactions(
-        this.bridge.getConversation(body.conversationId),
-        body.messageId,
-        body.reactionKeys,
-      )
+      const body = await readJson<{
+        conversationId: string
+        messageId: string
+        messageSequence?: string
+        reactionKeys: string[]
+      }>(request)
+      let context
+      try {
+        context = await this.bridge.setMessageReactions(
+          this.bridge.getConversation(body.conversationId),
+          body.messageId,
+          body.reactionKeys,
+          body.messageSequence,
+        )
+      } catch (error) {
+        if (error instanceof QQReactionTargetNotFoundError) {
+          json(response, 404, { error: error.message })
+          return
+        }
+        throw error
+      }
       log('info', `HTTP API set reactions id=${requestId} conversation=${body.conversationId} message=${body.messageId} requested=${body.reactionKeys.join(',')} resulting=${context.reactions.length}`)
       json(response, 200, context)
       return

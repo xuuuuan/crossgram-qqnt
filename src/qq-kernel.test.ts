@@ -2837,6 +2837,38 @@ describe('QQKernelBridge', () => {
     })
   })
 
+  it('resolves account-scoped group message IDs through the stable reaction sequence', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const conversation = await bridge.resolveConversation(2, '1058754719')
+    const currentView = {
+      ...f.message,
+      msgId: 'current-account-view-id', msgSeq: '571', chatType: 2 as const,
+      peerUid: '1058754719', peerUin: '1058754719', emojiLikesList: [],
+    }
+    f.msg.getMsgsByMsgId.mockRejectedValue(new Error('account-scoped message id is unavailable'))
+    f.msg.getMsgsBySeqAndCount.mockResolvedValue({
+      result: 0, errMsg: '', msgList: [currentView],
+    })
+
+    await expect(bridge.getMessageReactions(
+      conversation, 'other-account-view-id', '571',
+    )).resolves.toEqual({ reactions: [], maxSelected: 20 })
+    await expect(bridge.setMessageReactions(
+      conversation, 'other-account-view-id', ['1:14'], '571',
+    )).resolves.toMatchObject({ reactions: [{ key: '1:14', selected: true }] })
+
+    expect(f.msg.getMsgsBySeqAndCount).toHaveBeenCalledWith(
+      expect.objectContaining({ chatType: 2, peerUid: '1058754719' }),
+      '571', 1, true, false,
+    )
+    expect(f.msg.setMsgEmojiLikes).toHaveBeenCalledWith(
+      expect.objectContaining({ chatType: 2, peerUid: '1058754719' }),
+      '571', '14', '1', true,
+    )
+  })
+
   it('uses a reaction gray-tip target sequence to publish an immediate authoritative snapshot', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
@@ -2969,6 +3001,50 @@ describe('QQBridgeServer', () => {
     })
     expect(repeatedRead.status).toBe(200)
     await expect(repeatedRead.json()).resolves.toEqual({ ok: true })
+  })
+
+  it('passes reaction sequences through HTTP and returns permanent misses as 404', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    await bridge.resolveConversation(2, '1058754719')
+    const currentView = {
+      ...f.message,
+      msgId: 'current-account-view-id', msgSeq: '571', chatType: 2 as const,
+      peerUid: '1058754719', peerUin: '1058754719', emojiLikesList: [],
+    }
+    f.msg.getMsgsByMsgId.mockResolvedValue({ result: 0, errMsg: '', msgList: [] })
+    f.msg.getMsgsBySeqAndCount.mockResolvedValue({
+      result: 0, errMsg: '', msgList: [currentView],
+    })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const base = `http://127.0.0.1:${server.address().port}/v1`
+
+    const applied = await fetch(`${base}/messages/reactions`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        conversationId: '1058754719', messageId: 'other-account-view-id',
+        messageSequence: '571', reactionKeys: ['1:14'],
+      }),
+    })
+    expect(applied.status).toBe(200)
+    await expect(applied.json()).resolves.toMatchObject({
+      reactions: [{ key: '1:14', selected: true }],
+    })
+
+    f.msg.getMsgsBySeqAndCount.mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [] })
+    const missing = await fetch(`${base}/messages/reactions`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        conversationId: '1058754719', messageId: 'missing-account-view-id',
+        messageSequence: '999', reactionKeys: ['1:14'],
+      }),
+    })
+    expect(missing.status).toBe(404)
+    await expect(missing.json()).resolves.toEqual({
+      error: 'QQ reaction target not found: missing-account-view-id',
+    })
   })
 
   it('returns and negatively caches missing favorite sticker assets as HTTP 404', async () => {

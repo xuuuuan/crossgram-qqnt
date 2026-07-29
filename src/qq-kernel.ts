@@ -48,6 +48,8 @@ const TELEGRAM_STANDARD_REACTIONS = new Set([
   '🦄', '😘', '💊', '🙊', '😎', '👾', '🤷‍♂', '🤷', '🤷‍♀', '😡', '😂',
 ])
 
+export class QQReactionTargetNotFoundError extends Error {}
+
 export interface QQKernelOptions {
   tempPath?: string
   sendTimeoutMs?: number
@@ -1749,13 +1751,15 @@ export class QQKernelBridge {
     }
   }
 
-  async getMessageReactions(conversation: QQConversation, messageId: string): Promise<QQReactionState> {
+  async getMessageReactions(
+    conversation: QQConversation,
+    messageId: string,
+    messageSequence?: string,
+  ): Promise<QQReactionState> {
     if (conversation.chatType !== CHAT_GROUP) return { reactions: [], maxSelected: 0 }
-    const record = await withTimeout(
-      this.getMessageRecord(conversation, messageId),
-      5_000,
-      'QQ reaction lookup timed out',
-    )
+    const record = await withTimeout(this.getReactionRecord(
+      conversation, messageId, messageSequence,
+    ), 5_000, 'QQ reaction lookup timed out')
     if (!record) return { reactions: [], maxSelected: 20 }
     const message = this.mapMessage(record)
     const previous = (this.messages.get(conversation.id) ?? []).find((item) => item.id === messageId)
@@ -1868,6 +1872,7 @@ export class QQKernelBridge {
     conversation: QQConversation,
     messageId: string,
     reactionKeys: readonly string[],
+    messageSequence?: string,
   ): Promise<QQReactionState> {
     if (conversation.chatType !== CHAT_GROUP) throw new Error('QQ reactions are unavailable in direct conversations')
     const service = this.requireMsgService()
@@ -1876,26 +1881,27 @@ export class QQKernelBridge {
     // onAddSendMsg may expose a temporary group msgSeq at sendStatus=1. The
     // stable msgId can already be returned to callers, but reaction writes must
     // refresh the record and use QQ's final msgSeq.
-    let record = await withTimeout(
-      this.getMessageRecord(conversation, messageId),
-      5_000,
-      'QQ reaction target refresh timed out',
-    ).catch(() => null)
+    let record = await withTimeout(this.getReactionRecord(
+      conversation, messageId, messageSequence,
+    ), 5_000, 'QQ reaction target refresh timed out').catch(() => null)
     // Both getMsgsByMsgId and the first-view cache can briefly retain the
     // optimistic record. Poll the database view until QQ publishes the final
     // sendStatus/msgSeq, bounded to keep older builds responsive.
     for (let attempt = 0; record?.sendStatus === 1 && attempt < 8; attempt++) {
       const latest = await this.latestRecords(conversation, 20).catch(() => [])
-      const candidate = latest.find((item) => item.msgId === messageId)
+      const candidate = latest.find((item) => item.msgId === messageId
+        || messageSequence !== undefined && item.msgSeq === messageSequence)
       if (candidate && candidate.sendStatus >= 2) {
         record = candidate
         break
       }
       await delay(200)
-      record = await this.getMessageRecord(conversation, messageId).catch(() => record)
+      record = await this.getReactionRecord(
+        conversation, messageId, messageSequence,
+      ).catch(() => record) ?? record
     }
     const message = record ? this.mapMessage(record) : cached ?? null
-    if (!message) throw new Error(`QQ reaction target not found: ${messageId}`)
+    if (!message) throw new QQReactionTargetNotFoundError(`QQ reaction target not found: ${messageId}`)
     const current = new Set((message.reactionContext?.reactions ?? []).filter((item) => item.selected)
       .map((item) => item.key))
     const desired = new Set(reactionKeys)
@@ -3804,6 +3810,33 @@ export class QQKernelBridge {
     }
     const result = await service.getMsgs(contact(conversation), '0', limit, true)
     return result.result === 0 ? result.msgList : []
+  }
+
+  private async getReactionRecord(
+    conversation: QQConversation,
+    messageId: string,
+    messageSequence?: string,
+  ): Promise<MsgRecord | null> {
+    let byId: MsgRecord | null = null
+    try {
+      byId = await this.getMessageRecord(conversation, messageId)
+    } catch (error) {
+      if (!messageSequence) throw error
+      log('warn', `QQ reaction message-id lookup failed; falling back to sequence conversation=${conversation.id} message=${messageId} sequence=${messageSequence}`, error)
+    }
+    if (byId || !messageSequence) return byId
+    const service = this.requireMsgService()
+    if (!service.getMsgsBySeqAndCount) return null
+    log('info', `native API start name=getMsgsBySeqAndCount(reaction) conversation=${conversation.id} message=${messageId} sequence=${messageSequence}`)
+    const response = await service.getMsgsBySeqAndCount(
+      contact(conversation), messageSequence, 1, true, false,
+    )
+    log('info', `native API complete name=getMsgsBySeqAndCount(reaction) conversation=${conversation.id} message=${messageId} sequence=${messageSequence} result=${response.result} err=${JSON.stringify(response.errMsg)} records=${response.msgList.length}`)
+    if (response.result !== 0) {
+      throw new Error(`getMsgsBySeqAndCount(reaction): ${response.errMsg} (${response.result})`)
+    }
+    const record = response.msgList.find((item) => item.msgSeq === messageSequence)
+    return record && !isRecalledRecord(record) ? record : null
   }
 
   private async waitForForwardedMessages(
