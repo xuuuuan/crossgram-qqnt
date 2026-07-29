@@ -9,6 +9,7 @@ import { QQLoginController, wrapLoginServiceConstructor } from './login-controll
 import { createPacketBindingProber, createPacketHookInstaller, type PacketBindingProbe } from './packet-addon.js'
 import { QQKernelBridge } from './qq-kernel.js'
 import { QQBridgeServer } from './server.js'
+import { closeLargestVisibleWindow, type ClosableWindow } from './headless-window.js'
 
 declare const __QQNT_BRIDGE_BUILD_MODE__: string | undefined
 
@@ -21,9 +22,13 @@ const bootstrapState = globalThis as typeof globalThis & { [bootstrapKey]?: bool
 if ((processType === undefined || processType === 'browser') && !bootstrapState[bootstrapKey]) {
   bootstrapState[bootstrapKey] = true
   const bridge = new QQKernelBridge()
+  const headless = process.env.QQNT_BRIDGE_HEADLESS === '1'
   const login = new QQLoginController({
-    autoRequestQRCode: process.env.QQNT_BRIDGE_MANAGE_LOGIN !== '0',
-    enableAutoLogin: process.env.QQNT_BRIDGE_AUTO_LOGIN !== '0',
+    autoRequestQRCode: headless && process.env.QQNT_BRIDGE_MANAGE_LOGIN !== '0',
+    enableAutoLogin: headless && process.env.QQNT_BRIDGE_AUTO_LOGIN !== '0',
+    onSessionReady: headless && process.env.QQNT_BRIDGE_CLOSE_MAIN_WINDOW !== '0'
+      ? scheduleMainWindowClose
+      : undefined,
   })
   const server = new QQBridgeServer(bridge, {
     host: process.env.QQNT_BRIDGE_HOST ?? '127.0.0.1',
@@ -179,6 +184,29 @@ function wrapKernelModule(kernel: KernelModule, bridge: QQKernelBridge, login: Q
     }
   }
   return Object.defineProperties({}, descriptors) as KernelModule
+}
+
+let closeMainWindowTimer: NodeJS.Timeout | undefined
+
+function scheduleMainWindowClose(): void {
+  if (closeMainWindowTimer) clearTimeout(closeMainWindowTimer)
+  const configured = Number(process.env.QQNT_BRIDGE_CLOSE_MAIN_WINDOW_DELAY_MS ?? 15_000)
+  const delay = Number.isFinite(configured) && configured >= 0 ? configured : 15_000
+  closeMainWindowTimer = setTimeout(() => {
+    closeMainWindowTimer = undefined
+    try {
+      const electron = Module.createRequire(__filename)('electron') as {
+        BrowserWindow?: { getAllWindows(): ClosableWindow[] }
+      }
+      const windows = electron.BrowserWindow?.getAllWindows() ?? []
+      const closed = closeLargestVisibleWindow(windows)
+      if (closed) log('info', `closed QQNT main window after login visibleWindows=${windows.length}`)
+      else log('info', `QQNT main window already hidden after login windows=${windows.length}`)
+    } catch (error) {
+      log('warn', 'failed to close QQNT main window after login', error)
+    }
+  }, delay)
+  closeMainWindowTimer.unref?.()
 }
 
 function wrapSession(

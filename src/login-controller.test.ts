@@ -90,6 +90,16 @@ describe('QQLoginController', () => {
     expect(controller.status.autoLogin).toBe('enabled')
   })
 
+  it('announces a ready session even when automatic login management is disabled', () => {
+    const onSessionReady = vi.fn()
+    const controller = new QQLoginController({
+      autoRequestQRCode: false, enableAutoLogin: false, onSessionReady,
+    })
+    controller.attachSession({} as KernelSession)
+    expect(onSessionReady).toHaveBeenCalledOnce()
+    expect(controller.status.autoLogin).toBe('disabled')
+  })
+
   it('attaches when QQ constructs or retrieves the native login singleton', () => {
     let registered = 0
     class NativeService {
@@ -108,5 +118,21 @@ describe('QQLoginController', () => {
     expect(Facade.get?.()).toBeTruthy()
     expect(new Facade()).toBeTruthy()
     expect(registered).toBeGreaterThan(0)
+  })
+
+  it('removes the old listener when QQ replaces its login service', () => {
+    const controller = new QQLoginController({ autoRequestQRCode: false })
+    const kernel = { NodeIQQNTWrapperSession: { prototype: { init() {} } } } as KernelModule
+    const remove = vi.fn()
+    const first = {
+      addKernelLoginListener: vi.fn(), removeKernelLoginListener: remove,
+      getQRCodePicture: () => true, startPolling: () => true,
+    }
+    const second = {
+      addKernelLoginListener: vi.fn(), getQRCodePicture: () => true, startPolling: () => true,
+    }
+    controller.attachService(first, kernel)
+    controller.attachService(second, kernel)
+    expect(remove).toHaveBeenCalledOnce()
   })
 })

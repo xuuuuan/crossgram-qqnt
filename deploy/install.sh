@@ -71,8 +71,12 @@ if [ ! -f /etc/qqnt-bridge.env ]; then
     echo "QQNT_BRIDGE_SLOW_HTTP_LOG=/var/lib/qqnt-bridge/log/slow-http.log"
     echo "QQNT_BRIDGE_AUTO_LOGIN=1"
     echo "QQNT_BRIDGE_MANAGE_LOGIN=1"
+    echo "QQNT_BRIDGE_HEADLESS=1"
+    echo "QQNT_BRIDGE_CLOSE_MAIN_WINDOW=1"
   } > /etc/qqnt-bridge.env
 fi
+grep -q '^QQNT_BRIDGE_HEADLESS=' /etc/qqnt-bridge.env || echo 'QQNT_BRIDGE_HEADLESS=1' >> /etc/qqnt-bridge.env
+grep -q '^QQNT_BRIDGE_CLOSE_MAIN_WINDOW=' /etc/qqnt-bridge.env || echo 'QQNT_BRIDGE_CLOSE_MAIN_WINDOW=1' >> /etc/qqnt-bridge.env
 chmod 0600 /etc/qqnt-bridge.env
 
 install -m 0755 "$tmp/bridge/bin/qqntctl" /usr/local/bin/qqntctl

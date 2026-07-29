@@ -24,7 +24,13 @@ sudo qqntctl logs
 
 After a successful scan, the bridge calls QQNT's native
 `setAutoLoginSwitch(true)` setting. QQ should then reuse its stored ticket on
-subsequent service restarts.
+subsequent service restarts. In headless mode it closes the largest visible QQ
+window 15 seconds after the account session becomes ready, while keeping QQ's
+background/kernel processes alive. This behavior is gated by
+`QQNT_BRIDGE_HEADLESS=1`; ordinary Windows injection does not enable it.
+
+The systemd unit restarts QQ every seven days (`RuntimeMaxSec=7d`) and also
+restarts it if the whole service cgroup exceeds 800 MiB (`MemoryMax=800M`).
 
 The installer keeps existing `/etc/qqnt-bridge.env` values on upgrades. Set
 `QQNT_BRIDGE_ARCHIVE_URL` to install a local/debug build or

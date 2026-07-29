@@ -11,9 +11,11 @@ Environment=HOME=/var/lib/qqnt-bridge
 Environment=NO_COLOR=1
 EnvironmentFile=/etc/qqnt-bridge.env
 WorkingDirectory=/var/lib/qqnt-bridge
-ExecStart=/usr/bin/dbus-run-session -- /usr/bin/xvfb-run --auto-servernum --server-args=-screen\ 0\ 1280x720x24\ -nolisten\ tcp /opt/QQ/qq --no-sandbox --disable-gpu --disable-dev-shm-usage
+ExecStart=/usr/bin/dbus-run-session -- /usr/bin/xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24 -nolisten tcp" /opt/QQ/qq --no-sandbox --disable-gpu --disable-dev-shm-usage
 Restart=always
 RestartSec=3
+RuntimeMaxSec=7d
+MemoryMax=800M
 TimeoutStopSec=20
 KillMode=mixed
 LimitNOFILE=65536

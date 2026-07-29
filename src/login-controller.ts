@@ -33,13 +33,15 @@ export interface LoginControllerOptions {
   requestDelayMs?: number
   retryDelaysMs?: number[]
   setTimeout?: typeof setTimeout
+  onSessionReady?: () => void
 }
 
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
 
 export class QQLoginController {
-  private readonly options: Required<Omit<LoginControllerOptions, 'setTimeout'>>
+  private readonly options: Required<Omit<LoginControllerOptions, 'setTimeout' | 'onSessionReady'>>
   private readonly schedule: typeof setTimeout
+  private readonly onSessionReady?: () => void
   private phase: LoginPhase = 'initializing'
   private connected = false
   private service?: KernelLoginService
@@ -61,6 +63,7 @@ export class QQLoginController {
       retryDelaysMs: options.retryDelaysMs ?? [0, 500, 2_000, 5_000, 10_000],
     }
     this.schedule = options.setTimeout ?? setTimeout
+    this.onSessionReady = options.onSessionReady
     this.autoLogin = this.options.enableAutoLogin ? 'pending' : 'disabled'
   }
 
@@ -107,6 +110,13 @@ export class QQLoginController {
 
   attachService(service: KernelLoginService, kernel: KernelModule): void {
     if (this.service === service && this.listener) return
+    if (this.service && this.listener) {
+      try {
+        this.service.removeKernelLoginListener?.(this.listener)
+      } catch (error) {
+        log('warn', 'failed to replace the previous QQNT login listener', error)
+      }
+    }
     this.service = service
     const handlers: KernelLoginListener = {
       onLoginConnected: () => this.onConnected(),
@@ -133,6 +143,7 @@ export class QQLoginController {
   }
 
   attachSession(session: KernelSession): void {
+    this.onSessionReady?.()
     if (!this.options.enableAutoLogin) return
     this.settingAttempt = 0
     void this.tryEnableAutoLogin(session)
