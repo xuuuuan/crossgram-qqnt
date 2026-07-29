@@ -1881,9 +1881,13 @@ export class QQKernelBridge {
     // onAddSendMsg may expose a temporary group msgSeq at sendStatus=1. The
     // stable msgId can already be returned to callers, but reaction writes must
     // refresh the record and use QQ's final msgSeq.
+    let lookupError: unknown
     let record = await withTimeout(this.getReactionRecord(
       conversation, messageId, messageSequence,
-    ), 5_000, 'QQ reaction target refresh timed out').catch(() => null)
+    ), 5_000, 'QQ reaction target refresh timed out').catch((error) => {
+      lookupError = error
+      return null
+    })
     // Both getMsgsByMsgId and the first-view cache can briefly retain the
     // optimistic record. Poll the database view until QQ publishes the final
     // sendStatus/msgSeq, bounded to keep older builds responsive.
@@ -1898,9 +1902,16 @@ export class QQKernelBridge {
       await delay(200)
       record = await this.getReactionRecord(
         conversation, messageId, messageSequence,
-      ).catch(() => record) ?? record
+      ).then((refreshed) => {
+        if (refreshed) lookupError = undefined
+        return refreshed ?? record
+      }).catch((error) => {
+        lookupError = error
+        return record
+      })
     }
     const message = record ? this.mapMessage(record) : cached ?? null
+    if (!message && lookupError) throw lookupError
     if (!message) throw new QQReactionTargetNotFoundError(`QQ reaction target not found: ${messageId}`)
     const current = new Set((message.reactionContext?.reactions ?? []).filter((item) => item.selected)
       .map((item) => item.key))

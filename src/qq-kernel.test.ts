@@ -2869,6 +2869,20 @@ describe('QQKernelBridge', () => {
     )
   })
 
+  it('keeps transient reaction sequence lookup failures retryable', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const conversation = await bridge.resolveConversation(2, '1058754719')
+    f.msg.getMsgsByMsgId.mockRejectedValue(new Error('account-scoped message id is unavailable'))
+    f.msg.getMsgsBySeqAndCount.mockRejectedValue(new Error('QQ database is temporarily busy'))
+
+    await expect(bridge.setMessageReactions(
+      conversation, 'other-account-view-id', ['1:14'], '571',
+    )).rejects.toThrow('QQ database is temporarily busy')
+    expect(f.msg.setMsgEmojiLikes).not.toHaveBeenCalled()
+  })
+
   it('uses a reaction gray-tip target sequence to publish an immediate authoritative snapshot', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
@@ -3003,7 +3017,7 @@ describe('QQBridgeServer', () => {
     await expect(repeatedRead.json()).resolves.toEqual({ ok: true })
   })
 
-  it('passes reaction sequences through HTTP and returns permanent misses as 404', async () => {
+  it('passes reaction sequences through HTTP and distinguishes permanent from transient misses', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
@@ -3045,6 +3059,18 @@ describe('QQBridgeServer', () => {
     await expect(missing.json()).resolves.toEqual({
       error: 'QQ reaction target not found: missing-account-view-id',
     })
+
+    f.msg.getMsgsByMsgId.mockRejectedValueOnce(new Error('message-id lookup temporarily unavailable'))
+    f.msg.getMsgsBySeqAndCount.mockRejectedValueOnce(new Error('QQ database is temporarily busy'))
+    const transient = await fetch(`${base}/messages/reactions`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        conversationId: '1058754719', messageId: 'temporarily-unavailable-id',
+        messageSequence: '1000', reactionKeys: ['1:14'],
+      }),
+    })
+    expect(transient.status).toBe(500)
+    await expect(transient.json()).resolves.toEqual({ error: 'QQ database is temporarily busy' })
   })
 
   it('returns and negatively caches missing favorite sticker assets as HTTP 404', async () => {
