@@ -7,6 +7,9 @@
   "scripts": {
     "generate:proto": "protoc --proto_path=proto --es_out=src/generated --es_opt=target=ts proto/qqnt/packet.proto",
     "build": "pnpm build:native && node scripts/build.mjs && node scripts/copy-native.mjs",
+    "package": "pnpm build:native && node scripts/package-all.mjs",
+    "package:release": "pnpm build:native && node scripts/package-injection.mjs --mode=release",
+    "package:debug": "pnpm build:native && node scripts/package-injection.mjs --mode=debug",
     "build:native": "napi build --platform --release --cwd native/packet-addon --output-dir artifacts --no-js --dts index.d.ts",
     "test": "pnpm build:native && vitest run && pnpm test:native",
     "test:native": "cargo test --manifest-path native/packet-addon/Cargo.toml",
@@ -14,6 +17,7 @@
   },
   "devDependencies": {
     "@bufbuild/protoc-gen-es": "^2.13.0",
+    "@electron/asar": "^3.4.1",
     "@napi-rs/cli": "^3.7.4",
     "@types/node": "^26.1.1",
     "@types/ws": "^8.18.1",

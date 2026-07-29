@@ -1,0 +1,58 @@
+#!/bin/sh
+set -eu
+
+env_file=${QQNT_BRIDGE_ENV_FILE:-/etc/qqnt-bridge.env}
+if [ ! -r "$env_file" ]; then
+  echo "cannot read $env_file; run as root (for example: sudo qqntctl qr)" >&2
+  exit 1
+fi
+. "$env_file"
+
+base="http://${QQNT_BRIDGE_HOST:-127.0.0.1}:${QQNT_BRIDGE_PORT:-18767}"
+auth="Authorization: Bearer ${QQNT_BRIDGE_TOKEN}"
+
+wait_for_qr_url() {
+  curl -fsS -X POST -H "$auth" "$base/v1/login/qrcode/refresh" >/dev/null 2>&1 || true
+  tries=0
+  while [ "$tries" -lt 60 ]; do
+    if url=$(curl -fsS -H "$auth" "$base/v1/login/qrcode/url" 2>/dev/null); then
+      printf '%s\n' "$url"
+      return 0
+    fi
+    tries=$((tries + 1))
+    sleep 1
+  done
+  echo "QR code was not produced within 60 seconds" >&2
+  return 1
+}
+
+case "${1:-status}" in
+  status)
+    curl -fsS -H "$auth" "$base/v1/status"
+    printf '\n'
+    ;;
+  qr)
+    if [ "${2:-}" = "--png" ]; then
+      output=${3:-qqnt-login.png}
+      wait_for_qr_url >/dev/null
+      curl -fsS -H "$auth" "$base/v1/login/qrcode.png" -o "$output"
+      echo "saved QR code to $output"
+    else
+      wait_for_qr_url | qrencode -t ANSIUTF8
+    fi
+    ;;
+  refresh)
+    curl -fsS -X POST -H "$auth" "$base/v1/login/qrcode/refresh"
+    printf '\n'
+    ;;
+  logs)
+    exec journalctl -u qqnt-bridge.service -f
+    ;;
+  restart)
+    exec systemctl restart qqnt-bridge.service
+    ;;
+  *)
+    echo "usage: qqntctl {status|qr [--png FILE]|refresh|logs|restart}" >&2
+    exit 2
+    ;;
+esac

@@ -1,5 +1,6 @@
 /node_modules
 /dist
+/qqnt-login.png
 /native/packet-addon/target
 /native/packet-addon/artifacts/*.node
 /native/packet-addon/artifacts/index.d.ts
