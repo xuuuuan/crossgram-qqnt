@@ -1459,9 +1459,14 @@ describe('QQKernelBridge', () => {
     })
   })
 
-  it('uses one batch unread lookup and loads only the opened chat around its unread boundary', async () => {
+  it('uses one batch unread lookup and fills the window from the longer side of its unread boundary', async () => {
     const f = fixture()
-    const previous = { ...f.message, msgId: 'm0', msgSeq: 'seq0', msgTime: '1799999999' }
+    const older = Array.from({ length: 50 }, (_, index) => ({
+      ...f.message,
+      msgId: `older-${index}`,
+      msgSeq: `older-seq-${index}`,
+      msgTime: String(1_799_999_999 - index),
+    }))
     f.recent.getRecentContactInfos.mockResolvedValue({
       result: 0,
       errMsg: '',
@@ -1481,9 +1486,11 @@ describe('QQKernelBridge', () => {
         unreadCnt: '7',
       }],
     })
-    f.msg.getMsgsBySeqAndCount
-      .mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [previous, f.message] })
-      .mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [f.message] })
+    f.msg.getMsgsBySeqAndCount.mockImplementation(async (_peer, _seq, count, queryOrder) => ({
+      result: 0,
+      errMsg: '',
+      msgList: (queryOrder ? [...older, f.message] : [f.message]).slice(0, count),
+    }))
     const bridge = new QQKernelBridge()
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
 
@@ -1497,24 +1504,26 @@ describe('QQKernelBridge', () => {
     expect(f.msg.getABatchOfContactMsgBoxInfo).toHaveBeenCalledOnce()
     expect(f.msg.getMsgsBySeqAndCount).not.toHaveBeenCalled()
 
-    await bridge.getHistory(dialogs.conversations[0])
+    const history = await bridge.getHistory(dialogs.conversations[0])
+
+    expect(history.messages).toHaveLength(50)
 
     expect(f.msg.getMsgsBySeqAndCount).toHaveBeenCalledWith(
       expect.objectContaining({ peerUid: 'uid-1715311957' }),
       'seq1',
-      26,
+      51,
       true,
       false,
     )
     expect(f.msg.getMsgsBySeqAndCount).toHaveBeenCalledWith(
       expect.objectContaining({ peerUid: 'uid-1715311957' }),
       'seq1',
-      26,
+      51,
       false,
       false,
     )
     expect((await bridge.getDialogs()).conversations[0]).toMatchObject({
-      readInboxMaxMessage: { id: 'm0', msgSeq: 'seq0' },
+      readInboxMaxMessage: { id: 'older-0', msgSeq: 'older-seq-0' },
     })
     expect(f.msg.getABatchOfContactMsgBoxInfo).toHaveBeenCalledOnce()
   })
@@ -1727,6 +1736,29 @@ describe('QQKernelBridge', () => {
     f.msg.getMsgsIncludeSelf = vi.fn(async () => ({
       result: 0, errMsg: '', msgList: [{ ...f.message, chatType: 2, peerUid: '565265554', peerUin: '565265554' }],
     }))
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.getHistory(bridge.getConversation('565265554'))).resolves.toMatchObject({
+      messages: [{ id: 'm1', conversationId: '565265554' }],
+    })
+    expect(f.msg.getAioFirstViewLatestMsgs).toHaveBeenCalledOnce()
+    expect(f.msg.getMsgsIncludeSelf).toHaveBeenCalledOnce()
+  })
+
+  it('accepts a cold group remote history response slower than the legacy 450 ms deadline', async () => {
+    const f = fixture()
+    f.msg.getAioFirstViewLatestMsgs = vi.fn(async () => ({
+      result: 0, errMsg: '', msgList: [], needContinueGetMsg: true,
+    }))
+    f.msg.getMsgsIncludeSelf = vi.fn(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 550))
+      return {
+        result: 0,
+        errMsg: '',
+        msgList: [{ ...f.message, chatType: 2, peerUid: '565265554', peerUin: '565265554' }],
+      }
+    })
     const bridge = new QQKernelBridge()
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
 

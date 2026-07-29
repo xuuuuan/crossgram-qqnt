@@ -37,6 +37,7 @@ const MEMBER_SCENE_LIMIT = 64
 const DELETE_DEDUP_TTL_MS = 60_000
 const STICKER_MISSING_CACHE_TTL_MS = 30_000
 const STALE_CURSOR_REPLAY_LIMIT = 512
+const HISTORY_INTERACTIVE_TIMEOUT_MS = 2_000
 // Keep this in sync with Telegram's account-level reaction catalog. QQ emoji
 // outside this set are exposed as custom reactions backed by QQ's own icon.
 const TELEGRAM_STANDARD_REACTIONS = new Set([
@@ -571,7 +572,7 @@ export class QQKernelBridge {
         log('info', `native API fallback name=getMsgs conversation=${conversation.id} previousResult=${response.result}`)
         response = await withTimeout(
           service.getMsgs(peer, '0', limit, true),
-          450,
+          HISTORY_INTERACTIVE_TIMEOUT_MS,
           'QQ history fallback request timed out',
         )
       }
@@ -638,7 +639,7 @@ export class QQKernelBridge {
     )
     const first = await withTimeout(
       Promise.race([settledLocal, settledRemote]),
-      450,
+      HISTORY_INTERACTIVE_TIMEOUT_MS,
       'QQ first-screen history request timed out',
     )
     if (
@@ -653,7 +654,7 @@ export class QQKernelBridge {
     }
     const remoteResult = first.source === 'remote' ? first : await withTimeout(
       settledRemote,
-      Math.max(1, 450 - (Date.now() - started)),
+      Math.max(1, HISTORY_INTERACTIVE_TIMEOUT_MS - (Date.now() - started)),
       'QQ first-screen remote history request timed out',
     )
     if ('error' in remoteResult) throw remoteResult.error
@@ -1520,7 +1521,7 @@ export class QQKernelBridge {
       log('info', `native API start name=getABatchOfContactMsgBoxInfo contacts=${conversations.length}`)
       const response = await withTimeout(
         retryHistoryCall(() => service.getABatchOfContactMsgBoxInfo!(conversations.map(contact))),
-        450,
+        HISTORY_INTERACTIVE_TIMEOUT_MS,
         'QQ batch unread request timed out',
       )
       if (response.result !== 0) throw new Error(`getABatchOfContactMsgBoxInfo: ${response.errMsg} (${response.result})`)
@@ -1566,7 +1567,14 @@ export class QQKernelBridge {
     limit: number,
   ): Promise<{ result: number, errMsg: string, msgList: MsgRecord[] }> {
     const peer = contact(conversation)
-    const count = Math.max(2, Math.ceil(limit / 2) + 1)
+    // The unread anchor can sit close to either end of the available history.
+    // Asking each side for only half a page under-fills the result whenever
+    // the shorter side runs out (for example 27 older + 8 newer for limit 51).
+    // Fetch one full candidate page in both directions concurrently, then
+    // de-duplicate the shared anchor and trim below. This keeps the cold-path
+    // latency at one native round trip while allowing the longer side to fill
+    // the requested Telegram window.
+    const count = Math.max(2, Math.min(200, limit + 1))
     const call = async (queryOrder: boolean) => {
       const started = Date.now()
       try {
@@ -1584,7 +1592,7 @@ export class QQKernelBridge {
     // concurrently. Waiting for them serially doubles cold roaming latency.
     const [before, after] = await withTimeout(
       Promise.all([call(true), call(false)]),
-      450,
+      HISTORY_INTERACTIVE_TIMEOUT_MS,
       'QQ unread history request timed out',
     )
     // QQ returns kNoMoreMsg (2004000) together with the final non-empty
