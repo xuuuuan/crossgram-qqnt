@@ -289,6 +289,10 @@ export class QQLoginController {
       }
       const result = await settings.setAutoLoginSwitch(true)
       if (result.result !== 0) throw new Error(result.errMsg || `result ${result.result}`)
+      const verified = await settings.getAutoLoginSwitch?.()
+      if (verified && (verified.result !== 0 || !verified.state)) {
+        throw new Error(verified.errMsg || 'QQNT did not persist the automatic login switch')
+      }
       this.autoLogin = 'enabled'
       log('info', 'QQNT automatic login enabled')
     } catch (error) {

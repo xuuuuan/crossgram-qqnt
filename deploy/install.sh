@@ -138,8 +138,26 @@ test -f "$tmp/bridge/systemd/qqnt-bridge.service"
 test -f "$tmp/bridge/bin/qqntctl"
 test -f "$tmp/bridge/bin/install.sh"
 test -f "$tmp/bridge/bin/run-headless.sh"
+test -f "$tmp/bridge/bin/session-state.sh"
+
+state_dir=${QQNT_BRIDGE_STATE_DIR:-/var/lib/qqnt-bridge}
+was_ready=0
+if systemctl cat qqnt-bridge.service >/dev/null 2>&1; then
+  if command -v qqntctl >/dev/null 2>&1; then
+    previous_status=$(qqntctl status 2>/dev/null || true)
+    case "$previous_status" in *'"ready":true'*) was_ready=1 ;; esac
+  fi
+  systemctl stop qqnt-bridge.service
+fi
 
 install -d -m 0750 /var/lib/qqnt-bridge /var/lib/qqnt-bridge/log /var/lib/qqnt-bridge/backups
+pre_update_snapshot=
+if [ "$was_ready" -eq 1 ]; then
+  install -d -m 0700 "$state_dir/backups/session"
+  stamp=$(date +%Y%m%d-%H%M%S)
+  pre_update_snapshot=$state_dir/backups/session/pre-update.$stamp.tar.gz
+  QQNT_BRIDGE_STATE_DIR=$state_dir sh "$tmp/bridge/bin/session-state.sh" save "$pre_update_snapshot"
+fi
 if [ -f "$qq_resources/app.asar" ]; then
   stamp=$(date +%Y%m%d-%H%M%S)
   cp -a "$qq_resources/app.asar" "/var/lib/qqnt-bridge/backups/app.asar.$stamp"
@@ -183,10 +201,34 @@ install -m 0755 "$tmp/bridge/bin/qqntctl" /usr/local/bin/qqntctl
 install -d -m 0755 /usr/local/libexec/qqnt-bridge
 install -m 0755 "$tmp/bridge/bin/install.sh" /usr/local/libexec/qqnt-bridge/install.sh
 install -m 0755 "$tmp/bridge/bin/run-headless.sh" /usr/local/libexec/qqnt-bridge/run-headless.sh
+install -m 0755 "$tmp/bridge/bin/session-state.sh" /usr/local/libexec/qqnt-bridge/session-state.sh
 install -m 0644 "$tmp/bridge/systemd/qqnt-bridge.service" /etc/systemd/system/qqnt-bridge.service
 systemctl daemon-reload
 systemctl enable qqnt-bridge.service
 systemctl restart qqnt-bridge.service
+
+wait_for_ready() {
+  tries=0
+  limit=${QQNT_BRIDGE_UPDATE_READY_TIMEOUT_SECONDS:-180}
+  while [ "$tries" -lt "$limit" ]; do
+    current_status=$(qqntctl status 2>/dev/null || true)
+    case "$current_status" in *'"ready":true'*) return 0 ;; esac
+    tries=$((tries + 1))
+    sleep 1
+  done
+  return 1
+}
+
+if [ "$was_ready" -eq 1 ] && ! wait_for_ready; then
+  echo "QQNT did not restore the previous account after update; rolling back its login state" >&2
+  systemctl stop qqnt-bridge.service
+  QQNT_BRIDGE_STATE_DIR=$state_dir /usr/local/libexec/qqnt-bridge/session-state.sh restore "$pre_update_snapshot"
+  systemctl restart qqnt-bridge.service
+  if ! wait_for_ready; then
+    echo "QQNT login state was restored, but the account is still not ready; service was left running" >&2
+    exit 1
+  fi
+fi
 
 echo
 echo "qqnt-bridge is installed and bound to localhost."

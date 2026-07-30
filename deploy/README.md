@@ -51,21 +51,42 @@ the service, and prints the new account QR. Chat databases and Crossgram data
 are not removed.
 
 After a successful scan, the bridge calls QQNT's native
-`setAutoLoginSwitch(true)` setting. QQ should then reuse its stored ticket on
-subsequent service restarts. In headless mode it closes the largest visible QQ
-window 15 seconds after the account session becomes ready, while keeping QQ's
-background/kernel processes alive. This behavior is gated by
-`QQNT_BRIDGE_HEADLESS=1`; ordinary Windows injection does not enable it.
+`setAutoLoginSwitch(true)` setting and reads it back before reporting automatic
+login as enabled. Once the account remains ready for 15 seconds, the launcher
+saves a restricted last-known-good snapshot containing only `auth`, QQ's global
+login database, login markers and MMKV settings. If a later restart stays on the
+QR screen for two minutes, the launcher restores that snapshot and retries once.
+`qqntctl logout` moves both the active ticket and this recovery snapshot out of
+the way, so switching accounts cannot silently restore the old account.
+
+In headless mode the bridge also closes the largest visible QQ window 15 seconds
+after the account session becomes ready, while keeping QQ's background/kernel
+processes alive. These behaviors are gated by `QQNT_BRIDGE_HEADLESS=1`; ordinary
+Windows injection does not enable them.
 
 The systemd unit restarts QQ every seven days (`RuntimeMaxSec=7d`) and also
 restarts it if the whole service cgroup exceeds 800 MiB (`MemoryMax=800M`).
 
-`sudo qqntctl update` downloads the latest release, preserves the existing
-`/etc/qqnt-bridge.env`, login data and backups, then restarts the service.
+The Linux native packet hook has no QQ version profile or RVA allowlist. It
+locates the send wrapper from the assertion-string XRef, uses GNU unwind data
+for function boundaries, follows the response table relocation/call chain, and
+requires the `result`, `errMsg` and `rsp` XRefs to converge on the resolver.
+Ambiguous or malformed binaries fail closed.
+
+`sudo qqntctl update` downloads the latest release, stops QQ before replacing
+the injection, snapshots a currently ready account, preserves the existing
+`/etc/qqnt-bridge.env` and backups, then restarts the service. If the account no
+longer becomes ready, the installer restores the pre-update login snapshot and
+restarts once more.
 Running the one-line installer again performs the same in-place upgrade. Use
 `sudo qqntctl update debug` to switch to the latest debug package. Set
 `QQNT_BRIDGE_ARCHIVE_URL` when running the installer to use a local/custom
 build, or `QQNT_PACKAGE_URL` to pin an official QQ package.
+
+Release and debug archives are built and tested by GitHub Actions. Production
+VPS hosts only download those release assets; they should not compile QQNT
+bridge locally because native builds can starve the other services on a small
+server.
 
 ## HTTP login endpoints
 

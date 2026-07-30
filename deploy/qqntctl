@@ -70,6 +70,12 @@ case "${1:-status}" in
         moved=1
       fi
     done
+    lkg_archive="$state_dir/backups/session/last-known-good.tar.gz"
+    if [ -f "$lkg_archive" ]; then
+      mv -- "$lkg_archive" "$backup_dir/session.last-known-good.$stamp.tar.gz"
+      chmod 0600 "$backup_dir/session.last-known-good.$stamp.tar.gz"
+      moved=1
+    fi
     "$systemctl_command" start qqnt-bridge.service
     if [ "$moved" -eq 1 ]; then
       echo "QQNT login session was removed; backup saved under $backup_dir"

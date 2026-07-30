@@ -9,7 +9,7 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)))
 
 describe('Linux deployment files', () => {
   it('keeps installer and control scripts valid POSIX shell', () => {
-    for (const file of ['install.sh', 'qqntctl', 'run-headless.sh']) {
+    for (const file of ['install.sh', 'qqntctl', 'run-headless.sh', 'session-state.sh']) {
       expect(() => execFileSync('sh', ['-n', join(root, 'deploy', file)]), file).not.toThrow()
     }
   })
@@ -30,6 +30,8 @@ describe('Linux deployment files', () => {
     expect(installer).toContain('QQNT_BRIDGE_AUTO_LOGIN=1')
     expect(installer).toContain('QQNT_BRIDGE_HEADLESS=1')
     expect(installer).toContain('systemctl restart qqnt-bridge.service')
+    expect(installer).toContain('pre-update.')
+    expect(installer).toContain('session-state.sh restore')
     expect(installer).toContain('/usr/local/libexec/qqnt-bridge/install.sh')
     expect(installer).toContain('QQNT_BINARY=/absolute/path/to/qq')
     expect(installer).toContain('command -v dnf')
@@ -117,6 +119,85 @@ describe('Linux deployment files', () => {
     }
   })
 
+  it('restores one last-known-good session when the first headless login does not become ready', () => {
+    const temp = mkdtempSync(join(tmpdir(), 'qqnt-session-recovery-'))
+    const qq = join(temp, 'qq')
+    const launches = join(temp, 'launches')
+    const stateCalls = join(temp, 'session-state-calls')
+    try {
+      writeFileSync(join(temp, 'Xvfb'), '#!/bin/sh\ntrap \'exit 0\' TERM INT\nwhile :; do sleep 1; done\n')
+      writeFileSync(join(temp, 'dbus-run-session'), '#!/bin/sh\n[ "$1" = -- ] && shift\nexec "$@"\n')
+      writeFileSync(qq, '#!/bin/sh\ncount=0\n[ ! -f "$QQNT_LAUNCHES" ] || count=$(cat "$QQNT_LAUNCHES")\ncount=$((count + 1))\nprintf \'%s\' "$count" > "$QQNT_LAUNCHES"\nif [ "$count" -eq 1 ]; then trap \'exit 0\' TERM INT; while :; do sleep 1; done; else sleep 2; fi\n')
+      writeFileSync(join(temp, 'curl'), '#!/bin/sh\ncount=0\n[ ! -f "$QQNT_LAUNCHES" ] || count=$(cat "$QQNT_LAUNCHES")\nif [ "$count" -ge 2 ]; then printf \'{"ready":true}\n\'; else printf \'{"ready":false}\n\'; fi\n')
+      writeFileSync(join(temp, 'session-state'), '#!/bin/sh\nprintf \'%s\\n\' "$1" >> "$QQNT_SESSION_CALLS"\ncase "$1" in has-lkg) exit 0;; esac\n')
+      for (const file of ['Xvfb', 'dbus-run-session', 'qq', 'curl', 'session-state']) {
+        chmodSync(join(temp, file), 0o755)
+      }
+      execFileSync('sh', [join(root, 'deploy', 'run-headless.sh')], {
+        env: {
+          ...process.env,
+          PATH: `${temp}${delimiter}${process.env.PATH ?? ''}`,
+          QQNT_BINARY: qq,
+          QQNT_BRIDGE_TOKEN: 'test-token',
+          QQNT_BRIDGE_SESSION_TOOL: join(temp, 'session-state'),
+          QQNT_BRIDGE_CURL: join(temp, 'curl'),
+          QQNT_BRIDGE_SESSION_READY_TIMEOUT_SECONDS: '3',
+          QQNT_BRIDGE_SESSION_STABILIZE_SECONDS: '0',
+          QQNT_LAUNCHES: launches,
+          QQNT_SESSION_CALLS: stateCalls,
+        },
+        timeout: 15_000,
+      })
+      expect(readFileSync(launches, 'utf8')).toBe('2')
+      expect(readFileSync(stateCalls, 'utf8').trim().split('\n')).toEqual([
+        'has-lkg', 'restore-lkg', 'save-lkg',
+      ])
+    } finally {
+      rmSync(temp, { recursive: true, force: true })
+    }
+  })
+
+  it('snapshots and restores only QQNT login state', () => {
+    const temp = mkdtempSync(join(tmpdir(), 'qqnt-session-state-'))
+    const state = join(temp, 'state')
+    const config = join(state, '.config', 'qqnt-bridge-injection')
+    const archive = join(state, 'backups', 'session', 'manual.tar.gz')
+    const shellArchive = archive.replace(/^([A-Za-z]):/, (_, drive: string) => `/${drive.toLowerCase()}`).replaceAll('\\', '/')
+    const script = join(root, 'deploy', 'session-state.sh')
+    try {
+      mkdirSync(join(config, 'auth'), { recursive: true })
+      mkdirSync(join(config, 'global', 'nt_data', 'Login'), { recursive: true })
+      mkdirSync(join(config, 'global', 'nt_data', 'mmkv'), { recursive: true })
+      mkdirSync(join(config, 'global', 'nt_data', 'nt_db'), { recursive: true })
+      mkdirSync(join(config, 'global', 'nt_data', 'Emoji'), { recursive: true })
+      writeFileSync(join(config, 'auth', 'login.enc'), 'ticket-before')
+      writeFileSync(join(config, 'global', 'nt_data', 'Login', '.10001'), '')
+      writeFileSync(join(config, 'global', 'nt_data', 'mmkv', 'global'), 'switch-before')
+      writeFileSync(join(config, 'global', 'nt_data', 'nt_db', 'login.db'), 'db-before')
+      writeFileSync(join(config, 'global', 'nt_data', 'nt_db', 'login.db-wal'), 'wal-before')
+      writeFileSync(join(config, 'global', 'nt_data', 'Emoji', 'cache'), 'leave-me')
+      execFileSync('sh', [script, 'save', shellArchive], {
+        env: { ...process.env, QQNT_BRIDGE_STATE_DIR: state },
+      })
+
+      rmSync(join(config, 'auth'), { recursive: true, force: true })
+      rmSync(join(config, 'global', 'nt_data', 'Login'), { recursive: true, force: true })
+      writeFileSync(join(config, 'global', 'nt_data', 'mmkv', 'global'), 'switch-after')
+      writeFileSync(join(config, 'global', 'nt_data', 'nt_db', 'login.db'), 'db-after')
+      execFileSync('sh', [script, 'restore', shellArchive], {
+        env: { ...process.env, QQNT_BRIDGE_STATE_DIR: state },
+      })
+
+      expect(readFileSync(join(config, 'auth', 'login.enc'), 'utf8')).toBe('ticket-before')
+      expect(readFileSync(join(config, 'global', 'nt_data', 'mmkv', 'global'), 'utf8')).toBe('switch-before')
+      expect(readFileSync(join(config, 'global', 'nt_data', 'nt_db', 'login.db'), 'utf8')).toBe('db-before')
+      expect(readFileSync(join(config, 'global', 'nt_data', 'nt_db', 'login.db-wal'), 'utf8')).toBe('wal-before')
+      expect(readFileSync(join(config, 'global', 'nt_data', 'Emoji', 'cache'), 'utf8')).toBe('leave-me')
+    } finally {
+      rmSync(temp, { recursive: true, force: true })
+    }
+  })
+
   it('switches accounts without the bridge API and prints the new terminal QR', () => {
     const temp = mkdtempSync(join(tmpdir(), 'qqntctl-logout-'))
     const envFile = join(temp, 'bridge.env')
@@ -128,6 +209,8 @@ describe('Linux deployment files', () => {
       mkdirSync(authDir, { recursive: true })
       writeFileSync(join(authDir, 'login.enc'), 'encrypted-ticket')
       writeFileSync(join(authDir, 'login.enc-wal'), 'ticket-wal')
+      mkdirSync(join(state, 'backups', 'session'), { recursive: true })
+      writeFileSync(join(state, 'backups', 'session', 'last-known-good.tar.gz'), 'session-snapshot')
       writeFileSync(envFile, 'QQNT_BRIDGE_TOKEN=test-token\n')
       writeFileSync(join(temp, 'systemctl'), '#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$QQNT_SYSTEMCTL_MARKER"\n')
       writeFileSync(join(temp, 'curl'), '#!/bin/sh\ncase "$*" in *qrcode/url*) printf \'https://qr.test/new-account\\n\';; esac\n')
@@ -153,10 +236,11 @@ describe('Linux deployment files', () => {
       expect(readFileSync(qrMarker, 'utf8')).toBe('https://qr.test/new-account\n')
       expect(readdirSync(authDir)).toEqual([])
       const backups = readdirSync(join(state, 'backups', 'login')).sort()
-      expect(backups).toHaveLength(2)
+      expect(backups).toHaveLength(3)
       expect(backups).toEqual(expect.arrayContaining([
         expect.stringMatching(/^login\.enc\.\d{8}-\d{6}-\d+$/),
         expect.stringMatching(/^login\.enc-wal\.\d{8}-\d{6}-\d+$/),
+        expect.stringMatching(/^session\.last-known-good\.\d{8}-\d{6}-\d+\.tar\.gz$/),
       ]))
     } finally {
       rmSync(temp, { recursive: true, force: true })

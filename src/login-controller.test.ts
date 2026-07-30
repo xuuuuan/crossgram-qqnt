@@ -78,6 +78,23 @@ describe('QQLoginController', () => {
   })
 
   it('enables QQNT automatic login after a session attaches', async () => {
+    let enabled = false
+    const setAutoLoginSwitch = vi.fn(async () => {
+      enabled = true
+      return { result: 0, errMsg: '' }
+    })
+    const controller = new QQLoginController({ autoRequestQRCode: false, retryDelaysMs: [0] })
+    controller.attachSession({
+      getSettingService: () => ({
+        getAutoLoginSwitch: async () => ({ result: 0, errMsg: '', state: enabled }),
+        setAutoLoginSwitch,
+      }),
+    } as unknown as KernelSession)
+    await vi.waitFor(() => expect(setAutoLoginSwitch).toHaveBeenCalledWith(true))
+    expect(controller.status.autoLogin).toBe('enabled')
+  })
+
+  it('does not report automatic login as enabled until QQNT confirms the setting', async () => {
     const setAutoLoginSwitch = vi.fn(async () => ({ result: 0, errMsg: '' }))
     const controller = new QQLoginController({ autoRequestQRCode: false, retryDelaysMs: [0] })
     controller.attachSession({
@@ -85,9 +102,9 @@ describe('QQLoginController', () => {
         getAutoLoginSwitch: async () => ({ result: 0, errMsg: '', state: false }),
         setAutoLoginSwitch,
       }),
-    } as KernelSession)
-    await vi.waitFor(() => expect(setAutoLoginSwitch).toHaveBeenCalledWith(true))
-    expect(controller.status.autoLogin).toBe('enabled')
+    } as unknown as KernelSession)
+    await vi.waitFor(() => expect(controller.status.autoLogin).toBe('failed'))
+    expect(setAutoLoginSwitch).toHaveBeenCalledOnce()
   })
 
   it('announces a ready session even when automatic login management is disabled', () => {
