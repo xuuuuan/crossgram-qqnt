@@ -1,4 +1,8 @@
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
+#[cfg(target_os = "linux")]
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 const ELF_HEADER_SIZE: usize = 64;
@@ -8,10 +12,15 @@ const RELA_ENTRY_SIZE: usize = 24;
 const MAX_PROGRAM_HEADERS: usize = 128;
 const MAX_DYNAMIC_ENTRIES: usize = 4096;
 const MAX_RELA_ENTRIES: usize = 1_000_000;
+const MAX_UNWIND_FUNCTIONS: usize = 1_000_000;
+const MAX_FUNCTION_SIZE: u64 = 1024 * 1024;
+#[cfg(target_os = "linux")]
+const VERIFY_PREFIX_SIZE: usize = 16;
 
 const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
 const PT_NOTE: u32 = 4;
+const PT_GNU_EH_FRAME: u32 = 0x6474_e550;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 const PF_R: u32 = 4;
@@ -21,12 +30,36 @@ const DT_RELASZ: i64 = 8;
 const DT_RELAENT: i64 = 9;
 const R_X86_64_RELATIVE: u32 = 8;
 
+const DW_EH_PE_OMIT: u8 = 0xff;
+const DW_EH_PE_ABSPTR: u8 = 0x00;
+const DW_EH_PE_ULEB128: u8 = 0x01;
+const DW_EH_PE_UDATA2: u8 = 0x02;
+const DW_EH_PE_UDATA4: u8 = 0x03;
+const DW_EH_PE_UDATA8: u8 = 0x04;
+const DW_EH_PE_SLEB128: u8 = 0x09;
+const DW_EH_PE_SDATA2: u8 = 0x0a;
+const DW_EH_PE_SDATA4: u8 = 0x0b;
+const DW_EH_PE_SDATA8: u8 = 0x0c;
+const DW_EH_PE_PCREL: u8 = 0x10;
+const DW_EH_PE_DATAREL: u8 = 0x30;
+const DW_EH_PE_INDIRECT: u8 = 0x80;
+
+#[cfg(target_os = "linux")]
+const LOCATOR_NAME: &str = "linux-xref-v1";
+const RESPONSE_ANCHORS: [(&str, &[u8]); 3] = [
+    ("result", b"result\0"),
+    ("errMsg", b"errMsg\0"),
+    ("rsp", b"rsp\0"),
+];
+
 #[derive(Debug, Error)]
 pub enum ElfError {
     #[error("wrapper.node is not loaded in this process")]
     ModuleNotLoaded,
+    #[cfg(target_os = "linux")]
     #[error("multiple wrapper.node modules are loaded in this process")]
     ModuleAmbiguous,
+    #[cfg(target_os = "linux")]
     #[error("failed to read wrapper.node from disk: {0}")]
     ModuleRead(#[source] std::io::Error),
     #[error("ELF image is truncated")]
@@ -39,60 +72,27 @@ pub enum ElfError {
     VirtualAddress,
     #[error("ELF GNU Build ID is missing")]
     BuildIdMissing,
-    #[error("ELF dynamic RELA table is invalid")]
+    #[error("ELF GNU unwind lookup table is missing or invalid")]
+    UnwindTable,
+    #[error("ELF GNU unwind pointer encoding is unsupported")]
+    UnwindEncoding,
+    #[error("ELF dynamic RELA table is missing or invalid")]
     RelaTable,
-    #[error("QQNT wrapper.node build is not an approved packet-binding profile")]
-    UnsupportedProfile,
-    #[error("QQNT packet binding name scan did not produce exactly one read-only match")]
-    BindingNameScan,
-    #[error("QQNT packet binding name relocation scan did not produce exactly one writable slot")]
-    NameSlotScan,
-    #[error("QQNT packet N-API callback relocation scan failed")]
+    #[error("QQNT send assertion did not produce exactly one non-executable string match")]
+    SendAnchorScan,
+    #[error("QQNT send assertion did not produce exactly one executable RIP-relative XRef")]
+    SendAnchorXref,
+    #[error("QQNT send assertion XRef is not covered by the GNU unwind table")]
     NapiCallbackScan,
-    #[error("QQNT packet response action relocation scan failed")]
-    ResponseActionScan,
-    #[error("QQNT packet converter scan did not produce exactly one executable match")]
+    #[error("QQNT send wrapper did not contain one validated repeated converter call target")]
     ConverterScan,
-    #[error("QQNT packet symbol layout arithmetic overflowed")]
-    SymbolLayout,
-    #[error("approved profile's binding name is not a read-only PT_LOAD address")]
-    BindingNamePermissions,
-    #[error("approved profile's N-API callback is not an executable PT_LOAD address")]
-    NapiCallbackPermissions,
-    #[error("approved profile's response action is not an executable PT_LOAD address")]
-    ResponseActionPermissions,
-    #[error("approved profile's converter is not an executable PT_LOAD address")]
-    ConverterPermissions,
-    #[error("approved profile's resolve action is not an executable PT_LOAD address")]
-    ResolveActionPermissions,
-    #[error("approved profile's name slot is not a writable PT_LOAD address")]
-    NameSlotPermissions,
-    #[error("approved profile's N-API callback slot is not a writable PT_LOAD address")]
-    NapiCallbackSlotPermissions,
-    #[error("approved profile's response action slot is not a writable PT_LOAD address")]
-    ResponseActionSlotPermissions,
-    #[error("approved profile's binding name does not match")]
-    BindingName,
-    #[error("approved profile's N-API callback fingerprint does not match")]
-    NapiCallbackFingerprint,
-    #[error("approved profile's response action fingerprint does not match")]
-    ResponseActionFingerprint,
-    #[error("approved profile's converter fingerprint does not match")]
-    ConverterFingerprint,
-    #[error("approved profile's resolve action fingerprint does not match")]
-    ResolveActionFingerprint,
-    #[error("approved profile's name RELA entry does not match")]
-    NameRela,
-    #[error("approved profile's N-API callback RELA entry does not match")]
-    NapiCallbackRela,
-    #[error("approved profile's response action RELA entry does not match")]
-    ResponseActionRela,
-    #[error("loaded name slot does not point at the approved name")]
-    NameValue,
-    #[error("loaded N-API callback slot does not point at the approved wrapper")]
-    NapiCallbackValue,
-    #[error("loaded response action slot does not point at the approved response lambda")]
-    ResponseActionValue,
+    #[error("QQNT response property XRefs did not identify exactly one Promise resolver")]
+    ResolverScan,
+    #[error("located QQNT code or data has invalid ELF segment permissions")]
+    LocatorPermissions,
+    #[cfg(target_os = "linux")]
+    #[error("loaded QQNT {0} bytes differ from the wrapper.node parsed on disk")]
+    LoadedImageMismatch(&'static str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +103,12 @@ pub struct ProgramHeader {
     pub virtual_address: u64,
     pub file_size: u64,
     pub memory_size: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FunctionRange {
+    begin: u64,
+    end: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,13 +154,12 @@ impl<'a> ElfImage<'a> {
         if program_count == 0 || program_count > MAX_PROGRAM_HEADERS {
             return Err(ElfError::ProgramHeaders);
         }
-        let program_size = program_count
+        let program_end = program_count
             .checked_mul(PROGRAM_HEADER_SIZE)
             .and_then(|size| program_offset.checked_add(size))
+            .filter(|end| *end <= bytes.len())
             .ok_or(ElfError::Truncated)?;
-        if program_size > bytes.len() {
-            return Err(ElfError::Truncated);
-        }
+        let _ = program_end;
 
         let mut program_headers = Vec::with_capacity(program_count);
         for index in 0..program_count {
@@ -217,6 +222,7 @@ impl<'a> ElfImage<'a> {
         Err(ElfError::BuildIdMissing)
     }
 
+    #[cfg(target_os = "linux")]
     pub fn sha256(&self) -> [u8; 32] {
         Sha256::digest(self.bytes).into()
     }
@@ -256,12 +262,20 @@ impl<'a> ElfImage<'a> {
             .checked_add(address - header.virtual_address)
             .and_then(|offset| usize::try_from(offset).ok())
             .ok_or(ElfError::VirtualAddress)?;
-        let end = offset
+        offset
             .checked_add(usize::try_from(length).map_err(|_| ElfError::VirtualAddress)?)
             .filter(|end| *end <= self.bytes.len())
             .ok_or(ElfError::VirtualAddress)?;
-        let _ = end;
         Ok(offset)
+    }
+
+    fn bytes_at(&self, address: u64, length: usize) -> Result<&'a [u8], ElfError> {
+        let offset = self.file_offset_for_range(
+            address,
+            u64::try_from(length).map_err(|_| ElfError::VirtualAddress)?,
+        )?;
+        let end = offset.checked_add(length).ok_or(ElfError::VirtualAddress)?;
+        self.bytes.get(offset..end).ok_or(ElfError::VirtualAddress)
     }
 
     fn dynamic_entries(&self) -> Result<Vec<DynamicEntry>, ElfError> {
@@ -279,12 +293,12 @@ impl<'a> ElfImage<'a> {
         if count == 0 || count > MAX_DYNAMIC_ENTRIES {
             return Err(ElfError::RelaTable);
         }
-        let start = usize::try_from(header.offset).map_err(|_| ElfError::Truncated)?;
+        let start = usize::try_from(header.offset).map_err(|_| ElfError::RelaTable)?;
         let end = count
             .checked_mul(DYNAMIC_ENTRY_SIZE)
             .and_then(|size| start.checked_add(size))
             .filter(|end| *end <= self.bytes.len())
-            .ok_or(ElfError::Truncated)?;
+            .ok_or(ElfError::RelaTable)?;
         let mut entries = Vec::with_capacity(count);
         for offset in (start..end).step_by(DYNAMIC_ENTRY_SIZE) {
             let entry = DynamicEntry {
@@ -327,371 +341,568 @@ impl<'a> ElfImage<'a> {
         Ok(entries)
     }
 
-    fn bytes_at(&self, address: u64, length: usize) -> Result<&'a [u8], ElfError> {
-        let offset = self.file_offset_for_range(
-            address,
-            u64::try_from(length).map_err(|_| ElfError::VirtualAddress)?,
-        )?;
-        let end = offset.checked_add(length).ok_or(ElfError::VirtualAddress)?;
-        self.bytes.get(offset..end).ok_or(ElfError::VirtualAddress)
-    }
-
-    fn unique_load_match(&self, needle: &[u8], flags: u32) -> Option<u64> {
+    fn non_executable_matches(&self, needle: &[u8]) -> Vec<u64> {
         if needle.is_empty() {
-            return None;
+            return Vec::new();
         }
-        let mut found = None;
-        for header in self
-            .program_headers
-            .iter()
-            .filter(|header| header.kind == PT_LOAD && header.flags & (PF_R | PF_W | PF_X) == flags)
-        {
-            let start = usize::try_from(header.offset).ok()?;
-            let size = usize::try_from(header.file_size).ok()?;
-            let end = start
-                .checked_add(size)
-                .filter(|end| *end <= self.bytes.len())?;
-            for offset in self.bytes[start..end]
-                .windows(needle.len())
-                .enumerate()
-                .filter_map(|(offset, bytes)| (bytes == needle).then_some(offset))
-            {
-                let address = header
-                    .virtual_address
-                    .checked_add(u64::try_from(offset).ok()?)?;
-                if found.replace(address).is_some() {
-                    return None;
+        let mut matches = Vec::new();
+        for header in self.program_headers.iter().filter(|header| {
+            header.kind == PT_LOAD && header.flags & PF_R != 0 && header.flags & PF_X == 0
+        }) {
+            let Ok(start) = usize::try_from(header.offset) else {
+                continue;
+            };
+            let Some(end) = usize::try_from(header.file_size)
+                .ok()
+                .and_then(|size| start.checked_add(size))
+                .filter(|end| *end <= self.bytes.len())
+            else {
+                continue;
+            };
+            for (relative, bytes) in self.bytes[start..end].windows(needle.len()).enumerate() {
+                if bytes == needle {
+                    if let Some(address) = header
+                        .virtual_address
+                        .checked_add(u64::try_from(relative).unwrap_or(u64::MAX))
+                    {
+                        matches.push(address);
+                    }
                 }
             }
         }
-        found
+        matches
+    }
+
+    fn rip_relative_xrefs_for_targets(&self, targets: &BTreeSet<u64>) -> BTreeMap<u64, Vec<u64>> {
+        let mut xrefs: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+        if targets.is_empty() {
+            return xrefs;
+        }
+        for header in self.program_headers.iter().filter(|header| {
+            header.kind == PT_LOAD && header.flags & (PF_R | PF_W | PF_X) == (PF_R | PF_X)
+        }) {
+            let Ok(start) = usize::try_from(header.offset) else {
+                continue;
+            };
+            let Some(end) = usize::try_from(header.file_size)
+                .ok()
+                .and_then(|size| start.checked_add(size))
+                .filter(|end| *end <= self.bytes.len())
+            else {
+                continue;
+            };
+            for (relative, instruction) in self.bytes[start..end].windows(7).enumerate() {
+                if !(0x48..=0x4f).contains(&instruction[0])
+                    || instruction[1] != 0x8d
+                    || instruction[2] & 0xc7 != 0x05
+                {
+                    continue;
+                }
+                let instruction_rva = match header
+                    .virtual_address
+                    .checked_add(u64::try_from(relative).unwrap_or(u64::MAX))
+                {
+                    Some(value) => value,
+                    None => continue,
+                };
+                let displacement =
+                    i32::from_le_bytes(instruction[3..7].try_into().unwrap()) as i128;
+                let resolved = instruction_rva as i128 + 7 + displacement;
+                if resolved < 0 {
+                    continue;
+                }
+                let resolved = resolved as u64;
+                if targets.contains(&resolved) {
+                    xrefs.entry(resolved).or_default().push(instruction_rva);
+                }
+            }
+        }
+        xrefs
+    }
+
+    fn direct_calls(&self, function: FunctionRange) -> Vec<(u64, u64)> {
+        let function_size = function.end.saturating_sub(function.begin);
+        if function_size > MAX_FUNCTION_SIZE {
+            return Vec::new();
+        }
+        let Ok(length) = usize::try_from(function_size) else {
+            return Vec::new();
+        };
+        let Ok(bytes) = self.bytes_at(function.begin, length) else {
+            return Vec::new();
+        };
+        bytes
+            .windows(5)
+            .enumerate()
+            .filter_map(|(relative, instruction)| {
+                if instruction[0] != 0xe8 {
+                    return None;
+                }
+                let call = function.begin.checked_add(u64::try_from(relative).ok()?)?;
+                let displacement = i32::from_le_bytes(instruction[1..5].try_into().ok()?) as i128;
+                let target = call as i128 + 5 + displacement;
+                (target >= 0).then_some((call, target as u64))
+            })
+            .collect()
+    }
+
+    fn rip_relative_lea_targets(&self, function: FunctionRange) -> Vec<(u64, u64)> {
+        let function_size = function.end.saturating_sub(function.begin);
+        if function_size > MAX_FUNCTION_SIZE {
+            return Vec::new();
+        }
+        let Ok(length) = usize::try_from(function_size) else {
+            return Vec::new();
+        };
+        let Ok(bytes) = self.bytes_at(function.begin, length) else {
+            return Vec::new();
+        };
+        bytes
+            .windows(7)
+            .enumerate()
+            .filter_map(|(relative, instruction)| {
+                if !(0x48..=0x4f).contains(&instruction[0])
+                    || instruction[1] != 0x8d
+                    || instruction[2] & 0xc7 != 0x05
+                {
+                    return None;
+                }
+                let xref = function.begin.checked_add(u64::try_from(relative).ok()?)?;
+                let displacement = i32::from_le_bytes(instruction[3..7].try_into().ok()?) as i128;
+                let target = xref as i128 + 7 + displacement;
+                (target >= 0).then_some((xref, target as u64))
+            })
+            .collect()
+    }
+
+    fn unwind_functions(&self) -> Result<Vec<FunctionRange>, ElfError> {
+        let headers: Vec<_> = self
+            .program_headers
+            .iter()
+            .copied()
+            .filter(|header| header.kind == PT_GNU_EH_FRAME)
+            .collect();
+        if headers.len() != 1 {
+            return Err(ElfError::UnwindTable);
+        }
+        let header = headers[0];
+        let start = usize::try_from(header.offset).map_err(|_| ElfError::UnwindTable)?;
+        let size = usize::try_from(header.file_size).map_err(|_| ElfError::UnwindTable)?;
+        let end = start
+            .checked_add(size)
+            .filter(|end| *end <= self.bytes.len())
+            .ok_or(ElfError::UnwindTable)?;
+        let bytes = self.bytes.get(start..end).ok_or(ElfError::UnwindTable)?;
+        if bytes.len() < 4 || bytes[0] != 1 {
+            return Err(ElfError::UnwindTable);
+        }
+
+        let mut cursor = 4usize;
+        let _eh_frame = decode_eh_pointer(
+            bytes,
+            &mut cursor,
+            bytes[1],
+            header.virtual_address,
+            header.virtual_address,
+        )?;
+        let count = decode_eh_pointer(
+            bytes,
+            &mut cursor,
+            bytes[2],
+            header.virtual_address,
+            header.virtual_address,
+        )?;
+        let count = usize::try_from(count).map_err(|_| ElfError::UnwindTable)?;
+        if count == 0 || count > MAX_UNWIND_FUNCTIONS || bytes[3] == DW_EH_PE_OMIT {
+            return Err(ElfError::UnwindTable);
+        }
+
+        let mut starts = Vec::with_capacity(count);
+        for _ in 0..count {
+            let begin = decode_eh_pointer(
+                bytes,
+                &mut cursor,
+                bytes[3],
+                header.virtual_address,
+                header.virtual_address,
+            )?;
+            let _fde = decode_eh_pointer(
+                bytes,
+                &mut cursor,
+                bytes[3],
+                header.virtual_address,
+                header.virtual_address,
+            )?;
+            if self
+                .load_for_range(begin, 1)
+                .is_none_or(|load| load.flags & (PF_R | PF_W | PF_X) != (PF_R | PF_X))
+                || starts.last().is_some_and(|previous| *previous >= begin)
+            {
+                return Err(ElfError::UnwindTable);
+            }
+            starts.push(begin);
+        }
+
+        let mut functions = Vec::with_capacity(starts.len());
+        for (index, begin) in starts.iter().copied().enumerate() {
+            let load = self.load_for_range(begin, 1).ok_or(ElfError::UnwindTable)?;
+            let load_end = load
+                .virtual_address
+                .checked_add(load.file_size)
+                .ok_or(ElfError::UnwindTable)?;
+            let next = starts.get(index + 1).copied().unwrap_or(load_end);
+            let end = if next <= load_end { next } else { load_end };
+            if end <= begin {
+                return Err(ElfError::UnwindTable);
+            }
+            functions.push(FunctionRange { begin, end });
+        }
+        Ok(functions)
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct Profile {
-    pub name: &'static str,
-    pub build_id: &'static [u8],
-    pub sha256: [u8; 32],
-    pub name_slot_rva: u64,
-    pub binding_name_rva: u64,
-    pub binding_name: &'static [u8],
-    pub napi_callback_slot_rva: u64,
-    pub napi_callback_rva: u64,
-    pub napi_callback_fingerprint: &'static [u8],
-    pub response_action_slot_rva: u64,
-    pub response_action_rva: u64,
-    pub response_action_fingerprint: &'static [u8],
-    pub converter_rva: u64,
-    pub converter_fingerprint: &'static [u8],
-    pub resolve_action_rva: u64,
-    pub resolve_action_fingerprint: &'static [u8],
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocatedPacketBinding {
+    anchor_rva: u64,
+    anchor_xref_rva: u64,
+    napi_callback_rva: u64,
+    converter_rva: u64,
+    result_anchor_rva: u64,
+    result_xref_rva: u64,
+    err_msg_anchor_rva: u64,
+    err_msg_xref_rva: u64,
+    rsp_anchor_rva: u64,
+    rsp_xref_rva: u64,
+    response_table_xref_rva: u64,
+    response_table_rva: u64,
+    response_action_slot_rva: u64,
+    response_action_rva: u64,
+    dispatch_helper_rva: u64,
+    resolver_thunk_rva: u64,
+    resolve_action_rva: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PacketBindingProbe {
     pub module_base: usize,
     pub module_path: String,
-    pub profile: &'static str,
+    pub locator: &'static str,
     pub build_id: Vec<u8>,
     pub sha256: [u8; 32],
-    pub name_slot_rva: u64,
-    pub binding_name_rva: u64,
-    pub binding_name: Vec<u8>,
-    pub napi_callback_slot_rva: u64,
+    pub anchor_rva: u64,
+    pub anchor_xref_rva: u64,
     pub napi_callback_rva: u64,
-    pub napi_callback_fingerprint: Vec<u8>,
+    pub converter_rva: u64,
+    pub result_anchor_rva: u64,
+    pub result_xref_rva: u64,
+    pub err_msg_anchor_rva: u64,
+    pub err_msg_xref_rva: u64,
+    pub rsp_anchor_rva: u64,
+    pub rsp_xref_rva: u64,
+    pub response_table_xref_rva: u64,
+    pub response_table_rva: u64,
     pub response_action_slot_rva: u64,
     pub response_action_rva: u64,
-    pub response_action_fingerprint: Vec<u8>,
-    pub converter_rva: u64,
-    pub converter_fingerprint: Vec<u8>,
+    pub dispatch_helper_rva: u64,
+    pub resolver_thunk_rva: u64,
     pub resolve_action_rva: u64,
-    pub resolve_action_fingerprint: Vec<u8>,
 }
 
-pub fn verify_profile(
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ResponseChain {
+    response_table_xref_rva: u64,
+    response_table_rva: u64,
+    response_action_slot_rva: u64,
+    response_action_rva: u64,
+    dispatch_helper_rva: u64,
+    resolver_thunk_rva: u64,
+    resolve_action_rva: u64,
+}
+
+fn locate_packet_binding(
     image: &ElfImage<'_>,
-    profile: Profile,
-    name_value: u64,
-    napi_callback_value: u64,
-    response_action_value: u64,
-    binding_name: &[u8],
-    napi_callback_fingerprint: &[u8],
-    response_action_fingerprint: &[u8],
-    converter_fingerprint: &[u8],
-    resolve_action_fingerprint: &[u8],
-) -> Result<(), ElfError> {
-    if image
-        .load_for_range(profile.binding_name_rva, profile.binding_name.len() as u64)
-        .is_none_or(|header| header.flags & (PF_R | PF_W | PF_X) != PF_R)
-    {
-        return Err(ElfError::BindingNamePermissions);
+    send_anchor: &[u8],
+) -> Result<LocatedPacketBinding, ElfError> {
+    let functions = image.unwind_functions()?;
+    let anchor_rva =
+        unique(image.non_executable_matches(send_anchor)).ok_or(ElfError::SendAnchorScan)?;
+    let response_anchor_matches: Vec<Vec<u64>> = RESPONSE_ANCHORS
+        .iter()
+        .map(|(_, anchor)| image.non_executable_matches(anchor))
+        .collect();
+    let mut xref_targets = BTreeSet::new();
+    xref_targets.insert(anchor_rva);
+    for matches in &response_anchor_matches {
+        xref_targets.extend(matches.iter().copied());
     }
-    if image
-        .load_for_range(
-            profile.napi_callback_rva,
-            profile.napi_callback_fingerprint.len() as u64,
-        )
-        .is_none_or(|header| header.flags & (PF_R | PF_W | PF_X) != (PF_R | PF_X))
-    {
-        return Err(ElfError::NapiCallbackPermissions);
+    let xrefs = image.rip_relative_xrefs_for_targets(&xref_targets);
+    let anchor_xref_rva = unique(xrefs.get(&anchor_rva).cloned().unwrap_or_default())
+        .ok_or(ElfError::SendAnchorXref)?;
+    let napi_callback =
+        function_containing(&functions, anchor_xref_rva).ok_or(ElfError::NapiCallbackScan)?;
+
+    let calls = image.direct_calls(napi_callback);
+    let mut converters = BTreeSet::new();
+    for pair in calls.windows(2) {
+        let (first_call, first_target) = pair[0];
+        let (second_call, second_target) = pair[1];
+        if first_target == second_target
+            && (8..=32).contains(&second_call.saturating_sub(first_call))
+            && function_starting(&functions, first_target).is_some()
+        {
+            converters.insert(first_target);
+        }
     }
-    if image
-        .load_for_range(
-            profile.response_action_rva,
-            profile.response_action_fingerprint.len() as u64,
-        )
-        .is_none_or(|header| header.flags & (PF_R | PF_W | PF_X) != (PF_R | PF_X))
-    {
-        return Err(ElfError::ResponseActionPermissions);
-    }
-    if image
-        .load_for_range(
-            profile.converter_rva,
-            profile.converter_fingerprint.len() as u64,
-        )
-        .is_none_or(|header| header.flags & (PF_R | PF_W | PF_X) != (PF_R | PF_X))
-    {
-        return Err(ElfError::ConverterPermissions);
-    }
-    if image
-        .load_for_range(
-            profile.resolve_action_rva,
-            profile.resolve_action_fingerprint.len() as u64,
-        )
-        .is_none_or(|header| header.flags & (PF_R | PF_W | PF_X) != (PF_R | PF_X))
-    {
-        return Err(ElfError::ResolveActionPermissions);
-    }
-    if image
-        .load_for_range(profile.name_slot_rva, std::mem::size_of::<u64>() as u64)
-        .is_none_or(|header| header.flags & (PF_R | PF_W | PF_X) != (PF_R | PF_W))
-    {
-        return Err(ElfError::NameSlotPermissions);
-    }
-    if image
-        .load_for_range(
-            profile.napi_callback_slot_rva,
-            std::mem::size_of::<u64>() as u64,
-        )
-        .is_none_or(|header| header.flags & (PF_R | PF_W | PF_X) != (PF_R | PF_W))
-    {
-        return Err(ElfError::NapiCallbackSlotPermissions);
-    }
-    if image
-        .load_for_range(
-            profile.response_action_slot_rva,
-            std::mem::size_of::<u64>() as u64,
-        )
-        .is_none_or(|header| header.flags & (PF_R | PF_W | PF_X) != (PF_R | PF_W))
-    {
-        return Err(ElfError::ResponseActionSlotPermissions);
-    }
-    if binding_name != profile.binding_name {
-        return Err(ElfError::BindingName);
-    }
-    if napi_callback_fingerprint != profile.napi_callback_fingerprint {
-        return Err(ElfError::NapiCallbackFingerprint);
-    }
-    if response_action_fingerprint != profile.response_action_fingerprint {
-        return Err(ElfError::ResponseActionFingerprint);
-    }
-    if converter_fingerprint != profile.converter_fingerprint {
-        return Err(ElfError::ConverterFingerprint);
-    }
-    if resolve_action_fingerprint != profile.resolve_action_fingerprint {
-        return Err(ElfError::ResolveActionFingerprint);
+    let converter_rva = unique(converters.into_iter().collect()).ok_or(ElfError::ConverterScan)?;
+
+    let mut response_xrefs: Vec<BTreeMap<u64, Vec<(u64, u64)>>> = Vec::new();
+    for anchor_matches in response_anchor_matches {
+        let mut by_function: BTreeMap<u64, Vec<(u64, u64)>> = BTreeMap::new();
+        for anchor_rva in anchor_matches {
+            for xref_rva in xrefs.get(&anchor_rva).into_iter().flatten().copied() {
+                if let Some(function) = function_containing(&functions, xref_rva) {
+                    by_function
+                        .entry(function.begin)
+                        .or_default()
+                        .push((anchor_rva, xref_rva));
+                }
+            }
+        }
+        response_xrefs.push(by_function);
     }
 
+    let mut resolver_candidates: BTreeSet<u64> = response_xrefs
+        .first()
+        .map(|matches| matches.keys().copied().collect())
+        .unwrap_or_default();
+    for matches in response_xrefs.iter().skip(1) {
+        resolver_candidates.retain(|function| matches.contains_key(function));
+    }
+    let chain = locate_response_chain(image, &functions, napi_callback, &resolver_candidates)?;
+    let resolve_action_rva = chain.resolve_action_rva;
+    let selected: Vec<(u64, u64)> = response_xrefs
+        .iter()
+        .map(|matches| {
+            matches
+                .get(&resolve_action_rva)
+                .and_then(|values| unique(values.clone()))
+                .ok_or(ElfError::ResolverScan)
+        })
+        .collect::<Result<_, _>>()?;
+
+    let located = LocatedPacketBinding {
+        anchor_rva,
+        anchor_xref_rva,
+        napi_callback_rva: napi_callback.begin,
+        converter_rva,
+        result_anchor_rva: selected[0].0,
+        result_xref_rva: selected[0].1,
+        err_msg_anchor_rva: selected[1].0,
+        err_msg_xref_rva: selected[1].1,
+        rsp_anchor_rva: selected[2].0,
+        rsp_xref_rva: selected[2].1,
+        response_table_xref_rva: chain.response_table_xref_rva,
+        response_table_rva: chain.response_table_rva,
+        response_action_slot_rva: chain.response_action_slot_rva,
+        response_action_rva: chain.response_action_rva,
+        dispatch_helper_rva: chain.dispatch_helper_rva,
+        resolver_thunk_rva: chain.resolver_thunk_rva,
+        resolve_action_rva,
+    };
+    verify_locator_permissions(image, &located, send_anchor)?;
+    Ok(located)
+}
+
+fn locate_response_chain(
+    image: &ElfImage<'_>,
+    functions: &[FunctionRange],
+    napi_callback: FunctionRange,
+    resolver_candidates: &BTreeSet<u64>,
+) -> Result<ResponseChain, ElfError> {
+    if resolver_candidates.is_empty() {
+        return Err(ElfError::ResolverScan);
+    }
     let relocations = image.rela_entries()?;
-    let name_matches = relocations
-        .iter()
-        .filter(|rela| {
-            rela.offset == profile.name_slot_rva
-                && rela.info >> 32 == 0
-                && rela.info as u32 == R_X86_64_RELATIVE
-                && rela.addend == profile.binding_name_rva as i64
-        })
-        .count();
-    if name_matches != 1 {
-        return Err(ElfError::NameRela);
+    let mut chains = BTreeSet::new();
+    for (table_xref, table_rva) in image.rip_relative_lea_targets(napi_callback) {
+        if image
+            .load_for_range(table_rva, 1)
+            .is_none_or(|load| load.flags & PF_R == 0 || load.flags & PF_X != 0)
+        {
+            continue;
+        }
+        let table_end = table_rva.saturating_add(0x80);
+        for relocation in relocations.iter().filter(|relocation| {
+            relocation.offset >= table_rva
+                && relocation.offset < table_end
+                && relocation.info >> 32 == 0
+                && relocation.info as u32 == R_X86_64_RELATIVE
+                && relocation.addend >= 0
+        }) {
+            let response_action_rva = relocation.addend as u64;
+            let Some(response_action) = function_starting(functions, response_action_rva) else {
+                continue;
+            };
+            for (_, dispatch_helper_rva) in image.direct_calls(response_action) {
+                let Some(dispatch_helper) = function_starting(functions, dispatch_helper_rva)
+                else {
+                    continue;
+                };
+                for (_, resolver_thunk_rva) in image.rip_relative_lea_targets(dispatch_helper) {
+                    let Some(resolver_thunk) = function_starting(functions, resolver_thunk_rva)
+                    else {
+                        continue;
+                    };
+                    for (_, resolve_action_rva) in image.direct_calls(resolver_thunk) {
+                        if resolver_candidates.contains(&resolve_action_rva) {
+                            chains.insert(ResponseChain {
+                                response_table_xref_rva: table_xref,
+                                response_table_rva: table_rva,
+                                response_action_slot_rva: relocation.offset,
+                                response_action_rva,
+                                dispatch_helper_rva,
+                                resolver_thunk_rva,
+                                resolve_action_rva,
+                            });
+                        }
+                    }
+                }
+            }
+        }
     }
-    let napi_callback_matches = relocations
-        .iter()
-        .filter(|rela| {
-            rela.offset == profile.napi_callback_slot_rva
-                && rela.info >> 32 == 0
-                && rela.info as u32 == R_X86_64_RELATIVE
-                && rela.addend == profile.napi_callback_rva as i64
-        })
-        .count();
-    if napi_callback_matches != 1 {
-        return Err(ElfError::NapiCallbackRela);
+    unique(chains.into_iter().collect()).ok_or(ElfError::ResolverScan)
+}
+
+fn verify_locator_permissions(
+    image: &ElfImage<'_>,
+    located: &LocatedPacketBinding,
+    send_anchor: &[u8],
+) -> Result<(), ElfError> {
+    for (address, length) in [
+        (located.anchor_rva, send_anchor.len()),
+        (located.result_anchor_rva, RESPONSE_ANCHORS[0].1.len()),
+        (located.err_msg_anchor_rva, RESPONSE_ANCHORS[1].1.len()),
+        (located.rsp_anchor_rva, RESPONSE_ANCHORS[2].1.len()),
+    ] {
+        if image
+            .load_for_range(address, length as u64)
+            .is_none_or(|header| header.flags & PF_R == 0 || header.flags & PF_X != 0)
+        {
+            return Err(ElfError::LocatorPermissions);
+        }
     }
-    let response_action_matches = relocations
-        .iter()
-        .filter(|rela| {
-            rela.offset == profile.response_action_slot_rva
-                && rela.info >> 32 == 0
-                && rela.info as u32 == R_X86_64_RELATIVE
-                && rela.addend == profile.response_action_rva as i64
-        })
-        .count();
-    if response_action_matches != 1 {
-        return Err(ElfError::ResponseActionRela);
+    for address in [
+        located.anchor_xref_rva,
+        located.napi_callback_rva,
+        located.converter_rva,
+        located.result_xref_rva,
+        located.err_msg_xref_rva,
+        located.rsp_xref_rva,
+        located.response_table_xref_rva,
+        located.response_action_rva,
+        located.dispatch_helper_rva,
+        located.resolver_thunk_rva,
+        located.resolve_action_rva,
+    ] {
+        if image
+            .load_for_range(address, 1)
+            .is_none_or(|header| header.flags & (PF_R | PF_W | PF_X) != (PF_R | PF_X))
+        {
+            return Err(ElfError::LocatorPermissions);
+        }
     }
-    if name_value != profile.binding_name_rva {
-        return Err(ElfError::NameValue);
-    }
-    if napi_callback_value != profile.napi_callback_rva {
-        return Err(ElfError::NapiCallbackValue);
-    }
-    if response_action_value != profile.response_action_rva {
-        return Err(ElfError::ResponseActionValue);
+    if image
+        .load_for_range(located.response_action_slot_rva, 8)
+        .is_none_or(|header| header.flags & PF_R == 0 || header.flags & PF_X != 0)
+    {
+        return Err(ElfError::LocatorPermissions);
     }
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
-pub fn probe_packet_binding(profiles: &[Profile]) -> Result<PacketBindingProbe, ElfError> {
+pub fn probe_packet_binding(send_anchor: &[u8]) -> Result<PacketBindingProbe, ElfError> {
     let module = loaded_wrapper()?;
     let bytes = std::fs::read(&module.path).map_err(ElfError::ModuleRead)?;
     let image = ElfImage::parse(&bytes)?;
-    let build_id = image.build_id()?;
-    let sha256 = image.sha256();
-    let profile = match select_profile(profiles, &build_id, sha256) {
-        Ok(profile) => profile,
-        Err(ElfError::UnsupportedProfile) => derive_profile(&image, profiles)?,
-        Err(error) => return Err(error),
-    };
+    let located = locate_packet_binding(&image, send_anchor)?;
 
-    let name_slot = module
-        .base
-        .checked_add(usize::try_from(profile.name_slot_rva).map_err(|_| ElfError::NameValue)?)
-        .ok_or(ElfError::NameValue)?;
-    let napi_callback_slot = module
-        .base
-        .checked_add(
-            usize::try_from(profile.napi_callback_slot_rva)
-                .map_err(|_| ElfError::NapiCallbackValue)?,
-        )
-        .ok_or(ElfError::NapiCallbackValue)?;
-    let response_action_slot = module
-        .base
-        .checked_add(
-            usize::try_from(profile.response_action_slot_rva)
-                .map_err(|_| ElfError::ResponseActionValue)?,
-        )
-        .ok_or(ElfError::ResponseActionValue)?;
-    let binding_name_address = module
-        .base
-        .checked_add(usize::try_from(profile.binding_name_rva).map_err(|_| ElfError::BindingName)?)
-        .ok_or(ElfError::BindingName)?;
-    let napi_callback_address = module
-        .base
-        .checked_add(
-            usize::try_from(profile.napi_callback_rva)
-                .map_err(|_| ElfError::NapiCallbackFingerprint)?,
-        )
-        .ok_or(ElfError::NapiCallbackFingerprint)?;
-    let response_action_address = module
-        .base
-        .checked_add(
-            usize::try_from(profile.response_action_rva)
-                .map_err(|_| ElfError::ResponseActionFingerprint)?,
-        )
-        .ok_or(ElfError::ResponseActionFingerprint)?;
-    let converter_address = module
-        .base
-        .checked_add(
-            usize::try_from(profile.converter_rva).map_err(|_| ElfError::ConverterFingerprint)?,
-        )
-        .ok_or(ElfError::ConverterFingerprint)?;
-    let resolve_action_address = module
-        .base
-        .checked_add(
-            usize::try_from(profile.resolve_action_rva)
-                .map_err(|_| ElfError::ResolveActionFingerprint)?,
-        )
-        .ok_or(ElfError::ResolveActionFingerprint)?;
-
-    let name_value = unsafe { (name_slot as *const u64).read_unaligned() }
-        .checked_sub(module.base as u64)
-        .ok_or(ElfError::NameValue)?;
-    let napi_callback_value = unsafe { (napi_callback_slot as *const u64).read_unaligned() }
-        .checked_sub(module.base as u64)
-        .ok_or(ElfError::NapiCallbackValue)?;
-    let response_action_value = unsafe { (response_action_slot as *const u64).read_unaligned() }
-        .checked_sub(module.base as u64)
-        .ok_or(ElfError::ResponseActionValue)?;
-    let binding_name = unsafe {
-        std::slice::from_raw_parts(
-            binding_name_address as *const u8,
-            profile.binding_name.len(),
-        )
-    };
-    let napi_callback_fingerprint = unsafe {
-        std::slice::from_raw_parts(
-            napi_callback_address as *const u8,
-            profile.napi_callback_fingerprint.len(),
-        )
-    };
-    let response_action_fingerprint = unsafe {
-        std::slice::from_raw_parts(
-            response_action_address as *const u8,
-            profile.response_action_fingerprint.len(),
-        )
-    };
-    let converter_fingerprint = unsafe {
-        std::slice::from_raw_parts(
-            converter_address as *const u8,
-            profile.converter_fingerprint.len(),
-        )
-    };
-    let resolve_action_fingerprint = unsafe {
-        std::slice::from_raw_parts(
-            resolve_action_address as *const u8,
-            profile.resolve_action_fingerprint.len(),
-        )
-    };
-    verify_profile(
+    verify_loaded_bytes(
         &image,
-        profile,
-        name_value,
-        napi_callback_value,
-        response_action_value,
-        binding_name,
-        napi_callback_fingerprint,
-        response_action_fingerprint,
-        converter_fingerprint,
-        resolve_action_fingerprint,
+        module.base,
+        located.anchor_rva,
+        send_anchor,
+        "anchor",
     )?;
+    for (name, address, length) in [
+        ("anchor XRef", located.anchor_xref_rva, 7usize),
+        (
+            "N-API callback",
+            located.napi_callback_rva,
+            VERIFY_PREFIX_SIZE,
+        ),
+        ("converter", located.converter_rva, VERIFY_PREFIX_SIZE),
+        ("result XRef", located.result_xref_rva, 7usize),
+        ("errMsg XRef", located.err_msg_xref_rva, 7usize),
+        ("rsp XRef", located.rsp_xref_rva, 7usize),
+        (
+            "response table XRef",
+            located.response_table_xref_rva,
+            7usize,
+        ),
+        (
+            "response action",
+            located.response_action_rva,
+            VERIFY_PREFIX_SIZE,
+        ),
+        (
+            "dispatch helper",
+            located.dispatch_helper_rva,
+            VERIFY_PREFIX_SIZE,
+        ),
+        (
+            "resolver thunk",
+            located.resolver_thunk_rva,
+            VERIFY_PREFIX_SIZE,
+        ),
+        (
+            "Promise resolver",
+            located.resolve_action_rva,
+            VERIFY_PREFIX_SIZE,
+        ),
+    ] {
+        let expected = image.bytes_at(address, length)?;
+        verify_loaded_bytes(&image, module.base, address, expected, name)?;
+    }
 
     Ok(PacketBindingProbe {
         module_base: module.base,
         module_path: module.path,
-        profile: profile.name,
-        build_id,
-        sha256,
-        name_slot_rva: profile.name_slot_rva,
-        binding_name_rva: profile.binding_name_rva,
-        binding_name: profile.binding_name.to_vec(),
-        napi_callback_slot_rva: profile.napi_callback_slot_rva,
-        napi_callback_rva: profile.napi_callback_rva,
-        napi_callback_fingerprint: profile.napi_callback_fingerprint.to_vec(),
-        response_action_slot_rva: profile.response_action_slot_rva,
-        response_action_rva: profile.response_action_rva,
-        response_action_fingerprint: profile.response_action_fingerprint.to_vec(),
-        converter_rva: profile.converter_rva,
-        converter_fingerprint: profile.converter_fingerprint.to_vec(),
-        resolve_action_rva: profile.resolve_action_rva,
-        resolve_action_fingerprint: profile.resolve_action_fingerprint.to_vec(),
+        locator: LOCATOR_NAME,
+        build_id: image.build_id().unwrap_or_default(),
+        sha256: image.sha256(),
+        anchor_rva: located.anchor_rva,
+        anchor_xref_rva: located.anchor_xref_rva,
+        napi_callback_rva: located.napi_callback_rva,
+        converter_rva: located.converter_rva,
+        result_anchor_rva: located.result_anchor_rva,
+        result_xref_rva: located.result_xref_rva,
+        err_msg_anchor_rva: located.err_msg_anchor_rva,
+        err_msg_xref_rva: located.err_msg_xref_rva,
+        rsp_anchor_rva: located.rsp_anchor_rva,
+        rsp_xref_rva: located.rsp_xref_rva,
+        response_table_xref_rva: located.response_table_xref_rva,
+        response_table_rva: located.response_table_rva,
+        response_action_slot_rva: located.response_action_slot_rva,
+        response_action_rva: located.response_action_rva,
+        dispatch_helper_rva: located.dispatch_helper_rva,
+        resolver_thunk_rva: located.resolver_thunk_rva,
+        resolve_action_rva: located.resolve_action_rva,
     })
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn probe_packet_binding(_: &[Profile]) -> Result<PacketBindingProbe, ElfError> {
+pub fn probe_packet_binding(_: &[u8]) -> Result<PacketBindingProbe, ElfError> {
     Err(ElfError::ModuleNotLoaded)
 }
 
@@ -740,127 +951,43 @@ fn loaded_wrapper() -> Result<LoadedModule, ElfError> {
     }
 }
 
-fn select_profile(
-    profiles: &[Profile],
-    build_id: &[u8],
-    sha256: [u8; 32],
-) -> Result<Profile, ElfError> {
-    profiles
-        .iter()
-        .copied()
-        .find(|profile| profile.build_id == build_id && profile.sha256 == sha256)
-        .ok_or(ElfError::UnsupportedProfile)
-}
-
-fn derive_profile(image: &ElfImage<'_>, templates: &[Profile]) -> Result<Profile, ElfError> {
-    let mut last_error = ElfError::UnsupportedProfile;
-    for template in templates.iter().copied() {
-        match derive_profile_from_template(image, template) {
-            Ok(profile) => return Ok(profile),
-            Err(error) => last_error = error,
-        }
-    }
-    Err(last_error)
-}
-
-fn derive_profile_from_template(
+#[cfg(target_os = "linux")]
+fn verify_loaded_bytes(
     image: &ElfImage<'_>,
-    template: Profile,
-) -> Result<Profile, ElfError> {
-    let binding_name_rva = image
-        .unique_load_match(template.binding_name, PF_R)
-        .ok_or(ElfError::BindingNameScan)?;
-    let relocations = image.rela_entries()?;
-    let name_slot_rva = unique_relative_slot_for_target(&relocations, binding_name_rva)
-        .ok_or(ElfError::NameSlotScan)?;
-
-    let napi_slot_delta = template
-        .napi_callback_slot_rva
-        .checked_sub(template.name_slot_rva)
-        .ok_or(ElfError::SymbolLayout)?;
-    let response_slot_delta = template
-        .response_action_slot_rva
-        .checked_sub(template.name_slot_rva)
-        .ok_or(ElfError::SymbolLayout)?;
-    let resolve_action_delta = template
-        .resolve_action_rva
-        .checked_sub(template.response_action_rva)
-        .ok_or(ElfError::SymbolLayout)?;
-
-    let napi_callback_slot_rva = name_slot_rva
-        .checked_add(napi_slot_delta)
-        .ok_or(ElfError::SymbolLayout)?;
-    let napi_callback_rva = unique_relative_target_at(&relocations, napi_callback_slot_rva)
-        .ok_or(ElfError::NapiCallbackScan)?;
-    let response_action_slot_rva = name_slot_rva
-        .checked_add(response_slot_delta)
-        .ok_or(ElfError::SymbolLayout)?;
-    let response_action_rva = unique_relative_target_at(&relocations, response_action_slot_rva)
-        .ok_or(ElfError::ResponseActionScan)?;
-    let converter_rva = image
-        .unique_load_match(template.converter_fingerprint, PF_R | PF_X)
-        .ok_or(ElfError::ConverterScan)?;
-    let resolve_action_rva = response_action_rva
-        .checked_add(resolve_action_delta)
-        .ok_or(ElfError::SymbolLayout)?;
-
-    let profile = Profile {
-        name: "linux-symbol-scan-v1",
-        build_id: &[],
-        sha256: [0; 32],
-        name_slot_rva,
-        binding_name_rva,
-        binding_name: template.binding_name,
-        napi_callback_slot_rva,
-        napi_callback_rva,
-        napi_callback_fingerprint: template.napi_callback_fingerprint,
-        response_action_slot_rva,
-        response_action_rva,
-        response_action_fingerprint: template.response_action_fingerprint,
-        converter_rva,
-        converter_fingerprint: template.converter_fingerprint,
-        resolve_action_rva,
-        resolve_action_fingerprint: template.resolve_action_fingerprint,
-    };
-
-    verify_profile(
-        image,
-        profile,
-        binding_name_rva,
-        napi_callback_rva,
-        response_action_rva,
-        image.bytes_at(binding_name_rva, profile.binding_name.len())?,
-        image.bytes_at(napi_callback_rva, profile.napi_callback_fingerprint.len())?,
-        image.bytes_at(
-            response_action_rva,
-            profile.response_action_fingerprint.len(),
-        )?,
-        image.bytes_at(converter_rva, profile.converter_fingerprint.len())?,
-        image.bytes_at(resolve_action_rva, profile.resolve_action_fingerprint.len())?,
-    )?;
-    Ok(profile)
+    module_base: usize,
+    address: u64,
+    expected: &[u8],
+    name: &'static str,
+) -> Result<(), ElfError> {
+    image.bytes_at(address, expected.len())?;
+    let loaded = module_base
+        .checked_add(usize::try_from(address).map_err(|_| ElfError::LoadedImageMismatch(name))?)
+        .ok_or(ElfError::LoadedImageMismatch(name))?;
+    let actual = unsafe { std::slice::from_raw_parts(loaded as *const u8, expected.len()) };
+    if actual != expected {
+        return Err(ElfError::LoadedImageMismatch(name));
+    }
+    Ok(())
 }
 
-fn unique_relative_slot_for_target(relocations: &[Rela], target: u64) -> Option<u64> {
-    let mut matches = relocations.iter().filter(|rela| {
-        rela.info >> 32 == 0
-            && rela.info as u32 == R_X86_64_RELATIVE
-            && rela.addend >= 0
-            && rela.addend as u64 == target
-    });
-    let value = matches.next()?.offset;
-    matches.next().is_none().then_some(value)
+fn function_containing(functions: &[FunctionRange], address: u64) -> Option<FunctionRange> {
+    let index = functions.partition_point(|function| function.begin <= address);
+    let function = *functions.get(index.checked_sub(1)?)?;
+    (address < function.end && function.end - function.begin <= MAX_FUNCTION_SIZE)
+        .then_some(function)
 }
 
-fn unique_relative_target_at(relocations: &[Rela], slot: u64) -> Option<u64> {
-    let mut matches = relocations.iter().filter(|rela| {
-        rela.offset == slot
-            && rela.info >> 32 == 0
-            && rela.info as u32 == R_X86_64_RELATIVE
-            && rela.addend >= 0
-    });
-    let value = matches.next()?.addend as u64;
-    matches.next().is_none().then_some(value)
+fn function_starting(functions: &[FunctionRange], address: u64) -> Option<FunctionRange> {
+    functions
+        .binary_search_by_key(&address, |function| function.begin)
+        .ok()
+        .and_then(|index| functions.get(index).copied())
+}
+
+fn unique<T>(values: Vec<T>) -> Option<T> {
+    let mut values = values.into_iter();
+    let value = values.next()?;
+    values.next().is_none().then_some(value)
 }
 
 fn dynamic_value(entries: &[DynamicEntry], tag: i64) -> Option<u64> {
@@ -868,6 +995,111 @@ fn dynamic_value(entries: &[DynamicEntry], tag: i64) -> Option<u64> {
         .iter()
         .find(|entry| entry.tag == tag)
         .map(|entry| entry.value)
+}
+
+fn decode_eh_pointer(
+    bytes: &[u8],
+    cursor: &mut usize,
+    encoding: u8,
+    datarel_base: u64,
+    section_address: u64,
+) -> Result<u64, ElfError> {
+    if encoding == DW_EH_PE_OMIT || encoding & DW_EH_PE_INDIRECT != 0 {
+        return Err(ElfError::UnwindEncoding);
+    }
+    let field_address = section_address
+        .checked_add(u64::try_from(*cursor).map_err(|_| ElfError::UnwindEncoding)?)
+        .ok_or(ElfError::UnwindEncoding)?;
+    let format = encoding & 0x0f;
+    let value = match format {
+        DW_EH_PE_ABSPTR => i128::from(read_encoded_u64(bytes, cursor)?),
+        DW_EH_PE_ULEB128 => i128::from(read_uleb128(bytes, cursor)?),
+        DW_EH_PE_UDATA2 => i128::from(read_encoded_u16(bytes, cursor)?),
+        DW_EH_PE_UDATA4 => i128::from(read_encoded_u32(bytes, cursor)?),
+        DW_EH_PE_UDATA8 => i128::from(read_encoded_u64(bytes, cursor)?),
+        DW_EH_PE_SLEB128 => i128::from(read_sleb128(bytes, cursor)?),
+        DW_EH_PE_SDATA2 => i128::from(read_encoded_i16(bytes, cursor)?),
+        DW_EH_PE_SDATA4 => i128::from(read_encoded_i32(bytes, cursor)?),
+        DW_EH_PE_SDATA8 => i128::from(read_encoded_i64(bytes, cursor)?),
+        _ => return Err(ElfError::UnwindEncoding),
+    };
+    let base = match encoding & 0x70 {
+        0 => 0i128,
+        DW_EH_PE_PCREL => i128::from(field_address),
+        DW_EH_PE_DATAREL => i128::from(datarel_base),
+        _ => return Err(ElfError::UnwindEncoding),
+    };
+    let resolved = base.checked_add(value).ok_or(ElfError::UnwindEncoding)?;
+    u64::try_from(resolved).map_err(|_| ElfError::UnwindEncoding)
+}
+
+fn read_uleb128(bytes: &[u8], cursor: &mut usize) -> Result<u64, ElfError> {
+    let mut value = 0u64;
+    for shift in (0..64).step_by(7) {
+        let byte = *bytes.get(*cursor).ok_or(ElfError::UnwindTable)?;
+        *cursor += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+    }
+    Err(ElfError::UnwindEncoding)
+}
+
+fn read_sleb128(bytes: &[u8], cursor: &mut usize) -> Result<i64, ElfError> {
+    let mut value = 0i64;
+    let mut shift = 0u32;
+    loop {
+        if shift >= 64 {
+            return Err(ElfError::UnwindEncoding);
+        }
+        let byte = *bytes.get(*cursor).ok_or(ElfError::UnwindTable)?;
+        *cursor += 1;
+        value |= i64::from(byte & 0x7f) << shift;
+        shift += 7;
+        if byte & 0x80 == 0 {
+            if shift < 64 && byte & 0x40 != 0 {
+                value |= !0i64 << shift;
+            }
+            return Ok(value);
+        }
+    }
+}
+
+fn read_encoded_u16(bytes: &[u8], cursor: &mut usize) -> Result<u16, ElfError> {
+    let value = read_u16(bytes, *cursor).map_err(|_| ElfError::UnwindTable)?;
+    *cursor += 2;
+    Ok(value)
+}
+
+fn read_encoded_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32, ElfError> {
+    let value = read_u32(bytes, *cursor).map_err(|_| ElfError::UnwindTable)?;
+    *cursor += 4;
+    Ok(value)
+}
+
+fn read_encoded_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64, ElfError> {
+    let value = read_u64(bytes, *cursor).map_err(|_| ElfError::UnwindTable)?;
+    *cursor += 8;
+    Ok(value)
+}
+
+fn read_encoded_i16(bytes: &[u8], cursor: &mut usize) -> Result<i16, ElfError> {
+    Ok(i16::from_le_bytes(
+        read_encoded_u16(bytes, cursor)?.to_le_bytes(),
+    ))
+}
+
+fn read_encoded_i32(bytes: &[u8], cursor: &mut usize) -> Result<i32, ElfError> {
+    Ok(i32::from_le_bytes(
+        read_encoded_u32(bytes, cursor)?.to_le_bytes(),
+    ))
+}
+
+fn read_encoded_i64(bytes: &[u8], cursor: &mut usize) -> Result<i64, ElfError> {
+    Ok(i64::from_le_bytes(
+        read_encoded_u64(bytes, cursor)?.to_le_bytes(),
+    ))
 }
 
 fn align4(value: usize) -> Option<usize> {
@@ -927,24 +1159,23 @@ pub fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    const PROFILE: Profile = Profile {
-        name: "fixture",
-        build_id: &[0xde, 0xad, 0xbe, 0xef],
-        sha256: [0; 32],
-        name_slot_rva: 0x430,
-        binding_name_rva: 0x220,
-        binding_name: b"fixtureBinding\0",
-        napi_callback_slot_rva: 0x438,
-        napi_callback_rva: 0x180,
-        napi_callback_fingerprint: &[0x55, 0x48, 0x89, 0xe5],
-        response_action_slot_rva: 0x440,
-        response_action_rva: 0x190,
-        response_action_fingerprint: &[0x41, 0x57, 0x41, 0x56],
-        converter_rva: 0x1a0,
-        converter_fingerprint: &[0x53, 0x48, 0x83, 0xec],
-        resolve_action_rva: 0x1b0,
-        resolve_action_fingerprint: &[0x41, 0x54, 0x53, 0x48],
-    };
+    const SEND_ANCHOR: &[u8] = b"assertion (argc == 2) failed: fixture needs 2 arguments";
+    const CALLBACK: u64 = 0x200;
+    const CONVERTER: u64 = 0x280;
+    const RESPONSE_ACTION: u64 = 0x300;
+    const DISPATCH_HELPER: u64 = 0x380;
+    const RESOLVER_THUNK: u64 = 0x400;
+    const RESOLVER: u64 = 0x480;
+    const TEXT_END: u64 = 0x520;
+    const ANCHOR_RVA: u64 = 0x600;
+    const RESULT_RVA: u64 = 0x660;
+    const ERR_MSG_RVA: u64 = 0x670;
+    const RSP_RVA: u64 = 0x680;
+    const RESPONSE_TABLE: u64 = 0x800;
+    const RESPONSE_SLOT: u64 = 0x820;
+    const DYNAMIC_RVA: u64 = 0x900;
+    const RELA_RVA: u64 = 0x980;
+    const EH_FRAME_HDR: u64 = 0xa00;
 
     fn write_u16(image: &mut [u8], offset: usize, value: u16) {
         image[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
@@ -981,8 +1212,38 @@ mod tests {
         write_u64(image, header + 48, 0x1000);
     }
 
+    fn write_call(image: &mut [u8], instruction: u64, target: u64) {
+        image[instruction as usize] = 0xe8;
+        let displacement = target as i64 - instruction as i64 - 5;
+        image[instruction as usize + 1..instruction as usize + 5]
+            .copy_from_slice(&(displacement as i32).to_le_bytes());
+    }
+
+    fn write_lea(image: &mut [u8], instruction: u64, target: u64) {
+        image[instruction as usize..instruction as usize + 3].copy_from_slice(&[0x48, 0x8d, 0x15]);
+        let displacement = target as i64 - instruction as i64 - 7;
+        image[instruction as usize + 3..instruction as usize + 7]
+            .copy_from_slice(&(displacement as i32).to_le_bytes());
+    }
+
+    fn write_eh_frame_header(image: &mut [u8], starts: &[u64]) {
+        let offset = EH_FRAME_HDR as usize;
+        image[offset..offset + 4].copy_from_slice(&[1, 0x1b, 0x03, 0x3b]);
+        write_u32(image, offset + 4, 0);
+        write_u32(image, offset + 8, starts.len() as u32);
+        for (index, begin) in starts.iter().copied().enumerate() {
+            let entry = offset + 12 + index * 8;
+            write_u32(
+                image,
+                entry,
+                (begin as i64 - EH_FRAME_HDR as i64) as i32 as u32,
+            );
+            write_u32(image, entry + 4, 0);
+        }
+    }
+
     fn image() -> Vec<u8> {
-        let mut image = vec![0; 0x700];
+        let mut image = vec![0u8; 0xc00];
         image[..4].copy_from_slice(b"\x7fELF");
         image[4..7].copy_from_slice(&[2, 1, 1]);
         write_u16(&mut image, 16, 3);
@@ -991,251 +1252,176 @@ mod tests {
         write_u64(&mut image, 32, 0x40);
         write_u16(&mut image, 52, ELF_HEADER_SIZE as u16);
         write_u16(&mut image, 54, PROGRAM_HEADER_SIZE as u16);
-        write_u16(&mut image, 56, 5);
-        write_program_header(&mut image, 0, PT_LOAD, PF_X | PF_R, 0x180, 0x180, 0x80);
-        write_program_header(&mut image, 1, PT_LOAD, PF_R, 0x200, 0x200, 0x100);
-        write_program_header(&mut image, 2, PT_LOAD, PF_W | PF_R, 0x400, 0x400, 0x300);
-        write_program_header(&mut image, 3, PT_NOTE, 0, 0x300, 0, 0x20);
-        write_program_header(&mut image, 4, PT_DYNAMIC, 0, 0x500, 0x500, 0x40);
+        write_u16(&mut image, 56, 6);
+        write_program_header(
+            &mut image,
+            0,
+            PT_LOAD,
+            PF_R | PF_X,
+            CALLBACK,
+            CALLBACK,
+            TEXT_END - CALLBACK,
+        );
+        write_program_header(&mut image, 1, PT_LOAD, PF_R, 0x600, 0x600, 0x100);
+        write_program_header(&mut image, 2, PT_LOAD, PF_R | PF_W, 0x800, 0x800, 0x300);
+        write_program_header(
+            &mut image,
+            3,
+            PT_DYNAMIC,
+            PF_R | PF_W,
+            DYNAMIC_RVA,
+            DYNAMIC_RVA,
+            0x40,
+        );
+        write_program_header(
+            &mut image,
+            4,
+            PT_GNU_EH_FRAME,
+            PF_R,
+            EH_FRAME_HDR,
+            EH_FRAME_HDR,
+            0x40,
+        );
+        write_program_header(&mut image, 5, PT_NOTE, 0, 0xb00, 0, 0x20);
 
-        write_u32(&mut image, 0x300, 4);
-        write_u32(&mut image, 0x304, 4);
-        write_u32(&mut image, 0x308, 3);
-        image[0x30c..0x310].copy_from_slice(b"GNU\0");
-        image[0x310..0x314].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        write_u32(&mut image, 0xb00, 4);
+        write_u32(&mut image, 0xb04, 4);
+        write_u32(&mut image, 0xb08, 3);
+        image[0xb0c..0xb10].copy_from_slice(b"GNU\0");
+        image[0xb10..0xb14].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
 
-        image[0x220..0x220 + PROFILE.binding_name.len()].copy_from_slice(PROFILE.binding_name);
-        image[0x180..0x184].copy_from_slice(PROFILE.napi_callback_fingerprint);
-        image[0x190..0x194].copy_from_slice(PROFILE.response_action_fingerprint);
-        image[0x1a0..0x1a4].copy_from_slice(PROFILE.converter_fingerprint);
-        image[0x1b0..0x1b4].copy_from_slice(PROFILE.resolve_action_fingerprint);
-        write_i64(&mut image, 0x500, DT_RELA);
-        write_u64(&mut image, 0x508, 0x580);
-        write_i64(&mut image, 0x510, DT_RELASZ);
-        write_u64(&mut image, 0x518, 3 * RELA_ENTRY_SIZE as u64);
-        write_i64(&mut image, 0x520, DT_RELAENT);
-        write_u64(&mut image, 0x528, RELA_ENTRY_SIZE as u64);
-        for (index, (slot, target)) in [
-            (PROFILE.name_slot_rva, PROFILE.binding_name_rva),
-            (PROFILE.napi_callback_slot_rva, PROFILE.napi_callback_rva),
-            (
-                PROFILE.response_action_slot_rva,
-                PROFILE.response_action_rva,
-            ),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let offset = 0x580 + index * RELA_ENTRY_SIZE;
-            write_u64(&mut image, offset, slot);
-            write_u64(&mut image, offset + 8, R_X86_64_RELATIVE as u64);
-            write_i64(&mut image, offset + 16, target as i64);
-        }
+        image[ANCHOR_RVA as usize..ANCHOR_RVA as usize + SEND_ANCHOR.len()]
+            .copy_from_slice(SEND_ANCHOR);
+        image[RESULT_RVA as usize..RESULT_RVA as usize + 7].copy_from_slice(b"result\0");
+        image[ERR_MSG_RVA as usize..ERR_MSG_RVA as usize + 7].copy_from_slice(b"errMsg\0");
+        image[RSP_RVA as usize..RSP_RVA as usize + 4].copy_from_slice(b"rsp\0");
+
+        image[CALLBACK as usize..TEXT_END as usize].fill(0x90);
+        write_call(&mut image, CALLBACK + 0x10, CONVERTER);
+        write_call(&mut image, CALLBACK + 0x20, CONVERTER);
+        write_lea(&mut image, CALLBACK + 0x30, ANCHOR_RVA);
+        write_lea(&mut image, CALLBACK + 0x40, RESPONSE_TABLE);
+        write_call(&mut image, RESPONSE_ACTION + 0x10, DISPATCH_HELPER);
+        write_lea(&mut image, DISPATCH_HELPER + 0x10, RESOLVER_THUNK);
+        write_call(&mut image, RESOLVER_THUNK + 0x10, RESOLVER);
+        write_lea(&mut image, RESOLVER + 0x10, RESULT_RVA);
+        write_lea(&mut image, RESOLVER + 0x20, ERR_MSG_RVA);
+        write_lea(&mut image, RESOLVER + 0x30, RSP_RVA);
+        write_i64(&mut image, DYNAMIC_RVA as usize, DT_RELA);
+        write_u64(&mut image, DYNAMIC_RVA as usize + 8, RELA_RVA);
+        write_i64(&mut image, DYNAMIC_RVA as usize + 16, DT_RELASZ);
+        write_u64(
+            &mut image,
+            DYNAMIC_RVA as usize + 24,
+            RELA_ENTRY_SIZE as u64,
+        );
+        write_i64(&mut image, DYNAMIC_RVA as usize + 32, DT_RELAENT);
+        write_u64(
+            &mut image,
+            DYNAMIC_RVA as usize + 40,
+            RELA_ENTRY_SIZE as u64,
+        );
+        write_i64(&mut image, DYNAMIC_RVA as usize + 48, DT_NULL);
+        write_u64(&mut image, RESPONSE_SLOT as usize, 0);
+        write_u64(&mut image, RELA_RVA as usize, RESPONSE_SLOT);
+        write_u64(&mut image, RELA_RVA as usize + 8, R_X86_64_RELATIVE as u64);
+        write_i64(&mut image, RELA_RVA as usize + 16, RESPONSE_ACTION as i64);
+        write_eh_frame_header(
+            &mut image,
+            &[
+                CALLBACK,
+                CONVERTER,
+                RESPONSE_ACTION,
+                DISPATCH_HELPER,
+                RESOLVER_THUNK,
+                RESOLVER,
+            ],
+        );
         image
     }
 
-    fn verify(image: &[u8], profile: Profile) -> Result<(), ElfError> {
-        let elf = ElfImage::parse(image)?;
-        verify_profile(
-            &elf,
-            profile,
-            profile.binding_name_rva,
-            profile.napi_callback_rva,
-            profile.response_action_rva,
-            profile.binding_name,
-            profile.napi_callback_fingerprint,
-            profile.response_action_fingerprint,
-            profile.converter_fingerprint,
-            profile.resolve_action_fingerprint,
-        )
-    }
-
     #[test]
-    fn parses_build_id_hash_and_validates_all_packet_targets() {
+    fn locates_packet_targets_from_xrefs_without_a_version_profile() {
         let image = image();
         let elf = ElfImage::parse(&image).unwrap();
-        assert_eq!(elf.build_id().unwrap(), PROFILE.build_id);
         assert_eq!(
-            hex(&elf.sha256()),
-            "425112219668ce8340cc46b81b328dd2e1525335b6fe7d0c52108d3f60f55fe0"
+            locate_packet_binding(&elf, SEND_ANCHOR).unwrap(),
+            LocatedPacketBinding {
+                anchor_rva: ANCHOR_RVA,
+                anchor_xref_rva: CALLBACK + 0x30,
+                napi_callback_rva: CALLBACK,
+                converter_rva: CONVERTER,
+                result_anchor_rva: RESULT_RVA,
+                result_xref_rva: RESOLVER + 0x10,
+                err_msg_anchor_rva: ERR_MSG_RVA,
+                err_msg_xref_rva: RESOLVER + 0x20,
+                rsp_anchor_rva: RSP_RVA,
+                rsp_xref_rva: RESOLVER + 0x30,
+                response_table_xref_rva: CALLBACK + 0x40,
+                response_table_rva: RESPONSE_TABLE,
+                response_action_slot_rva: RESPONSE_SLOT,
+                response_action_rva: RESPONSE_ACTION,
+                dispatch_helper_rva: DISPATCH_HELPER,
+                resolver_thunk_rva: RESOLVER_THUNK,
+                resolve_action_rva: RESOLVER,
+            }
         );
-        verify(&image, PROFILE).unwrap();
+        assert_eq!(elf.build_id().unwrap(), [0xde, 0xad, 0xbe, 0xef]);
     }
 
     #[test]
-    fn rejects_unknown_profile_identity() {
+    fn rejects_ambiguous_send_anchor_xrefs() {
+        let mut image = image();
+        write_lea(&mut image, CALLBACK + 0x50, ANCHOR_RVA);
+        let elf = ElfImage::parse(&image).unwrap();
         assert!(matches!(
-            select_profile(&[PROFILE], &[0; 8], [0; 32]),
-            Err(ElfError::UnsupportedProfile)
+            locate_packet_binding(&elf, SEND_ANCHOR),
+            Err(ElfError::SendAnchorXref)
         ));
     }
 
     #[test]
-    fn derives_an_unknown_build_from_unique_symbols_and_relocations() {
-        let image = image();
+    fn rejects_missing_converter_call_pair() {
+        let mut image = image();
+        image[(CALLBACK + 0x20) as usize] = 0x90;
         let elf = ElfImage::parse(&image).unwrap();
-        let derived = derive_profile(&elf, &[PROFILE]).unwrap();
-        assert_eq!(derived.name, "linux-symbol-scan-v1");
-        assert_eq!(derived.name_slot_rva, PROFILE.name_slot_rva);
-        assert_eq!(derived.binding_name_rva, PROFILE.binding_name_rva);
-        assert_eq!(
-            derived.napi_callback_slot_rva,
-            PROFILE.napi_callback_slot_rva
-        );
-        assert_eq!(derived.napi_callback_rva, PROFILE.napi_callback_rva);
-        assert_eq!(
-            derived.response_action_slot_rva,
-            PROFILE.response_action_slot_rva
-        );
-        assert_eq!(derived.response_action_rva, PROFILE.response_action_rva);
-        assert_eq!(derived.converter_rva, PROFILE.converter_rva);
-        assert_eq!(derived.resolve_action_rva, PROFILE.resolve_action_rva);
-    }
-
-    #[test]
-    fn rejects_ambiguous_dynamic_symbol_matches() {
-        let mut duplicate_name = image();
-        duplicate_name[0x250..0x250 + PROFILE.binding_name.len()]
-            .copy_from_slice(PROFILE.binding_name);
-        let elf = ElfImage::parse(&duplicate_name).unwrap();
         assert!(matches!(
-            derive_profile_from_template(&elf, PROFILE),
-            Err(ElfError::BindingNameScan)
-        ));
-
-        let mut duplicate_converter = image();
-        duplicate_converter[0x1c0..0x1c0 + PROFILE.converter_fingerprint.len()]
-            .copy_from_slice(PROFILE.converter_fingerprint);
-        let elf = ElfImage::parse(&duplicate_converter).unwrap();
-        assert!(matches!(
-            derive_profile_from_template(&elf, PROFILE),
+            locate_packet_binding(&elf, SEND_ANCHOR),
             Err(ElfError::ConverterScan)
         ));
     }
 
     #[test]
-    fn rejects_invalid_name_callback_and_response_relocations() {
-        for (index, error) in [
-            (0, ElfError::NameRela),
-            (1, ElfError::NapiCallbackRela),
-            (2, ElfError::ResponseActionRela),
-        ] {
-            let mut image = image();
-            write_u64(&mut image, 0x580 + index * RELA_ENTRY_SIZE + 8, 1);
-            assert!(
-                matches!(verify(&image, PROFILE), Err(actual) if std::mem::discriminant(&actual) == std::mem::discriminant(&error))
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_mismatched_loaded_slot_values() {
-        let image = image();
+    fn rejects_response_anchors_split_across_functions() {
+        let mut image = image();
+        write_lea(&mut image, CONVERTER + 0x10, RSP_RVA);
+        image[(RESOLVER + 0x30) as usize..(RESOLVER + 0x37) as usize].fill(0x90);
         let elf = ElfImage::parse(&image).unwrap();
         assert!(matches!(
-            verify_profile(
-                &elf,
-                PROFILE,
-                PROFILE.binding_name_rva,
-                PROFILE.napi_callback_rva + 1,
-                PROFILE.response_action_rva,
-                PROFILE.binding_name,
-                PROFILE.napi_callback_fingerprint,
-                PROFILE.response_action_fingerprint,
-                PROFILE.converter_fingerprint,
-                PROFILE.resolve_action_fingerprint,
-            ),
-            Err(ElfError::NapiCallbackValue)
+            locate_packet_binding(&elf, SEND_ANCHOR),
+            Err(ElfError::ResolverScan)
         ));
     }
 
     #[test]
-    fn rejects_invalid_target_and_slot_permissions() {
-        let image = image();
-        let mut target_profile = PROFILE;
-        target_profile.converter_rva = PROFILE.name_slot_rva;
+    fn rejects_invalid_unwind_table_and_permissions() {
+        let mut broken_unwind = image();
+        broken_unwind[EH_FRAME_HDR as usize] = 2;
         assert!(matches!(
-            verify(&image, target_profile),
-            Err(ElfError::ConverterPermissions)
+            ElfImage::parse(&broken_unwind).unwrap().unwind_functions(),
+            Err(ElfError::UnwindTable)
         ));
-        let mut slot_profile = PROFILE;
-        slot_profile.response_action_slot_rva = PROFILE.binding_name_rva;
-        assert!(matches!(
-            verify(&image, slot_profile),
-            Err(ElfError::ResponseActionSlotPermissions)
-        ));
-    }
 
-    #[test]
-    fn rejects_mismatched_name_and_code_fingerprints() {
-        let image = image();
-        let elf = ElfImage::parse(&image).unwrap();
-        assert!(matches!(
-            verify_profile(
-                &elf,
-                PROFILE,
-                PROFILE.binding_name_rva,
-                PROFILE.napi_callback_rva,
-                PROFILE.response_action_rva,
-                b"wrongBinding\0",
-                PROFILE.napi_callback_fingerprint,
-                PROFILE.response_action_fingerprint,
-                PROFILE.converter_fingerprint,
-                PROFILE.resolve_action_fingerprint,
-            ),
-            Err(ElfError::BindingName)
-        ));
-        assert!(matches!(
-            verify_profile(
-                &elf,
-                PROFILE,
-                PROFILE.binding_name_rva,
-                PROFILE.napi_callback_rva,
-                PROFILE.response_action_rva,
-                PROFILE.binding_name,
-                PROFILE.napi_callback_fingerprint,
-                PROFILE.response_action_fingerprint,
-                &[0; 4],
-                PROFILE.resolve_action_fingerprint,
-            ),
-            Err(ElfError::ConverterFingerprint)
-        ));
-    }
-
-    #[test]
-    fn accepts_current_sized_rela_tables_and_rejects_the_cap() {
-        let count = 65_537usize;
-        let mut large = image();
-        let end = 0x580 + count * RELA_ENTRY_SIZE;
-        large.resize(end, 0);
-        write_program_header(
-            &mut large,
-            2,
-            PT_LOAD,
-            PF_W | PF_R,
-            0x400,
-            0x400,
-            (end - 0x400) as u64,
+        let mut executable_strings = image();
+        write_u32(
+            &mut executable_strings,
+            0x40 + PROGRAM_HEADER_SIZE + 4,
+            PF_R | PF_X,
         );
-        write_u64(&mut large, 0x518, (count * RELA_ENTRY_SIZE) as u64);
-        assert_eq!(
-            ElfImage::parse(&large)
-                .unwrap()
-                .rela_entries()
-                .unwrap()
-                .len(),
-            count
-        );
-
-        let mut oversized = image();
-        write_u64(
-            &mut oversized,
-            0x518,
-            ((MAX_RELA_ENTRIES + 1) * RELA_ENTRY_SIZE) as u64,
-        );
+        let elf = ElfImage::parse(&executable_strings).unwrap();
         assert!(matches!(
-            ElfImage::parse(&oversized).unwrap().rela_entries(),
-            Err(ElfError::RelaTable)
+            locate_packet_binding(&elf, SEND_ANCHOR),
+            Err(ElfError::SendAnchorScan)
         ));
     }
 
@@ -1245,5 +1431,18 @@ mod tests {
             ElfImage::parse(b"not an ELF image"),
             Err(ElfError::Truncated)
         ));
+    }
+
+    #[test]
+    #[ignore = "set QQNT_WRAPPER_FIXTURE to an extracted Linux wrapper.node"]
+    fn locates_an_extracted_linux_qqnt_wrapper() {
+        let path = std::env::var_os("QQNT_WRAPPER_FIXTURE")
+            .expect("QQNT_WRAPPER_FIXTURE must point to wrapper.node");
+        let bytes = std::fs::read(path).unwrap();
+        let elf = ElfImage::parse(&bytes).unwrap();
+        let located = locate_packet_binding(&elf, crate::locator::SEND_ANCHOR.as_bytes()).unwrap();
+        assert_ne!(located.anchor_xref_rva, 0);
+        assert_ne!(located.converter_rva, 0);
+        assert_ne!(located.resolve_action_rva, 0);
     }
 }

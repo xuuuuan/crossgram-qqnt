@@ -54,12 +54,13 @@ describe('native packet addon', () => {
 
   it('prevents synchronous recursive probes and restores the prober state', () => {
     const result: PacketBindingProbe = {
-      moduleBase: '0x1', modulePath: '/qqnt/wrapper.node', profile: 'linux-xref-v1',
-      buildId: 'build-id', sha256: 'sha256', nameSlotRva: '0x1', bindingNameRva: '0x2',
-      bindingName: 'sendSsoCmdReqByContend', napiCallbackSlotRva: '0x3', napiCallbackRva: '0x4',
-      napiCallbackFingerprint: 'fingerprint', responseActionSlotRva: '0x5', responseActionRva: '0x6',
-      responseActionFingerprint: 'fingerprint', converterRva: '0x7', converterFingerprint: 'fingerprint',
-      resolveActionRva: '0x8', resolveActionFingerprint: 'fingerprint',
+      moduleBase: '0x1', modulePath: '/qqnt/wrapper.node', locator: 'linux-xref-v1',
+      buildId: 'build-id', sha256: 'sha256', anchorRva: '0x1', anchorXrefRva: '0x2',
+      napiCallbackRva: '0x3', converterRva: '0x4', resultAnchorRva: '0x5',
+      resultXrefRva: '0x6', errMsgAnchorRva: '0x7', errMsgXrefRva: '0x8',
+      rspAnchorRva: '0x9', rspXrefRva: '0xa', responseTableXrefRva: '0xb',
+      responseTableRva: '0xc', responseActionSlotRva: '0xd', responseActionRva: '0xe',
+      dispatchHelperRva: '0xf', resolverThunkRva: '0x10', resolveActionRva: '0x11',
     }
     let prober!: () => PacketBindingProbe | undefined
     const probePacketBinding = vi.fn(() => {
@@ -80,7 +81,7 @@ describe('native packet addon', () => {
 
   it('prevents synchronous recursive installs and restores the installer state', () => {
     const location: NativeSendBindingLocation = {
-      moduleBase: '0x1', profile: 'xref-v1', timeDateStamp: 0, sizeOfImage: 0,
+      moduleBase: '0x1', locator: 'xref-v1', timeDateStamp: 0, sizeOfImage: 0,
       anchorRva: 0, xrefRva: 0, functionRva: 0, converterRva: 0x7, responseRva: 0x8,
     }
     let installer!: () => NativeSendBindingLocation | undefined

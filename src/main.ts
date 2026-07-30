@@ -122,7 +122,7 @@ function installKernelRequireHook(bridge: QQKernelBridge, login: QQLoginControll
     try {
       const location = installPacketHook()
       if (!location) return
-      log('info', `QQNT Linux packet hook installed module=${location.moduleBase} profile=${location.profile} converterRva=0x${location.converterRva.toString(16)} resolverRva=0x${location.responseRva.toString(16)}`)
+      log('info', `QQNT Linux packet hook installed module=${location.moduleBase} locator=${location.locator} converterRva=0x${location.converterRva.toString(16)} resolverRva=0x${location.responseRva.toString(16)}`)
     } catch (error) {
       log('error', 'QQNT Linux packet hook install failed; packet media URLs will be unavailable', error)
     }
@@ -130,7 +130,7 @@ function installKernelRequireHook(bridge: QQKernelBridge, login: QQLoginControll
 }
 
 function logLinuxPacketProbe(probe: PacketBindingProbe): void {
-  log('info', `QQNT Linux packet profile verified profile=${probe.profile} buildIdPrefix=${probe.buildId.slice(0, 16)} sha256Prefix=${probe.sha256.slice(0, 16)} nameSlotRva=${probe.nameSlotRva} bindingNameRva=${probe.bindingNameRva} napiCallbackSlotRva=${probe.napiCallbackSlotRva} napiCallbackRva=${probe.napiCallbackRva} responseActionSlotRva=${probe.responseActionSlotRva} responseActionRva=${probe.responseActionRva} converterRva=${probe.converterRva} resolveActionRva=${probe.resolveActionRva}`)
+  log('info', `QQNT Linux packet locator verified locator=${probe.locator} buildIdPrefix=${probe.buildId.slice(0, 16)} sha256Prefix=${probe.sha256.slice(0, 16)} anchorRva=${probe.anchorRva} anchorXrefRva=${probe.anchorXrefRva} napiCallbackRva=${probe.napiCallbackRva} converterRva=${probe.converterRva} responseTableXrefRva=${probe.responseTableXrefRva} responseActionRva=${probe.responseActionRva} dispatchHelperRva=${probe.dispatchHelperRva} resolverThunkRva=${probe.resolverThunkRva} resultXrefRva=${probe.resultXrefRva} errMsgXrefRva=${probe.errMsgXrefRva} rspXrefRva=${probe.rspXrefRva} resolveActionRva=${probe.resolveActionRva}`)
 }
 
 function isKernelModule(value: unknown): value is KernelModule & object {

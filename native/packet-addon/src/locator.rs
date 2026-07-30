@@ -1,5 +1,5 @@
 use crate::{
-    elf::{self, ElfError, Profile},
+    elf::{self, ElfError},
     pe::{self, PeError},
 };
 use thiserror::Error;
@@ -7,55 +7,16 @@ use thiserror::Error;
 pub const SEND_ANCHOR: &str =
     "assertion (argc == 2) failed: NodeIKernelMsgService::sendSsoCmdReqByContend needs 2 arguments";
 
-const LINUX_PACKET_PROFILES: [Profile; 1] = [Profile {
-    name: "linux-3.2.30-50969",
-    build_id: &[0x7e, 0x05, 0xde, 0x9b, 0x68, 0x82, 0xbf, 0x5d],
-    sha256: [
-        0x85, 0xda, 0x60, 0x1b, 0xb7, 0x60, 0x82, 0x81, 0x6e, 0xba, 0x46, 0x1c, 0x10, 0xd8, 0x99,
-        0xb4, 0xad, 0x11, 0x4f, 0x85, 0xc5, 0x8b, 0x25, 0xff, 0xd3, 0x5a, 0xf7, 0xf1, 0xd6, 0xf8,
-        0x2d, 0x27,
-    ],
-    name_slot_rva: 0x82a6110,
-    binding_name_rva: 0x8b0499,
-    binding_name: b"sendSsoCmdReqByContend\0",
-    napi_callback_slot_rva: 0x82a6120,
-    napi_callback_rva: 0x3458d90,
-    napi_callback_fingerprint: &[
-        0x41, 0x57, 0x41, 0x56, 0x53, 0x48, 0x81, 0xec, 0xa0, 0x00, 0x00, 0x00, 0x49, 0x89, 0xff,
-        0x48,
-    ],
-    response_action_slot_rva: 0x82ab790,
-    response_action_rva: 0x34b9730,
-    response_action_fingerprint: &[
-        0x55, 0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x53, 0x48, 0x81, 0xec, 0x10, 0x01, 0x00, 0x00,
-        0x48,
-    ],
-    converter_rva: 0x63f47b0,
-    converter_fingerprint: &[
-        0x41, 0x57, 0x41, 0x56, 0x53, 0x48, 0x83, 0xec, 0x30, 0x49, 0x89, 0xd7, 0x49, 0x89, 0xf6,
-        0x48,
-    ],
-    // The JS-thread Promise resolver: invoked on the libuv main loop via the
-    // thread-aware dispatch shim when the native response action resolves. This
-    // is the safe N-API patchpoint (the prior 0x30cd370 target is an unrelated
-    // resolve family that produces a `sigInfo` result).
-    resolve_action_rva: 0x34b9e30,
-    resolve_action_fingerprint: &[
-        0x41, 0x57, 0x41, 0x56, 0x53, 0x48, 0x83, 0xec, 0x40, 0x4c, 0x8b, 0x7f, 0x10, 0x49, 0x83,
-        0x7f,
-    ],
-}];
-
 pub fn probe_packet_binding() -> Result<elf::PacketBindingProbe, ElfError> {
-    elf::probe_packet_binding(&LINUX_PACKET_PROFILES)
+    elf::probe_packet_binding(SEND_ANCHOR.as_bytes())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LocatorProfile {
+pub enum LocatorKind {
     XrefV1,
 }
 
-impl LocatorProfile {
+impl LocatorKind {
     pub const fn name(self) -> &'static str {
         match self {
             Self::XrefV1 => "xref-v1",
@@ -67,7 +28,7 @@ impl LocatorProfile {
 pub struct LocatedBinding {
     pub module_base: usize,
     pub identity: pe::PeIdentity,
-    pub profile: LocatorProfile,
+    pub locator: LocatorKind,
     pub anchor_rva: u32,
     pub xref_rva: u32,
     pub function_rva: u32,
@@ -99,25 +60,14 @@ pub enum LocateError {
 
 pub fn locate_in_image(image: &[u8], module_base: usize) -> Result<LocatedBinding, LocateError> {
     let identity = pe::identity(image)?;
-    let profile = select_locator_profile(identity);
-    match profile {
-        LocatorProfile::XrefV1 => locate_xref_v1(image, module_base, identity, profile),
-    }
-}
-
-fn select_locator_profile(identity: pe::PeIdentity) -> LocatorProfile {
-    match (identity.time_date_stamp, identity.size_of_image) {
-        // Unknown builds keep using the fully validated xref probe. Add exact
-        // identity branches only when a QQNT build needs a different locator.
-        _ => LocatorProfile::XrefV1,
-    }
+    locate_xref_v1(image, module_base, identity, LocatorKind::XrefV1)
 }
 
 fn locate_xref_v1(
     image: &[u8],
     module_base: usize,
     identity: pe::PeIdentity,
-    profile: LocatorProfile,
+    locator: LocatorKind,
 ) -> Result<LocatedBinding, LocateError> {
     let text = pe::section(image, ".text")?;
     let rdata = pe::section(image, ".rdata")?;
@@ -155,7 +105,7 @@ fn locate_xref_v1(
     Ok(LocatedBinding {
         module_base,
         identity,
-        profile,
+        locator,
         anchor_rva,
         xref_rva,
         function_rva,
@@ -359,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_builds_use_the_validated_xref_profile() {
+    fn unknown_builds_use_the_validated_xref_locator() {
         let (image, _) = xref_v1_image();
         assert_eq!(
             locate_in_image(&image, MODULE_BASE).unwrap(),
@@ -369,7 +319,7 @@ mod tests {
                     time_date_stamp: TIMESTAMP,
                     size_of_image: IMAGE_SIZE,
                 },
-                profile: LocatorProfile::XrefV1,
+                locator: LocatorKind::XrefV1,
                 anchor_rva: 0x800,
                 xref_rva: 0x150,
                 function_rva: 0x100,
@@ -377,7 +327,7 @@ mod tests {
                 response_rva: 0x600,
             },
         );
-        assert_eq!(LocatorProfile::XrefV1.name(), "xref-v1");
+        assert_eq!(LocatorKind::XrefV1.name(), "xref-v1");
     }
 
     #[test]
