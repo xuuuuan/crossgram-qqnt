@@ -1629,7 +1629,7 @@ describe('QQKernelBridge', () => {
         elementType: 10, elementId: 'merged',
         arkElement: { bytesData: JSON.stringify({
           app: 'com.tencent.multimsg', prompt: 'Alice & Bob 的聊天记录',
-          meta: { detail: { news: [{ text: 'Alice: hello' }, { text: 'Bob: world' }] } },
+          meta: { detail: { news: [{ text: '2条消息的合并转发' }] } },
         }) },
       }],
     }
@@ -1658,7 +1658,7 @@ describe('QQKernelBridge', () => {
     await expect(bridge.forwardMessages(conversation, ['m1', 'm2'], conversation, true)).resolves.toMatchObject([
       { id: 'merged-1', parts: [{
         type: 'multi-forward', title: 'Alice & Bob 的聊天记录',
-        preview: 'Alice: hello\nBob: world',
+        preview: 'Self: hello\nAlice: hello',
         locator: { conversationId: 'uid-1715311957', rootMessageId: 'merged-1' },
       }] },
     ])
@@ -1735,6 +1735,32 @@ describe('QQKernelBridge', () => {
       id: 'xml-forward', parts: [{
         type: 'multi-forward', title: 'QQ用户的聊天记录',
         preview: 'Alice: 第一条\nBob: 第二条 & 回复\nCarol: 第三条',
+      }],
+    }])
+  })
+
+  it('drops generic merged-forward counters instead of exposing them as previews', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    await bridge.getDialogs()
+    const forwarded = {
+      ...f.message, msgId: 'xml-forward-generic',
+      elements: [{
+        elementType: 16, elementId: 'xml-forward-generic-element',
+        multiForwardMsgElement: {
+          fileName: '聊天记录', resId: 'xml-forward-generic-resource',
+          xmlContent: '<msg><item><summary><![CDATA[3条消息的合并转发]]></summary></item></msg>',
+        },
+      }],
+    }
+    f.msg.getMultiMsg.mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [forwarded] })
+
+    await expect(bridge.getMultiForwardMessages({
+      conversationId: 'uid-1715311957', rootMessageId: 'xml-forward-generic',
+    })).resolves.toMatchObject([{
+      id: 'xml-forward-generic', parts: [{
+        type: 'multi-forward', title: '聊天记录', preview: undefined,
       }],
     }])
   })

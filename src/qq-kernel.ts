@@ -1680,6 +1680,7 @@ export class QQKernelBridge {
     const api = merged ? 'multiForwardMsg' : 'forwardMsg'
     log('info', `native API start name=${api} from=${source.id} to=${destination.id} messages=${ids.join(',')}`)
     const pendingMerged = merged ? { conversationId: destination.id, startedAt } : undefined
+    let mergedPreview: string | undefined
     if (pendingMerged) this.pendingMergedForwards.push(pendingMerged)
     try {
       let result: { result: number, errMsg: string }
@@ -1690,6 +1691,14 @@ export class QQKernelBridge {
         const records = await service.getMsgsByMsgId(contact(source), ids)
         if (records.result !== 0) throw new Error(`getMsgsByMsgId: ${records.errMsg} (${records.result})`)
         const byId = new Map(records.msgList.map((record) => [record.msgId, record]))
+        mergedPreview = forwardedMessagesPreview(ids.flatMap((msgId) => {
+          const record = byId.get(msgId)
+          return record ? [{
+            message: this.mapMessage(record),
+            senderName: record.sendRemarkName || record.sendMemberName
+              || record.sendNickName || record.senderUin,
+          }] : []
+        }))
         const messages = ids.map((msgId) => {
           const record = byId.get(msgId)
           return {
@@ -1711,6 +1720,14 @@ export class QQKernelBridge {
       const messages = await this.waitForForwardedMessages(
         destination, before, merged ? 1 : ids.length, startedAt, merged,
       )
+      if (mergedPreview) {
+        for (const message of messages) {
+          message.parts = message.parts.map((part) => part.type === 'multi-forward'
+            && (!part.preview || isGenericMultiForwardPreview(part.preview))
+            ? { ...part, preview: mergedPreview }
+            : part)
+        }
+      }
       log('info', `native API complete name=${api} from=${source.id} to=${destination.id} result=${result.result} messages=${messages.map((item) => item.id).join(',')} err=${JSON.stringify(result.errMsg)}`)
       return messages
     } finally {
@@ -4625,9 +4642,36 @@ function multiForwardPreview(
     .matchAll(/<summary\b[^>]*>(?:<!\[CDATA\[([\s\S]*?)\]\]>|([\s\S]*?))<\/summary>/gi)]
     .map((match) => normalizeMultiForwardPreview(match[1] ?? match[2] ?? ''))
     .filter(Boolean)
-  const detailed = summaries.filter((summary) =>
-    !/^(?:点击)?查看(?:\s*\d+\s*条)?转发消息$/.test(summary))
-  return [...new Set(detailed.length ? detailed : summaries)].join('\n') || undefined
+  const detailed = summaries.filter((summary) => !isGenericMultiForwardPreview(summary))
+  return [...new Set(detailed)].join('\n') || undefined
+}
+
+function isGenericMultiForwardPreview(value: string): boolean {
+  const compact = value.replace(/\s+/g, '')
+  return /^(?:点击)?查看(?:[xX×\d]+条)?(?:消息的)?(?:合并)?转发(?:消息)?$/.test(compact)
+    || /^(?:共)?[xX×\d]+条消息的合并转发$/.test(compact)
+    || /^(?:合并转发|聊天记录)$/.test(compact)
+}
+
+function forwardedMessagesPreview(
+  inputs: readonly { message: QQMessage, senderName?: string }[],
+): string | undefined {
+  const lines = inputs.slice(0, 4).map(({ message, senderName }) => {
+    const sender = senderName?.trim() || message.sender?.alias?.trim()
+      || message.sender?.name?.trim() || message.senderId
+    const content = message.parts.map((part) => {
+      if (part.type === 'text') return part.text.trim()
+      if (part.type === 'media') {
+        return part.media.name?.trim() || (part.media.kind === 'image' ? '[图片]'
+          : part.media.kind === 'video' ? '[视频]' : '[文件]')
+      }
+      if (part.type === 'sticker') return part.sticker.title?.trim() || '[表情]'
+      if (part.type === 'multi-forward') return `查看${part.title || '聊天记录'}`
+      return part.card.title?.trim() || part.card.description?.trim() || '[卡片消息]'
+    }).filter(Boolean).join(' ').replace(/\s+/g, ' ').trim()
+    return content ? `${sender}: ${content}` : ''
+  }).filter(Boolean)
+  return lines.join('\n') || undefined
 }
 
 function normalizeMultiForwardPreview(value: string): string {
