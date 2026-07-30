@@ -4102,6 +4102,7 @@ function mapMedia(record: MsgRecord, element: MsgElement): QQMedia | undefined {
       id: element.elementId || `${record.msgId}:file`,
       kind: 'file',
       name: file.fileName,
+      mimeType: fileVideoMimeType(file.fileName),
       size: numberOrUndefined(file.fileSize),
       locator: {
         ...base, kind: 'file', fileName: file.fileName, fileSize: file.fileSize,
@@ -4372,14 +4373,25 @@ function videoMimeType(path: string, format?: number): string {
     7: 'video/x-ms-asf', 8: 'video/quicktime', 9: 'video/mod', 10: 'video/mp2t', 11: 'video/mp2t',
   }
   if (format && byFormat[format]) return byFormat[format]
+  return fileVideoMimeType(path) ?? 'video/mp4'
+}
+
+function fileVideoMimeType(path: string): string | undefined {
   const extension = extname(path).toLowerCase()
+  if (extension === '.mp4' || extension === '.m4v' || extension === '.f4v') return 'video/mp4'
   if (extension === '.avi') return 'video/x-msvideo'
   if (extension === '.wmv') return 'video/x-ms-wmv'
   if (extension === '.mkv') return 'video/x-matroska'
   if (extension === '.mov') return 'video/quicktime'
-  if (extension === '.ts' || extension === '.mts') return 'video/mp2t'
+  if (extension === '.ts' || extension === '.mts' || extension === '.m2ts') return 'video/mp2t'
   if (extension === '.webm') return 'video/webm'
-  return 'video/mp4'
+  if (extension === '.mpeg' || extension === '.mpg' || extension === '.mpe') return 'video/mpeg'
+  if (extension === '.ogv') return 'video/ogg'
+  if (extension === '.3gp') return 'video/3gpp'
+  if (extension === '.3g2') return 'video/3gpp2'
+  if (extension === '.flv') return 'video/x-flv'
+  if (extension === '.asf') return 'video/x-ms-asf'
+  if (extension === '.mod') return 'video/mod'
 }
 
 function isAnimatedPicture(picture: NonNullable<MsgElement['picElement']>): boolean {

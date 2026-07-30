@@ -1395,7 +1395,7 @@ describe('QQKernelBridge', () => {
     bridge.unsubscribe(queue)
   })
 
-  it('hides recalled records, maps native videos, and renders unsupported elements as text fallbacks', async () => {
+  it('hides recalled records, maps native and file-sent videos, and renders unsupported elements as text fallbacks', async () => {
     const f = fixture()
     f.msg.getLatestDbMsgs.mockResolvedValueOnce({
       result: 0, errMsg: '', msgList: [
@@ -1411,6 +1411,16 @@ describe('QQKernelBridge', () => {
             fileFormat: 2, fileSize: '1048576', thumbWidth: 1280, thumbHeight: 720,
             videoMd5: 'video-md5', fileUuid: 'video-uuid', fileSubId: 'video-sub-id', fileBizId: 4601,
             sourceVideoCodecFormat: 1,
+          } },
+          { elementType: 3, elementId: 'file-video', fileElement: {
+            fileName: 'FILE-SENT.MP4', fileSize: '2097152', filePath: '/missing/FILE-SENT.MP4',
+            fileMd5: 'file-video-md5', fileUuid: 'file-video-uuid', fileSubId: 'file-video-sub-id',
+            fileBizId: 102,
+          } },
+          { elementType: 3, elementId: 'document', fileElement: {
+            fileName: 'report.pdf', fileSize: '4096', filePath: '/missing/report.pdf',
+            fileMd5: 'document-md5', fileUuid: 'document-uuid', fileSubId: 'document-sub-id',
+            fileBizId: 102,
           } },
           { elementType: 10, elementId: 'ark', arkElement: {
             bytesData: JSON.stringify({ meta: { news: { title: '卡片标题' } } }),
@@ -1434,6 +1444,23 @@ describe('QQKernelBridge', () => {
           kind: 'file', fileName: 'clip.mp4', fileSize: '1048576', filePath: '/missing/clip.mp4',
           fileUuid: 'video-uuid', fileSubId: 'video-sub-id', fileBizId: 4601, md5: 'video-md5',
           videoCodecFormat: 1,
+        },
+      } },
+      { type: 'media', media: {
+        id: 'file-video', kind: 'file', name: 'FILE-SENT.MP4', mimeType: 'video/mp4', size: 2097152,
+        locator: {
+          messageId: 'fallbacks', elementId: 'file-video', chatType: 1, peerUid: 'uid-1715311957',
+          kind: 'file', fileName: 'FILE-SENT.MP4', fileSize: '2097152',
+          filePath: '/missing/FILE-SENT.MP4', fileUuid: 'file-video-uuid',
+          fileSubId: 'file-video-sub-id', fileBizId: 102, md5: 'file-video-md5',
+        },
+      } },
+      { type: 'media', media: {
+        id: 'document', kind: 'file', name: 'report.pdf', size: 4096,
+        locator: {
+          messageId: 'fallbacks', elementId: 'document', chatType: 1, peerUid: 'uid-1715311957',
+          kind: 'file', fileName: 'report.pdf', fileSize: '4096', filePath: '/missing/report.pdf',
+          fileUuid: 'document-uuid', fileSubId: 'document-sub-id', fileBizId: 102, md5: 'document-md5',
         },
       } },
       { type: 'card', card: { kind: 'application', title: '卡片标题' } },
