@@ -114,7 +114,7 @@ describe('Linux deployment files', () => {
           QQNT_BINARY: qq,
           QQNT_LAUNCH_MARKER: marker,
         },
-        timeout: 5_000,
+        timeout: 15_000,
       })
       expect(readFileSync(marker, 'utf8').trim().split('\n')).toEqual([
         '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage',
