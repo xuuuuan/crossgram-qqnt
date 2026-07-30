@@ -1601,7 +1601,7 @@ describe('QQKernelBridge', () => {
         elementType: 10, elementId: 'merged',
         arkElement: { bytesData: JSON.stringify({
           app: 'com.tencent.multimsg', prompt: 'Alice & Bob 的聊天记录',
-          meta: { detail: { news: [{ text: 'Alice: hello' }, { text: 'Bob: world' }] } },
+          meta: { detail: { news: [{ text: '2条消息的合并转发' }] } },
         }) },
       }],
     }
@@ -1630,7 +1630,7 @@ describe('QQKernelBridge', () => {
     await expect(bridge.forwardMessages(conversation, ['m1', 'm2'], conversation, true)).resolves.toMatchObject([
       { id: 'merged-1', parts: [{
         type: 'multi-forward', title: 'Alice & Bob 的聊天记录',
-        preview: 'Alice: hello\nBob: world',
+        preview: 'Self: hello\nAlice: hello',
         locator: { conversationId: 'uid-1715311957', rootMessageId: 'merged-1' },
       }] },
     ])
