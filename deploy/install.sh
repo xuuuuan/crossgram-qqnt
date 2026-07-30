@@ -199,9 +199,15 @@ chmod 0600 /etc/qqnt-bridge.env
 
 install -m 0755 "$tmp/bridge/bin/qqntctl" /usr/local/bin/qqntctl
 install -d -m 0755 /usr/local/libexec/qqnt-bridge
+for helper in "$tmp/bridge/bin/"*; do
+  helper_name=${helper##*/}
+  case "$helper_name" in
+    qqntctl|install.sh) continue ;;
+  esac
+  [ -f "$helper" ] || continue
+  install -m 0755 "$helper" "/usr/local/libexec/qqnt-bridge/$helper_name"
+done
 install -m 0755 "$tmp/bridge/bin/install.sh" /usr/local/libexec/qqnt-bridge/install.sh
-install -m 0755 "$tmp/bridge/bin/run-headless.sh" /usr/local/libexec/qqnt-bridge/run-headless.sh
-install -m 0755 "$tmp/bridge/bin/session-state.sh" /usr/local/libexec/qqnt-bridge/session-state.sh
 install -m 0644 "$tmp/bridge/systemd/qqnt-bridge.service" /etc/systemd/system/qqnt-bridge.service
 systemctl daemon-reload
 systemctl enable qqnt-bridge.service

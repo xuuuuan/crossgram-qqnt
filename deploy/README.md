@@ -83,6 +83,11 @@ Running the one-line installer again performs the same in-place upgrade. Use
 `QQNT_BRIDGE_ARCHIVE_URL` when running the installer to use a local/custom
 build, or `QQNT_PACKAGE_URL` to pin an official QQ package.
 
+`qqntctl update` executes a temporary copy of the currently installed bootstrap
+instead of overwriting the script that is still running. The installer copies
+all helper files shipped in the release payload, so later releases can add a
+helper without requiring a second repair pass.
+
 Release and debug archives are built and tested by GitHub Actions. Production
 VPS hosts only download those release assets; they should not compile QQNT
 bridge locally because native builds can starve the other services on a small

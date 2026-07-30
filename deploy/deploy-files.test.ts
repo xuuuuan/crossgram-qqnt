@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { delimiter, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -11,6 +11,33 @@ describe('Linux deployment files', () => {
   it('keeps installer and control scripts valid POSIX shell', () => {
     for (const file of ['install.sh', 'qqntctl', 'run-headless.sh', 'session-state.sh']) {
       expect(() => execFileSync('sh', ['-n', join(root, 'deploy', file)]), file).not.toThrow()
+    }
+  })
+
+  it('runs updates from a temporary installer copy and removes it afterwards', () => {
+    const temp = mkdtempSync(join(tmpdir(), 'qqnt-update-bootstrap-'))
+    const envFile = join(temp, 'bridge.env')
+    const installer = join(temp, 'install.sh')
+    const marker = join(temp, 'installer-path')
+    try {
+      writeFileSync(envFile, 'QQNT_BRIDGE_TOKEN=test-token\n')
+      writeFileSync(installer, '#!/bin/sh\nprintf \'%s\n\' "$0" > "$QQNT_INSTALLER_MARKER"\n')
+      chmodSync(installer, 0o755)
+      execFileSync('sh', [join(root, 'deploy', 'qqntctl'), 'update'], {
+        env: {
+          ...process.env,
+          QQNT_BRIDGE_ENV_FILE: envFile,
+          QQNT_BRIDGE_INSTALLER: installer,
+          QQNT_INSTALLER_MARKER: marker,
+          TMPDIR: temp,
+        },
+      })
+      const executed = readFileSync(marker, 'utf8').trim()
+      expect(executed).not.toBe(installer)
+      expect(executed).toContain('qqnt-bridge-installer.')
+      expect(existsSync(executed)).toBe(false)
+    } finally {
+      rmSync(temp, { recursive: true, force: true })
     }
   })
 
@@ -32,6 +59,7 @@ describe('Linux deployment files', () => {
     expect(installer).toContain('systemctl restart qqnt-bridge.service')
     expect(installer).toContain('pre-update.')
     expect(installer).toContain('session-state.sh restore')
+    expect(installer).toContain('for helper in "$tmp/bridge/bin/"*')
     expect(installer).toContain('/usr/local/libexec/qqnt-bridge/install.sh')
     expect(installer).toContain('QQNT_BINARY=/absolute/path/to/qq')
     expect(installer).toContain('command -v dnf')

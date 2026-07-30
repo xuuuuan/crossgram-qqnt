@@ -92,11 +92,17 @@ case "${1:-status}" in
       echo "run the one-line installer again to repair this installation" >&2
       exit 1
     fi
+    temporary_installer=$(mktemp "${TMPDIR:-/tmp}/qqnt-bridge-installer.XXXXXX")
+    trap 'rm -f -- "$temporary_installer"' EXIT HUP INT TERM
+    cp "$installer" "$temporary_installer"
+    chmod 0700 "$temporary_installer"
     case "${2:-}" in
-      '') exec "$installer" ;;
-      release|debug) exec env QQNT_BRIDGE_MODE="$2" "$installer" ;;
+      '') "$temporary_installer" ;;
+      release|debug) env QQNT_BRIDGE_MODE="$2" "$temporary_installer" ;;
       *) echo "usage: qqntctl update [release|debug]" >&2; exit 2 ;;
     esac
+    rm -f -- "$temporary_installer"
+    trap - EXIT HUP INT TERM
     ;;
   *)
     echo "usage: qqntctl {status|qr [--png FILE]|refresh|logs|restart|logout|switch-account|update [release|debug]}" >&2
