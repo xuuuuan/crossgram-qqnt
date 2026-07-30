@@ -4531,9 +4531,15 @@ function multiForwardPreview(
     .matchAll(/<summary\b[^>]*>(?:<!\[CDATA\[([\s\S]*?)\]\]>|([\s\S]*?))<\/summary>/gi)]
     .map((match) => normalizeMultiForwardPreview(match[1] ?? match[2] ?? ''))
     .filter(Boolean)
-  const detailed = summaries.filter((summary) =>
-    !/^(?:点击)?查看(?:\s*\d+\s*条)?转发消息$/.test(summary))
-  return [...new Set(detailed.length ? detailed : summaries)].join('\n') || undefined
+  const detailed = summaries.filter((summary) => !isGenericMultiForwardPreview(summary))
+  return [...new Set(detailed)].join('\n') || undefined
+}
+
+function isGenericMultiForwardPreview(value: string): boolean {
+  const compact = value.replace(/\s+/g, '')
+  return /^(?:点击)?查看(?:[xX×\d]+条)?(?:消息的)?(?:合并)?转发(?:消息)?$/.test(compact)
+    || /^(?:共)?[xX×\d]+条消息的合并转发$/.test(compact)
+    || /^(?:合并转发|聊天记录)$/.test(compact)
 }
 
 function normalizeMultiForwardPreview(value: string): string {

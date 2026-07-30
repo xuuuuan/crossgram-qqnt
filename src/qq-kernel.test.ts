@@ -1711,6 +1711,32 @@ describe('QQKernelBridge', () => {
     }])
   })
 
+  it('drops generic merged-forward counters instead of exposing them as previews', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    await bridge.getDialogs()
+    const forwarded = {
+      ...f.message, msgId: 'xml-forward-generic',
+      elements: [{
+        elementType: 16, elementId: 'xml-forward-generic-element',
+        multiForwardMsgElement: {
+          fileName: '聊天记录', resId: 'xml-forward-generic-resource',
+          xmlContent: '<msg><item><summary><![CDATA[3条消息的合并转发]]></summary></item></msg>',
+        },
+      }],
+    }
+    f.msg.getMultiMsg.mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [forwarded] })
+
+    await expect(bridge.getMultiForwardMessages({
+      conversationId: 'uid-1715311957', rootMessageId: 'xml-forward-generic',
+    })).resolves.toMatchObject([{
+      id: 'xml-forward-generic', parts: [{
+        type: 'multi-forward', title: '聊天记录', preview: undefined,
+      }],
+    }])
+  })
+
   it('creates transcript-scoped virtual participants from forwarded names and avatars', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
