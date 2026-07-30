@@ -576,7 +576,7 @@ export class QQBridgeServer {
           replayWritten = replay.index
           replayTotal = replay.total
         }
-        if (!replay || replay.index === 1 || replay.last || replay.index % 100 === 0) {
+        if (event.type !== 'native-avsdk' && (!replay || replay.index === 1 || replay.last || replay.index % 100 === 0)) {
           log('info', `WebSocket event write request=${requestId} replay=${replay ? `${replay.index}/${replay.total}` : 'live'} ${wireEventSummary(event)} streamEventId=${eventId ?? ''}`)
         }
         await sendWebSocket(webSocket, JSON.stringify({ id: eventId, event }))

@@ -1,5 +1,5 @@
 import type {
-  KernelBuddyService, KernelGroupService, KernelMsgService, KernelProfileService, KernelRecentService,
+  KernelAVSDKService, KernelBuddyService, KernelGroupService, KernelMsgService, KernelProfileService, KernelRecentService,
 } from './kernel-types.js'
 import { log } from './log.js'
 
@@ -41,6 +41,10 @@ export function teeGroupService(nativeService: KernelGroupService): KernelGroupS
 
 export function teeRecentService(nativeService: KernelRecentService): KernelRecentService {
   return teeListenerService(nativeService, 'recent', 'addKernelRecentContactListener', 'removeKernelRecentContactListener')
+}
+
+export function teeAVSDKService(nativeService: KernelAVSDKService): KernelAVSDKService {
+  return teeListenerService(nativeService, 'avsdk', 'addKernelAVSDKListener', 'removeKernelAVSDKListener')
 }
 
 function teeListenerService<T extends object>(

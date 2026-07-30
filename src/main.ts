@@ -1,9 +1,9 @@
 import Module from 'node:module'
 import type {
-  InitSessionConfig, KernelBuddyService, KernelGroupService, KernelModule, KernelMsgService,
+  InitSessionConfig, KernelAVSDKService, KernelBuddyService, KernelGroupService, KernelModule, KernelMsgService,
   KernelProfileService, KernelRecentService, KernelSession,
 } from './kernel-types.js'
-import { teeBuddyService, teeGroupService, teeMsgService, teeProfileService, teeRecentService } from './listener-tee.js'
+import { teeAVSDKService, teeBuddyService, teeGroupService, teeMsgService, teeProfileService, teeRecentService } from './listener-tee.js'
 import { log, logPath } from './log.js'
 import { QQLoginController, wrapLoginServiceConstructor } from './login-controller.js'
 import { createPacketBindingProber, createPacketHookInstaller, type PacketBindingProbe } from './packet-addon.js'
@@ -208,11 +208,11 @@ function scheduleMainWindowClose(): void {
   closeMainWindowTimer.unref?.()
 }
 
-function wrapSession(
+export function wrapSession(
   kernel: KernelModule,
   nativeSession: KernelSession,
   bridge: QQKernelBridge,
-  login: QQLoginController,
+  login?: QQLoginController,
 ): KernelSession {
   let attached = false
   let msgServiceFacade: KernelMsgService | undefined
@@ -220,6 +220,7 @@ function wrapSession(
   let profileServiceFacade: KernelProfileService | undefined
   let groupServiceFacade: KernelGroupService | undefined
   let recentServiceFacade: KernelRecentService | undefined
+  let avsdkServiceFacade: KernelAVSDKService | undefined
   let facade: KernelSession
   facade = new Proxy(nativeSession, {
     get(target, property) {
@@ -228,7 +229,7 @@ function wrapSession(
         return (config: InitSessionConfig, ...args: unknown[]) => {
           log('info', `QQNT session init invoked for ${config.selfUin}`)
           const result = Reflect.apply(value, target, [config, ...args])
-          login.attachSession(facade)
+          login?.attachSession(facade)
           if (!attached) {
             attached = true
             try {
@@ -280,6 +281,34 @@ function wrapSession(
           const nativeService = Reflect.apply(value, target, []) as KernelRecentService | undefined
           if (!nativeService) return nativeService
           return recentServiceFacade = teeRecentService(nativeService)
+        }
+      }
+      if (property === 'getAVSDKService' && typeof value === 'function') {
+        return () => {
+          if (avsdkServiceFacade) return avsdkServiceFacade
+          const nativeService = Reflect.apply(value, target, []) as KernelAVSDKService | undefined
+          if (!nativeService) return nativeService
+          const listenerFacade = teeAVSDKService(nativeService)
+          return avsdkServiceFacade = new Proxy(listenerFacade, {
+            get(service, serviceProperty) {
+              const serviceValue = Reflect.get(service, serviceProperty, service)
+              if (serviceProperty === 'setActionFromAVSDK' && typeof serviceValue === 'function') {
+                return (...args: unknown[]) => {
+                  const result = Reflect.apply(serviceValue, service, args)
+                  const [action, bytes] = args
+                  if (typeof action === 'number' && bytes instanceof Uint8Array) {
+                    try {
+                      bridge.observeAVSDKAction(action, bytes)
+                    } catch {
+                      log('warn', 'avsdk-call projection outcome=failed source=action-intercept')
+                    }
+                  }
+                  return result
+                }
+              }
+              return serviceValue
+            },
+          })
         }
       }
       // Native methods reject a JS Proxy as their receiver. Always bind them

@@ -3,11 +3,18 @@ export class AsyncQueue<T> implements AsyncIterable<T> {
   private waiters: Array<(value: IteratorResult<T>) => void> = []
   private ended = false
 
-  push(value: T): void {
-    if (this.ended) return
+  constructor(private readonly dropIfFullAt?: number) {}
+
+  push(value: T, dropIfFull = false): boolean {
+    if (this.ended) return false
     const waiter = this.waiters.shift()
-    if (waiter) waiter({ value, done: false })
-    else this.values.push(value)
+    if (waiter) {
+      waiter({ value, done: false })
+      return true
+    }
+    if (dropIfFull && this.dropIfFullAt !== undefined && this.values.length >= this.dropIfFullAt) return false
+    this.values.push(value)
+    return true
   }
 
   close(): void {

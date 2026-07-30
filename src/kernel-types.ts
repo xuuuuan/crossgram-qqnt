@@ -616,6 +616,12 @@ export interface KernelRichMediaService {
   getRichMediaFileDir?(elementType: number, downType: number, isTemp: boolean): string
 }
 
+export interface KernelAVSDKService {
+  addKernelAVSDKListener(listener: unknown): string
+  removeKernelAVSDKListener(listenerId: string): void
+  setActionFromAVSDK(action: number, bytes: Uint8Array): unknown
+}
+
 export interface KernelSession {
   getMsgService(): KernelMsgService
   getRecentContactService(): KernelRecentService
@@ -623,6 +629,7 @@ export interface KernelSession {
   getProfileService?(): KernelProfileService
   getGroupService(): KernelGroupService
   getSearchService?(): KernelSearchService
+  getAVSDKService?(): KernelAVSDKService
   getRichMediaService(): KernelRichMediaService
   getSettingService?(): KernelSettingService
   getAvatarService?(): {
@@ -698,6 +705,7 @@ export interface KernelModule {
     create?(): KernelLoginService
   }
   NodeIKernelLoginListener?: new (handlers: KernelLoginListener) => KernelLoginListener
+  NodeIAVSDKListener?: new (handlers: Record<string, (...args: never[]) => unknown>) => unknown
 }
 
 export interface InitSessionConfig {
