@@ -1015,6 +1015,52 @@ describe('QQKernelBridge', () => {
     expect(f.msg.sendMsg).not.toHaveBeenCalled()
   })
 
+  it('resolves a stale group reply ID through the stable native sequence before sending', async () => {
+    const f = fixture()
+    const currentSource = {
+      ...f.message,
+      msgId: 'current-account-view-id',
+      msgSeq: '571',
+      chatType: 2,
+      peerUid: '1058754719',
+      peerUin: '1058754719',
+      senderUid: 'u_sender',
+      senderUin: '1715311957',
+      sendType: 2,
+    } satisfies MsgRecord
+    f.msg.getMsgsByMsgId.mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [] })
+    f.msg.getMsgsBySeqAndCount.mockResolvedValueOnce({
+      result: 0, errMsg: '', msgList: [currentSource],
+    })
+    f.msg.getMsgUniqueId.mockReturnValueOnce('0')
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    await bridge.resolveConversation(2, '1058754719')
+
+    await bridge.send({
+      conversationId: '1058754719',
+      replyToId: 'old-account-view-id',
+      replyToSequence: '571',
+      text: 'stable reply',
+    }, Readable.from([]))
+
+    expect(f.msg.getMsgsBySeqAndCount).toHaveBeenCalledWith(
+      expect.objectContaining({ chatType: 2, peerUid: '1058754719' }),
+      '571', 1, true, true,
+    )
+    expect(f.protocolSend).toHaveBeenCalledWith(
+      2, '1058754719', '1058754719', [
+        expect.objectContaining({
+          kind: 'reply',
+          reply: expect.objectContaining({
+            messageId: 'current-account-view-id', sequence: '571', clientSequence: '571',
+          }),
+        }),
+        { kind: 'text', text: 'stable reply' },
+      ], 'self',
+    )
+  })
+
   it('maps QQ animated system faces as stickers, opens their catalog asset, and round-trips metadata', async () => {
     const f = fixture()
     f.message.elements = [{
@@ -2960,6 +3006,7 @@ describe('QQBridgeServer', () => {
     })
     const bridge = new QQKernelBridge()
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const send = vi.spyOn(bridge, 'send')
     server = new QQBridgeServer(bridge, { port: 0 })
     await server.start()
     const { port } = server.address()
@@ -2993,12 +3040,16 @@ describe('QQBridgeServer', () => {
     }))
     const manifest = Buffer.from(JSON.stringify({
       conversationId: 'uid-1715311957', text: 'via HTTP',
+      replyToId: 'm1', replyToSequence: 'seq1',
     })).toString('base64url')
     const response = await fetch(`${base}/messages`, {
       method: 'POST', headers: { 'x-qqnt-manifest': manifest }, body: new Uint8Array(),
     })
     expect(response.status).toBe(200)
     expect(await response.json()).toMatchObject({ id: 'm1' })
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({
+      replyToId: 'm1', replyToSequence: 'seq1',
+    }), expect.anything())
     const read = await fetch(`${base}/messages/read`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ conversationId: 'uid-1715311957', messageId: 'm1' }),

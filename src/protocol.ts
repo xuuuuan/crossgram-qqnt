@@ -321,6 +321,8 @@ export interface SendManifest {
   text?: string
   textParts?: QQTextPart[]
   replyToId?: string
+  /** Stable QQ msgSeq used when replyToId came from another account view. */
+  replyToSequence?: string
   originRequestId?: string
   sticker?: QQStickerReference
   /** Length-prefixed chunks terminated by a zero-length frame for each media item. */

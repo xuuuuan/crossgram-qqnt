@@ -1243,7 +1243,11 @@ export class QQKernelBridge {
     const conversation = this.getConversation(manifest.conversationId)
     const peerUin = await this.requireProtocolPeerUin(conversation)
     const protocolParts: DirectMessagePart[] = []
-    if (manifest.replyToId) protocolParts.push(await this.directReplyPart(conversation, manifest.replyToId))
+    if (manifest.replyToId) {
+      protocolParts.push(await this.directReplyPart(
+        conversation, manifest.replyToId, manifest.replyToSequence,
+      ))
+    }
     if (manifest.textParts?.length) {
       for (const part of manifest.textParts) protocolParts.push(...directTextParts(part))
     } else if (manifest.text) protocolParts.push({ kind: 'text', text: manifest.text })
@@ -3524,19 +3528,35 @@ export class QQKernelBridge {
   private async directReplyPart(
     conversation: QQConversation,
     messageId: string,
+    sequenceHint?: string,
   ): Promise<DirectMessagePart> {
     let source: MsgRecord | undefined
+    const service = this.requireMsgService()
     try {
-      const result = await this.requireMsgService().getMsgsByMsgId(contact(conversation), [messageId])
+      const result = await service.getMsgsByMsgId(contact(conversation), [messageId])
       if (result.result === 0) source = result.msgList.find((record) => record.msgId === messageId)
     } catch (error) {
       log('warn', `QQ reply source lookup failed message=${messageId}`, error)
     }
+    if (!source && sequenceHint && service.getMsgsBySeqAndCount) {
+      try {
+        log('info', `native API start name=getMsgsBySeqAndCount(reply-send) conversation=${conversation.id} message=${messageId} sequence=${sequenceHint}`)
+        const result = await retryHistoryCall(() => service.getMsgsBySeqAndCount!(
+          contact(conversation), sequenceHint, 1, true, true,
+        ))
+        log('info', `native API complete name=getMsgsBySeqAndCount(reply-send) conversation=${conversation.id} message=${messageId} sequence=${sequenceHint} result=${result.result} err=${JSON.stringify(result.errMsg)} records=${result.msgList.length}`)
+        if (result.result === 0) {
+          source = result.msgList.find((record) => record.msgSeq === sequenceHint)
+        }
+      } catch (error) {
+        log('warn', `QQ reply source sequence lookup failed message=${messageId} sequence=${sequenceHint}`, error)
+      }
+    }
     const config = this.requireConfig()
     return { kind: 'reply', reply: {
-      messageId,
-      sequence: source?.msgSeq,
-      clientSequence: source?.msgSeq,
+      messageId: source?.msgId ?? messageId,
+      sequence: source?.msgSeq ?? sequenceHint,
+      clientSequence: source?.msgSeq ?? sequenceHint,
       senderUin: source?.senderUin,
       senderUid: source?.senderUid,
       receiverUid: source
