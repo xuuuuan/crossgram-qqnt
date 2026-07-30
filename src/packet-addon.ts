@@ -34,7 +34,7 @@ export interface NativeSysFace {
 
 export interface NativeSendBindingLocation {
   moduleBase: string
-  profile: string
+  locator: string
   timeDateStamp: number
   sizeOfImage: number
   anchorRva: number
@@ -47,22 +47,26 @@ export interface NativeSendBindingLocation {
 export interface PacketBindingProbe {
   moduleBase: string
   modulePath: string
-  profile: string
+  locator: string
   buildId: string
   sha256: string
-  nameSlotRva: string
-  bindingNameRva: string
-  bindingName: string
-  napiCallbackSlotRva: string
+  anchorRva: string
+  anchorXrefRva: string
   napiCallbackRva: string
-  napiCallbackFingerprint: string
+  converterRva: string
+  resultAnchorRva: string
+  resultXrefRva: string
+  errMsgAnchorRva: string
+  errMsgXrefRva: string
+  rspAnchorRva: string
+  rspXrefRva: string
+  responseTableXrefRva: string
+  responseTableRva: string
   responseActionSlotRva: string
   responseActionRva: string
-  responseActionFingerprint: string
-  converterRva: string
-  converterFingerprint: string
+  dispatchHelperRva: string
+  resolverThunkRva: string
   resolveActionRva: string
-  resolveActionFingerprint: string
 }
 
 export interface PacketAddon {

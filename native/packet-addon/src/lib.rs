@@ -44,7 +44,7 @@ pub struct SysFace {
 #[napi(object)]
 pub struct SendBindingLocation {
     pub module_base: String,
-    pub profile: String,
+    pub locator: String,
     pub time_date_stamp: u32,
     pub size_of_image: u32,
     pub anchor_rva: u32,
@@ -58,22 +58,26 @@ pub struct SendBindingLocation {
 pub struct PacketBindingProbe {
     pub module_base: String,
     pub module_path: String,
-    pub profile: String,
+    pub locator: String,
     pub build_id: String,
     pub sha256: String,
-    pub name_slot_rva: String,
-    pub binding_name_rva: String,
-    pub binding_name: String,
-    pub napi_callback_slot_rva: String,
+    pub anchor_rva: String,
+    pub anchor_xref_rva: String,
     pub napi_callback_rva: String,
-    pub napi_callback_fingerprint: String,
+    pub converter_rva: String,
+    pub result_anchor_rva: String,
+    pub result_xref_rva: String,
+    pub err_msg_anchor_rva: String,
+    pub err_msg_xref_rva: String,
+    pub rsp_anchor_rva: String,
+    pub rsp_xref_rva: String,
+    pub response_table_xref_rva: String,
+    pub response_table_rva: String,
     pub response_action_slot_rva: String,
     pub response_action_rva: String,
-    pub response_action_fingerprint: String,
-    pub converter_rva: String,
-    pub converter_fingerprint: String,
+    pub dispatch_helper_rva: String,
+    pub resolver_thunk_rva: String,
     pub resolve_action_rva: String,
-    pub resolve_action_fingerprint: String,
 }
 
 /// Calls QQNT's bound sendSsoCmdReqByContend function from the addon so the
@@ -242,25 +246,26 @@ pub fn probe_packet_binding() -> Result<PacketBindingProbe> {
     Ok(PacketBindingProbe {
         module_base: format!("0x{:x}", probe.module_base),
         module_path: probe.module_path,
-        profile: probe.profile.into(),
+        locator: probe.locator.into(),
         build_id: elf::hex(&probe.build_id),
         sha256: elf::hex(&probe.sha256),
-        name_slot_rva: format!("0x{:x}", probe.name_slot_rva),
-        binding_name_rva: format!("0x{:x}", probe.binding_name_rva),
-        binding_name: String::from_utf8(probe.binding_name)
-            .map_err(|_| Error::from_reason("packet binding name is not valid UTF-8"))?
-            .trim_end_matches('\0')
-            .into(),
-        napi_callback_slot_rva: format!("0x{:x}", probe.napi_callback_slot_rva),
+        anchor_rva: format!("0x{:x}", probe.anchor_rva),
+        anchor_xref_rva: format!("0x{:x}", probe.anchor_xref_rva),
         napi_callback_rva: format!("0x{:x}", probe.napi_callback_rva),
-        napi_callback_fingerprint: elf::hex(&probe.napi_callback_fingerprint),
+        converter_rva: format!("0x{:x}", probe.converter_rva),
+        result_anchor_rva: format!("0x{:x}", probe.result_anchor_rva),
+        result_xref_rva: format!("0x{:x}", probe.result_xref_rva),
+        err_msg_anchor_rva: format!("0x{:x}", probe.err_msg_anchor_rva),
+        err_msg_xref_rva: format!("0x{:x}", probe.err_msg_xref_rva),
+        rsp_anchor_rva: format!("0x{:x}", probe.rsp_anchor_rva),
+        rsp_xref_rva: format!("0x{:x}", probe.rsp_xref_rva),
+        response_table_xref_rva: format!("0x{:x}", probe.response_table_xref_rva),
+        response_table_rva: format!("0x{:x}", probe.response_table_rva),
         response_action_slot_rva: format!("0x{:x}", probe.response_action_slot_rva),
         response_action_rva: format!("0x{:x}", probe.response_action_rva),
-        response_action_fingerprint: elf::hex(&probe.response_action_fingerprint),
-        converter_rva: format!("0x{:x}", probe.converter_rva),
-        converter_fingerprint: elf::hex(&probe.converter_fingerprint),
+        dispatch_helper_rva: format!("0x{:x}", probe.dispatch_helper_rva),
+        resolver_thunk_rva: format!("0x{:x}", probe.resolver_thunk_rva),
         resolve_action_rva: format!("0x{:x}", probe.resolve_action_rva),
-        resolve_action_fingerprint: elf::hex(&probe.resolve_action_fingerprint),
     })
 }
 
@@ -299,9 +304,8 @@ static CACHED_PROBE: std::sync::Mutex<Option<elf::PacketBindingProbe>> =
 
 #[cfg(target_os = "linux")]
 fn install_send_hook_impl() -> Result<SendBindingLocation> {
-    // Cache the probe: once the converter is patched its prologue no longer
-    // matches the profile fingerprint, so a re-probe on the idempotent install
-    // path would fail. The first call reads the original bytes.
+    // Cache the probe because installation patches the converter and resolver
+    // bytes that the locator compares with the on-disk wrapper.
     let mut cache = CACHED_PROBE
         .lock()
         .map_err(|_| Error::from_reason("QQNT packet probe cache poisoned"))?;
@@ -317,7 +321,7 @@ fn install_send_hook_impl() -> Result<SendBindingLocation> {
     })?;
     Ok(SendBindingLocation {
         module_base: format!("0x{:x}", probe.module_base),
-        profile: probe.profile.into(),
+        locator: probe.locator.into(),
         time_date_stamp: 0,
         size_of_image: 0,
         anchor_rva: 0,
@@ -338,7 +342,7 @@ fn install_send_hook_impl() -> Result<SendBindingLocation> {
 fn binding_location(location: locator::LocatedBinding) -> SendBindingLocation {
     SendBindingLocation {
         module_base: format!("0x{:x}", location.module_base),
-        profile: location.profile.name().into(),
+        locator: location.locator.name().into(),
         time_date_stamp: location.identity.time_date_stamp,
         size_of_image: location.identity.size_of_image,
         anchor_rva: location.anchor_rva,

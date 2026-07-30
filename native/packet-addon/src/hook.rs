@@ -348,9 +348,10 @@ mod windows {
 //    as a binary `rspbuffer` Buffer instead of a lossy UTF-8 string. The
 //    original is not called back; the deferred is nulled after resolve.
 //
-// The profile fingerprint guarantees both targets begin with the 5-byte
-// prologue `push r15; push r14; push rbx` (41 57 41 56 53), which contains no
-// RIP-relative addressing and therefore relocates verbatim into a trampoline.
+// The XRef locator verifies both targets against the on-disk image before the
+// hook is installed. Both targets begin with `push r15; push r14; push rbx`
+// (41 57 41 56 53), which contains no RIP-relative addressing and therefore
+// relocates verbatim into a trampoline.
 #[cfg(target_os = "linux")]
 mod linux {
     use super::HookError;

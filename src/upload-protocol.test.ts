@@ -268,7 +268,7 @@ describe('direct QQ upload protocol', () => {
     const addon = {
       sendPacket: vi.fn((send, command, payload) => send(command, payload)),
       installSendHook: vi.fn(() => ({
-        moduleBase: '0x1', profile: 'test', timeDateStamp: 0, sizeOfImage: 0,
+        moduleBase: '0x1', locator: 'test', timeDateStamp: 0, sizeOfImage: 0,
         anchorRva: 0, xrefRva: 0, functionRva: 0, converterRva: 0, responseRva: 0,
       })),
     } as unknown as PacketAddon
@@ -312,7 +312,7 @@ describe('direct QQ upload protocol', () => {
     const addon = {
       sendPacket: vi.fn((sender, command, payload) => sender(command, payload)),
       installSendHook: vi.fn(() => ({
-        moduleBase: '0x1', profile: 'test', timeDateStamp: 0, sizeOfImage: 0,
+        moduleBase: '0x1', locator: 'test', timeDateStamp: 0, sizeOfImage: 0,
         anchorRva: 0, xrefRva: 0, functionRva: 0, converterRva: 0, responseRva: 0,
       })),
     } as unknown as PacketAddon
