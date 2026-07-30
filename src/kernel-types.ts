@@ -504,6 +504,12 @@ export interface KernelMsgService {
     height: number
     jobType: number
   }): Promise<{ result: number, errMsg: string }>
+  fetchMarketEmoticonAuthDetail?(request: {
+    epId: number
+    eId: string
+    /** 0 = add to favorites, 1 = single-forward authorization. */
+    scene: number
+  }): Promise<{ result: number, errMsg: string }>
   getMarketEmoticonPath?(
     epId: number, eIds: string[], serviceType: number,
   ): Map<string, { isExist: boolean, path: string }> | Promise<{

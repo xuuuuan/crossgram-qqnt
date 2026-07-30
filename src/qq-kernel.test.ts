@@ -177,6 +177,7 @@ function fixture() {
     fetchMarketEmoticonShowImage: vi.fn(async () => ({ result: 0, errMsg: '' })),
     fetchMarketEmotionJsonFile: undefined,
     fetchMarketEmoticonAioImage: vi.fn(async () => ({ result: 0, errMsg: '' })),
+    fetchMarketEmoticonAuthDetail: vi.fn(async () => ({ result: 0, errMsg: '' })),
     getMarketEmoticonPath: vi.fn(() => new Map()),
     getMarketEmoticonEncryptKeys: vi.fn(async () => ({ result: 0, errMsg: '', encryptKeyMap: new Map() })),
     getFavMarketEmoticonInfo: vi.fn(async () => ({
@@ -2333,8 +2334,15 @@ describe('QQKernelBridge', () => {
 
     const page = await bridge.getSavedStickers()
     expect(page.stickers).toMatchObject([{
-      stickerId: 'favorite:fav-res', format: 'static', width: 1, height: 1,
+      stickerId: 'favorite:fav-res', packId: 'qq-favorites', format: 'static', width: 1, height: 1,
     }])
+    await expect(bridge.getStickerPacks()).resolves.toMatchObject({
+      packs: [{ packId: 'qq-favorites', title: 'QQ 收藏表情', count: 1 }],
+    })
+    await expect(bridge.getStickerPack('qq-favorites')).resolves.toMatchObject({
+      packId: 'qq-favorites', title: 'QQ 收藏表情', count: 1,
+      stickers: [{ stickerId: 'favorite:fav-res', packId: 'qq-favorites' }],
+    })
     const reference = page.stickers[0].reference
     await bridge.setSavedSticker(reference, true)
     expect(f.msg.addFavEmoji).toHaveBeenCalledWith(expect.objectContaining({
@@ -2342,6 +2350,33 @@ describe('QQKernelBridge', () => {
     }))
     await bridge.setSavedSticker(reference, false)
     expect(f.msg.deleteFavEmoji).toHaveBeenCalledWith(['fav-res'])
+  })
+
+  it('authorizes market stickers before adding them to QQ favorites', async () => {
+    const f = fixture()
+    const directory = await mkdtemp(join(tmpdir(), 'qqnt-market-favorite-'))
+    tempPaths.push(directory)
+    const path = join(directory, 'market.png')
+    await writeFile(path, Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+      'base64',
+    ))
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: directory })
+
+    await bridge.setSavedSticker({
+      kind: 'market', packageId: '42', stickerId: 'wave', name: 'Wave', key: 'secret',
+      width: 1, height: 1, animated: false, staticPath: path,
+    }, true)
+
+    expect(f.msg.fetchMarketEmoticonAuthDetail).toHaveBeenCalledWith({
+      epId: 42, eId: 'wave', scene: 0,
+    })
+    expect(f.msg.addFavEmoji).toHaveBeenCalledWith(expect.objectContaining({
+      emojiId: 'wave', packageId: 42, emojiPath: path, isMarkFace: true,
+    }))
+    expect(vi.mocked(f.msg.fetchMarketEmoticonAuthDetail).mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(f.msg.addFavEmoji).mock.invocationCallOrder[0]!)
   })
 
   it('stages favorite stickers with their final subtype and preserves the collection file', async () => {

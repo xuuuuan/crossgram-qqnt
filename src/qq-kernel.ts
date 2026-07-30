@@ -29,6 +29,8 @@ const ELEMENT_FACE = 6
 const ELEMENT_REPLY = 7
 const ELEMENT_MARKET_FACE = 11
 const ELEMENT_MULTI_FORWARD = 16
+const FAVORITE_STICKER_PACK_ID = 'qq-favorites'
+const FAVORITE_STICKER_PACK_TITLE = 'QQ 收藏表情'
 const SEND_FROM_SELF = new Set([1, 2])
 const MEMBER_ADMIN = 3
 const MEMBER_OWNER = 4
@@ -132,6 +134,7 @@ export class QQKernelBridge {
   private readonly stickerPacks = new Map<string, QQStickerPack>()
   private readonly stickerPackInfo = new Map<string, MarketStickerPackInfo>()
   private readonly stickers = new Map<string, QQSticker>()
+  private favoriteStickerPackPromise?: Promise<QQStickerPack>
   private readonly pendingMessages = new Map<string, ReturnType<typeof deferred<MsgRecord>>>()
   private readonly pendingAcceptances = new Map<string, ReturnType<typeof deferred<void>>>()
   private readonly pendingMinimumStatuses = new Map<string, number>()
@@ -228,6 +231,7 @@ export class QQKernelBridge {
     this.stickerPacks.clear()
     this.stickerPackInfo.clear()
     this.stickers.clear()
+    this.favoriteStickerPackPromise = undefined
     this.buddySnapshotLoaded = false
     this.kernel = kernel
     this.session = session
@@ -962,12 +966,21 @@ export class QQKernelBridge {
     packs: QQStickerPackSummary[]
     nextCursor?: string
   }> {
-    await this.loadStickerPackCatalog()
+    const [favoritePack] = await Promise.all([
+      this.loadFavoriteStickerPack(),
+      this.loadStickerPackCatalog(),
+    ])
     const offset = parseCursor(cursor)
-    const packs = [...this.stickerPackInfo.values()].map((item) => ({
+    const packs: QQStickerPackSummary[] = [...this.stickerPackInfo.values()].map((item) => ({
       packId: String(item.epId), title: item.tabName || String(item.epId), version: 1,
       count: this.stickerPacks.get(String(item.epId))?.stickers.length,
     }))
+    if (favoritePack.stickers.length) packs.unshift({
+      packId: favoritePack.packId,
+      title: favoritePack.title,
+      count: favoritePack.count,
+      version: favoritePack.version,
+    })
     const selected = packs.slice(offset, offset + clamp(limit, 1, 200))
     return {
       packs: selected,
@@ -976,6 +989,7 @@ export class QQKernelBridge {
   }
 
   async getStickerPack(packId: string): Promise<QQStickerPack | null> {
+    if (packId === FAVORITE_STICKER_PACK_ID) return this.loadFavoriteStickerPack()
     const cached = this.stickerPacks.get(packId)
     if (cached) return cached
     await this.loadStickerPackCatalog()
@@ -1040,7 +1054,7 @@ export class QQKernelBridge {
         dynamicPath,
       }
       const sticker: QQSticker = {
-        stickerId: marketStickerId(packId, item.id), packId, title: item.name || info.tabName,
+        stickerId: marketStickerId(packId, item.id), packId, title: item.name || info?.tabName,
         format: animated ? 'animated' : 'static',
         mimeType: animated ? 'image/gif' : 'image/png',
         width: reference.width, height: reference.height, version: 1, reference,
@@ -1083,7 +1097,10 @@ export class QQKernelBridge {
     if (!service.fetchFavEmojiList) return { stickers: [] }
     const result = await service.fetchFavEmojiList(cursor ?? '', clamp(limit, 1, 200), true, false)
     if (result.result !== 0) throw new Error(`fetchFavEmojiList: ${result.errMsg} (${result.result})`)
-    const stickers = await mapConcurrent(result.emojiInfoList, 8, (item) => this.mapFavoriteSticker(item))
+    const stickers = await mapConcurrent(result.emojiInfoList, 8, async (item) => ({
+      ...await this.mapFavoriteSticker(item),
+      packId: FAVORITE_STICKER_PACK_ID,
+    }))
     for (const sticker of stickers) this.stickers.set(sticker.stickerId, sticker)
     return {
       stickers,
@@ -1179,9 +1196,19 @@ export class QQKernelBridge {
       if (!resId) return
       const result = await service.deleteFavEmoji([resId])
       if (result.result !== 0) throw new Error(`deleteFavEmoji: ${result.errMsg} (${result.result})`)
+      this.stickers.delete(favoriteStickerId(resId))
+      this.invalidateFavoriteStickerPack()
       return
     }
     if (!service.addFavEmoji) throw new Error('QQ favorite creation is unavailable')
+    if (reference.kind === 'market' && service.fetchMarketEmoticonAuthDetail) {
+      const authorization = await service.fetchMarketEmoticonAuthDetail({
+        epId: Number(reference.packageId), eId: reference.stickerId, scene: 0,
+      })
+      if (authorization.result !== 0) {
+        throw new Error(`fetchMarketEmoticonAuthDetail: ${authorization.errMsg} (${authorization.result})`)
+      }
+    }
     const path = reference.kind === 'favorite'
       ? reference.path
       : (await this.resolveMarketStickerPath(reference)).path
@@ -1195,6 +1222,7 @@ export class QQKernelBridge {
       fileName: reference.name, md5: reference.md5 ?? '', isMarkFace: false, isOrigin: true,
     })
     if (result.result !== 0) throw new Error(`addFavEmoji: ${result.errMsg} (${result.result})`)
+    this.invalidateFavoriteStickerPack()
   }
 
   async prepareMediaUpload(conversationId: string, spec: QQSendMediaSpec): Promise<QQMediaUploadPlan> {
@@ -3701,6 +3729,45 @@ export class QQKernelBridge {
     throw new Error('QQ sticker pack pagination exceeded 100 pages')
   }
 
+  private loadFavoriteStickerPack(): Promise<QQStickerPack> {
+    if (this.favoriteStickerPackPromise) return this.favoriteStickerPackPromise
+    const loading = this.fetchFavoriteStickerPack()
+    this.favoriteStickerPackPromise = loading
+    void loading.finally(() => {
+      if (this.favoriteStickerPackPromise === loading) this.favoriteStickerPackPromise = undefined
+    }).catch(() => {})
+    return loading
+  }
+
+  private async fetchFavoriteStickerPack(): Promise<QQStickerPack> {
+    const stickers: QQSticker[] = []
+    let cursor: string | undefined
+    const seenCursors = new Set<string>()
+    for (let pageIndex = 0; pageIndex < 100; pageIndex++) {
+      const page = await this.getSavedStickers(cursor, 200)
+      stickers.push(...page.stickers)
+      if (!page.nextCursor) break
+      if (seenCursors.has(page.nextCursor)) {
+        throw new Error(`QQ favorite sticker pagination repeated cursor: ${page.nextCursor}`)
+      }
+      seenCursors.add(page.nextCursor)
+      cursor = page.nextCursor
+      if (pageIndex === 99) throw new Error('QQ favorite sticker pagination exceeded 100 pages')
+    }
+    return {
+      packId: FAVORITE_STICKER_PACK_ID,
+      title: FAVORITE_STICKER_PACK_TITLE,
+      count: stickers.length,
+      version: favoritePackVersion(stickers),
+      stickers,
+    }
+  }
+
+  private invalidateFavoriteStickerPack(): void {
+    this.stickerPacks.delete(FAVORITE_STICKER_PACK_ID)
+    this.favoriteStickerPackPromise = undefined
+  }
+
   private async mapFavoriteSticker(item: CustomEmotionData): Promise<QQSticker> {
     const service = this.requireMsgService()
     if (item.isMarkFace && item.epId && item.eId) {
@@ -3755,6 +3822,9 @@ export class QQKernelBridge {
   }> {
     if (reference.animated && reference.dynamicPath && existsSync(reference.dynamicPath)) {
       return { path: reference.dynamicPath, encrypted: true, animated: true }
+    }
+    if (!reference.animated && reference.staticPath && existsSync(reference.staticPath)) {
+      return { path: reference.staticPath, encrypted: false, animated: false }
     }
     const service = this.requireMsgService()
     const epId = Number(reference.packageId)
@@ -4344,6 +4414,18 @@ function parseMarketStickerId(value: string): { packageId: string, stickerId: st
 
 function favoriteStickerId(resId: string): string {
   return `favorite:${resId}`
+}
+
+function favoritePackVersion(stickers: QQSticker[]): number {
+  let hash = 0x811c9dc5
+  for (const sticker of stickers) {
+    const value = `${sticker.stickerId}:${sticker.version ?? 0}\u0000`
+    for (let index = 0; index < value.length; index++) {
+      hash ^= value.charCodeAt(index)
+      hash = Math.imul(hash, 0x01000193)
+    }
+  }
+  return hash >>> 0
 }
 
 function matchesElementKind(element: MsgElement, kind: 'image' | 'file' | 'sticker'): boolean {
