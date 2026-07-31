@@ -2075,7 +2075,7 @@ describe('QQKernelBridge', () => {
     await writeFile(detailPath, JSON.stringify({
       name: 'Downloaded QQ Waves',
       isApng: 0,
-      imgs: [{ id: 'emoji-a', name: 'Wave', wWidthInPhone: 320, wHeightInPhone: 180, isApng: 1 }],
+      imgs: [{ id: 'emoji-a', wWidthInPhone: 320, wHeightInPhone: 180, isApng: 1 }],
     }))
     await writeFile(staticPath, Buffer.from('static'))
     const gif = Buffer.from('GIF89a-decrypted-sticker')
@@ -2156,7 +2156,7 @@ describe('QQKernelBridge', () => {
     f.msg.fetchMarketEmotionJsonFile = vi.fn(async () => ({ result: 0, errMsg: '' }))
     await expect(bridge.getStickerPack('43')).resolves.toMatchObject({
       packId: '43', title: 'Downloaded QQ Waves',
-      stickers: [{ packId: '43', stickerId: 'market:43:emoji-a' }],
+      stickers: [{ packId: '43', stickerId: 'market:43:emoji-a', title: 'Downloaded QQ Waves' }],
     })
     expect(f.msg.fetchMarketEmotionJsonFile).toHaveBeenCalledWith(43)
   })

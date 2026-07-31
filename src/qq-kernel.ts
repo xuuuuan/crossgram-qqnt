@@ -1175,10 +1175,15 @@ export class QQKernelBridge {
         dynamicPath,
       }
       const sticker: QQSticker = {
-        stickerId: marketStickerId(packId, item.id), packId, title: item.name || info.tabName,
+        stickerId: marketStickerId(packId, item.id),
+        packId,
+        title: item.name || info?.tabName || detail.name || packId,
         format: animated ? 'animated' : 'static',
         mimeType: animated ? 'image/gif' : 'image/png',
-        width: reference.width, height: reference.height, version: 1, reference,
+        width: reference.width,
+        height: reference.height,
+        version: 1,
+        reference,
       }
       this.stickers.set(sticker.stickerId, sticker)
       return sticker
