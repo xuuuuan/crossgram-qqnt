@@ -8,7 +8,9 @@ license = "MIT"
 crate-type = ["cdylib"]
 
 [dependencies]
+getrandom = "0.3.4"
 napi = { version = "3.6.0", default-features = false, features = ["napi8"] }
+subtle = "2.6.1"
 napi-derive = "3.3.0"
 prost = "0.14.1"
 sha2 = "0.10.9"

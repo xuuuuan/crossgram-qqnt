@@ -1,6 +1,26 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { dirname, join } from 'node:path'
-import { createPacketBindingProber, createPacketHookInstaller, loadPacketAddon, packetAddonCandidates, type NativeSendBindingLocation, type PacketBindingProbe } from './packet-addon.js'
+import { createPacketBindingProber, createPacketHookInstaller, loadPacketAddon, loadQrtcMetadataAddon, packetAddonCandidates, type NativeSendBindingLocation, type PacketBindingProbe, type QrtcMetadataAddon, type QrtcMetadataSnapshot } from './packet-addon.js'
+
+class FakeQrtcMetadataAddon implements QrtcMetadataAddon {
+  private lifecycle: QrtcMetadataSnapshot['lifecycle'] = 'active'
+  private inFlight = 0
+  private shutdownWasIdle = false
+
+  qrtcMetadataStatus(): QrtcMetadataSnapshot {
+    return {
+      lifecycle: this.lifecycle,
+      sameThread: true,
+      inFlight: this.inFlight,
+      shutdownWasIdle: this.shutdownWasIdle,
+    }
+  }
+
+  shutdown(): void {
+    this.shutdownWasIdle = this.inFlight === 0
+    this.lifecycle = 'destroyed'
+  }
+}
 
 describe('native packet addon', () => {
   afterEach(() => {
@@ -121,4 +141,33 @@ describe('native packet addon', () => {
       expect(() => addon.installSendHook()).toThrow(/only supported on Windows and Linux/)
     }
   })
+
+  it('exports only the metadata-only QRTC surface with no live profile', () => {
+    const addon = loadPacketAddon() as unknown as Record<string, unknown>
+    expect(Object.keys(addon).filter((key) => key.toLowerCase().includes('qrtc')).sort()).toEqual([
+      'qrtcMetadataStatus',
+    ])
+    expect(loadQrtcMetadataAddon().qrtcMetadataStatus()).toEqual({
+      lifecycle: 'destroyed', sameThread: false, inFlight: 0, shutdownWasIdle: false,
+    })
+  })
+
+  it('serializes only the fixed safe QRTC metadata snapshot', () => {
+    const fake = new FakeQrtcMetadataAddon()
+    const addon = loadQrtcMetadataAddon(() => fake)
+    expect(addon.qrtcMetadataStatus()).toEqual({
+      lifecycle: 'active', sameThread: true, inFlight: 0, shutdownWasIdle: false,
+    })
+
+    fake.shutdown()
+    const snapshot = addon.qrtcMetadataStatus()
+    expect(Object.keys(snapshot).sort()).toEqual([
+      'inFlight', 'lifecycle', 'sameThread', 'shutdownWasIdle',
+    ])
+    expect(JSON.stringify(snapshot)).not.toMatch(/address|call|contact|digest|identity|module|path|payload|pointer|token/i)
+    expect(snapshot).toEqual({
+      lifecycle: 'destroyed', sameThread: true, inFlight: 0, shutdownWasIdle: true,
+    })
+  })
+
 })

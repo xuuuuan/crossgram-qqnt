@@ -65,6 +65,21 @@ export interface PacketBindingProbe {
   resolveActionFingerprint: string
 }
 
+export type QrtcLifecycle = 'active' | 'closing' | 'destroyed'
+
+/** Fixed, identifier-free QRTC lifecycle metadata for one authorized future observation. */
+export interface QrtcMetadataSnapshot {
+  lifecycle: QrtcLifecycle
+  sameThread: boolean
+  inFlight: number
+  shutdownWasIdle: boolean
+}
+
+/** Deliberately a fixed snapshot surface, not an invocation or hook API. */
+export interface QrtcMetadataAddon {
+  qrtcMetadataStatus(): QrtcMetadataSnapshot
+}
+
 export interface PacketAddon {
   sendPacket(
     send: (command: string, payload: Buffer) => unknown,
@@ -112,6 +127,16 @@ export function loadPacketAddon(): PacketAddon {
     if (typeof required[name] !== 'function') throw new Error(`QQNT packet addon is missing ${name}`)
   }
   return loadedAddon = required as PacketAddon
+}
+
+export function loadQrtcMetadataAddon(
+  loadAddon: () => Partial<QrtcMetadataAddon> = () => loadPacketAddon() as PacketAddon & Partial<QrtcMetadataAddon>,
+): QrtcMetadataAddon {
+  const addon = loadAddon()
+  if (typeof addon.qrtcMetadataStatus !== 'function') {
+    throw new Error('QQNT packet addon is missing qrtcMetadataStatus')
+  }
+  return addon as QrtcMetadataAddon
 }
 
 export function packetAddonCandidates(

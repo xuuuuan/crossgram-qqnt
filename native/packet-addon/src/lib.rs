@@ -3,6 +3,7 @@ mod hook;
 mod locator;
 mod pe;
 mod proto;
+mod qrtc;
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -74,6 +75,16 @@ pub struct PacketBindingProbe {
     pub converter_fingerprint: String,
     pub resolve_action_rva: String,
     pub resolve_action_fingerprint: String,
+}
+
+/// Fixed, identifier-free QRTC lifecycle metadata for one authorized future
+/// observation. No native object, call, module, payload, or token is exposed.
+#[napi(object)]
+pub struct QrtcMetadataSnapshot {
+    pub lifecycle: String,
+    pub same_thread: bool,
+    pub in_flight: u32,
+    pub shutdown_was_idle: bool,
 }
 
 /// Calls QQNT's bound sendSsoCmdReqByContend function from the addon so the
@@ -206,6 +217,17 @@ pub fn decode_private_file_download_response(payload: Buffer) -> Result<DirectUr
         proto::decode_private_file_download(payload.as_ref()),
         "private file download",
     )
+}
+
+#[napi]
+pub fn qrtc_metadata_status() -> QrtcMetadataSnapshot {
+    let snapshot = qrtc::addon_metadata_snapshot();
+    QrtcMetadataSnapshot {
+        lifecycle: snapshot.lifecycle.as_str().into(),
+        same_thread: snapshot.same_thread,
+        in_flight: snapshot.in_flight,
+        shutdown_was_idle: snapshot.shutdown_was_idle,
+    }
 }
 
 #[napi]
