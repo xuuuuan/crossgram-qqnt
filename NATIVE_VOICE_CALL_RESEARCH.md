@@ -33,8 +33,8 @@
 - `wrapSession()` 缓存 AVSDK facade；监听器通过 `teeAVSDKService()` 复用既有 listener tee。
 - bridge 不拦截、不观察或序列化 `setActionFromAVSDK` 的参数、返回值或异常；该原生方法保持原样调用。
 - listener tee 保持 QQ 自身 listener 为唯一 native 注册，并在 JavaScript 层向 bridge tap 扇出受限的来电状态投影。
-- 在本 Linux 样本的 wrapper 路径中，候选 QRTC service 从 wrapper receiver 的 `+0x260` 存储位置取得；该偏移只适用于本节列出的 Build ID。
-- 该 service 的取得路径包含 singleton/getter、wrapper 持有的 storage 与 destructor 证据；这些证据只证明对象取得和清理路径，不能证明任一控制方法可安全调用。
+- 在固定 Build `d6159b6701b46683` 的正常 wrapper 链中，wrapper receiver 的 `+0x260` 存储位置唯一指向 `qav::service_interface::QRTCService`；该偏移及映射只适用于本节列出的 Build ID。
+- 该 service 的取得路径包含 singleton/getter、wrapper 持有的 storage 与 destructor 证据；其精确静态映射见“固定 Build 静态映射”。这些证据只证明对象取得和清理路径，不能证明任一控制方法可安全调用。
 - wrapper 与原生控制层之间存在 selector 驱动的 `CallCpp` 调度边界；已核对该边界的调用 ABI。selector 和 ABI 仅可用于在同一固定样本中辨认既有调用路径，不能作为新控制调用的参数契约。selector/signature 观察不证明 `0x4e26→5/9/10` 的业务策略，也不授权构造任何新调用。
 - Task #70 已确认 `StartCall` JSON 的**有界核心字段类别/默认值**和 **parse→Request 路由**。完整 schema、枚举域、嵌套分支、所有权、语义范围及安全调用仍属未知；这些已确认事实不授权构造或执行调用。
 - Task #84 已确认 registration 保存 raw callback、`CallCpp` 直接解析 raw singleton、PPP shutdown 仅做 key cleanup，且 service destruction 是独立路径。未建立 queue-post、owner-thread、in-flight admission、cancel 或 drain barrier；该结论不证明安全调用，live control 保持禁用。
@@ -92,6 +92,22 @@
 | `OnChatClosed` | `0x533ac0` | — | Confirmed |
 
 此表仅记录 Task #66 已确认的符号定位。除本节为复现所必需的 Linux VA 外，不记录任何运行时内存位置。方法名称和槽位不能单独证明参数语义、成功条件或资源所有权。
+
+## 固定 Build 静态映射
+
+以下结论只适用于 AVSDK plugin Build `d6159b6701b46683`，且来自独立静态交叉确认；它们不构成运行时调用契约。
+
+| 项目 | 静态定位 | Confirmed 结论 |
+| --- | --- | --- |
+| wrapper singleton storage | global `0x1413a18` | `QRTCServiceInterfaceWrapper::GetInstance()` 的 `instance`，即 wrapper singleton storage。 |
+| QRTC service singleton pointer | global `0x1416438` | `qav::service_interface::g_QRTCService`，即 `QRTCService` singleton pointer。 |
+| wrapper → service | wrapper receiver `+0x260` | 正常 wrapper 链唯一指向 `qav::service_interface::QRTCService`。 |
+| service factory、构造与 vtable | `0x782830`、`0x7828b0`、`0x13ca440` / address point `0x13ca450` | 分别为 `QRTCServiceInterface::GetQRTCInstance()` factory、`QRTCService` constructor 与 `QRTCService` vtable。 |
+| service destructors | `0x7835c0`、`0x783a10` | 分别为 `QRTCService` complete/base destructor 与 deleting destructor。 |
+| destroy 路径 | callsite `0x53f8f8`；boundary `0x782880` | `0x53f8f8` 只是在 wrapper destructor 中调用 `DestroyQRTCInstance()` 的 callsite；`DestroyQRTCInstance()` 的实际边界是 `0x782880`。 |
+| main-thread helpers | `PostToMainThread` `0x559d40`；`StaticMainThreadCallBack` `0x55afe0` | 仅为线程/调度调查线索，不证明 owner thread、queue-post、准入、cancel 或 drain barrier。 |
+
+这些静态映射不补足控制方法参数、线程归属、对象所有权或生命周期屏障；live control 保持禁用。
 
 ## 当前参数语义
 
