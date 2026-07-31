@@ -67,6 +67,18 @@ export interface PacketBindingProbe {
 
 export type QrtcLifecycle = 'active' | 'closing' | 'destroyed'
 
+/** Fixed, identifier-free status for the compile-time AVSDK loader identity probe. */
+export interface AvsdkLoaderProbeStatus {
+  prepared: boolean
+  observed: boolean
+  unique: boolean
+  sameObject: boolean
+  sameNamespace: boolean
+  buildMatch: boolean
+  flagsCompatible: boolean
+  observationCount: number
+}
+
 /** Fixed, identifier-free QRTC lifecycle metadata for one authorized future observation. */
 export interface QrtcMetadataSnapshot {
   lifecycle: QrtcLifecycle
@@ -100,6 +112,7 @@ export interface PacketAddon {
   probePacketBinding(): PacketBindingProbe
   locateSendBinding(): NativeSendBindingLocation
   installSendHook(): NativeSendBindingLocation
+  avsdkLoaderProbeStatus?(): AvsdkLoaderProbeStatus
 }
 
 let loadedAddon: PacketAddon | undefined
@@ -123,6 +136,7 @@ export function loadPacketAddon(): PacketAddon {
     'encodeGroupFileDownloadRequest', 'decodeGroupFileDownloadResponse',
     'encodePrivateFileDownloadRequest', 'decodePrivateFileDownloadResponse',
     'refreshImageUrl', 'probePacketBinding', 'locateSendBinding', 'installSendHook',
+    'avsdkLoaderProbeStatus',
   ] satisfies Array<keyof PacketAddon>) {
     if (typeof required[name] !== 'function') throw new Error(`QQNT packet addon is missing ${name}`)
   }

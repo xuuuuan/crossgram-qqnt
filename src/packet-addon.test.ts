@@ -152,6 +152,21 @@ describe('native packet addon', () => {
     })
   })
 
+  it('serializes only the fixed AVSDK loader probe status keys', () => {
+    const status = loadPacketAddon().avsdkLoaderProbeStatus
+    expect(status).toBeTypeOf('function')
+    const snapshot = status!()
+    expect(Object.keys(snapshot).sort()).toEqual([
+      'buildMatch', 'flagsCompatible', 'observationCount', 'observed', 'prepared',
+      'sameNamespace', 'sameObject', 'unique',
+    ])
+    expect(JSON.stringify(snapshot)).not.toMatch(/address|handle|hash|identity|inode|lmid|module|path|pointer|profile|payload/i)
+    expect(snapshot).toEqual({
+      prepared: false, observed: false, unique: false, sameObject: false,
+      sameNamespace: false, buildMatch: false, flagsCompatible: false, observationCount: 0,
+    })
+  })
+
   it('serializes only the fixed safe QRTC metadata snapshot', () => {
     const fake = new FakeQrtcMetadataAddon()
     const addon = loadQrtcMetadataAddon(() => fake)
