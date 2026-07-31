@@ -7,6 +7,10 @@ import { teeAVSDKService, teeBuddyService, teeGroupService, teeMsgService, teePr
 import { log, logPath } from './log.js'
 import { createPacketBindingProber, createPacketHookInstaller, type PacketBindingProbe } from './packet-addon.js'
 import { QQKernelBridge } from './qq-kernel.js'
+import {
+  localPCMMediaGatewayFromEnvironment,
+  type LocalPCMMediaGateway,
+} from './media-gateway.js'
 import { QQBridgeServer } from './server.js'
 
 const processType = (process as NodeJS.Process & { type?: string }).type
@@ -17,7 +21,8 @@ const bootstrapState = globalThis as typeof globalThis & { [bootstrapKey]?: bool
 // Electron's browser (main) process; plain Node remains useful for diagnostics.
 if ((processType === undefined || processType === 'browser') && !bootstrapState[bootstrapKey]) {
   bootstrapState[bootstrapKey] = true
-  const bridge = new QQKernelBridge()
+  const mediaGateway = createLocalPCMMediaGateway()
+  const bridge = new QQKernelBridge({ mediaGateway })
   const server = new QQBridgeServer(bridge, {
     host: process.env.QQNT_BRIDGE_HOST ?? '127.0.0.1',
     port: Number(process.env.QQNT_BRIDGE_PORT ?? 18767),
@@ -30,7 +35,9 @@ if ((processType === undefined || processType === 'browser') && !bootstrapState[
 
   installKernelRequireHook(bridge)
   void startServer(server)
-  log('info', `injected processType=${processType ?? 'node'} pid=${process.pid}; log file: ${logPath}`)
+  startLocalPCMMediaGateway(mediaGateway)
+  log('info', `injected processType=${processType ?? 'node'} pid=${process.pid}; log file: ${logPath}`,
+  )
 }
 
 async function startServer(server: QQBridgeServer): Promise<void> {
@@ -43,6 +50,23 @@ async function startServer(server: QQBridgeServer): Promise<void> {
       await new Promise((resolve) => setTimeout(resolve, 1_000))
     }
   }
+}
+
+function createLocalPCMMediaGateway(): LocalPCMMediaGateway | undefined {
+  try {
+    return localPCMMediaGatewayFromEnvironment()
+  } catch {
+    log('error', 'PCM media gateway configuration is invalid')
+  }
+}
+
+function startLocalPCMMediaGateway(
+  gateway: LocalPCMMediaGateway | undefined,
+): void {
+  if (!gateway) return
+  void gateway
+    .start()
+    .catch(() => log('error', 'PCM media gateway failed to start'))
 }
 
 /**
@@ -165,7 +189,11 @@ function wrapKernelModule(kernel: KernelModule, bridge: QQKernelBridge): KernelM
   return Object.defineProperties({}, descriptors) as KernelModule
 }
 
-export function wrapSession(kernel: KernelModule, nativeSession: KernelSession, bridge: QQKernelBridge): KernelSession {
+export function wrapSession(
+  kernel: KernelModule,
+  nativeSession: KernelSession,
+  bridge: QQKernelBridge,
+): KernelSession {
   let attached = false
   let msgServiceFacade: KernelMsgService | undefined
   let buddyServiceFacade: KernelBuddyService | undefined
@@ -199,7 +227,7 @@ export function wrapSession(kernel: KernelModule, nativeSession: KernelSession, 
           if (msgServiceFacade) return msgServiceFacade
           const nativeService = Reflect.apply(value, target, []) as KernelMsgService | undefined
           if (!nativeService) return nativeService
-          return msgServiceFacade = teeMsgService(nativeService)
+          return (msgServiceFacade = teeMsgService(nativeService))
         }
       }
       if (property === 'getBuddyService' && typeof value === 'function') {
@@ -207,7 +235,7 @@ export function wrapSession(kernel: KernelModule, nativeSession: KernelSession, 
           if (buddyServiceFacade) return buddyServiceFacade
           const nativeService = Reflect.apply(value, target, []) as KernelBuddyService | undefined
           if (!nativeService) return nativeService
-          return buddyServiceFacade = teeBuddyService(nativeService)
+          return (buddyServiceFacade = teeBuddyService(nativeService))
         }
       }
       if (property === 'getProfileService' && typeof value === 'function') {
@@ -215,7 +243,7 @@ export function wrapSession(kernel: KernelModule, nativeSession: KernelSession, 
           if (profileServiceFacade) return profileServiceFacade
           const nativeService = Reflect.apply(value, target, []) as KernelProfileService | undefined
           if (!nativeService) return nativeService
-          return profileServiceFacade = teeProfileService(nativeService)
+          return (profileServiceFacade = teeProfileService(nativeService))
         }
       }
       if (property === 'getGroupService' && typeof value === 'function') {
@@ -223,15 +251,17 @@ export function wrapSession(kernel: KernelModule, nativeSession: KernelSession, 
           if (groupServiceFacade) return groupServiceFacade
           const nativeService = Reflect.apply(value, target, []) as KernelGroupService | undefined
           if (!nativeService) return nativeService
-          return groupServiceFacade = teeGroupService(nativeService)
+          return (groupServiceFacade = teeGroupService(nativeService))
         }
       }
-      if (property === 'getRecentContactService' && typeof value === 'function') {
+      if (
+        property === 'getRecentContactService' && typeof value === 'function'
+      ) {
         return () => {
           if (recentServiceFacade) return recentServiceFacade
           const nativeService = Reflect.apply(value, target, []) as KernelRecentService | undefined
           if (!nativeService) return nativeService
-          return recentServiceFacade = teeRecentService(nativeService)
+          return (recentServiceFacade = teeRecentService(nativeService))
         }
       }
       if (property === 'getAVSDKService' && typeof value === 'function') {
@@ -239,27 +269,7 @@ export function wrapSession(kernel: KernelModule, nativeSession: KernelSession, 
           if (avsdkServiceFacade) return avsdkServiceFacade
           const nativeService = Reflect.apply(value, target, []) as KernelAVSDKService | undefined
           if (!nativeService) return nativeService
-          const listenerFacade = teeAVSDKService(nativeService)
-          return avsdkServiceFacade = new Proxy(listenerFacade, {
-            get(service, serviceProperty) {
-              const serviceValue = Reflect.get(service, serviceProperty, service)
-              if (serviceProperty === 'setActionFromAVSDK' && typeof serviceValue === 'function') {
-                return (...args: unknown[]) => {
-                  const result = Reflect.apply(serviceValue, service, args)
-                  const [action, bytes] = args
-                  if (typeof action === 'number' && bytes instanceof Uint8Array) {
-                    try {
-                      bridge.observeAVSDKAction(action, bytes)
-                    } catch {
-                      log('warn', 'avsdk-call projection outcome=failed source=action-intercept')
-                    }
-                  }
-                  return result
-                }
-              }
-              return serviceValue
-            },
-          })
+          return (avsdkServiceFacade = teeAVSDKService(nativeService))
         }
       }
       // Native methods reject a JS Proxy as their receiver. Always bind them

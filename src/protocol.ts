@@ -1,5 +1,32 @@
 export const PROTOCOL_VERSION = 20
 
+/** Local Unix-socket PCM media protocol. Audio frames use a 1-byte type plus a 4-byte big-endian length. */
+export const PCM_MEDIA_PROTOCOL_VERSION = 1
+export const PCM_MEDIA_SAMPLE_RATE = 48_000
+export const PCM_MEDIA_CHANNELS = 1
+export const PCM_MEDIA_SAMPLE_FORMAT = 's16le'
+export const PCM_MEDIA_FRAME_DURATION_MS = 20
+export const PCM_MEDIA_FRAME_BYTES =
+  (PCM_MEDIA_SAMPLE_RATE *
+    PCM_MEDIA_CHANNELS *
+    2 *
+    PCM_MEDIA_FRAME_DURATION_MS) /
+  1_000
+/** Wire values for a 1-byte type plus a 4-byte big-endian payload length. */
+export const PCM_MEDIA_FRAME_TYPES = {
+  auth: 1,
+  uplink: 2,
+  ready: 0x80,
+  downlink: 0x81,
+} as const
+
+export type QQPCMMediaFrameType = keyof typeof PCM_MEDIA_FRAME_TYPES
+export interface QQPCMMediaFrame {
+  type: QQPCMMediaFrameType
+  /** Auth and ready payloads contain the protocol version; audio payloads are fixed 20 ms PCM frames. */
+  payload: Uint8Array
+}
+
 export type QQChatType = 1 | 2
 
 export interface QQContact {
@@ -214,8 +241,6 @@ export interface QQConversation {
   readInboxMaxMessage?: QQMessage
 }
 
-export type QQJsonValue = null | boolean | number | string | QQJsonValue[] | { [key: string]: QQJsonValue }
-
 export interface QQCallSignalEvent {
   type: 'call-signal'
   version: 1
@@ -237,7 +262,6 @@ export type QQEvent =
       context: QQReactionState
       timestamp: number
     }
-  | { type: 'native-avsdk', version: 1, callback: string, args: QQJsonValue[] }
   | QQCallSignalEvent
 
 export interface QQReactionDefinition {
