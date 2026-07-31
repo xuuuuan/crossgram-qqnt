@@ -84,9 +84,76 @@ function pm2FixtureTests() {
     const regularProfile = join(root, 'regular-pm2');
     writeFileSync(regularProfile, '#!/bin/sh\n', { mode: 0o755 });
     assert.throws(() => pm2Binary(regularProfile, `${store}/`));
+
+    const original = ['-i', 'DISPLAY=:0', 'PATH=/usr/bin:/bin', '/usr/bin/setsid', '--wait', '/opt/QQ/qq', '--type=ppapi'];
+    const synthetic = '/tmp/synthetic-hardened.so';
+    const inserted = definitionWithPreload({ env: {}, args: original }, synthetic).args;
+    assert.deepEqual(inserted, ['-i', `LD_PRELOAD=${synthetic}`, ...original.slice(1)]);
+    assert.deepEqual(original, ['-i', 'DISPLAY=:0', 'PATH=/usr/bin:/bin', '/usr/bin/setsid', '--wait', '/opt/QQ/qq', '--type=ppapi']);
+    envIPlan(original);
+    envIPlan(inserted, synthetic);
+    const dangerousMarker = join(root, 'must-not-execute');
+    assert.throws(() => envIPlan(['-i', `LD_PRELOAD=/tmp/x;touch ${dangerousMarker}`, '/usr/bin/setsid', '--wait', '/opt/QQ/qq']));
+    assert.throws(() => envIPlan(['-i', 'X=1', '-i', '/usr/bin/setsid', '--wait', '/opt/QQ/qq']));
+    assert.throws(() => envIPlan(['-S', '/usr/bin/setsid', '--wait', '/opt/QQ/qq']));
+    assert.throws(() => envIPlan(['-i', '-u', 'root', '/usr/bin/setsid', '--wait', '/opt/QQ/qq']));
+    assert.throws(() => envIPlan(['-i', '--', '/usr/bin/setsid', '--wait', '/opt/QQ/qq']));
+    assert.throws(() => envIPlan(['-i', 'X=1', 'X=2', '/usr/bin/setsid', '--wait', '/opt/QQ/qq']));
+    assert.throws(() => envIPlan(['-i', 'X=1', '/usr/bin/setsid', '--wait', '/wrong/qq']));
+    assert.throws(() => envIPlan(['-i', 'X=1', '/wrong/setsid', '--wait', '/opt/QQ/qq']));
+    assert.throws(() => envIPlan(['-i', 'X=1', '/usr/bin/setsid', '--wait', '/opt/QQ/qq', 1]));
+    assert.throws(() => envIPlan(['-i', 'LD_PRELOAD=/tmp/x', '/usr/bin/setsid', '--wait', '/opt/QQ/qq']));
+    assert.throws(() => readFileSync(dangerousMarker));
+
+    const marker = join(root, 'preload-marker');
+    const source = join(root, 'marker.c');
+    const helper = join(root, 'helper.c');
+    const so = join(root, 'marker.so');
+    const child = join(root, 'helper');
+    writeFileSync(source, `#include <fcntl.h>\n#include <unistd.h>\n__attribute__((constructor)) static void mark(void) { int f=open(${JSON.stringify(marker)}, O_CREAT|O_WRONLY|O_TRUNC, 0600); if(f>=0) { write(f, \"loaded\", 6); close(f); } }\n`);
+    writeFileSync(helper, 'int main(void) { return 0; }\n');
+    const cc = realpathSync('/root/.nix-profile/bin/cc');
+    assert.equal(spawnSync(cc, ['-shared', '-fPIC', '-Wl,-z,now,-z,relro', '-o', so, source]).status, 0);
+    assert.equal(spawnSync(cc, ['-Wl,-z,now,-z,relro', '-o', child, helper]).status, 0);
+    assert.equal(spawnSync('/usr/bin/env', ['-i', `LD_PRELOAD=${so}`, '/usr/bin/setsid', '--wait', child], { env: {} }).status, 0);
+    assert.equal(readFileSync(marker, 'utf8'), 'loaded');
+    unlinkSync(marker);
+    assert.equal(spawnSync('/usr/bin/env', ['-i', '/usr/bin/setsid', '--wait', child], { env: {} }).status, 0);
+    assert.throws(() => readFileSync(marker));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+}
+const ASSIGNMENT = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/;
+function envIPlan(args, expectedPreload = undefined) {
+  if (!Array.isArray(args) || !args.every((arg) => typeof arg === 'string')) {
+    fail('qq argv must contain only strings');
+  }
+  if (args[0] !== '-i' || args.slice(1).includes('-i') || args.includes('--')) {
+    fail('qq argv must begin with one exact env -i option and contain no --');
+  }
+  let command = 1;
+  const names = new Set();
+  while (command < args.length) {
+    const match = ASSIGNMENT.exec(args[command]);
+    if (!match) break;
+    if (names.has(match[1])) fail('qq env -i assignments contain a duplicate variable name');
+    names.add(match[1]);
+    command += 1;
+  }
+  if (args[command] !== '/usr/bin/setsid' || args[command + 1] !== '--wait' || args[command + 2] !== '/opt/QQ/qq') {
+    fail('qq argv does not match the exact env -i setsid --wait /opt/QQ/qq launcher grammar');
+  }
+  const preloads = args.slice(1, command).filter((arg) => arg.startsWith('LD_PRELOAD='));
+  if (expectedPreload === undefined && preloads.length !== 0) fail('qq env -i argv already has LD_PRELOAD');
+  if (expectedPreload !== undefined && (preloads.length !== 1 || args[1] !== `LD_PRELOAD=${expectedPreload}`)) {
+    fail('qq argv does not contain exactly one LD_PRELOAD immediately after -i');
+  }
+  return { command, preloads };
+}
+function definitionWithPreload(snapshot, preload) {
+  envIPlan(snapshot.args);
+  return { ...snapshot, env: { ...snapshot.env }, args: ['-i', `LD_PRELOAD=${preload}`, ...snapshot.args.slice(1)] };
 }
 function pm2List(pm2) {
   return JSON.parse(execFileSync(pm2, ['jlist'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] }));
@@ -106,9 +173,10 @@ function currentDefinition(pm2) {
     interpreter: p.exec_interpreter,
     env,
   };
-  if (!isAbsolute(definition.exec) || !isAbsolute(definition.cwd) || !Array.isArray(definition.args)) {
-    fail('qq PM2 definition is incomplete');
+  if (definition.exec !== '/usr/bin/env' || !isAbsolute(definition.cwd) || !Array.isArray(definition.args)) {
+    fail('qq PM2 definition must execute the exact /usr/bin/env -i form');
   }
+  envIPlan(definition.args);
   return definition;
 }
 function writeSnapshot(definition) {
@@ -134,9 +202,10 @@ function loadSnapshot() {
   checkedDirectory(STATE_DIR);
   checkedRegular(SNAPSHOT, 'snapshot');
   const snapshot = JSON.parse(readFileSync(SNAPSHOT, 'utf8'));
-  if (snapshot.name !== APP || !isAbsolute(snapshot.exec) || !isAbsolute(snapshot.cwd) || !Array.isArray(snapshot.args) || !snapshot.env || Object.hasOwn(snapshot.env, 'LD_PRELOAD')) {
+  if (snapshot.name !== APP || snapshot.exec !== '/usr/bin/env' || !isAbsolute(snapshot.cwd) || !Array.isArray(snapshot.args) || !snapshot.env || Object.hasOwn(snapshot.env, 'LD_PRELOAD')) {
     fail('snapshot has an invalid or preloaded definition');
   }
+  envIPlan(snapshot.args);
   return snapshot;
 }
 function checkedPreload(path) {
@@ -147,12 +216,6 @@ function checkedPreload(path) {
   if ((stat.mode & 0o022) !== 0) fail('preload is group/world writable');
   return realpathSync(path);
 }
-function expected(snapshot, preload) {
-  const env = { ...snapshot.env };
-  if (preload) env.LD_PRELOAD = preload;
-  else delete env.LD_PRELOAD;
-  return { ...snapshot, env };
-}
 function replace(pm2, definition) {
   const deleted = spawnSync(pm2, ['delete', APP], { stdio: 'inherit' });
   if (deleted.status !== 0) fail('PM2 failed to delete qq');
@@ -162,7 +225,7 @@ function replace(pm2, definition) {
   ], { env: definition.env, stdio: 'inherit' });
   if (started.status !== 0) fail('PM2 failed to start qq');
 }
-function verify(pm2, wanted) {
+function verify(pm2, wanted, preload = undefined) {
   const apps = pm2List(pm2).filter((app) => app.name === APP);
   if (apps.length !== 1) fail('qq was not restored as exactly one PM2 application');
   const actual = apps[0].pm2_env;
@@ -171,7 +234,8 @@ function verify(pm2, wanted) {
   assert.equal(actual.pm_cwd, wanted.cwd, 'PM2 cwd mismatch');
   assert.equal(actual.exec_interpreter, wanted.interpreter, 'PM2 interpreter mismatch');
   assert.deepEqual(actual.env, wanted.env, 'PM2 saved environment mismatch');
-  if (Object.hasOwn(wanted.env, 'LD_PRELOAD') !== Object.hasOwn(actual.env, 'LD_PRELOAD')) fail('PM2 preload policy mismatch');
+  if (Object.hasOwn(actual.env, 'LD_PRELOAD')) fail('PM2 environment must not contain LD_PRELOAD');
+  envIPlan(actual.args ?? [], preload);
 }
 
 try {
@@ -183,11 +247,12 @@ try {
   else if (command === 'install' && argument !== undefined) {
     const snapshot = currentDefinition(pm2);
     writeSnapshot(snapshot);
-    const wanted = expected(snapshot, checkedPreload(argument));
+    const preload = checkedPreload(argument);
+    const wanted = definitionWithPreload(snapshot, preload);
     replace(pm2, wanted);
-    verify(pm2, wanted);
+    verify(pm2, wanted, preload);
   } else if (command === 'rollback' && argument === undefined) {
-    const wanted = expected(loadSnapshot(), '');
+    const wanted = loadSnapshot();
     replace(pm2, wanted);
     verify(pm2, wanted);
     } else fail('usage: ppapi-host-pm2.mjs {snapshot|install /absolute/preload.so|rollback}');

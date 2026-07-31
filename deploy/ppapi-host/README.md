@@ -59,7 +59,7 @@ Do not run this procedure until independent security review of task #128 has app
    "$repo/scripts/ppapi-host-pm2.mjs" snapshot
    ```
 
-4. After the collector is waiting, replace only that process definition by deleting and starting `qq` with the saved exact `/usr/bin/env -i` arguments plus exactly one inserted `LD_PRELOAD`. The script verifies the stored PM2 environment contains the requested preload; it never acts on another app name:
+4. After the collector is waiting, replace only that process definition by deleting and starting `qq` with the saved exact launcher grammar: `/usr/bin/env -i [NAME=VALUE ...] /usr/bin/setsid --wait /opt/QQ/qq [ordinary args ...]`. The PM2 environment remains byte-for-byte the saved environment and must not contain `LD_PRELOAD`; the script inserts exactly one validated `LD_PRELOAD=/absolute/real.so` assignment immediately after the one exact `-i` argv option. It rejects `--`, all other env options such as `-S`/`-u`, duplicate `-i`, duplicate or malformed assignment names, missing/ambiguous launcher boundaries, non-string argv values, other `setsid`/QQ paths, and any pre-existing preload in either PM2 environment or env-i argv. Verification parses the same exact grammar and requires the saved executable, argv insertion position/count, CWD, interpreter, and full PM2 environment to match exactly. The script never acts on another app name:
 
    ```sh
    "$repo/scripts/ppapi-host-pm2.mjs" install "$probe"
@@ -67,7 +67,7 @@ Do not run this procedure until independent security review of task #128 has app
 
 5. Allow that one replacement, then wait passively for the collector result. Do not invoke a call, send loader commands, or attach another probe.
 
-6. Roll back by deleting and starting only `qq` from the saved exact original arguments. The script asserts that stored `LD_PRELOAD` is absent afterwards:
+6. Roll back by deleting and starting only `qq` from the saved exact original arguments and environment. The script asserts that `LD_PRELOAD` is absent from both stored PM2 environment and env-i assignment argv afterwards:
 
    ```sh
    "$repo/scripts/ppapi-host-pm2.mjs" rollback
