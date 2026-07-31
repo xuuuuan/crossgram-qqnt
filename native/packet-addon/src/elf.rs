@@ -209,6 +209,20 @@ impl<'a> ElfImage<'a> {
         Sha256::digest(self.bytes).into()
     }
 
+    #[cfg(feature = "avsdk-loader-probe")]
+    pub fn executable_bytes(&self, address: u64, length: u64) -> Result<&[u8], ElfError> {
+        if self
+            .load_for_range(address, length)
+            .is_none_or(|header| header.flags & (PF_R | PF_W | PF_X) != (PF_R | PF_X))
+        {
+            return Err(ElfError::VirtualAddress);
+        }
+        let offset = self.file_offset_for_range(address, length)?;
+        self.bytes
+            .get(offset..offset + usize::try_from(length).map_err(|_| ElfError::VirtualAddress)?)
+            .ok_or(ElfError::VirtualAddress)
+    }
+
     fn load_for_range(&self, address: u64, length: u64) -> Option<ProgramHeader> {
         let end = address.checked_add(length)?;
         self.program_headers.iter().copied().find(|header| {
