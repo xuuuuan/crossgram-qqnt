@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { types } from 'node:util'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import WebSocket from 'ws'
-import type { ContactMsgBoxInfo, KernelModule, KernelSession, MsgElement, MsgRecord } from './kernel-types.js'
+import type { ContactMsgBoxInfo, KernelGroupService, KernelModule, KernelMsgService, KernelSession, MsgElement, MsgRecord } from './kernel-types.js'
 import type { PacketAddon } from './packet-addon.js'
 import { parseConversationId, type QQEvent } from './protocol.js'
 import { QQKernelBridge } from './qq-kernel.js'
@@ -79,7 +79,6 @@ function testProtocolElements(part: DirectMessagePart): MsgElement[] {
     elementType: 7, elementId: '', replyElement: {
       replayMsgId: part.reply.messageId, replayMsgSeq: part.reply.sequence,
       replyMsgClientSeq: part.reply.clientSequence, replyMsgTime: part.reply.time ? String(part.reply.time) : undefined,
-      senderUin: part.reply.senderUin, senderUidStr: part.reply.senderUid,
       sourceMsgTextElems: [], replyMsgRevokeType: 0,
       sourceMsgIsIncPic: false, sourceMsgExpired: false,
     },
@@ -94,7 +93,7 @@ function testProtocolElements(part: DirectMessagePart): MsgElement[] {
     elementType: 3, elementId: 'file-element', fileElement: {
       fileName: part.spec.name, fileSize: String(part.spec.size), filePath: '',
       fileUuid: part.upload.fileUuid, fileSubId: '', fileMd5: part.spec.md5,
-      fileSha: part.spec.sha1, file10MMd5: part.spec.file10MMd5,
+      fileSha: part.spec.sha1, fileSha3: '', file10MMd5: part.spec.file10MMd5,
     },
   }]
 }
@@ -128,6 +127,7 @@ function fixture() {
     }),
     removeKernelMsgListener: vi.fn(),
     getMsgUniqueId: vi.fn(() => 'm1'),
+    sendSsoCmdReqByContend: vi.fn<NonNullable<KernelMsgService['sendSsoCmdReqByContend']>>(),
     sendMsg: vi.fn(async (_id, _peer, elements) => {
       const files = elements.filter((element: { fileElement?: { filePath: string }, picElement?: { sourcePath?: string } }) =>
         element.fileElement || element.picElement)
@@ -161,13 +161,15 @@ function fixture() {
       result: 0, errMsg: '', msgList: [] as MsgRecord[],
     })),
     setMsgEmojiLikes: vi.fn(async () => ({ result: 0, errMsg: '' })),
-    getMsgEmojiLikesList: vi.fn(async () => ({
+    getMsgEmojiLikesList: vi.fn<NonNullable<KernelMsgService['getMsgEmojiLikesList']>>(async () => ({
       result: 0, errMsg: '', emojiLikesList: [], cookie: '', isLastPage: true, isFirstPage: true,
     })),
-    fetchFavEmojiList: vi.fn(async () => ({ result: 0, errMsg: '', emojiInfoList: [] })),
+    fetchFavEmojiList: vi.fn<NonNullable<KernelMsgService['fetchFavEmojiList']>>(async () => ({
+      result: 0, errMsg: '', emojiInfoList: [],
+    })),
     addFavEmoji: vi.fn(async () => ({ result: 0, errMsg: '', isExist: 0 })),
     deleteFavEmoji: vi.fn(async () => ({ result: 0, errMsg: '' })),
-    fetchMarketEmoticonList: vi.fn(async () => ({
+    fetchMarketEmoticonList: vi.fn<NonNullable<KernelMsgService['fetchMarketEmoticonList']>>(async () => ({
       result: 0, errMsg: '', marketEmoticonInfo: { roamEmojiTab: {
         timesTamp: 1, segmentFlag: -1, ordinaryTabinfoList: [], magicTabinfoList: [],
         smallTabinfoList: [], epIds: [],
@@ -175,9 +177,9 @@ function fixture() {
     })),
     fetchBottomEmojiTableList: undefined as import('./kernel-types.js').KernelMsgService['fetchBottomEmojiTableList'],
     fetchMarketEmoticonShowImage: vi.fn(async () => ({ result: 0, errMsg: '' })),
-    fetchMarketEmotionJsonFile: undefined,
+    fetchMarketEmotionJsonFile: undefined as KernelMsgService['fetchMarketEmotionJsonFile'],
     fetchMarketEmoticonAioImage: vi.fn(async () => ({ result: 0, errMsg: '' })),
-    getMarketEmoticonPath: vi.fn(() => new Map()),
+    getMarketEmoticonPath: vi.fn<NonNullable<KernelMsgService['getMarketEmoticonPath']>>(() => new Map()),
     getMarketEmoticonEncryptKeys: vi.fn(async () => ({ result: 0, errMsg: '', encryptKeyMap: new Map() })),
     getFavMarketEmoticonInfo: vi.fn(async () => ({
       result: 0, errMsg: '', favMarketEmoticonInfo: { eId: '', width: 240, height: 240, faceName: '' },
@@ -233,6 +235,7 @@ function fixture() {
       return 'group-listener'
     }), removeKernelGroupListener: vi.fn(),
     getGroupList: vi.fn(async () => ({ result: 0, errMsg: '' })),
+    getGroupDetailInfo: vi.fn<NonNullable<KernelGroupService['getGroupDetailInfo']>>(async () => ({ result: 0, errMsg: '' })),
     createMemberListScene: vi.fn(() => 'scene'), destroyMemberListScene: vi.fn(),
     getNextMemberList: vi.fn(async () => ({
       errCode: 0, errMsg: '', result: {
@@ -926,6 +929,8 @@ describe('QQKernelBridge', () => {
       peerUid: `group-${index}`,
       peerUin: `group-${index}`,
       peerName: `Group ${index}`,
+      remark: '', avatarUrl: '', unreadCnt: '0', msgId: '', msgTime: '',
+      senderUid: '', senderUin: '', abstractContent: [],
     }))
     f.recent.getRecentContactInfos.mockResolvedValue({
       result: 0, errMsg: '', relation: full.slice(0, 8),
@@ -1935,14 +1940,14 @@ describe('QQKernelBridge', () => {
         const elements = parts.map((part) => part.kind === 'image' ? {
           elementType: 2, elementId: 'image-element', picElement: {
             fileName: 'direct.png', fileSize: String(image.length), sourcePath: '',
-            fileUuid: part.upload.fileUuid, md5HexStr: '5289df737df57326fcdd22597afb1fac',
+            fileUuid: part.upload.fileUuid, fileSubId: '', md5HexStr: '5289df737df57326fcdd22597afb1fac',
             picWidth: 1, picHeight: 1, picType: 1001, picSubType: 0,
           },
         } : {
           elementType: 3, elementId: 'file-element', fileElement: {
             fileName: 'direct.bin', fileSize: String(file.length), filePath: '',
-            fileUuid: part.kind === 'file' ? part.upload.fileUuid : '',
-            fileMd5: 'a6b8537b97d58b417d3dfdd1030b15d2',
+            fileUuid: part.kind === 'file' ? part.upload.fileUuid : '', fileSubId: '',
+            fileMd5: 'a6b8537b97d58b417d3dfdd1030b15d2', fileSha: '', fileSha3: '', file10MMd5: '',
           },
         })
         queueMicrotask(() => f.emitMessages([{

@@ -4354,7 +4354,7 @@ function delay(milliseconds: number): Promise<void> {
 
 class FramedUploadReader {
   private readonly iterator: AsyncIterator<unknown>
-  private buffered = Buffer.alloc(0)
+  private buffered: Buffer<ArrayBufferLike> = Buffer.alloc(0)
   private ended = false
 
   constructor(body: Readable) {

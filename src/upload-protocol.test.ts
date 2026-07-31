@@ -312,7 +312,7 @@ describe('direct QQ upload protocol', () => {
   })
 })
 
-function highwayResponse(head = Buffer.alloc(0), body = Buffer.alloc(0)): Buffer {
+function highwayResponse(head: Buffer<ArrayBufferLike> = Buffer.alloc(0), body: Buffer<ArrayBufferLike> = Buffer.alloc(0)): Buffer {
   const output = Buffer.alloc(10 + head.length + body.length)
   output[0] = 0x28
   output.writeUInt32BE(head.length, 1)
