@@ -3699,6 +3699,31 @@ export class QQKernelBridge {
         const sticker = mergeKnownSticker(this.stickers.get(mappedSticker.stickerId), mappedSticker)
         this.stickers.set(sticker.stickerId, sticker)
         parts.push({ type: 'sticker', sticker })
+      } else if (element.markdownElement?.content) {
+        parts.push({ type: 'markdown', content: element.markdownElement.content })
+      } else if (element.inlineKeyboardElement?.rows.length) {
+        parts.push({
+          type: 'inline-keyboard',
+          keyboard: {
+            botAppid: element.inlineKeyboardElement.botAppid,
+            rows: element.inlineKeyboardElement.rows.map((row) => ({
+              buttons: row.buttons.map((button) => ({
+                id: button.id,
+                label: button.label,
+                visitedLabel: button.visitedLabel,
+                style: button.style,
+                type: button.type,
+                clickLimit: button.clickLimit,
+                unsupportTips: button.unsupportTips,
+                data: button.data,
+                atBotShowChannelList: button.atBotShowChannelList,
+                permissionType: button.permissionType,
+                specifyRoleIds: button.specifyRoleIds,
+                specifyTinyids: button.specifyTinyids,
+              })),
+            })),
+          },
+        })
       } else if (element.elementType === ELEMENT_TEXT && element.textElement?.content) {
         const text = element.textElement
         const mentionedId = text.atNtUid || text.atUid
@@ -3812,6 +3837,35 @@ export class QQKernelBridge {
       reactionContext: record.chatType === CHAT_GROUP && record.emojiLikesList?.length
         ? this.mapReactionState(record)
         : undefined,
+    }
+  }
+
+  async clickInlineKeyboard(input: import('./protocol.js').QQInlineKeyboardClick) {
+    const conversation = this.getConversation(input.conversationId)
+    const service = this.requireMsgService()
+    if (!service.clickInlineKeyboardButton) throw new Error('QQNT inline keyboard API is unavailable')
+    let messageSequence = input.messageSequence
+    if (!messageSequence) {
+      const message = await this.getMessage(conversation, input.messageId)
+      messageSequence = message?.msgSeq
+    }
+    if (!messageSequence) throw new Error(`QQNT message ${input.messageId} has no msgSeq`)
+    const result = await service.clickInlineKeyboardButton({
+      guildId: '',
+      peerId: conversation.peerUid,
+      botAppid: input.botAppid,
+      msgSeq: messageSequence,
+      buttonId: input.buttonId,
+      callback_data: input.callbackData,
+      dmFlag: 0,
+      chatType: conversation.chatType,
+    })
+    if (result.result !== 0) throw new Error(result.errMsg || `QQNT inline keyboard click failed: ${result.result}`)
+    return {
+      status: result.status,
+      promptText: result.promptText,
+      promptType: result.promptType,
+      promptIcon: result.promptIcon,
     }
   }
 
@@ -5597,11 +5651,13 @@ function forwardedMessagesPreview(
     const content = message.parts.map((part) => {
       if (part.type === 'text') return part.text.trim()
       if (part.type === 'media') {
-        return part.media.name?.trim() || (part.media.kind === 'image' ? '[图片]'
-          : part.media.kind === 'video' ? '[视频]' : '[文件]')
+        return part.media.name?.trim() || (part.media.kind === 'image' ? '[图片]' : '[文件]')
       }
       if (part.type === 'sticker') return part.sticker.title?.trim() || '[表情]'
       if (part.type === 'multi-forward') return `查看${part.title || '聊天记录'}`
+      if (part.type === 'markdown') return part.content.trim()
+      if (part.type === 'inline-keyboard') return part.keyboard.rows
+        .flatMap((row) => row.buttons.map((button) => button.label)).join(' ')
       return part.card.title?.trim() || part.card.description?.trim() || '[卡片消息]'
     }).filter(Boolean).join(' ').replace(/\s+/g, ' ').trim()
     return content ? `${sender}: ${content}` : ''
@@ -6024,6 +6080,10 @@ function receivedMessageSummary(conversation: QQConversation, message: QQMessage
   const content = message.parts.length
     ? message.parts.map((part) => part.type === 'text'
       ? JSON.stringify(truncateLogText(part.text))
+      : part.type === 'markdown'
+        ? `[markdown ${JSON.stringify(truncateLogText(part.content))}]`
+        : part.type === 'inline-keyboard'
+          ? `[inline-keyboard rows=${part.keyboard.rows.length}]`
       : part.type === 'sticker'
         ? `[sticker id=${JSON.stringify(part.sticker.stickerId)}]`
         : part.type === 'card'

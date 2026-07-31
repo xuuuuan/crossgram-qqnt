@@ -179,6 +179,9 @@ function fixture() {
       result: 0, errMsg: '', msgList: [] as MsgRecord[],
     })),
     setMsgEmojiLikes: vi.fn(async () => ({ result: 0, errMsg: '' })),
+    clickInlineKeyboardButton: vi.fn(async () => ({
+      result: 0, errMsg: '', status: 0, promptText: '操作成功', promptType: 0, promptIcon: 0,
+    })),
     getMsgEmojiLikesList: vi.fn(async () => ({
       result: 0, errMsg: '', emojiLikesList: [], cookie: '', isLastPage: true, isFirstPage: true,
     })),
@@ -2581,9 +2584,62 @@ describe('QQKernelBridge', () => {
         },
       } },
       { type: 'card', card: { kind: 'application', title: '卡片标题' } },
-      { type: 'text', text: '**Markdown**' },
+      { type: 'markdown', content: '**Markdown**' },
       { type: 'text', text: '[暂不支持的消息 999]' },
     ] })
+  })
+
+  it('preserves native bot markdown and full inline keyboard payloads and clicks callbacks', async () => {
+    const f = fixture()
+    f.message.msgId = 'bot-message'
+    f.message.msgSeq = '7788'
+    f.message.elements = [
+      { elementType: 14, elementId: 'markdown', markdownElement: {
+        content: '**粗体** [文档](https://example.com/docs)',
+      } },
+      { elementType: 17, elementId: 'keyboard', inlineKeyboardElement: {
+        botAppid: '1024',
+        rows: [{ buttons: [
+          {
+            id: 'open', label: '打开', visitedLabel: '已打开', style: 1, type: 0,
+            clickLimit: 0, unsupportTips: '请升级', data: 'https://example.com',
+            atBotShowChannelList: false, permissionType: 2, specifyRoleIds: [], specifyTinyids: [],
+          },
+          {
+            id: 'confirm', label: '确认', visitedLabel: '已确认', style: 2, type: 1,
+            clickLimit: 1, unsupportTips: '请升级', data: 'confirm:42',
+            atBotShowChannelList: false, permissionType: 2, specifyRoleIds: [], specifyTinyids: [],
+          },
+        ] }],
+      } },
+    ]
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    const history = await bridge.getHistory(bridge.getConversation('uid-1715311957'))
+    expect(history.messages[0].parts).toEqual([
+      { type: 'markdown', content: '**粗体** [文档](https://example.com/docs)' },
+      { type: 'inline-keyboard', keyboard: {
+        botAppid: '1024',
+        rows: [{ buttons: [
+          expect.objectContaining({ id: 'open', label: '打开', type: 0, data: 'https://example.com' }),
+          expect.objectContaining({ id: 'confirm', label: '确认', type: 1, data: 'confirm:42' }),
+        ] }],
+      } },
+    ])
+
+    await expect(bridge.clickInlineKeyboard({
+      conversationId: 'uid-1715311957',
+      messageId: 'bot-message',
+      messageSequence: '7788',
+      buttonId: 'confirm',
+      callbackData: 'confirm:42',
+      botAppid: '1024',
+    })).resolves.toEqual({ status: 0, promptText: '操作成功', promptType: 0, promptIcon: 0 })
+    expect(f.msg.clickInlineKeyboardButton).toHaveBeenCalledWith({
+      guildId: '', peerId: 'uid-1715311957', botAppid: '1024', msgSeq: '7788',
+      buttonId: 'confirm', callback_data: 'confirm:42', dmFlag: 0, chatType: 1,
+    })
   })
 
   it('parses legacy and current mini-app Ark payloads into structured cards', async () => {
@@ -4273,6 +4329,31 @@ describe('QQBridgeServer', () => {
     })
     expect(repeatedRead.status).toBe(200)
     await expect(repeatedRead.json()).resolves.toEqual({ ok: true })
+  })
+
+  it('serves inline keyboard clicks end to end through HTTP', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const base = `http://127.0.0.1:${server.address().port}/v1`
+
+    const response = await fetch(`${base}/messages/inline-keyboard/click`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        conversationId: 'uid-1715311957', messageId: 'bot-message', messageSequence: '7788',
+        buttonId: 'confirm', callbackData: 'confirm:42', botAppid: '1024',
+      }),
+    })
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toEqual({
+      status: 0, promptText: '操作成功', promptType: 0, promptIcon: 0,
+    })
+    expect(f.msg.clickInlineKeyboardButton).toHaveBeenCalledWith({
+      guildId: '', peerId: 'uid-1715311957', botAppid: '1024', msgSeq: '7788',
+      buttonId: 'confirm', callback_data: 'confirm:42', dmFlag: 0, chatType: 1,
+    })
   })
 
   it('returns HTTP 403 for permanent send rejection while keeping transient failures retryable', async () => {

@@ -142,6 +142,8 @@ export interface QQMessage {
   serviceAction?: { type: 'custom', text: string }
   parts: Array<
     | QQTextPart
+    | { type: 'markdown', content: string }
+    | { type: 'inline-keyboard', keyboard: QQInlineKeyboard }
     | { type: 'media', media: QQMedia }
     | { type: 'sticker', sticker: QQSticker }
     | { type: 'multi-forward', title: string, preview?: string, locator: QQMultiForwardLocator }
@@ -149,6 +151,42 @@ export interface QQMessage {
   >
   /** Per-message state only. The shared definition catalog has its own endpoint. */
   reactionContext?: QQReactionState
+}
+
+export interface QQInlineKeyboard {
+  botAppid: string
+  rows: Array<{ buttons: QQInlineKeyboardButton[] }>
+}
+
+export interface QQInlineKeyboardButton {
+  id: string
+  label: string
+  visitedLabel: string
+  style: number
+  type: number
+  clickLimit: number
+  unsupportTips: string
+  data: string
+  atBotShowChannelList: boolean
+  permissionType: number
+  specifyRoleIds: string[]
+  specifyTinyids: string[]
+}
+
+export interface QQInlineKeyboardClick {
+  conversationId: string
+  messageId: string
+  messageSequence?: string
+  buttonId: string
+  callbackData: string
+  botAppid: string
+}
+
+export interface QQInlineKeyboardClickResult {
+  status: number
+  promptText: string
+  promptType: number
+  promptIcon: number
 }
 
 /** Structured QQ Ark/XML share rendered as a native preview by the relay. */

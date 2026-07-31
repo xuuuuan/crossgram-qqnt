@@ -431,6 +431,16 @@ export class QQBridgeServer {
       json(response, 200, { ok: true })
       return
     }
+    if (request.method === 'POST' && path === '/v1/messages/inline-keyboard/click') {
+      const body = await readJson<import('./protocol.js').QQInlineKeyboardClick>(request)
+      if (!body || typeof body.conversationId !== 'string' || typeof body.messageId !== 'string'
+        || typeof body.buttonId !== 'string' || typeof body.callbackData !== 'string'
+        || typeof body.botAppid !== 'string') {
+        throw new Error('invalid inline keyboard click request')
+      }
+      json(response, 200, await this.bridge.clickInlineKeyboard(body))
+      return
+    }
     if (request.method === 'POST' && path === '/v1/messages/get') {
       const body = await readJson<{ conversationId: string, messageId: string }>(request)
       const message = await this.bridge.getMessage(

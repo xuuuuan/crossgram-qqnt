@@ -208,7 +208,23 @@ export interface MsgElement {
     descriptionContent?: { title?: string }
     contentlist?: Array<{ title?: string }>
   }
-  inlineKeyboardElement?: { rows: Array<{ buttons: Array<{ label: string }> }> }
+  inlineKeyboardElement?: {
+    botAppid: string
+    rows: Array<{ buttons: Array<{
+      id: string
+      label: string
+      visitedLabel: string
+      style: number
+      type: number
+      clickLimit: number
+      unsupportTips: string
+      data: string
+      atBotShowChannelList: boolean
+      permissionType: number
+      specifyRoleIds: string[]
+      specifyTinyids: string[]
+    }> }>
+  }
   picElement?: {
     fileName: string
     fileSize: string
@@ -431,6 +447,23 @@ export interface KernelMsgService {
     emojiType: string,
     setEmoji: boolean,
   ): Promise<{ result: number, errMsg: string }>
+  clickInlineKeyboardButton?(info: {
+    guildId: string
+    peerId: string
+    botAppid: string
+    msgSeq: string
+    buttonId: string
+    callback_data: string
+    dmFlag: number
+    chatType: number
+  }): Promise<{
+    result: number
+    errMsg: string
+    status: number
+    promptText: string
+    promptType: number
+    promptIcon: number
+  }>
   getMsgEmojiLikesList?(
     peer: Contact,
     msgSeq: string,
