@@ -53,7 +53,7 @@ Do not run this procedure until independent security review of task #128 has app
    "$collector"
    ```
 
-3. The only supported PM2 target is the existing application named exactly `qq`. Do **not** use `pm2 restart --update-env`: it does not replace the stored process definition safely. The operational script uses only the fixed `/root/.nix-profile/bin/pm2` entry, validates its root/current-UID-owned `0777` profile symlink, then resolves and requires a root/current-UID-owned, non-writable executable under `/nix/store/.../bin/pm2`. It accepts no PM2 path override. First snapshot the precise saved `qq` environment, executable, interpreter, CWD, and argv; the snapshot is mode `0600` beneath a mode-`0700` state directory:
+3. The only supported PM2 target is the existing application named exactly `qq`. Do **not** use `pm2 restart --update-env`: it does not replace the stored process definition safely. The operational script uses only the fixed `/root/.nix-profile/bin/pm2` entry, validates its root/current-UID-owned `0777` profile symlink, then resolves and requires a root/current-UID-owned, non-writable executable under `/nix/store/.../bin/pm2`. It accepts no PM2 path override. PM2 evidence confirms that `unique_id` is the sole regenerated saved-environment key: it is stripped from the snapshot and never replayed, while verification requires one nonempty safe regenerated `unique_id` and exact key/value equality for every other environment key. First snapshot the precise saved `qq` environment, executable, interpreter, CWD, and argv; the snapshot is mode `0600` beneath a mode-`0700` state directory:
 
    ```sh
    "$repo/scripts/ppapi-host-pm2.mjs" snapshot

@@ -15,10 +15,22 @@ const PM2_PROFILE = '/root/.nix-profile/bin/pm2';
 const STATE_DIR = join(homedir(), '.local', 'state', 'crossgram-ppapi-host');
 const SNAPSHOT = join(STATE_DIR, 'qq-pm2.json');
 const { O_CREAT, O_EXCL, O_NOFOLLOW, O_WRONLY } = constants;
+const DYNAMIC_ENV_KEYS = new Set(['unique_id']);
+const SAFE_UNIQUE_ID = /^[A-Za-z0-9._-]{1,128}$/;
 
 process.umask(0o077);
 
 function fail(message) { throw new Error(message); }
+function staticEnvironment(env, requireUniqueId = false) {
+  if (!env || typeof env !== 'object' || Array.isArray(env)) fail('qq has no saved PM2 environment');
+  const result = { ...env };
+  const uniqueId = result.unique_id;
+  for (const key of DYNAMIC_ENV_KEYS) delete result[key];
+  if (requireUniqueId && (typeof uniqueId !== 'string' || !SAFE_UNIQUE_ID.test(uniqueId))) {
+    fail('PM2 regenerated unique_id is missing or unsafe');
+  }
+  return result;
+}
 function ownedPrivate(stat, mode, label) {
   if (stat.uid !== process.getuid()) fail(`${label} has the wrong owner`);
   if ((stat.mode & 0o777) !== mode) fail(`${label} has the wrong mode`);
@@ -105,6 +117,26 @@ function pm2FixtureTests() {
     assert.throws(() => envIPlan(['-i', 'LD_PRELOAD=/tmp/x', '/usr/bin/setsid', '--wait', '/opt/QQ/qq']));
     assert.throws(() => readFileSync(dangerousMarker));
 
+    const snapshot = {
+      exec: '/usr/bin/env', args: original, cwd: '/opt/QQ', interpreter: 'none',
+      env: { DISPLAY: ':0', PATH: '/usr/bin:/bin' },
+    };
+    let starts = 0;
+    const mockStart = (wanted, mutation = {}) => ({
+      pm_exec_path: wanted.exec, args: wanted.args, pm_cwd: wanted.cwd,
+      exec_interpreter: wanted.interpreter,
+      env: { ...wanted.env, unique_id: `pm2-${++starts}`, ...mutation },
+    });
+    const installed = definitionWithPreload(snapshot, synthetic);
+    verifyDefinition(mockStart(installed), installed, synthetic);
+    verifyDefinition(mockStart(snapshot), snapshot);
+    assert.throws(() => verifyDefinition(mockStart(installed, { DISPLAY: ':9' }), installed, synthetic));
+    assert.throws(() => verifyDefinition(mockStart(installed, { EXTRA: 'unexpected' }), installed, synthetic));
+    for (const uniqueId of ['', 'unsafe/id']) {
+      assert.throws(() => verifyDefinition(mockStart(installed, { unique_id: uniqueId }), installed, synthetic));
+      assert.throws(() => verifyDefinition(mockStart(snapshot, { unique_id: uniqueId }), snapshot));
+    }
+
     const marker = join(root, 'preload-marker');
     const source = join(root, 'marker.c');
     const helper = join(root, 'helper.c');
@@ -162,9 +194,10 @@ function currentDefinition(pm2) {
   const apps = pm2List(pm2).filter((app) => app.name === APP);
   if (apps.length !== 1) fail('expected exactly one PM2 application named qq');
   const p = apps[0].pm2_env;
-  const env = p.env;
-  if (!env || typeof env !== 'object' || Array.isArray(env)) fail('qq has no saved PM2 environment');
-  if (Object.hasOwn(env, 'LD_PRELOAD')) fail('refusing to snapshot an already-preloaded qq process');
+  const actualEnv = p.env;
+  if (Object.hasOwn(actualEnv ?? {}, 'LD_PRELOAD')) fail('refusing to snapshot an already-preloaded qq process');
+  // unique_id is PM2-generated metadata; never persist or replay it.
+  const env = staticEnvironment(actualEnv);
   const definition = {
     name: APP,
     exec: p.pm_exec_path,
@@ -202,10 +235,11 @@ function loadSnapshot() {
   checkedDirectory(STATE_DIR);
   checkedRegular(SNAPSHOT, 'snapshot');
   const snapshot = JSON.parse(readFileSync(SNAPSHOT, 'utf8'));
-  if (snapshot.name !== APP || snapshot.exec !== '/usr/bin/env' || !isAbsolute(snapshot.cwd) || !Array.isArray(snapshot.args) || !snapshot.env || Object.hasOwn(snapshot.env, 'LD_PRELOAD')) {
+  if (snapshot.name !== APP || snapshot.exec !== '/usr/bin/env' || !isAbsolute(snapshot.cwd) || !Array.isArray(snapshot.args) || !snapshot.env || Object.hasOwn(snapshot.env, 'LD_PRELOAD') || Object.hasOwn(snapshot.env, 'unique_id')) {
     fail('snapshot has an invalid or preloaded definition');
   }
   envIPlan(snapshot.args);
+  staticEnvironment(snapshot.env);
   return snapshot;
 }
 function checkedPreload(path) {
@@ -225,17 +259,19 @@ function replace(pm2, definition) {
   ], { env: definition.env, stdio: 'inherit' });
   if (started.status !== 0) fail('PM2 failed to start qq');
 }
-function verify(pm2, wanted, preload = undefined) {
-  const apps = pm2List(pm2).filter((app) => app.name === APP);
-  if (apps.length !== 1) fail('qq was not restored as exactly one PM2 application');
-  const actual = apps[0].pm2_env;
+function verifyDefinition(actual, wanted, preload = undefined) {
   assert.equal(actual.pm_exec_path, wanted.exec, 'PM2 executable mismatch');
   assert.deepEqual(actual.args ?? [], wanted.args, 'PM2 argv mismatch');
   assert.equal(actual.pm_cwd, wanted.cwd, 'PM2 cwd mismatch');
   assert.equal(actual.exec_interpreter, wanted.interpreter, 'PM2 interpreter mismatch');
-  assert.deepEqual(actual.env, wanted.env, 'PM2 saved environment mismatch');
-  if (Object.hasOwn(actual.env, 'LD_PRELOAD')) fail('PM2 environment must not contain LD_PRELOAD');
+  if (Object.hasOwn(actual.env ?? {}, 'LD_PRELOAD')) fail('PM2 environment must not contain LD_PRELOAD');
+  assert.deepEqual(staticEnvironment(actual.env, true), wanted.env, 'PM2 saved environment mismatch');
   envIPlan(actual.args ?? [], preload);
+}
+function verify(pm2, wanted, preload = undefined) {
+  const apps = pm2List(pm2).filter((app) => app.name === APP);
+  if (apps.length !== 1) fail('qq was not restored as exactly one PM2 application');
+  verifyDefinition(apps[0].pm2_env, wanted, preload);
 }
 
 try {
