@@ -537,6 +537,37 @@ export class QQBridgeServer {
       json(response, 200, result)
       return
     }
+    if (request.method === 'POST' && path === '/v1/files/asset') {
+      const locator = await readJson<QQMediaLocator>(request)
+      const range = parseByteRange(request.headers.range)
+      if (range === false) {
+        response.writeHead(416, { 'content-range': 'bytes */*', 'cache-control': 'no-store' })
+        response.end()
+        return
+      }
+      const asset = await this.bridge.openMedia(locator, range ?? {})
+      if (!asset) {
+        json(response, 404, { error: 'media asset not found' })
+        return
+      }
+      if (range && asset.offset >= asset.size) {
+        response.writeHead(416, {
+          'content-range': `bytes */${asset.size}`, 'accept-ranges': 'bytes', 'cache-control': 'no-store',
+        })
+        response.end()
+        return
+      }
+      response.writeHead(range ? 206 : 200, {
+        'content-type': asset.mimeType,
+        'content-length': String(asset.length),
+        ...(range ? { 'content-range': `bytes ${asset.offset}-${asset.offset + asset.length - 1}/${asset.size}` } : {}),
+        'accept-ranges': 'bytes',
+        'cache-control': 'no-store',
+      })
+      log('info', `HTTP API media asset id=${requestId} kind=${locator.kind} message=${locator.messageId} element=${locator.elementId} offset=${asset.offset} length=${asset.length} size=${asset.size}`)
+      await pipe(asset.stream, response)
+      return
+    }
     if (request.method === 'POST' && path === '/v1/messages/read') {
       const body = await readJson<{ conversationId: string, messageId: string }>(request)
       await this.bridge.markRead(this.bridge.getConversation(body.conversationId), body.messageId)

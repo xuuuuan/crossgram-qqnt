@@ -1,7 +1,7 @@
 import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto'
 import { createReadStream, createWriteStream, existsSync, mkdirSync, statSync } from 'node:fs'
 import { open as openFile, readFile, rm, stat } from 'node:fs/promises'
-import { basename, dirname, extname, join } from 'node:path'
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { Readable } from 'node:stream'
 import { types } from 'node:util'
@@ -2233,6 +2233,30 @@ export class QQKernelBridge {
 
   async getDirectUrl(locator: QQMediaLocator): Promise<{ url: string, expiresAt: number } | undefined> {
     return this.packetClientForSession().getMediaDirectUrl(locator, this.requireConfig().selfUid)
+  }
+
+  async openMedia(
+    locator: QQMediaLocator,
+    range: { offset?: number, limit?: number } = {},
+  ): Promise<{ stream: Readable, mimeType: string, size: number, offset: number, length: number } | undefined> {
+    if (!locator.filePath || !isPathInside(this.requireConfig().userPath, locator.filePath)
+      || !existsSync(locator.filePath)) return
+    const size = statSync(locator.filePath).size
+    const offset = Math.max(0, Math.trunc(range.offset ?? 0))
+    const available = Math.max(0, size - offset)
+    const requested = range.limit === undefined ? available : Math.max(0, Math.trunc(range.limit))
+    const length = Math.min(available, requested)
+    return {
+      stream: length
+        ? createReadStream(locator.filePath, { start: offset, end: offset + length - 1 })
+        : Readable.from([]),
+      mimeType: locator.kind === 'image'
+        ? imageMimeType(locator.fileName, false)
+        : fileVideoMimeType(locator.fileName) ?? 'application/octet-stream',
+      size,
+      offset,
+      length,
+    }
   }
 
   private registerListeners(): void {
@@ -4822,6 +4846,12 @@ function imageMimeType(path: string, animated: boolean): string {
   if (extension === '.jpg' || extension === '.jpeg') return 'image/jpeg'
   if (extension === '.bmp') return 'image/bmp'
   return 'image/png'
+}
+
+function isPathInside(root: string, candidate: string): boolean {
+  const path = relative(resolve(root), resolve(candidate))
+  return path !== '' && path !== '..' && !path.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`)
+    && !isAbsolute(path)
 }
 
 function videoMimeType(path: string, format?: number): string {
