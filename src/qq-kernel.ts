@@ -9,6 +9,7 @@ import { AsyncQueue, deferred } from './async.js'
 import { markBridgeListener } from './listener-tee.js'
 import { log } from './log.js'
 import { resolveMultiForwardParticipants } from './multi-forward-participants.js'
+import type { PCMMediaLease } from './media-gateway.js'
 import { QQPacketClient, type DirectHighwayUpload, type QQPacketClientOptions } from './packet-client.js'
 import { HIGHWAY_BLOCK_SIZE, type DirectMessagePart } from './upload-protocol.js'
 import type {
@@ -16,8 +17,7 @@ import type {
   MarketStickerPackInfo, MemberInfo, MsgElement, MsgRecord, ProfileSimpleInfo, RecentContactInfo, SearchMsgKeywordsResult,
 } from './kernel-types.js'
 import {
-  conversationId, parseConversationId, type HistoryQuery, type MemberPage, type QQCallSignalEvent, type QQCard, type QQConversation, type QQEvent,
-  type QQJsonValue, type QQMedia, type QQMediaLocator, type QQMediaUploadPlan, type QQMessage, type QQMultiForwardLocator, type QQReactionContext, type QQReactionDefinition, type QQReactionState,
+  conversationId, parseConversationId, type HistoryQuery, type MemberPage, type QQCallSignalEvent, type QQCard, type QQConversation, type QQEvent, type QQMedia, type QQMediaLocator, type QQMediaUploadPlan, type QQMessage, type QQMultiForwardLocator, type QQReactionContext, type QQReactionDefinition, type QQReactionState,
   type QQSendMediaSpec, type QQSticker, type QQStickerPack, type QQStickerPackSummary, type QQStickerReference, type QQTextPart, type SearchPage, type SearchQuery, type SendManifest,
 } from './protocol.js'
 
@@ -30,8 +30,6 @@ const ELEMENT_FACE = 6
 const ELEMENT_REPLY = 7
 const ELEMENT_MARKET_FACE = 11
 const ELEMENT_MULTI_FORWARD = 16
-const FAVORITE_STICKER_PACK_ID = 'qq-favorites'
-const FAVORITE_STICKER_PACK_TITLE = 'QQ 收藏表情'
 const SEND_FROM_SELF = new Set([1, 2])
 const MEMBER_ADMIN = 3
 const MEMBER_OWNER = 4
@@ -40,19 +38,6 @@ const MEMBER_SCENE_LIMIT = 64
 const DELETE_DEDUP_TTL_MS = 60_000
 const STICKER_MISSING_CACHE_TTL_MS = 30_000
 const STALE_CURSOR_REPLAY_LIMIT = 512
-const HISTORY_INTERACTIVE_TIMEOUT_MS = 2_000
-const AVSDK_EVENT_WINDOW_MS = 1_000
-const AVSDK_MAX_EVENTS_PER_WINDOW = 100
-const AVSDK_MAX_EVENTS_PER_CALLBACK = 20
-const AVSDK_MAX_ARGS = 16
-const AVSDK_MAX_DEPTH = 8
-const AVSDK_MAX_NODES = 64
-const AVSDK_MAX_COLLECTION_ITEMS = 16
-const AVSDK_MAX_STRING_LENGTH = 256
-const AVSDK_MAX_BINARY_PREVIEW_BYTES = 64
-const AVSDK_MAX_BINARY_BYTES = 1_024
-const AVSDK_MAX_OUTPUT_BYTES = 16 * 1024
-const AVSDK_SUBSCRIBER_QUEUE_LIMIT = 64
 const CALL_SIGNAL_EVENT_WINDOW_MS = 60_000
 const CALL_SIGNAL_MAX_EVENTS_PER_WINDOW = 10
 const CALL_SIGNAL_RELATION_ID_MAX_BYTES = 32
@@ -68,12 +53,6 @@ const U64_MAX = 0xffff_ffff_ffff_ffffn
 const CALL_SIGNAL_NONTERMINAL_QUEUE_LIMIT = 16
 const CALL_SIGNAL_TERMINAL_QUEUE_LIMIT = 3
 const CALL_SIGNAL_QUEUE_LIMIT = CALL_SIGNAL_NONTERMINAL_QUEUE_LIMIT + CALL_SIGNAL_TERMINAL_QUEUE_LIMIT
-const AVSDK_DIAGNOSTIC_WINDOW_MS = 60_000
-const AVSDK_DIAGNOSTIC_MAX_PER_WINDOW = 24
-const AVSDK_DIAGNOSTIC_MAX_PER_KIND = 4
-const AVSDK_DIAGNOSTIC_MAX_ARGS = 4
-const AVSDK_DIAGNOSTIC_ADMISSION_MAX_PER_WINDOW = 64
-const AVSDK_DIAGNOSTIC_ADMISSION_MAX_PER_CALLBACK = 16
 const AVSDK_ACCEPT_INVITE = 'trpc.qqrtc.av_appsvr.AvAppsvr.SsoAcceptInvite'
 const AVSDK_REFUSE_INVITE = 'trpc.qqrtc.av_appsvr.AvAppsvr.SsoRefuseInvite'
 const AVSDK_LOG_OUT = 'trpc.qqrtc.av_appsvr.AvAppsvr.SsoLogOut'
@@ -90,7 +69,11 @@ const TELEGRAM_STANDARD_REACTIONS = new Set([
   '🦄', '😘', '💊', '🙊', '😎', '👾', '🤷‍♂', '🤷', '🤷‍♀', '😡', '😂',
 ])
 
-export class QQReactionTargetNotFoundError extends Error {}
+export interface QQMediaLeaseIssuer {
+  readonly isRunning?: boolean
+  issueLease(context: { callId: string }): PCMMediaLease
+  revokeCallLeases(callId: string): void
+}
 
 export interface QQKernelOptions {
   tempPath?: string
@@ -99,6 +82,21 @@ export interface QQKernelOptions {
   packetClient?: QQPacketClientOptions
   deleteDedupTtlMs?: number
   stickerMissingCacheTtlMs?: number
+mediaGateway?: QQMediaLeaseIssuer
+}
+
+export class QQMediaLeaseUnavailableError extends Error {
+  constructor() {
+    super('media lease unavailable')
+    this.name = 'QQMediaLeaseUnavailableError'
+  }
+}
+
+export class QQMediaLeaseAuthorizationError extends Error {
+  constructor() {
+    super('media lease unauthorized')
+    this.name = 'QQMediaLeaseAuthorizationError'
+  }
 }
 
 export class QQStickerAssetNotFoundError extends Error {
@@ -159,26 +157,10 @@ type AVSDKInviteParseResult =
   | { ok: true, invite: ParsedAVSDKInvite }
   | { ok: false, reason: AVSDKInviteParseFailure }
 
-type AVSDKDiagnosticSource = 'listener-tap' | 'action-intercept'
 type CallSignalJob =
-  | { kind: 'invite', generation: number, source: AVSDKDiagnosticSource, invite: ParsedAVSDKInvite }
-  | { kind: 'accept' | 'refuse' | 'logout' | 'ended', generation: number, source: AVSDKDiagnosticSource }
-
-type AVSDKDiagnosticCallback = 'OnInviteActionToAVSDK' | 'setActionFromAVSDK' | 'onS2CActionToAVSDK'
-type AVSDKDiagnosticDrop =
-  | AVSDKInviteParseFailure
-  | 'missing-call-id'
-  | 'unresolved-conversation'
-  | 'stale-session'
-  | 'duplicate-transition'
-  | 'no-active-call'
-  | 'uncorrelated-transition'
-  | 'rate-limited'
-  | 'queue-coalesced'
-  | 'concurrent-call'
-  | 'crypto-failure'
-type CallSignalEnqueueResult =
-  | { outcome: 'enqueued' | 'coalesced' | 'concurrent' }
+  | { kind: 'invite', generation: number, invite: ParsedAVSDKInvite }
+  | { kind: 'accept' | 'refuse' | 'logout' | 'ended', generation: number, }
+type CallSignalEnqueueResult = { outcome: 'enqueued' | 'coalesced' | 'concurrent' }
 
 export class QQKernelBridge {
   readonly events = new Set<AsyncQueue<QQEvent>>()
@@ -186,17 +168,8 @@ export class QQKernelBridge {
   private readonly eventIds = new WeakMap<object, string>()
   private readonly replayStates = new WeakMap<AsyncQueue<QQEvent>, { remaining: number, total: number }>()
   private eventSequence = 0
-  private avsdkEventWindowStartedAt = 0
-  private avsdkEventCount = 0
-  private readonly avsdkCallbackEventCounts = new Map<string, number>()
   private callSignalEventWindowStartedAt = 0
   private callSignalEventCount = 0
-  private avsdkDiagnosticWindowStartedAt = 0
-  private avsdkDiagnosticCount = 0
-  private readonly avsdkDiagnosticCounts = new Map<string, number>()
-  private avsdkDiagnosticAdmissionWindowStartedAt = 0
-  private avsdkDiagnosticAdmissionCount = 0
-  private readonly avsdkDiagnosticAdmissionCounts = new Map<AVSDKDiagnosticCallback, number>()
   private readonly callSignalJobs: CallSignalJob[] = []
   private readonly pendingCallSignalKinds = new Map<CallSignalJob['kind'], number>()
   private callSignalQueueRunning = false
@@ -244,7 +217,6 @@ export class QQKernelBridge {
   private readonly stickerPacks = new Map<string, QQStickerPack>()
   private readonly stickerPackInfo = new Map<string, MarketStickerPackInfo>()
   private readonly stickers = new Map<string, QQSticker>()
-  private favoriteStickerPackPromise?: Promise<QQStickerPack>
   private readonly pendingMessages = new Map<string, ReturnType<typeof deferred<MsgRecord>>>()
   private readonly pendingAcceptances = new Map<string, ReturnType<typeof deferred<void>>>()
   private readonly pendingMinimumStatuses = new Map<string, number>()
@@ -297,6 +269,8 @@ export class QQKernelBridge {
   private readonly deleteDedupTtlMs: number
   private readonly stickerMissingCacheTtlMs: number
 
+  private readonly mediaGateway?: QQMediaLeaseIssuer
+
   constructor(options: QQKernelOptions = {}) {
     this.tempPath = options.tempPath ?? join(process.env.TMPDIR ?? '/tmp', 'qqnt-mtproto-bridge')
     this.sendTimeoutMs = options.sendTimeoutMs ?? 60_000
@@ -304,6 +278,7 @@ export class QQKernelBridge {
     this.packetClientOptions = options.packetClient ?? {}
     this.deleteDedupTtlMs = options.deleteDedupTtlMs ?? DELETE_DEDUP_TTL_MS
     this.stickerMissingCacheTtlMs = options.stickerMissingCacheTtlMs ?? STICKER_MISSING_CACHE_TTL_MS
+    this.mediaGateway = options.mediaGateway
     try {
       this.callSignalSecret = randomBytes(CALL_SIGNAL_SECRET_BYTES)
       this.callSignalProcessEpoch = randomBytes(CALL_SIGNAL_PROCESS_EPOCH_BYTES)
@@ -321,7 +296,23 @@ export class QQKernelBridge {
     }
   }
 
-  attach(kernel: KernelModule, session: KernelSession, config: InitSessionConfig): void {
+  issueMediaLease(callId: unknown): PCMMediaLease {
+    const state = this.callSignalState
+    if (!this.mediaGateway || this.mediaGateway.isRunning === false)
+      throw new QQMediaLeaseUnavailableError()
+    if (
+      typeof callId !== 'string' ||
+      !state ||
+      state.signal === 'ended' ||
+      state.callId !== callId
+    ) {
+      throw new QQMediaLeaseAuthorizationError()
+    }
+    return this.mediaGateway.issueLease({ callId: state.callId })
+  }
+
+  attach(kernel: KernelModule, session: KernelSession, config: InitSessionConfig,
+  ): void {
     this.detach()
     log('info', `bridge attach start selfUin=${config.selfUin} selfUid=${config.selfUid} listenerConstructors=msg:${Boolean(kernel.NodeIKernelMsgListener)},buddy:${Boolean(kernel.NodeIKernelBuddyListener)},group:${Boolean(kernel.NodeIKernelGroupListener)},recent:${Boolean(kernel.NodeIKernelRecentContactListener)}`)
     // A native wrapper can be re-initialized after logout/account switching.
@@ -337,17 +328,8 @@ export class QQKernelBridge {
     this.resolvedReplyTargets.clear()
     this.groupProfileAttempts.clear()
     this.recentDeletes.clear()
-    this.avsdkEventWindowStartedAt = 0
-    this.avsdkEventCount = 0
-    this.avsdkCallbackEventCounts.clear()
     this.callSignalEventWindowStartedAt = 0
     this.callSignalEventCount = 0
-    this.avsdkDiagnosticWindowStartedAt = 0
-    this.avsdkDiagnosticCount = 0
-    this.avsdkDiagnosticCounts.clear()
-    this.avsdkDiagnosticAdmissionWindowStartedAt = 0
-    this.avsdkDiagnosticAdmissionCount = 0
-    this.avsdkDiagnosticAdmissionCounts.clear()
     this.callSignalJobs.splice(0)
     this.pendingCallSignalKinds.clear()
     this.callSignalQueueRunning = false
@@ -364,7 +346,6 @@ export class QQKernelBridge {
     this.stickerPacks.clear()
     this.stickerPackInfo.clear()
     this.stickers.clear()
-    this.favoriteStickerPackPromise = undefined
     this.buddySnapshotLoaded = false
     this.kernel = kernel
     this.session = session
@@ -395,6 +376,7 @@ export class QQKernelBridge {
     this.callSignalJobs.splice(0)
     this.pendingCallSignalKinds.clear()
     this.callSignalQueueRunning = false
+    this.revokeCurrentCallMediaLeases()
     this.callSignalState = undefined
     if (this.listenerRetry) clearTimeout(this.listenerRetry)
     if (this.avsdkListenerRetry) clearTimeout(this.avsdkListenerRetry)
@@ -472,7 +454,7 @@ export class QQKernelBridge {
   }
 
   subscribe(lastEventId?: string): AsyncQueue<QQEvent> {
-    const queue = new AsyncQueue<QQEvent>(AVSDK_SUBSCRIBER_QUEUE_LIMIT)
+    const queue = new AsyncQueue<QQEvent>()
     this.events.add(queue)
     if (lastEventId) {
       const cursor = this.recentEvents.findIndex((item) => item.id === lastEventId)
@@ -562,7 +544,9 @@ export class QQKernelBridge {
     if (recentError) throw recentError
   }
 
-  async getDialogs(cursor?: string, limit = 100, afterId?: string): Promise<{
+  async getDialogs(
+    cursor?: string, limit = 100, afterId?: string,
+  ): Promise<{
     conversations: QQConversation[]
     nextCursor?: string
     total: number
@@ -582,7 +566,7 @@ export class QQKernelBridge {
       ...[...this.contacts.values()].filter((conversation) => !orderedIds.has(conversation.id)),
     ]
     const afterIndex = afterId ? dialogs.findIndex((dialog) => dialog.id === afterId) : -1
-    const offset = afterId ? (afterIndex < 0 ? 0 : afterIndex + 1) : parseCursor(cursor)
+    const offset = afterId ? afterIndex < 0 ? 0 : afterIndex + 1 : parseCursor(cursor)
     const selected = dialogs.slice(offset, offset + clamp(limit, 1, 500))
     const hydrated = await mapConcurrent(selected, 8, (conversation) => this.hydrateRecentTopMessage(conversation))
     await this.refreshUnreadMarkers(hydrated)
@@ -601,7 +585,9 @@ export class QQKernelBridge {
     }
   }
 
-  async getContacts(cursor?: string, limit = 500): Promise<{
+  async getContacts(
+    cursor?: string, limit = 500,
+  ): Promise<{
     users: Array<{ id: string, numericId?: string, name: string, signature?: string, avatar?: QQMedia }>
     nextCursor?: string
   }> {
@@ -627,6 +613,7 @@ export class QQKernelBridge {
     // cold-cache miss does not stay permanent.
     const users = await mapConcurrent(selected, 4, async (user) => ({
       ...user,
+      name: firstUsefulTitle(user.id, user.name, user.numericId, user.id),
       avatar: await this.userAvatar(user.id, false),
     }))
     return { users, nextCursor: offset + users.length < all.length ? String(offset + users.length) : undefined }
@@ -723,7 +710,7 @@ export class QQKernelBridge {
         log('info', `native API fallback name=getMsgs conversation=${conversation.id} previousResult=${response.result}`)
         response = await withTimeout(
           service.getMsgs(peer, '0', limit, true),
-          HISTORY_INTERACTIVE_TIMEOUT_MS,
+          450,
           'QQ history fallback request timed out',
         )
       }
@@ -790,7 +777,7 @@ export class QQKernelBridge {
     )
     const first = await withTimeout(
       Promise.race([settledLocal, settledRemote]),
-      HISTORY_INTERACTIVE_TIMEOUT_MS,
+      450,
       'QQ first-screen history request timed out',
     )
     if (
@@ -805,7 +792,7 @@ export class QQKernelBridge {
     }
     const remoteResult = first.source === 'remote' ? first : await withTimeout(
       settledRemote,
-      Math.max(1, HISTORY_INTERACTIVE_TIMEOUT_MS - (Date.now() - started)),
+      Math.max(1, 450 - (Date.now() - started)),
       'QQ first-screen remote history request timed out',
     )
     if ('error' in remoteResult) throw remoteResult.error
@@ -1111,21 +1098,12 @@ export class QQKernelBridge {
     packs: QQStickerPackSummary[]
     nextCursor?: string
   }> {
-    const [favoritePack] = await Promise.all([
-      this.loadFavoriteStickerPack(),
-      this.loadStickerPackCatalog(),
-    ])
+    await this.loadStickerPackCatalog()
     const offset = parseCursor(cursor)
-    const packs: QQStickerPackSummary[] = [...this.stickerPackInfo.values()].map((item) => ({
+    const packs = [...this.stickerPackInfo.values()].map((item) => ({
       packId: String(item.epId), title: item.tabName || String(item.epId), version: 1,
       count: this.stickerPacks.get(String(item.epId))?.stickers.length,
     }))
-    if (favoritePack.stickers.length) packs.unshift({
-      packId: favoritePack.packId,
-      title: favoritePack.title,
-      count: favoritePack.count,
-      version: favoritePack.version,
-    })
     const selected = packs.slice(offset, offset + clamp(limit, 1, 200))
     return {
       packs: selected,
@@ -1134,7 +1112,6 @@ export class QQKernelBridge {
   }
 
   async getStickerPack(packId: string): Promise<QQStickerPack | null> {
-    if (packId === FAVORITE_STICKER_PACK_ID) return this.loadFavoriteStickerPack()
     const cached = this.stickerPacks.get(packId)
     if (cached) return cached
     await this.loadStickerPackCatalog()
@@ -1199,10 +1176,15 @@ export class QQKernelBridge {
         dynamicPath,
       }
       const sticker: QQSticker = {
-        stickerId: marketStickerId(packId, item.id), packId, title: item.name || info?.tabName,
+        stickerId: marketStickerId(packId, item.id),
+        packId,
+        title: item.name || info?.tabName || detail.name || packId,
         format: animated ? 'animated' : 'static',
         mimeType: animated ? 'image/gif' : 'image/png',
-        width: reference.width, height: reference.height, version: 1, reference,
+        width: reference.width,
+        height: reference.height,
+        version: 1,
+        reference,
       }
       this.stickers.set(sticker.stickerId, sticker)
       return sticker
@@ -1219,8 +1201,10 @@ export class QQKernelBridge {
     if (cached) return cached
     const market = parseMarketStickerId(stickerId)
     if (market) {
-      return (await this.getStickerPack(market.packageId))?.stickers
-        .find((item) => item.stickerId === stickerId) ?? null
+      return ( (await this.getStickerPack(market.packageId))?.stickers.find(
+          (item) => item.stickerId === stickerId,
+        ) ?? null
+      )
     }
     if (stickerId.startsWith('favorite:')) {
       let cursor: string | undefined
@@ -1242,10 +1226,7 @@ export class QQKernelBridge {
     if (!service.fetchFavEmojiList) return { stickers: [] }
     const result = await service.fetchFavEmojiList(cursor ?? '', clamp(limit, 1, 200), true, false)
     if (result.result !== 0) throw new Error(`fetchFavEmojiList: ${result.errMsg} (${result.result})`)
-    const stickers = await mapConcurrent(result.emojiInfoList, 8, async (item) => ({
-      ...await this.mapFavoriteSticker(item),
-      packId: FAVORITE_STICKER_PACK_ID,
-    }))
+    const stickers = await mapConcurrent(result.emojiInfoList, 8, (item) => this.mapFavoriteSticker(item))
     for (const sticker of stickers) this.stickers.set(sticker.stickerId, sticker)
     return {
       stickers,
@@ -1330,30 +1311,23 @@ export class QQKernelBridge {
     }
   }
 
-  async setSavedSticker(reference: QQStickerReference, saved: boolean): Promise<void> {
+  async setSavedSticker(
+    reference: QQStickerReference, saved: boolean,
+  ): Promise<void> {
     if (reference.kind === 'sysface') throw new Error('QQ system faces cannot be added to favorites')
     const service = this.requireMsgService()
     if (!saved) {
       if (!service.deleteFavEmoji) throw new Error('QQ favorite deletion is unavailable')
       const resId = reference.kind === 'favorite'
         ? reference.resId
-        : reference.favoriteResId ?? await this.findFavoriteResId(reference)
+        : (reference.favoriteResId ??
+            (await this.findFavoriteResId(reference)))
       if (!resId) return
       const result = await service.deleteFavEmoji([resId])
       if (result.result !== 0) throw new Error(`deleteFavEmoji: ${result.errMsg} (${result.result})`)
-      this.stickers.delete(favoriteStickerId(resId))
-      this.invalidateFavoriteStickerPack()
       return
     }
     if (!service.addFavEmoji) throw new Error('QQ favorite creation is unavailable')
-    if (reference.kind === 'market' && service.fetchMarketEmoticonAuthDetail) {
-      const authorization = await service.fetchMarketEmoticonAuthDetail({
-        epId: Number(reference.packageId), eId: reference.stickerId, scene: 0,
-      })
-      if (authorization.result !== 0) {
-        throw new Error(`fetchMarketEmoticonAuthDetail: ${authorization.errMsg} (${authorization.result})`)
-      }
-    }
     const path = reference.kind === 'favorite'
       ? reference.path
       : (await this.resolveMarketStickerPath(reference)).path
@@ -1367,7 +1341,6 @@ export class QQKernelBridge {
       fileName: reference.name, md5: reference.md5 ?? '', isMarkFace: false, isOrigin: true,
     })
     if (result.result !== 0) throw new Error(`addFavEmoji: ${result.errMsg} (${result.result})`)
-    this.invalidateFavoriteStickerPack()
   }
 
   async prepareMediaUpload(conversationId: string, spec: QQSendMediaSpec): Promise<QQMediaUploadPlan> {
@@ -1416,11 +1389,7 @@ export class QQKernelBridge {
     const conversation = this.getConversation(manifest.conversationId)
     const peerUin = await this.requireProtocolPeerUin(conversation)
     const protocolParts: DirectMessagePart[] = []
-    if (manifest.replyToId) {
-      protocolParts.push(await this.directReplyPart(
-        conversation, manifest.replyToId, manifest.replyToSequence,
-      ))
-    }
+    if (manifest.replyToId) protocolParts.push(await this.directReplyPart(conversation, manifest.replyToId))
     if (manifest.textParts?.length) {
       for (const part of manifest.textParts) protocolParts.push(...directTextParts(part))
     } else if (manifest.text) protocolParts.push({ kind: 'text', text: manifest.text })
@@ -1700,7 +1669,7 @@ export class QQKernelBridge {
       log('info', `native API start name=getABatchOfContactMsgBoxInfo contacts=${conversations.length}`)
       const response = await withTimeout(
         retryHistoryCall(() => service.getABatchOfContactMsgBoxInfo!(conversations.map(contact))),
-        HISTORY_INTERACTIVE_TIMEOUT_MS,
+        450,
         'QQ batch unread request timed out',
       )
       if (response.result !== 0) throw new Error(`getABatchOfContactMsgBoxInfo: ${response.errMsg} (${response.result})`)
@@ -1746,14 +1715,7 @@ export class QQKernelBridge {
     limit: number,
   ): Promise<{ result: number, errMsg: string, msgList: MsgRecord[] }> {
     const peer = contact(conversation)
-    // The unread anchor can sit close to either end of the available history.
-    // Asking each side for only half a page under-fills the result whenever
-    // the shorter side runs out (for example 27 older + 8 newer for limit 51).
-    // Fetch one full candidate page in both directions concurrently, then
-    // de-duplicate the shared anchor and trim below. This keeps the cold-path
-    // latency at one native round trip while allowing the longer side to fill
-    // the requested Telegram window.
-    const count = Math.max(2, Math.min(200, limit + 1))
+    const count = Math.max(2, Math.ceil(limit / 2) + 1)
     const call = async (queryOrder: boolean) => {
       const started = Date.now()
       try {
@@ -1771,14 +1733,15 @@ export class QQKernelBridge {
     // concurrently. Waiting for them serially doubles cold roaming latency.
     const [before, after] = await withTimeout(
       Promise.all([call(true), call(false)]),
-      HISTORY_INTERACTIVE_TIMEOUT_MS,
+      450,
       'QQ unread history request timed out',
     )
     // QQ returns kNoMoreMsg (2004000) together with the final non-empty
     // page. The official client consumes that page instead of discarding it.
     const successful = [before, after].filter((item) => item && (item.result === 0 || item.msgList.length > 0))
     if (!successful.length) {
-      return before ?? after ?? { result: -1, errMsg: 'unread history unavailable', msgList: [] }
+      return ( before ?? after ?? { result: -1, errMsg: 'unread history unavailable', msgList: [], }
+      )
     }
     const records = new Map<string, MsgRecord>()
     for (const result of successful) {
@@ -1825,7 +1788,6 @@ export class QQKernelBridge {
     const api = merged ? 'multiForwardMsg' : 'forwardMsg'
     log('info', `native API start name=${api} from=${source.id} to=${destination.id} messages=${ids.join(',')}`)
     const pendingMerged = merged ? { conversationId: destination.id, startedAt } : undefined
-    let mergedPreview: string | undefined
     if (pendingMerged) this.pendingMergedForwards.push(pendingMerged)
     try {
       let result: { result: number, errMsg: string }
@@ -1836,14 +1798,6 @@ export class QQKernelBridge {
         const records = await service.getMsgsByMsgId(contact(source), ids)
         if (records.result !== 0) throw new Error(`getMsgsByMsgId: ${records.errMsg} (${records.result})`)
         const byId = new Map(records.msgList.map((record) => [record.msgId, record]))
-        mergedPreview = forwardedMessagesPreview(ids.flatMap((msgId) => {
-          const record = byId.get(msgId)
-          return record ? [{
-            message: this.mapMessage(record),
-            senderName: record.sendRemarkName || record.sendMemberName
-              || record.sendNickName || record.senderUin,
-          }] : []
-        }))
         const messages = ids.map((msgId) => {
           const record = byId.get(msgId)
           return {
@@ -1865,14 +1819,6 @@ export class QQKernelBridge {
       const messages = await this.waitForForwardedMessages(
         destination, before, merged ? 1 : ids.length, startedAt, merged,
       )
-      if (mergedPreview) {
-        for (const message of messages) {
-          message.parts = message.parts.map((part) => part.type === 'multi-forward'
-            && (!part.preview || isGenericMultiForwardPreview(part.preview))
-            ? { ...part, preview: mergedPreview }
-            : part)
-        }
-      }
       log('info', `native API complete name=${api} from=${source.id} to=${destination.id} result=${result.result} messages=${messages.map((item) => item.id).join(',')} err=${JSON.stringify(result.errMsg)}`)
       return messages
     } finally {
@@ -1884,13 +1830,21 @@ export class QQKernelBridge {
   }
 
   async getUser(uid: string) {
+    if (!uid.trim()) return undefined
     let cached = this.seenUsers.get(uid) ?? this.users.get(uid)
     if (cached && (isFallbackUserName(cached) || cached.signature === undefined)) {
       await this.ensureUserProfiles([uid]).catch((error) =>
         log('error', `QQ profile resolve failed uid=${uid}; using cached fallback`, error))
       cached = this.seenUsers.get(uid) ?? this.users.get(uid)
     }
-    if (cached) return { ...cached, avatar: await this.userAvatar(uid, false) }
+    if (cached) { return { ...cached,
+        name: firstUsefulTitle(
+          cached.numericId ?? cached.id,
+          cached.name,
+          cached.numericId,
+          cached.id,
+        ), avatar: await this.userAvatar(uid, false),
+      } }
     let numericId: string | undefined
     try {
       const numeric = await withTimeout(
@@ -1911,6 +1865,12 @@ export class QQKernelBridge {
     const resolved = this.seenUsers.get(uid) ?? user
     return {
       ...resolved,
+      name: firstUsefulTitle(
+        resolved.id,
+        resolved.name,
+        resolved.numericId,
+        resolved.id,
+      ),
       avatar: await this.userAvatar(uid, false),
     }
   }
@@ -1945,15 +1905,13 @@ export class QQKernelBridge {
     }
   }
 
-  async getMessageReactions(
-    conversation: QQConversation,
-    messageId: string,
-    messageSequence?: string,
-  ): Promise<QQReactionState> {
+  async getMessageReactions(conversation: QQConversation, messageId: string): Promise<QQReactionState> {
     if (conversation.chatType !== CHAT_GROUP) return { reactions: [], maxSelected: 0 }
-    const record = await withTimeout(this.getReactionRecord(
-      conversation, messageId, messageSequence,
-    ), 5_000, 'QQ reaction lookup timed out')
+    const record = await withTimeout(
+      this.getMessageRecord(conversation, messageId),
+      5_000,
+      'QQ reaction lookup timed out',
+    )
     if (!record) return { reactions: [], maxSelected: 20 }
     const message = this.mapMessage(record)
     const previous = (this.messages.get(conversation.id) ?? []).find((item) => item.id === messageId)
@@ -2022,7 +1980,9 @@ export class QQKernelBridge {
     return this.normalizeReactionActors([...actors.values()].slice(0, 100))
   }
 
-  private async normalizeReactionActors(actors: EmojiLikesUserInfo[]): Promise<EmojiLikesUserInfo[]> {
+  private async normalizeReactionActors(
+    actors: EmojiLikesUserInfo[],
+  ): Promise<EmojiLikesUserInfo[]> {
     const numericIds = [...new Set(actors.map((actor) => actor.tinyId).filter((id) => /^\d+$/.test(id)))]
     const opaqueIds = [...new Set(actors.map((actor) => actor.tinyId).filter((id) => !/^\d+$/.test(id)))]
     const [uidInfo, uinInfo] = await Promise.all([
@@ -2046,7 +2006,7 @@ export class QQKernelBridge {
     const normalized = new Map<string, EmojiLikesUserInfo>()
     for (const actor of actors) {
       const numericId = /^\d+$/.test(actor.tinyId) ? actor.tinyId : uinInfo.get(actor.tinyId)
-      const id = numericId ? uidInfo.get(numericId) ?? actor.tinyId : actor.tinyId
+      const id = numericId ? (uidInfo.get(numericId) ?? actor.tinyId) : actor.tinyId
       if (normalized.has(id)) continue
       const previous = this.seenUsers.get(id) ?? this.users.get(id)
       this.rememberSeenUser({
@@ -2066,7 +2026,6 @@ export class QQKernelBridge {
     conversation: QQConversation,
     messageId: string,
     reactionKeys: readonly string[],
-    messageSequence?: string,
   ): Promise<QQReactionState> {
     if (conversation.chatType !== CHAT_GROUP) throw new Error('QQ reactions are unavailable in direct conversations')
     const service = this.requireMsgService()
@@ -2075,38 +2034,26 @@ export class QQKernelBridge {
     // onAddSendMsg may expose a temporary group msgSeq at sendStatus=1. The
     // stable msgId can already be returned to callers, but reaction writes must
     // refresh the record and use QQ's final msgSeq.
-    let lookupError: unknown
-    let record = await withTimeout(this.getReactionRecord(
-      conversation, messageId, messageSequence,
-    ), 5_000, 'QQ reaction target refresh timed out').catch((error) => {
-      lookupError = error
-      return null
-    })
+    let record = await withTimeout(
+      this.getMessageRecord(conversation, messageId),
+      5_000,
+      'QQ reaction target refresh timed out',
+    ).catch(() => null)
     // Both getMsgsByMsgId and the first-view cache can briefly retain the
     // optimistic record. Poll the database view until QQ publishes the final
     // sendStatus/msgSeq, bounded to keep older builds responsive.
     for (let attempt = 0; record?.sendStatus === 1 && attempt < 8; attempt++) {
       const latest = await this.latestRecords(conversation, 20).catch(() => [])
-      const candidate = latest.find((item) => item.msgId === messageId
-        || messageSequence !== undefined && item.msgSeq === messageSequence)
+      const candidate = latest.find((item) => item.msgId === messageId)
       if (candidate && candidate.sendStatus >= 2) {
         record = candidate
         break
       }
       await delay(200)
-      record = await this.getReactionRecord(
-        conversation, messageId, messageSequence,
-      ).then((refreshed) => {
-        if (refreshed) lookupError = undefined
-        return refreshed ?? record
-      }).catch((error) => {
-        lookupError = error
-        return record
-      })
+      record = await this.getMessageRecord(conversation, messageId).catch(() => record)
     }
-    const message = record ? this.mapMessage(record) : cached ?? null
-    if (!message && lookupError) throw lookupError
-    if (!message) throw new QQReactionTargetNotFoundError(`QQ reaction target not found: ${messageId}`)
+    const message = record ? this.mapMessage(record) : (cached ?? null)
+    if (!message) throw new Error(`QQ reaction target not found: ${messageId}`)
     const current = new Set((message.reactionContext?.reactions ?? []).filter((item) => item.selected)
       .map((item) => item.key))
     const desired = new Set(reactionKeys)
@@ -2385,7 +2332,9 @@ export class QQKernelBridge {
       this.profileListenerId = this.profileService.addKernelProfileListener(profileListener)
       log('info', `native listener registered service=profile id=${this.profileListenerId || '<empty>'}`)
     }
-    const groupListener = markBridgeListener(makeListener('NodeIKernelGroupListener', kernel.NodeIKernelGroupListener, {
+    const groupListener = markBridgeListener(
+      makeListener(
+        'NodeIKernelGroupListener', kernel.NodeIKernelGroupListener, {
       onGroupListUpdate: (
         value: number | {
           groupList: Array<{
@@ -2406,7 +2355,7 @@ export class QQKernelBridge {
           memberRole?: number
         }>,
       ) => {
-        const groups = typeof value === 'object' && value ? value.groupList ?? [] : legacyGroups ?? []
+        const groups = typeof value === 'object' && value ? (value.groupList ?? []) : (legacyGroups ?? [])
         log('info', `group list update received: type=${typeof value === 'number' ? value : 'object'} groups=${groups.length}`)
         for (const group of groups) {
           this.upsertGroupProfile(group)
@@ -2438,26 +2387,34 @@ export class QQKernelBridge {
           finish: !info.hasNext,
         })
       },
-    }))
+        },
+      ),
+    )
     this.groupListenerId = groupService.addKernelGroupListener(groupListener)
     log('info', `native listener registered service=group id=${this.groupListenerId || '<empty>'}`)
     if (recentService.addKernelRecentContactListener) {
-      const recentListener = markBridgeListener(makeListener('NodeIKernelRecentContactListener', kernel.NodeIKernelRecentContactListener, {
-        onRecentContactListChanged: (value: string[] | RecentContactInfo[] | {
+      const recentListener = markBridgeListener(
+        makeListener(
+          'NodeIKernelRecentContactListener', kernel.NodeIKernelRecentContactListener, {
+        onRecentContactListChanged: (
+              value: string[] | RecentContactInfo[] | {
           changedList: RecentContactInfo[]
-        }, legacyChanged?: RecentContactInfo[]) => {
-          const sorted = Array.isArray(value) && typeof value[0] === 'string' ? value as string[] : undefined
+        }, legacyChanged?: RecentContactInfo[],
+            ) => {
+          const sorted = Array.isArray(value) && typeof value[0] === 'string' ? (value as string[]) : undefined
           const changed = Array.isArray(value)
-            ? (typeof value[0] === 'string' ? legacyChanged ?? [] : value as RecentContactInfo[])
-            : value.changedList ?? legacyChanged ?? []
+            ? typeof value[0] === 'string' ? (legacyChanged ?? []) : (value as RecentContactInfo[])
+            : (value.changedList ?? legacyChanged ?? [])
           log('info', `recent contact update received: version=1 changed=${changed.length}`)
           this.consumeRecentContactList(sorted, changed)
           this.resolveRecentListUpdates()
         },
-        onRecentContactListChangedVer2: (value: Array<{ sortedContactList?: string[], changedList?: RecentContactInfo[] }> | {
+        onRecentContactListChangedVer2: (
+              value: Array<{ sortedContactList?: string[], changedList?: RecentContactInfo[] }> | {
           changedRecentContactLists?: Array<{ sortedContactList?: string[], changedList?: RecentContactInfo[] }>
-        }) => {
-          const lists = Array.isArray(value) ? value : value.changedRecentContactLists ?? []
+        },
+            ) => {
+          const lists = Array.isArray(value) ? value : (value.changedRecentContactLists ?? [])
           const changed = lists.flatMap((item) => item.changedList ?? [])
           log('info', `recent contact update received: version=2 lists=${lists.length} changed=${changed.length} messages=${changed.map((item) => `${item.chatType}:${item.peerUid}:${item.msgSeq ?? ''}:${item.msgId || '<none>'}`).join(',') || '<none>'}`)
           for (const list of lists) {
@@ -2465,7 +2422,9 @@ export class QQKernelBridge {
           }
           this.resolveRecentListUpdates()
         },
-      }))
+      },
+        ),
+      )
       this.recentListenerId = recentService.addKernelRecentContactListener(recentListener)
       log('info', `native listener registered service=recent id=${this.recentListenerId || '<empty>'}`)
     }
@@ -2482,33 +2441,35 @@ export class QQKernelBridge {
       this.searchListenerId = this.searchService.addKernelSearchListener(searchListener)
       log('info', `native listener registered service=search id=${this.searchListenerId || '<empty>'}`)
     }
-    if (isAVSDKTapEnabled()) {
       try {
         if (!this.registerAVSDKListener()) this.scheduleAVSDKListenerRegistration(2)
       } catch (error) {
-        log('error', 'initial AVSDK listener registration failed; scheduling retry', error)
+      log(
+        'error', 'initial AVSDK listener registration failed; scheduling retry',
+        error,
+      )
         this.scheduleAVSDKListenerRegistration(2)
-      }
     }
   }
 
   private registerAVSDKListener(): boolean {
-    if (!isAVSDKTapEnabled() || this.avsdkListenerId) return true
+    if (this.avsdkListenerId) return true
     const session = this.requireSession()
     const service = this.avsdkService ?? session.getAVSDKService?.()
     if (!service) return false
     this.avsdkService = service
-    const listener = markBridgeListener(makeAVSDKListener(
-      this.kernel!.NodeIAVSDKListener,
-      (callback, args) => this.onAVSDKCallback(callback, args, 'listener-tap'),
-    ))
+    const listener = markBridgeListener(
+      makeAVSDKListener(this.kernel!.NodeIAVSDKListener,
+      (callback, args) => this.onAVSDKCallback(callback, args),
+      ),
+    )
     this.avsdkListenerId = service.addKernelAVSDKListener(listener)
     log('info', `native listener registered service=avsdk id=${this.avsdkListenerId || '<empty>'}`)
     return true
   }
 
   private scheduleAVSDKListenerRegistration(attempt = 1): void {
-    if (!isAVSDKTapEnabled() || this.avsdkListenerRetry || this.avsdkListenerId) return
+    if (this.avsdkListenerRetry || this.avsdkListenerId) return
     this.avsdkListenerRetry = setTimeout(() => {
       this.avsdkListenerRetry = undefined
       if (!this.session || this.avsdkListenerId) return
@@ -2527,148 +2488,36 @@ export class QQKernelBridge {
     }, attempt === 1 ? 0 : 250)
   }
 
-  observeAVSDKAction(action: number, bytes: Uint8Array): void {
-    this.onAVSDKCallback('setActionFromAVSDK', [action, bytes], 'action-intercept')
-  }
-
-  private onAVSDKCallback(callback: string, args: unknown[], source: AVSDKDiagnosticSource): void {
-    if (!isAVSDKTapEnabled()) return
-    const callCallback = isAVSDKDiagnosticCallback(callback) ? callback : undefined
-    const diagnosticAdmitted = callCallback ? this.acceptAVSDKDiagnosticAdmission(callCallback) : false
-    let inviteResult: AVSDKInviteParseResult | undefined
-    if (callCallback === 'OnInviteActionToAVSDK' && this.config && this.callSignalSecret) {
-      try {
-        inviteResult = parseAVSDKInvite(args, this.config, this.callSignalSecret)
-      } catch {
-        // The call-signal observer reports the fixed crypto-failure outcome.
-      }
-    }
-    if (callCallback) this.observeCallSignal(callCallback, args, source, diagnosticAdmitted, inviteResult)
-    if (isAVSDKRawEnabled() && this.acceptAVSDKEvent(callback)) {
-      this.dispatch({ type: 'native-avsdk', version: 1, callback, args: normalizeAVSDKArgs(args) })
-    }
-  }
-
-  private observeCallSignal(
-    callback: AVSDKDiagnosticCallback,
-    args: unknown[],
-    source: AVSDKDiagnosticSource,
-    diagnosticAdmitted: boolean,
-    inviteResult?: AVSDKInviteParseResult,
-  ): void {
-    if (diagnosticAdmitted) this.observeAVSDKReceipt(callback, args, source, inviteResult)
-    const generation = this.callSignalGeneration
+  private onAVSDKCallback(callback: string, args: unknown[]): void {
     if (callback === 'OnInviteActionToAVSDK') {
-      if (!inviteResult) {
-        this.observeAVSDKDrop(callback, source, 'crypto-failure')
+      if (!this.config || !this.callSignalSecret) return
+    let result: AVSDKInviteParseResult
+      try {
+        result = parseAVSDKInvite(args, this.config, this.callSignalSecret)
+      } catch {
         return
       }
-      if (!inviteResult.ok) {
-        this.observeAVSDKDrop(callback, source, inviteResult.reason)
-        return
-      }
-      const enqueued = this.enqueueCallSignal({ kind: 'invite', generation, source, invite: inviteResult.invite })
-      if (enqueued.outcome === 'coalesced') this.observeAVSDKDrop(callback, source, 'queue-coalesced')
-      else if (enqueued.outcome === 'concurrent') this.observeAVSDKDrop(callback, source, 'concurrent-call')
+      if (result.ok) this.enqueueCallSignal({ kind: 'invite',
+          generation: this.callSignalGeneration, invite: result.invite, })
       return
     }
     if (callback === 'setActionFromAVSDK') {
       const kind = callSignalActionKind(args[1])
-      if (!kind) return
-      const enqueued = this.enqueueCallSignal({ kind, generation, source })
-      if (enqueued.outcome === 'coalesced') this.observeAVSDKDrop(callback, source, 'queue-coalesced', false, kind)
+      if (kind) this.enqueueCallSignal({ kind, generation: this.callSignalGeneration })
       return
     }
-    if (!hasDestroyReason(args[0])) return
-    const enqueued = this.enqueueCallSignal({ kind: 'ended', generation, source })
-    if (enqueued.outcome === 'coalesced') this.observeAVSDKDrop(callback, source, 'queue-coalesced', false, 'unknown', true)
-  }
-
-  private observeAVSDKReceipt(
-    callback: AVSDKDiagnosticCallback,
-    args: unknown[],
-    source: AVSDKDiagnosticSource,
-    inviteResult?: AVSDKInviteParseResult,
-  ): void {
-    try {
-      const values = args.slice(0, AVSDK_DIAGNOSTIC_MAX_ARGS)
-      const invite = inviteResult?.ok ? inviteResult.invite : undefined
-      const action = callback === 'setActionFromAVSDK' ? callSignalActionKind(args[1]) ?? 'unknown' : 'unknown'
-      const terminal = callback === 'onS2CActionToAVSDK' && hasDestroyReason(args[0])
-      const callIdFound = Boolean(invite)
-      const inviteRelation = callback === 'OnInviteActionToAVSDK' && hasAVSDKInviteRelation(args[0])
-      this.logAVSDKDiagnostic(
-        `receipt:${source}:${callback}`,
-        `avsdk-call receipt source=${source} callback=${callback} args=${Math.min(args.length, AVSDK_MAX_ARGS)} types=${values.map(diagnosticAVSDKArgType).join(',')} binaryBytes=${values.map(diagnosticAVSDKBinaryBytes).join(',')} inviteRelation=${inviteRelation} media=${invite?.media ?? 'unknown'} callIdFound=${callIdFound} action=${action} terminal=${terminal}`,
-      )
-    } catch {
-      // Diagnostics must never alter native callback handling.
-    }
-  }
-
-  private observeAVSDKDrop(
-    callback: AVSDKDiagnosticCallback,
-    source: AVSDKDiagnosticSource,
-    reason: AVSDKDiagnosticDrop,
-    callIdFound = false,
-    action: 'accept' | 'refuse' | 'logout' | 'unknown' = 'unknown',
-    terminal = false,
-  ): void {
-    try {
-      this.logAVSDKDiagnostic(
-        `drop:${source}:${callback}:${reason}`,
-        `avsdk-call drop source=${source} callback=${callback} reason=${reason} callIdFound=${callIdFound} action=${action} terminal=${terminal}`,
-      )
-    } catch {
-      // Diagnostics must never alter native callback handling.
-    }
-  }
-
-  private observeAVSDKObservation(
-    callback: AVSDKDiagnosticCallback,
-    source: AVSDKDiagnosticSource,
-    outcome: 'queue-replaced',
-  ): void {
-    this.logAVSDKDiagnostic(
-      `observation:${source}:${callback}:${outcome}`,
-      `avsdk-call observation source=${source} callback=${callback} outcome=${outcome} action=unknown terminal=false`,
-    )
-  }
-
-  private acceptAVSDKDiagnosticAdmission(callback: AVSDKDiagnosticCallback): boolean {
-    const now = Date.now()
-    if (now < this.avsdkDiagnosticAdmissionWindowStartedAt || now - this.avsdkDiagnosticAdmissionWindowStartedAt >= AVSDK_DIAGNOSTIC_WINDOW_MS) {
-      this.avsdkDiagnosticAdmissionWindowStartedAt = now
-      this.avsdkDiagnosticAdmissionCount = 0
-      this.avsdkDiagnosticAdmissionCounts.clear()
-    }
-    const count = this.avsdkDiagnosticAdmissionCounts.get(callback) ?? 0
-    if (this.avsdkDiagnosticAdmissionCount >= AVSDK_DIAGNOSTIC_ADMISSION_MAX_PER_WINDOW || count >= AVSDK_DIAGNOSTIC_ADMISSION_MAX_PER_CALLBACK) return false
-    this.avsdkDiagnosticAdmissionCount++
-    this.avsdkDiagnosticAdmissionCounts.set(callback, count + 1)
-    return true
-  }
-
-  private logAVSDKDiagnostic(kind: string, message: string): void {
-    const now = Date.now()
-    if (now < this.avsdkDiagnosticWindowStartedAt || now - this.avsdkDiagnosticWindowStartedAt >= AVSDK_DIAGNOSTIC_WINDOW_MS) {
-      this.avsdkDiagnosticWindowStartedAt = now
-      this.avsdkDiagnosticCount = 0
-      this.avsdkDiagnosticCounts.clear()
-    }
-    const count = this.avsdkDiagnosticCounts.get(kind) ?? 0
-    if (this.avsdkDiagnosticCount >= AVSDK_DIAGNOSTIC_MAX_PER_WINDOW || count >= AVSDK_DIAGNOSTIC_MAX_PER_KIND) return
-    this.avsdkDiagnosticCount++
-    this.avsdkDiagnosticCounts.set(kind, count + 1)
-    try {
-      log('info', message)
-    } catch {
-      // Diagnostics must never alter native callback handling.
+    if (callback === 'onS2CActionToAVSDK' && hasDestroyReason(args[0])) { this.enqueueCallSignal({ kind: 'ended',
+        generation: this.callSignalGeneration, })
     }
   }
 
   private hasCallSignalQueueCapacity(): boolean {
-    return [...this.pendingCallSignalKinds.values()].reduce((total, count) => total + count, 0) < CALL_SIGNAL_QUEUE_LIMIT
+    return (
+      [...this.pendingCallSignalKinds.values()].reduce(
+        (total, count) => total + count,
+        0,
+      ) < CALL_SIGNAL_QUEUE_LIMIT
+    )
   }
 
   private enqueueCallSignal(job: CallSignalJob): CallSignalEnqueueResult {
@@ -2694,15 +2543,16 @@ export class QQKernelBridge {
     if (this.callSignalQueueRunning) return
     const generation = this.callSignalGeneration
     this.callSignalQueueRunning = true
-    queueMicrotask(() => void (async () => {
+    queueMicrotask(
+      () => void (async () => {
       while (generation === this.callSignalGeneration) {
         const job = this.callSignalJobs.shift()
         if (!job) break
         try {
           if (job.generation !== this.callSignalGeneration) continue
-          if (job.kind === 'invite') await this.onCallInvite(job.invite, job.generation, job.source)
-          else if (job.kind === 'ended') this.onCallEnded(job.source)
-          else this.onCallAction(job.kind, job.source)
+          if (job.kind === 'invite') await this.onCallInvite(job.invite, job.generation)
+          else if (job.kind === 'ended') this.onCallEnded()
+          else this.onCallAction(job.kind)
         } catch {
           log('error', 'QQ call signal observation failed')
         } finally {
@@ -2716,56 +2566,52 @@ export class QQKernelBridge {
       if (generation !== this.callSignalGeneration) return
       this.callSignalQueueRunning = false
       if (this.callSignalJobs.length) this.drainCallSignalQueue()
-    })())
+        })(),
+    )
   }
 
   private async onCallInvite(
     invite: ParsedAVSDKInvite,
     generation: number,
-    source: AVSDKDiagnosticSource = 'listener-tap',
   ): Promise<void> {
     const session = this.session
     const config = this.config
-    if (!session || !config || !this.isCurrentCallGeneration(generation, session, config)) {
-      this.observeAVSDKDrop('OnInviteActionToAVSDK', source, 'stale-session')
+    if (
+      !session || !config || !this.isCurrentCallGeneration(generation, session, config)
+    ) {
       return
     }
     const previous = this.callSignalState
     if (previous?.fingerprint === invite.fingerprint) {
-      this.observeAVSDKDrop('OnInviteActionToAVSDK', source, 'duplicate-transition')
       return
     }
     if (previous) {
-      this.observeAVSDKDrop('OnInviteActionToAVSDK', source, 'concurrent-call')
       return
     }
     const conversation = await this.resolveCallConversation(invite.fromUid, invite.relationId, generation, session, config)
     if (!conversation) {
-      this.observeAVSDKDrop(
-        'OnInviteActionToAVSDK', source,
-        this.isCurrentCallGeneration(generation, session, config) ? 'unresolved-conversation' : 'stale-session',
-      )
       return
     }
     let callId: string | undefined
     try {
       callId = this.createCallId(invite.fingerprintDigest)
     } catch {
-      this.observeAVSDKDrop('OnInviteActionToAVSDK', source, 'crypto-failure')
       return
     }
     if (!this.isCurrentCallGeneration(generation, session, config)) {
-      this.observeAVSDKDrop('OnInviteActionToAVSDK', source, 'stale-session')
       return
     }
     this.callSignalState = {
       callId, fingerprint: invite.fingerprint, conversation, media: invite.media, signal: 'incoming',
     }
-    this.dispatchCallSignal('incoming', source)
+    this.dispatchCallSignal('incoming')
   }
 
-  private isCurrentCallGeneration(generation: number, session: KernelSession, config: InitSessionConfig): boolean {
-    return generation === this.callSignalGeneration && this.session === session && this.config === config
+  private isCurrentCallGeneration(
+    generation: number, session: KernelSession, config: InitSessionConfig,
+  ): boolean {
+    return ( generation === this.callSignalGeneration && this.session === session && this.config === config
+    )
   }
 
   private async resolveCallConversation(
@@ -2794,14 +2640,13 @@ export class QQKernelBridge {
     }
     if (!this.isCurrentCallGeneration(generation, session, config)) return undefined
     const known = [...this.contacts.values()].find((item) => item.chatType === CHAT_C2C && item.peerUid === peerUid)
-    if (known) return known
+    if (known) return this.mergeConversation(known)
     const buddy = this.users.get(peerUid)
     const created: QQConversation = {
       id: conversationId(CHAT_C2C, peerUid), kind: 'direct', title: buddy?.name ?? numericId,
       peerUid, peerUin: numericId, chatType: CHAT_C2C,
     }
-    this.mergeConversation(created)
-    return created
+    return this.mergeConversation(created)
   }
 
   private createCallId(fingerprintDigest: Buffer): string {
@@ -2821,51 +2666,47 @@ export class QQKernelBridge {
 
   private onCallAction(
     kind: Extract<CallSignalJob['kind'], 'accept' | 'refuse' | 'logout'>,
-    source: AVSDKDiagnosticSource = 'listener-tap',
   ): void {
     const signal = kind === 'accept' ? 'accept-requested' : kind === 'refuse' ? 'refuse-requested' : 'logout-requested'
     const state = this.callSignalState
-    if (!state) {
-      this.observeAVSDKDrop('setActionFromAVSDK', source, 'no-active-call', false, kind)
+    if (!state)
       return
-    }
     const allowed = state.signal === 'incoming'
-      || state.signal === 'accept-requested' && signal === 'logout-requested'
-    if (!allowed) {
-      this.observeAVSDKDrop(
-        'setActionFromAVSDK', source,
-        state.signal === signal ? 'duplicate-transition' : 'uncorrelated-transition', false, kind,
-      )
+      ||
+      (state.signal === 'accept-requested' && signal === 'logout-requested')
+    if (!allowed)
       return
-    }
     state.signal = signal
-    this.dispatchCallSignal(signal, source)
+    this.dispatchCallSignal(signal)
   }
 
-  private onCallEnded(source: AVSDKDiagnosticSource = 'listener-tap'): void {
+  private onCallEnded(): void {
     const state = this.callSignalState
-    if (!state) {
-      this.observeAVSDKDrop('onS2CActionToAVSDK', source, 'no-active-call', false, 'unknown', true)
+    if (!state)
       return
-    }
     state.signal = 'ended'
-    this.dispatchCallSignal('ended', source)
+    this.dispatchCallSignal('ended')
+    this.revokeCurrentCallMediaLeases()
     this.callSignalState = undefined
   }
 
-  private dispatchCallSignal(signal: QQCallSignalEvent['signal'], source: AVSDKDiagnosticSource = 'listener-tap'): void {
+  private revokeCurrentCallMediaLeases(): void {
+    const callId = this.callSignalState?.callId
+    if (!callId) return
+    try {
+      this.mediaGateway?.revokeCallLeases(callId)
+    } catch {
+      // Lease revocation must not alter native call handling.
+    }
+  }
+
+  private dispatchCallSignal(signal: QQCallSignalEvent['signal']): void {
     const state = this.callSignalState
     if (!state) return
-    if ((signal === 'incoming' || signal === 'accept-requested') && !this.acceptCallSignalEvent()) {
-      this.observeAVSDKDrop(
-        signal === 'incoming' ? 'OnInviteActionToAVSDK' : 'setActionFromAVSDK',
-        source,
-        'rate-limited',
-        signal === 'incoming',
-        signal === 'accept-requested' ? 'accept' : 'unknown',
+    if (
+      (signal === 'incoming' || signal === 'accept-requested') && !this.acceptCallSignalEvent()
       )
       return
-    }
     this.dispatch({
       type: 'call-signal', version: 1, signal, media: state.media,
       callId: state.callId, conversation: state.conversation, timestamp: Math.floor(Date.now() / 1_000),
@@ -3313,7 +3154,7 @@ export class QQKernelBridge {
   }
 
   private onRecall(chatType: number, peerUid: string, msgSeq: string): void {
-    if (chatType !== CHAT_C2C && chatType !== CHAT_GROUP || !msgSeq) return
+    if ((chatType !== CHAT_C2C && chatType !== CHAT_GROUP) || !msgSeq) return
     const id = conversationId(chatType, peerUid)
     const cached = (this.messages.get(id) ?? []).find((message) => message.msgSeq === msgSeq)
     if (cached) {
@@ -3339,30 +3180,12 @@ export class QQKernelBridge {
   }
 
   private dispatch(event: QQEvent): void {
-    if (event.type === 'native-avsdk') {
-      for (const queue of this.events) queue.push(event, true)
-      return
-    }
     const eventId = String(++this.eventSequence)
     this.eventIds.set(event, eventId)
     this.recentEvents.push({ id: eventId, event })
     if (this.recentEvents.length > 2_048) this.recentEvents.splice(0, this.recentEvents.length - 2_048)
     log('info', `bridge event dispatch ${eventSummary(event)} eventId=${eventId} subscribers=${this.events.size}`)
     for (const queue of this.events) queue.push(event)
-  }
-
-  private acceptAVSDKEvent(callback: string): boolean {
-    const now = Date.now()
-    if (now - this.avsdkEventWindowStartedAt >= AVSDK_EVENT_WINDOW_MS) {
-      this.avsdkEventWindowStartedAt = now
-      this.avsdkEventCount = 0
-      this.avsdkCallbackEventCounts.clear()
-    }
-    const callbackCount = this.avsdkCallbackEventCounts.get(callback) ?? 0
-    if (this.avsdkEventCount >= AVSDK_MAX_EVENTS_PER_WINDOW || callbackCount >= AVSDK_MAX_EVENTS_PER_CALLBACK) return false
-    this.avsdkEventCount++
-    this.avsdkCallbackEventCounts.set(callback, callbackCount + 1)
-    return true
   }
 
   private acceptCallSignalEvent(): boolean {
@@ -3606,8 +3429,12 @@ export class QQKernelBridge {
     return merged
   }
 
-  private replaceBuddySnapshot(categories: Array<{ buddyList: ProfileSimpleInfo[] }>): void {
-    const buddies = categories.flatMap((category) => category.buddyList)
+  private replaceBuddySnapshot(
+    categories: Array<{ buddyList: ProfileSimpleInfo[] }>,
+  ): void {
+    const buddies = categories
+      .flatMap((category) => category.buddyList)
+      .filter((buddy) => buddy.uid.trim())
     const keep = new Set(buddies.map((buddy) => buddy.uid))
     if (this.config?.selfUid) keep.add(this.config.selfUid)
     for (const uid of this.users.keys()) if (!keep.has(uid)) this.users.delete(uid)
@@ -3699,31 +3526,6 @@ export class QQKernelBridge {
         const sticker = mergeKnownSticker(this.stickers.get(mappedSticker.stickerId), mappedSticker)
         this.stickers.set(sticker.stickerId, sticker)
         parts.push({ type: 'sticker', sticker })
-      } else if (element.markdownElement?.content) {
-        parts.push({ type: 'markdown', content: element.markdownElement.content })
-      } else if (element.inlineKeyboardElement?.rows.length) {
-        parts.push({
-          type: 'inline-keyboard',
-          keyboard: {
-            botAppid: element.inlineKeyboardElement.botAppid,
-            rows: element.inlineKeyboardElement.rows.map((row) => ({
-              buttons: row.buttons.map((button) => ({
-                id: button.id,
-                label: button.label,
-                visitedLabel: button.visitedLabel,
-                style: button.style,
-                type: button.type,
-                clickLimit: button.clickLimit,
-                unsupportTips: button.unsupportTips,
-                data: button.data,
-                atBotShowChannelList: button.atBotShowChannelList,
-                permissionType: button.permissionType,
-                specifyRoleIds: button.specifyRoleIds,
-                specifyTinyids: button.specifyTinyids,
-              })),
-            })),
-          },
-        })
       } else if (element.elementType === ELEMENT_TEXT && element.textElement?.content) {
         const text = element.textElement
         const mentionedId = text.atNtUid || text.atUid
@@ -3840,35 +3642,6 @@ export class QQKernelBridge {
     }
   }
 
-  async clickInlineKeyboard(input: import('./protocol.js').QQInlineKeyboardClick) {
-    const conversation = this.getConversation(input.conversationId)
-    const service = this.requireMsgService()
-    if (!service.clickInlineKeyboardButton) throw new Error('QQNT inline keyboard API is unavailable')
-    let messageSequence = input.messageSequence
-    if (!messageSequence) {
-      const message = await this.getMessage(conversation, input.messageId)
-      messageSequence = message?.msgSeq
-    }
-    if (!messageSequence) throw new Error(`QQNT message ${input.messageId} has no msgSeq`)
-    const result = await service.clickInlineKeyboardButton({
-      guildId: '',
-      peerId: conversation.peerUid,
-      botAppid: input.botAppid,
-      msgSeq: messageSequence,
-      buttonId: input.buttonId,
-      callback_data: input.callbackData,
-      dmFlag: 0,
-      chatType: conversation.chatType,
-    })
-    if (result.result !== 0) throw new Error(result.errMsg || `QQNT inline keyboard click failed: ${result.result}`)
-    return {
-      status: result.status,
-      promptText: result.promptText,
-      promptType: result.promptType,
-      promptIcon: result.promptIcon,
-    }
-  }
-
   private async resolveGrayTipUsers(records: readonly MsgRecord[]): Promise<void> {
     const users = new Set<string>()
     for (const record of records) {
@@ -3904,7 +3677,8 @@ export class QQKernelBridge {
       return (this.messages.get(conversation) ?? []).flatMap((message) =>
         message.msgSeq ? [[`${conversation}\u0000${message.msgSeq}`, message.id] as const] : [])
     }))
-    await Promise.all(records.map(async (record) => {
+    await Promise.all(
+      records.map(async (record) => {
       // QQ group msgSeq is the Telegram megagroup message ID, so group replies
       // never need a target msgId lookup.
       if (record.chatType === CHAT_GROUP) return
@@ -3913,8 +3687,9 @@ export class QQKernelBridge {
       if (!reply) return
       const conversation = conversationId(record.chatType as 1 | 2, record.peerUid)
       const local = reply.replayMsgSeq
-        ? batchBySeq.get(`${conversation}\u0000${reply.replayMsgSeq}`)
-          ?? cachedBySeq.get(`${conversation}\u0000${reply.replayMsgSeq}`)
+        ? (batchBySeq.get(`${conversation}\u0000${reply.replayMsgSeq}`)
+          ??
+            cachedBySeq.get(`${conversation}\u0000${reply.replayMsgSeq}`))
         : undefined
       if (local) {
         this.resolvedReplyTargets.set(record.msgId, local)
@@ -3951,7 +3726,8 @@ export class QQKernelBridge {
       } catch (error) {
         log('error', `QQ reply source resolve failed message=${record.msgId} peer=${record.peerUid}`, error)
       }
-    }))
+      }),
+    )
   }
 
   private mapReactionState(record: MsgRecord): QQReactionState {
@@ -4181,52 +3957,36 @@ export class QQKernelBridge {
   }
 
   private packetClientForSession(): QQPacketClient {
-    return this.packetClient ??= new QQPacketClient(
+    return (this.packetClient ??= new QQPacketClient(
       this.requireSession().getMsgService(), this.packetClientOptions,
-    )
+    ))
   }
 
   private async directReplyPart(
     conversation: QQConversation,
     messageId: string,
-    sequenceHint?: string,
   ): Promise<DirectMessagePart> {
     let source: MsgRecord | undefined
-    const service = this.requireMsgService()
     try {
-      const result = await service.getMsgsByMsgId(contact(conversation), [messageId])
+      const result = await this.requireMsgService().getMsgsByMsgId(contact(conversation), [messageId])
       if (result.result === 0) source = result.msgList.find((record) => record.msgId === messageId)
     } catch (error) {
       log('warn', `QQ reply source lookup failed message=${messageId}`, error)
     }
-    if (!source && sequenceHint && service.getMsgsBySeqAndCount) {
-      try {
-        log('info', `native API start name=getMsgsBySeqAndCount(reply-send) conversation=${conversation.id} message=${messageId} sequence=${sequenceHint}`)
-        const result = await retryHistoryCall(() => service.getMsgsBySeqAndCount!(
-          contact(conversation), sequenceHint, 1, true, true,
-        ))
-        log('info', `native API complete name=getMsgsBySeqAndCount(reply-send) conversation=${conversation.id} message=${messageId} sequence=${sequenceHint} result=${result.result} err=${JSON.stringify(result.errMsg)} records=${result.msgList.length}`)
-        if (result.result === 0) {
-          source = result.msgList.find((record) => record.msgSeq === sequenceHint)
-        }
-      } catch (error) {
-        log('warn', `QQ reply source sequence lookup failed message=${messageId} sequence=${sequenceHint}`, error)
-      }
-    }
     const config = this.requireConfig()
     return { kind: 'reply', reply: {
-      messageId: source?.msgId ?? messageId,
-      sequence: source?.msgSeq ?? sequenceHint,
-      clientSequence: source?.msgSeq ?? sequenceHint,
+      messageId,
+      sequence: source?.msgSeq,
+      clientSequence: source?.msgSeq,
       senderUin: source?.senderUin,
       senderUid: source?.senderUid,
       receiverUid: source
-        ? (SEND_FROM_SELF.has(source.sendType) || source.senderUid === config.selfUid
+        ? SEND_FROM_SELF.has(source.sendType) || source.senderUid === config.selfUid
             ? conversation.peerUid
-            : config.selfUid)
+            : config.selfUid
         : undefined,
       time: validTimestamp(source?.msgTime) || undefined,
-    } }
+      }, }
   }
 
   private stagingPath(kind?: 'image' | 'file'): string {
@@ -4275,27 +4035,27 @@ export class QQKernelBridge {
   }
 
   private requireMsgService(): ReturnType<KernelSession['getMsgService']> {
-    return this.msgService ??= this.requireSession().getMsgService()
+    return (this.msgService ??= this.requireSession().getMsgService())
   }
 
   private requireBuddyService(): ReturnType<KernelSession['getBuddyService']> {
-    return this.buddyService ??= this.requireSession().getBuddyService()
+    return (this.buddyService ??= this.requireSession().getBuddyService())
   }
 
   private requireGroupService(): ReturnType<KernelSession['getGroupService']> {
-    return this.groupService ??= this.requireSession().getGroupService()
+    return (this.groupService ??= this.requireSession().getGroupService())
   }
 
   private requireSearchService(): NonNullable<ReturnType<NonNullable<KernelSession['getSearchService']>>> {
     const service = this.searchService ?? this.requireSession().getSearchService?.()
     if (!service) throw new Error('QQ message search is unavailable in this QQNT build')
-    return this.searchService = service
+    return (this.searchService = service)
   }
 
   private getAvatarService(): NonNullable<ReturnType<NonNullable<KernelSession['getAvatarService']>>> | undefined {
     if (this.avatarService) return this.avatarService
     try {
-      return this.avatarService = this.requireSession().getAvatarService?.()
+      return (this.avatarService = this.requireSession().getAvatarService?.())
     } catch {
       return
     }
@@ -4362,46 +4122,9 @@ export class QQKernelBridge {
     throw new Error('QQ sticker pack pagination exceeded 100 pages')
   }
 
-  private loadFavoriteStickerPack(): Promise<QQStickerPack> {
-    if (this.favoriteStickerPackPromise) return this.favoriteStickerPackPromise
-    const loading = this.fetchFavoriteStickerPack()
-    this.favoriteStickerPackPromise = loading
-    void loading.finally(() => {
-      if (this.favoriteStickerPackPromise === loading) this.favoriteStickerPackPromise = undefined
-    }).catch(() => {})
-    return loading
-  }
-
-  private async fetchFavoriteStickerPack(): Promise<QQStickerPack> {
-    const stickers: QQSticker[] = []
-    let cursor: string | undefined
-    const seenCursors = new Set<string>()
-    for (let pageIndex = 0; pageIndex < 100; pageIndex++) {
-      const page = await this.getSavedStickers(cursor, 200)
-      stickers.push(...page.stickers)
-      if (!page.nextCursor) break
-      if (seenCursors.has(page.nextCursor)) {
-        throw new Error(`QQ favorite sticker pagination repeated cursor: ${page.nextCursor}`)
-      }
-      seenCursors.add(page.nextCursor)
-      cursor = page.nextCursor
-      if (pageIndex === 99) throw new Error('QQ favorite sticker pagination exceeded 100 pages')
-    }
-    return {
-      packId: FAVORITE_STICKER_PACK_ID,
-      title: FAVORITE_STICKER_PACK_TITLE,
-      count: stickers.length,
-      version: favoritePackVersion(stickers),
-      stickers,
-    }
-  }
-
-  private invalidateFavoriteStickerPack(): void {
-    this.stickerPacks.delete(FAVORITE_STICKER_PACK_ID)
-    this.favoriteStickerPackPromise = undefined
-  }
-
-  private async mapFavoriteSticker(item: CustomEmotionData): Promise<QQSticker> {
+  private async mapFavoriteSticker(
+    item: CustomEmotionData,
+  ): Promise<QQSticker> {
     const service = this.requireMsgService()
     if (item.isMarkFace && item.epId && item.eId) {
       const packageId = item.epId
@@ -4415,7 +4138,7 @@ export class QQKernelBridge {
       const reference: QQStickerReference = {
         kind: 'market', packageId, stickerId: item.eId,
         name: info?.faceName || item.desc || '[表情]',
-        key: keys?.result === 0 ? keys.encryptKeyMap.get(item.eId) ?? '' : '',
+        key: keys?.result === 0 ? (keys.encryptKeyMap.get(item.eId) ?? '') : '',
         width: positiveInteger(info?.width, 240), height: positiveInteger(info?.height, 240),
         animated,
         staticPath: item.thumbPath || item.emoPath || undefined,
@@ -4455,9 +4178,6 @@ export class QQKernelBridge {
   }> {
     if (reference.animated && reference.dynamicPath && existsSync(reference.dynamicPath)) {
       return { path: reference.dynamicPath, encrypted: true, animated: true }
-    }
-    if (!reference.animated && reference.staticPath && existsSync(reference.staticPath)) {
-      return { path: reference.staticPath, encrypted: false, animated: false }
     }
     const service = this.requireMsgService()
     const epId = Number(reference.packageId)
@@ -4546,33 +4266,6 @@ export class QQKernelBridge {
     return result.result === 0 ? result.msgList : []
   }
 
-  private async getReactionRecord(
-    conversation: QQConversation,
-    messageId: string,
-    messageSequence?: string,
-  ): Promise<MsgRecord | null> {
-    let byId: MsgRecord | null = null
-    try {
-      byId = await this.getMessageRecord(conversation, messageId)
-    } catch (error) {
-      if (!messageSequence) throw error
-      log('warn', `QQ reaction message-id lookup failed; falling back to sequence conversation=${conversation.id} message=${messageId} sequence=${messageSequence}`, error)
-    }
-    if (byId || !messageSequence) return byId
-    const service = this.requireMsgService()
-    if (!service.getMsgsBySeqAndCount) return null
-    log('info', `native API start name=getMsgsBySeqAndCount(reaction) conversation=${conversation.id} message=${messageId} sequence=${messageSequence}`)
-    const response = await service.getMsgsBySeqAndCount(
-      contact(conversation), messageSequence, 1, true, false,
-    )
-    log('info', `native API complete name=getMsgsBySeqAndCount(reaction) conversation=${conversation.id} message=${messageId} sequence=${messageSequence} result=${response.result} err=${JSON.stringify(response.errMsg)} records=${response.msgList.length}`)
-    if (response.result !== 0) {
-      throw new Error(`getMsgsBySeqAndCount(reaction): ${response.errMsg} (${response.result})`)
-    }
-    const record = response.msgList.find((item) => item.msgSeq === messageSequence)
-    return record && !isRecalledRecord(record) ? record : null
-  }
-
   private async waitForForwardedMessages(
     conversation: QQConversation,
     before: Set<string>,
@@ -4583,11 +4276,14 @@ export class QQKernelBridge {
     const deadline = Date.now() + Math.min(this.sendTimeoutMs, 20_000)
     do {
       const records = await this.latestRecords(conversation, Math.max(50, expected * 4))
-      const forwarded = records.filter((record) =>
+      const forwarded = records.filter(
+        (record) =>
         !before.has(record.msgId)
         && Number(record.msgTime) >= startedAt - 1
         && (SEND_FROM_SELF.has(record.sendType) || record.senderUid === this.config?.selfUid)
-        && (!requireMergedCard || record.sendStatus >= 2 && isMultiForwardRecord(record)))
+        && (!requireMergedCard ||
+            (record.sendStatus >= 2 && isMultiForwardRecord(record))),
+      )
       if (forwarded.length >= expected) {
         return forwarded.slice(0, expected).reverse().map((record) => {
           const message = this.mapMessage(record)
@@ -4629,8 +4325,14 @@ function validTimestamp(value: string | undefined): number {
   return Number.isFinite(timestamp) && timestamp > 0 ? Math.trunc(timestamp) : 0
 }
 
-function matchesSearchMedia(message: QQMessage, kind: SearchQuery['mediaKind']): boolean {
-  return !kind || message.parts.some((part) => part.type === 'media' && part.media.kind === kind)
+function matchesSearchMedia(
+  message: QQMessage, kind: SearchQuery['mediaKind'],
+): boolean {
+  return ( !kind ||
+    message.parts.some(
+      (part) => part.type === 'media' && part.media.kind === kind,
+    )
+  )
 }
 
 function safeCancelSearch(
@@ -4652,7 +4354,7 @@ function delay(milliseconds: number): Promise<void> {
 
 class FramedUploadReader {
   private readonly iterator: AsyncIterator<unknown>
-  private buffered = Buffer.alloc(0)
+  private buffered: Buffer<ArrayBufferLike> = Buffer.alloc(0)
   private ended = false
 
   constructor(body: Readable) {
@@ -4805,7 +4507,6 @@ function mapMedia(record: MsgRecord, element: MsgElement): QQMedia | undefined {
       id: element.elementId || `${record.msgId}:file`,
       kind: 'file',
       name: file.fileName,
-      mimeType: fileVideoMimeType(file.fileName),
       size: numberOrUndefined(file.fileSize),
       locator: {
         ...base, kind: 'file', fileName: file.fileName, fileSize: file.fileSize,
@@ -5049,24 +4750,18 @@ function favoriteStickerId(resId: string): string {
   return `favorite:${resId}`
 }
 
-function favoritePackVersion(stickers: QQSticker[]): number {
-  let hash = 0x811c9dc5
-  for (const sticker of stickers) {
-    const value = `${sticker.stickerId}:${sticker.version ?? 0}\u0000`
-    for (let index = 0; index < value.length; index++) {
-      hash ^= value.charCodeAt(index)
-      hash = Math.imul(hash, 0x01000193)
-    }
-  }
-  return hash >>> 0
-}
-
-function matchesElementKind(element: MsgElement, kind: 'image' | 'file' | 'sticker'): boolean {
+function matchesElementKind(
+  element: MsgElement, kind: 'image' | 'file' | 'sticker',
+): boolean {
   if (kind === 'file') return Boolean(element.fileElement)
   if (kind === 'sticker') {
-    return Boolean(element.marketFaceElement)
-      || Boolean(element.faceElement && (element.faceElement.faceType === 3 || element.faceElement.faceType === 4))
+    return ( Boolean(element.marketFaceElement)
+      ||
+      Boolean(
+        element.faceElement && (element.faceElement.faceType === 3 || element.faceElement.faceType === 4),
+      )
       || Boolean(element.picElement && isStickerPicture(element.picElement))
+    )
   }
   return Boolean(element.picElement)
 }
@@ -5088,29 +4783,21 @@ function videoMimeType(path: string, format?: number): string {
     7: 'video/x-ms-asf', 8: 'video/quicktime', 9: 'video/mod', 10: 'video/mp2t', 11: 'video/mp2t',
   }
   if (format && byFormat[format]) return byFormat[format]
-  return fileVideoMimeType(path) ?? 'video/mp4'
-}
-
-function fileVideoMimeType(path: string): string | undefined {
   const extension = extname(path).toLowerCase()
-  if (extension === '.mp4' || extension === '.m4v' || extension === '.f4v') return 'video/mp4'
   if (extension === '.avi') return 'video/x-msvideo'
   if (extension === '.wmv') return 'video/x-ms-wmv'
   if (extension === '.mkv') return 'video/x-matroska'
   if (extension === '.mov') return 'video/quicktime'
-  if (extension === '.ts' || extension === '.mts' || extension === '.m2ts') return 'video/mp2t'
+  if (extension === '.ts' || extension === '.mts') return 'video/mp2t'
   if (extension === '.webm') return 'video/webm'
-  if (extension === '.mpeg' || extension === '.mpg' || extension === '.mpe') return 'video/mpeg'
-  if (extension === '.ogv') return 'video/ogg'
-  if (extension === '.3gp') return 'video/3gpp'
-  if (extension === '.3g2') return 'video/3gpp2'
-  if (extension === '.flv') return 'video/x-flv'
-  if (extension === '.asf') return 'video/x-ms-asf'
-  if (extension === '.mod') return 'video/mod'
+  return 'video/mp4'
 }
 
-function isAnimatedPicture(picture: NonNullable<MsgElement['picElement']>): boolean {
-  return [2000, 2001].includes(picture.picType ?? 0) || /\.(?:gif|apng)$/i.test(picture.fileName)
+function isAnimatedPicture(
+  picture: NonNullable<MsgElement['picElement']>,
+): boolean {
+  return ( [2000, 2001].includes(picture.picType ?? 0) || /\.(?:gif|apng)$/i.test(picture.fileName)
+  )
 }
 
 function isStickerPicture(picture: NonNullable<MsgElement['picElement']>): boolean {
@@ -5201,187 +4888,26 @@ function makeAVSDKListener(
   Constructor: (new (handlers: Record<string, (...args: never[]) => unknown>) => unknown) | undefined,
   handle: (callback: string, args: unknown[]) => void,
 ): unknown {
-  const handlers = new Proxy({} as Record<string, (...args: never[]) => unknown>, {
+  const handlers = new Proxy(
+    {} as Record<string, (...args: never[]) => unknown>, {
     get(target, property) {
       if (typeof property !== 'string') return undefined
-      return target[property] ??= (...args: unknown[]) => {
+      return (target[property] ??= (...args: unknown[]) => {
         try {
           handle(property, args)
         } catch {
           log('error', 'native AVSDK callback handling failed')
         }
-      }
-    },
   })
+    },
+    },
+  )
   return Constructor ? new Constructor(handlers) : handlers
 }
 
-function normalizeAVSDKArgs(args: unknown[]): QQJsonValue[] {
-  const state = { ancestors: new WeakSet<object>(), nodes: 0, binaryBytes: 0 }
-  const normalized: QQJsonValue[] = []
-  let outputBytes = 0
-  for (const value of args.slice(0, AVSDK_MAX_ARGS)) {
-    let safe: QQJsonValue
-    try {
-      safe = jsonSafeValue(value, state, 0)
-    } catch {
-      safe = { type: 'unreadable' }
-    }
-    const size = Buffer.byteLength(JSON.stringify(safe))
-    if (outputBytes + size > AVSDK_MAX_OUTPUT_BYTES) {
-      normalized.push({ type: 'truncated', reason: 'output-budget' })
-      break
-    }
-    normalized.push(safe)
-    outputBytes += size
-  }
-  return normalized
-}
-
-function jsonSafeValue(
-  value: unknown,
-  state: { ancestors: WeakSet<object>, nodes: number, binaryBytes: number },
-  depth: number,
-): QQJsonValue {
-  if (depth > AVSDK_MAX_DEPTH || state.nodes++ >= AVSDK_MAX_NODES) return { type: 'truncated', reason: 'node-budget' }
-  if (value === null || typeof value === 'boolean') return value
-  if (typeof value === 'string') return truncateAVSDKString(value)
-  if (typeof value === 'number') return Number.isFinite(value) ? value : String(value)
-  if (typeof value === 'bigint') return { type: 'bigint', value: String(value) }
-  if (typeof value === 'undefined') return { type: 'undefined' }
-  if (typeof value === 'symbol') return { type: 'symbol', value: String(value) }
-  if (isAVSDKProxy(value) || typeof value === 'function') return { type: 'opaque' }
-  if (typeof value !== 'object') return { type: 'opaque' }
-  if (types.isNativeError(value) || types.isDate(value) || types.isMap(value) || types.isSet(value)) return { type: 'opaque' }
-  if (types.isAnyArrayBuffer(value)) return jsonSafeBinary(new Uint8Array(value), state)
-  if (ArrayBuffer.isView(value)) {
-    return jsonSafeBinary(new Uint8Array(value.buffer, value.byteOffset, value.byteLength), state)
-  }
-  if (Array.isArray(value)) return jsonSafeArray(value, state, depth)
-  if (!isPlainAVSDKObject(value)) return { type: 'opaque' }
-  return jsonSafeObject(value, state, depth)
-}
-
-function jsonSafeArray(
-  value: unknown[],
-  state: { ancestors: WeakSet<object>, nodes: number, binaryBytes: number },
-  depth: number,
-): QQJsonValue {
-  return withAVSDKAncestor(value, state, () => {
-    const output: QQJsonValue[] = []
-    let keys: string[]
-    try {
-      keys = Object.keys(value)
-    } catch {
-      return { type: 'unreadable' }
-    }
-    for (const key of keys) {
-      if (output.length >= AVSDK_MAX_COLLECTION_ITEMS) {
-        output.push({ type: 'truncated', reason: 'collection-budget' })
-        break
-      }
-      if (!/^(?:0|[1-9]\d*)$/.test(key)) continue
-      try {
-        const descriptor = Object.getOwnPropertyDescriptor(value, key)
-        output.push(!descriptor ? { type: 'unreadable' } : 'value' in descriptor
-          ? jsonSafeValue(descriptor.value, state, depth + 1)
-          : { type: 'accessor' })
-      } catch {
-        output.push({ type: 'unreadable' })
-      }
-    }
-    return output
-  })
-}
-
-function jsonSafeObject(
-  value: object,
-  state: { ancestors: WeakSet<object>, nodes: number, binaryBytes: number },
-  depth: number,
-): QQJsonValue {
-  return withAVSDKAncestor(value, state, () => {
-    let keys: string[]
-    try {
-      keys = Object.keys(value)
-    } catch {
-      return { type: 'unreadable' }
-    }
-    const object: { [key: string]: QQJsonValue } = {}
-    let count = 0
-    for (const key of keys) {
-      if (count++ >= AVSDK_MAX_COLLECTION_ITEMS) {
-        object.truncated = true
-        break
-      }
-      const safeKey = truncateAVSDKString(key)
-      try {
-        const descriptor = Object.getOwnPropertyDescriptor(value, key)
-        if (!descriptor) continue
-        object[safeKey] = 'value' in descriptor
-          ? jsonSafeValue(descriptor.value, state, depth + 1)
-          : { type: 'accessor' }
-      } catch {
-        object[safeKey] = { type: 'unreadable' }
-      }
-    }
-    return object
-  })
-}
-
-function isPlainAVSDKObject(value: object): boolean {
-  try {
-    const prototype = Object.getPrototypeOf(value)
-    return prototype === Object.prototype || prototype === null
-  } catch {
-    return false
-  }
-}
-
-function isAVSDKProxy(value: unknown): boolean {
-  try {
-    return types.isProxy(value)
-  } catch {
-    return true
-  }
-}
-
-function withAVSDKAncestor<T extends QQJsonValue>(
-  value: object,
-  state: { ancestors: WeakSet<object> },
-  map: () => T,
-): T | { type: 'circular' } {
-  if (state.ancestors.has(value)) return { type: 'circular' }
-  state.ancestors.add(value)
-  try {
-    return map()
-  } finally {
-    state.ancestors.delete(value)
-  }
-}
-
-function jsonSafeBinary(
-  value: Uint8Array,
-  state: { binaryBytes: number },
-): QQJsonValue {
-  const previewLength = Math.min(
-    value.byteLength,
-    AVSDK_MAX_BINARY_PREVIEW_BYTES,
-    Math.max(0, AVSDK_MAX_BINARY_BYTES - state.binaryBytes),
-  )
-  state.binaryBytes += previewLength
-  return {
-    type: 'binary',
-    length: value.byteLength,
-    ...(previewLength ? { base64: Buffer.from(value.subarray(0, previewLength)).toString('base64') } : {}),
-    ...(previewLength < value.byteLength ? { truncated: true } : {}),
-  }
-}
-
-function truncateAVSDKString(value: string): string {
-  return value.length > AVSDK_MAX_STRING_LENGTH ? value.slice(0, AVSDK_MAX_STRING_LENGTH) : value
-}
-
-function parseAVSDKInvite(args: unknown[], config: InitSessionConfig, secret: Buffer): AVSDKInviteParseResult {
+function parseAVSDKInvite(
+  args: unknown[], config: InitSessionConfig, secret: Buffer,
+): AVSDKInviteParseResult {
   const invite = args[0]
   if (!isPlainAVSDKOwnDataObject(invite)) return { ok: false, reason: 'invalid-object' }
   const relationId = ownAVSDKDataProperty(invite, 'relation_id')
@@ -5394,14 +4920,29 @@ function parseAVSDKInvite(args: unknown[], config: InitSessionConfig, secret: Bu
   if (!isSafeSignedInt32(action)) return { ok: false, reason: 'invalid-arg1' }
   const argument = args[2]
   if (typeof argument !== 'string') return { ok: false, reason: 'invalid-arg2' }
-  const relationBytes = callSignalStringBytes(relationId, CALL_SIGNAL_RELATION_ID_MAX_BYTES, 1)
+  const relationBytes = callSignalStringBytes(
+    relationId, CALL_SIGNAL_RELATION_ID_MAX_BYTES,
+    1,
+  )
   if (!relationBytes || !isASCIIDigits(relationBytes)) return { ok: false, reason: 'invalid-relation' }
-  const fromUidBytes = callSignalStringBytes(fromUid, CALL_SIGNAL_FROM_UID_MAX_BYTES, 0)
+  const fromUidBytes = callSignalStringBytes(
+    fromUid, CALL_SIGNAL_FROM_UID_MAX_BYTES,
+    0,
+  )
   if (!fromUidBytes) return { ok: false, reason: 'invalid-from-uid' }
-  const argumentBytes = callSignalStringBytes(argument, CALL_SIGNAL_ARGUMENT_MAX_BYTES, 0, false)
+  const argumentBytes = callSignalStringBytes(
+    argument, CALL_SIGNAL_ARGUMENT_MAX_BYTES, 0,
+    false,
+  )
   if (!argumentBytes) return { ok: false, reason: 'invalid-arg2' }
-  const selfUidBytes = callSignalStringBytes(config.selfUid, CALL_SIGNAL_FROM_UID_MAX_BYTES, 1)
-  const selfUinBytes = callSignalStringBytes(config.selfUin, CALL_SIGNAL_RELATION_ID_MAX_BYTES, 1)
+  const selfUidBytes = callSignalStringBytes(
+    config.selfUid, CALL_SIGNAL_FROM_UID_MAX_BYTES,
+    1,
+  )
+  const selfUinBytes = callSignalStringBytes(
+    config.selfUin, CALL_SIGNAL_RELATION_ID_MAX_BYTES,
+    1,
+  )
   if (!selfUidBytes || !selfUinBytes || !isASCIIDigits(selfUinBytes)) throw new Error('call signal crypto failed')
   try {
     const digest = createHmac('sha256', secret)
@@ -5427,10 +4968,24 @@ function parseAVSDKInvite(args: unknown[], config: InitSessionConfig, secret: Bu
   }
 }
 
-function hasAVSDKInviteRelation(value: unknown): boolean {
-  if (!isPlainAVSDKOwnDataObject(value)) return false
-  const relationId = ownAVSDKDataProperty(value, 'relation_id')
-  return typeof relationId === 'string' && Boolean(callSignalStringBytes(relationId, CALL_SIGNAL_RELATION_ID_MAX_BYTES, 1))
+function isPlainAVSDKObject(value: object): boolean {
+  try {
+    const prototype = Object.getPrototypeOf(value)
+    return prototype === Object.prototype || prototype === null
+  } catch {
+    return false
+  }
+}
+
+function isAVSDKProxy(value: unknown): boolean {
+  try { return types.isProxy(value)
+  } catch {
+  return true
+  }
+}
+
+function isAVSDKPrimitive(value: unknown): boolean {
+  return value === null || (typeof value !== 'object' && typeof value !== 'function')
 }
 
 function isPlainAVSDKOwnDataObject(value: unknown): value is object {
@@ -5445,10 +5000,6 @@ function ownAVSDKDataProperty(value: object, key: string): unknown {
   } catch {
     return undefined
   }
-}
-
-function isAVSDKPrimitive(value: unknown): boolean {
-  return value === null || (typeof value !== 'object' && typeof value !== 'function')
 }
 
 function callSignalActionKind(value: unknown): Extract<CallSignalJob['kind'], 'accept' | 'refuse' | 'logout'> | undefined {
@@ -5474,21 +5025,6 @@ function hasAVSDKPrimitiveDataProperty(value: unknown, key: string): boolean {
   }
 }
 
-function isAVSDKDiagnosticCallback(value: string): value is AVSDKDiagnosticCallback {
-  return value === 'OnInviteActionToAVSDK' || value === 'setActionFromAVSDK' || value === 'onS2CActionToAVSDK'
-}
-
-function diagnosticAVSDKArgType(value: unknown): 'null' | 'number' | 'string' | 'object' | 'binary' {
-  if (value === null) return 'null'
-  if (typeof value === 'number') return 'number'
-  if (typeof value === 'string') return 'string'
-  return asUint8Array(value) ? 'binary' : 'object'
-}
-
-function diagnosticAVSDKBinaryBytes(value: unknown): number {
-  return Math.min(asUint8Array(value)?.byteLength ?? 0, CALL_SIGNAL_ACTION_SCAN_BYTES)
-}
-
 function asUint8Array(value: unknown): Uint8Array | undefined {
   if (isAVSDKProxy(value)) return undefined
   if (types.isAnyArrayBuffer(value)) return new Uint8Array(value)
@@ -5496,13 +5032,19 @@ function asUint8Array(value: unknown): Uint8Array | undefined {
   return new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
 }
 
-function callSignalStringBytes(value: string, maxBytes: number, minBytes: number, rejectNul = true): Buffer | undefined {
+function callSignalStringBytes(
+  value: string, maxBytes: number, minBytes: number, rejectNul = true,
+): Buffer | undefined {
   // The UTF-16 guard is O(1); the fixed buffer prevents allocation from an
   // untrusted string's full size before encodeInto validates it.
   if (value.length > maxBytes) return undefined
   const destination = new Uint8Array(maxBytes)
   const { read, written } = new TextEncoder().encodeInto(value, destination)
-  if (read !== value.length || written < minBytes || written > maxBytes || rejectNul && value.includes('\0') || !isWellFormedUTF16(value)) return undefined
+  if (
+    read !== value.length || written < minBytes || written > maxBytes ||
+    (rejectNul && value.includes('\0')) ||
+    !isWellFormedUTF16(value)
+  ) return undefined
   return Buffer.from(destination.buffer, destination.byteOffset, written)
 }
 
@@ -5510,14 +5052,18 @@ function isWellFormedUTF16(value: string): boolean {
   for (let index = 0; index < value.length; index++) {
     const code = value.charCodeAt(index)
     if (code >= 0xd800 && code <= 0xdbff) {
-      if (++index >= value.length || (value.charCodeAt(index) < 0xdc00 || value.charCodeAt(index) > 0xdfff)) return false
+      if (
+        ++index >= value.length ||
+        value.charCodeAt(index) < 0xdc00 || value.charCodeAt(index) > 0xdfff
+      ) return false
     } else if (code >= 0xdc00 && code <= 0xdfff) return false
   }
   return true
 }
 
 function isSafeSignedInt32(value: unknown): value is number {
-  return typeof value === 'number' && Number.isSafeInteger(value) && value >= -0x8000_0000 && value <= 0x7fff_ffff
+  return ( typeof value === 'number' && Number.isSafeInteger(value) && value >= -0x8000_0000 && value <= 0x7fff_ffff
+  )
 }
 
 function isASCIIDigits(value: Uint8Array): boolean {
@@ -5557,17 +5103,11 @@ function hasCompleteASCIIToken(bytes: Uint8Array, needle: Buffer): boolean {
 }
 
 function isASCIITokenByte(value: number | undefined): boolean {
-  return value !== undefined && (
-    value >= 48 && value <= 57 || value >= 65 && value <= 90 || value >= 97 && value <= 122 || value === 46 || value === 95
+  return ( value !== undefined &&
+    ((value >= 48 && value <= 57) ||
+      (value >= 65 && value <= 90) ||
+      (value >= 97 && value <= 122) || value === 46 || value === 95)
   )
-}
-
-function isAVSDKTapEnabled(): boolean {
-  return process.env.QQNT_BRIDGE_AVSDK_TAP === '1'
-}
-
-function isAVSDKRawEnabled(): boolean {
-  return process.env.QQNT_BRIDGE_AVSDK_RAW === '1'
 }
 
 function makeListener(
@@ -5612,7 +5152,8 @@ function recordTextContent(record: MsgRecord): string {
 }
 
 function isRecalledRecord(record: MsgRecord): boolean {
-  return record.elements?.some((element) => element.grayTipElement?.revokeElement) ?? false
+  return ( record.elements?.some((element) => element.grayTipElement?.revokeElement) ?? false
+  )
 }
 
 function multiForwardTitle(element: NonNullable<MsgElement['multiForwardMsgElement']>): string {
@@ -5631,38 +5172,10 @@ function multiForwardPreview(
     .matchAll(/<summary\b[^>]*>(?:<!\[CDATA\[([\s\S]*?)\]\]>|([\s\S]*?))<\/summary>/gi)]
     .map((match) => normalizeMultiForwardPreview(match[1] ?? match[2] ?? ''))
     .filter(Boolean)
-  const detailed = summaries.filter((summary) => !isGenericMultiForwardPreview(summary))
-  return [...new Set(detailed)].join('\n') || undefined
-}
-
-function isGenericMultiForwardPreview(value: string): boolean {
-  const compact = value.replace(/\s+/g, '')
-  return /^(?:点击)?查看(?:[xX×\d]+条)?(?:消息的)?(?:合并)?转发(?:消息)?$/.test(compact)
-    || /^(?:共)?[xX×\d]+条消息的合并转发$/.test(compact)
-    || /^(?:合并转发|聊天记录)$/.test(compact)
-}
-
-function forwardedMessagesPreview(
-  inputs: readonly { message: QQMessage, senderName?: string }[],
-): string | undefined {
-  const lines = inputs.slice(0, 4).map(({ message, senderName }) => {
-    const sender = senderName?.trim() || message.sender?.alias?.trim()
-      || message.sender?.name?.trim() || message.senderId
-    const content = message.parts.map((part) => {
-      if (part.type === 'text') return part.text.trim()
-      if (part.type === 'media') {
-        return part.media.name?.trim() || (part.media.kind === 'image' ? '[图片]' : '[文件]')
-      }
-      if (part.type === 'sticker') return part.sticker.title?.trim() || '[表情]'
-      if (part.type === 'multi-forward') return `查看${part.title || '聊天记录'}`
-      if (part.type === 'markdown') return part.content.trim()
-      if (part.type === 'inline-keyboard') return part.keyboard.rows
-        .flatMap((row) => row.buttons.map((button) => button.label)).join(' ')
-      return part.card.title?.trim() || part.card.description?.trim() || '[卡片消息]'
-    }).filter(Boolean).join(' ').replace(/\s+/g, ' ').trim()
-    return content ? `${sender}: ${content}` : ''
-  }).filter(Boolean)
-  return lines.join('\n') || undefined
+  const detailed = summaries.filter((summary) =>
+    !/^(?:点击)?查看(?:\s*\d+\s*条)?转发消息$/.test(summary))
+  return ( [...new Set(detailed.length ? detailed : summaries)].join('\n') || undefined
+  )
 }
 
 function normalizeMultiForwardPreview(value: string): string {
@@ -5674,15 +5187,21 @@ function normalizeMultiForwardPreview(value: string): string {
 }
 
 function decodeXmlText(text: string): string {
-  return text.replace(/&(amp|lt|gt|quot|apos|#\d+|#x[\da-f]+);/gi, (entity, code: string) => {
+  return text.replace(
+    /&(amp|lt|gt|quot|apos|#\d+|#x[\da-f]+);/gi, (entity, code: string) => {
     if (code[0] === '#') {
       const value = code[1]?.toLowerCase() === 'x'
         ? Number.parseInt(code.slice(2), 16)
         : Number.parseInt(code.slice(1), 10)
       return Number.isFinite(value) ? String.fromCodePoint(value) : entity
     }
-    return ({ amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" })[code.toLowerCase()] ?? entity
-  })
+    return (
+        { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" }[
+          code.toLowerCase()
+        ] ?? entity
+      )
+    },
+  )
 }
 
 function fallbackElementText(element: MsgElement, selfUid?: string): string {
@@ -5710,16 +5229,21 @@ function fallbackElementText(element: MsgElement, selfUid?: string): string {
   }
   if (element.textGiftElement) return `[礼物] ${element.textGiftElement.giftName}`
   if (element.calendarElement) {
-    return [element.calendarElement.summary, element.calendarElement.msg].filter(Boolean).join(' ')
+    return ( [element.calendarElement.summary, element.calendarElement.msg]
+        .filter(Boolean)
+        .join(' ')
       || '[日程]'
+    )
   }
   if (element.avRecordElement) {
-    return element.avRecordElement.text || (element.avRecordElement.time
+    return ( element.avRecordElement.text || (element.avRecordElement.time
       ? `[通话 ${element.avRecordElement.time}]` : '[通话]')
+    )
   }
   if (element.faceBubbleElement) {
-    return element.faceBubbleElement.content || element.faceBubbleElement.faceSummary
+    return ( element.faceBubbleElement.content || element.faceBubbleElement.faceSummary
       || element.faceBubbleElement.oldVersionStr || '[互动表情]'
+    )
   }
   if (element.shareLocationElement) return element.shareLocationElement.text || '[位置]'
   if (element.tofuRecordElement) {
@@ -5869,8 +5393,8 @@ function formatDuration(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds <= 0) return ''
   const parts: string[] = []
   const days = Math.floor(seconds / 86_400)
-  const hours = Math.floor(seconds % 86_400 / 3_600)
-  const minutes = Math.floor(seconds % 3_600 / 60)
+  const hours = Math.floor((seconds % 86_400) / 3_600)
+  const minutes = Math.floor((seconds % 3_600) / 60)
   const remaining = seconds % 60
   if (days) parts.push(`${days}天`)
   if (hours) parts.push(`${hours}小时`)
@@ -6023,7 +5547,7 @@ function xmlTagText(xml: string, tags: string[]): string {
 
 function recordValue(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
+    ? (value as Record<string, unknown>)
     : undefined
 }
 
@@ -6080,10 +5604,6 @@ function receivedMessageSummary(conversation: QQConversation, message: QQMessage
   const content = message.parts.length
     ? message.parts.map((part) => part.type === 'text'
       ? JSON.stringify(truncateLogText(part.text))
-      : part.type === 'markdown'
-        ? `[markdown ${JSON.stringify(truncateLogText(part.content))}]`
-        : part.type === 'inline-keyboard'
-          ? `[inline-keyboard rows=${part.keyboard.rows.length}]`
       : part.type === 'sticker'
         ? `[sticker id=${JSON.stringify(part.sticker.stickerId)}]`
         : part.type === 'card'
@@ -6123,9 +5643,6 @@ function eventSummary(event: QQEvent): string {
   if (event.type === 'message-delete') {
     return `type=message-delete conversation=${event.conversation.id} title=${JSON.stringify(event.conversation.title)} avatar=${event.conversation.avatar?.id ?? '<none>'} messages=${event.messageIds.join(',')}`
   }
-  if (event.type === 'native-avsdk') {
-    return `type=native-avsdk version=${event.version} callback=${event.callback} args=${event.args.length}`
-  }
   if (event.type === 'call-signal') {
     return `type=call-signal version=${event.version} signal=${event.signal} media=${event.media}`
   }
@@ -6136,20 +5653,31 @@ function hasAvatarFile(avatar: QQMedia): boolean {
   return Boolean(avatar.locator.filePath && existsSync(avatar.locator.filePath))
 }
 
+function normalizeDisplayTitle(title: string | undefined): string | undefined {
+  const normalized = title?.trim()
+  return normalized && !['undefined', 'null'].includes(normalized.toLowerCase())
+    ? normalized
+    : undefined
+}
+
 function isFallbackTitle(title: string | undefined, peerKey: string): boolean {
-  return !title?.trim() || title.trim() === peerKey
+  const normalized = normalizeDisplayTitle(title)
+  return !normalized || normalized === peerKey
 }
 
 function isFallbackUserName(user: { id: string, numericId?: string, name: string }): boolean {
-  return !user.name || user.name === user.id || user.name === user.numericId
+  const name = normalizeDisplayTitle(user.name)
+  return !name || name === user.id || name === user.numericId
 }
 
-function firstUsefulTitle(peerKey: string, ...candidates: Array<string | undefined>): string {
+function firstUsefulTitle(
+  peerKey: string, ...candidates: Array<string | undefined>
+): string {
   for (const candidate of candidates) {
-    const title = candidate?.trim()
+    const title = normalizeDisplayTitle(candidate)
     if (title && title !== peerKey) return title
   }
-  return candidates.find((candidate) => candidate?.trim())?.trim() || peerKey
+  return candidates.map(normalizeDisplayTitle).find(Boolean) || peerKey
 }
 
 function removePending(
@@ -6288,14 +5816,20 @@ function isGrayTipRecord(record: MsgRecord): boolean {
 }
 
 function isMultiForwardRecord(record: MsgRecord): boolean {
-  return isArkMultiForwardRecord(record)
-    || record.elements.some((element) =>
-      element.elementType === ELEMENT_MULTI_FORWARD && Boolean(element.multiForwardMsgElement))
+  return ( isArkMultiForwardRecord(record)
+    ||
+    record.elements.some(
+      (element) =>
+      element.elementType === ELEMENT_MULTI_FORWARD &&
+        Boolean(element.multiForwardMsgElement),
+    )
+  )
 }
 
 function isArkMultiForwardRecord(record: MsgRecord): boolean {
-  return record.msgType === 11 && record.subMsgType === 7
+  return ( record.msgType === 11 && record.subMsgType === 7
     && record.elements.some((element) => Boolean(element.arkElement))
+  )
 }
 
 function arkMultiForwardTitle(bytesData: string): string {
@@ -6337,8 +5871,11 @@ function pngDimensions(bytes: Uint8Array): { width: number, height: number } | u
   return width > 0 && height > 0 ? { width, height } : undefined
 }
 
-function encodedImageDimensions(bytes: Uint8Array): { width: number, height: number } | undefined {
-  return pngDimensions(bytes) ?? gifDimensions(bytes) ?? jpegDimensions(bytes) ?? webpDimensions(bytes)
+function encodedImageDimensions(
+  bytes: Uint8Array,
+): { width: number, height: number } | undefined {
+  return ( pngDimensions(bytes) ?? gifDimensions(bytes) ?? jpegDimensions(bytes) ?? webpDimensions(bytes)
+  )
 }
 
 function gifDimensions(bytes: Uint8Array): { width: number, height: number } | undefined {
@@ -6367,7 +5904,9 @@ function jpegDimensions(bytes: Uint8Array): { width: number, height: number } | 
   }
 }
 
-function webpDimensions(bytes: Uint8Array): { width: number, height: number } | undefined {
+function webpDimensions(
+  bytes: Uint8Array,
+): { width: number, height: number } | undefined {
   if (bytes.length < 30 || ascii(bytes, 0, 4) !== 'RIFF' || ascii(bytes, 8, 4) !== 'WEBP') return
   const chunk = ascii(bytes, 12, 4)
   if (chunk === 'VP8X') return positiveDimensions(readU24LE(bytes, 24) + 1, readU24LE(bytes, 27) + 1)
@@ -6375,7 +5914,10 @@ function webpDimensions(bytes: Uint8Array): { width: number, height: number } | 
     return positiveDimensions(readU16LE(bytes, 26) & 0x3fff, readU16LE(bytes, 28) & 0x3fff)
   }
   if (chunk === 'VP8L' && bytes[20] === 0x2f) {
-    const bits = (bytes[21]! | bytes[22]! << 8 | bytes[23]! << 16 | bytes[24]! << 24) >>> 0
+    const bits = (bytes[21]! |
+        (bytes[22]! << 8) |
+        (bytes[23]! << 16) |
+        (bytes[24]! << 24)) >>> 0
     return positiveDimensions((bits & 0x3fff) + 1, ((bits >>> 14) & 0x3fff) + 1)
   }
 }
@@ -6405,10 +5947,14 @@ function wireHighwayUpload(
 
 function imagePicType(name: string): number {
   const extension = name.split('.').at(-1)?.toLowerCase()
-  return ({
+  return (
+    (
+      {
     jpg: 0, jpeg: 1000, png: 1001, webp: 1002, sharpp: 1004,
     bmp: 1005, gif: 2000, apng: 2001,
-  } as Record<string, number | undefined>)[extension ?? ''] ?? 4
+  } as Record<string, number | undefined>
+    )[extension ?? ''] ?? 4
+  )
 }
 
 function favoriteStickerAssetKey(reference: Extract<QQStickerReference, { kind: 'favorite' }>): string {
@@ -6433,5 +5979,6 @@ function readU16LE(bytes: Uint8Array, offset: number): number {
 }
 
 function readU24LE(bytes: Uint8Array, offset: number): number {
-  return bytes[offset]! + bytes[offset + 1]! * 0x100 + bytes[offset + 2]! * 0x10000
+  return ( bytes[offset]! + bytes[offset + 1]! * 0x100 + bytes[offset + 2]! * 0x10000
+  )
 }

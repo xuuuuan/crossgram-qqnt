@@ -1,3 +1,4 @@
+import { createHash, timingSafeEqual } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { once } from 'node:events'
 import type { Duplex } from 'node:stream'
@@ -6,10 +7,10 @@ import WebSocket, { WebSocketServer } from 'ws'
 import {
   PROTOCOL_VERSION, type QQMediaLocator, type QQMultiForwardLocator, type QQSendMediaSpec, type QQStickerReference, type SendManifest,
 } from './protocol.js'
-import {
-  QQKernelBridge, QQReactionTargetNotFoundError, QQStickerAssetNotFoundError,
+import { QQKernelBridge, QQMediaLeaseAuthorizationError,
+  QQMediaLeaseUnavailableError,
+  QQStickerAssetNotFoundError ,
 } from './qq-kernel.js'
-import { QQMessageSendRejectedError } from './upload-protocol.js'
 import { log, recordSlowHttpRequest, slowHttpLogPath } from './log.js'
 import type { QQLoginController } from './login-controller.js'
 
@@ -34,16 +35,21 @@ export class QQBridgeServer {
   readonly webSocketHost: string
   readonly webSocketPort?: number
   readonly token?: string
+  private readonly tokenDigest?: Buffer
   readonly slowRequestThresholdMs: number
   readonly slowRequestPath: string
   readonly login?: QQLoginController
 
-  constructor(readonly bridge: QQKernelBridge, options: BridgeServerOptions = {}) {
+  constructor(readonly bridge: QQKernelBridge, options: BridgeServerOptions = {},
+  ) {
     this.host = options.host ?? '127.0.0.1'
     this.port = options.port ?? 18767
     this.webSocketHost = options.webSocketHost ?? this.host
     this.webSocketPort = options.webSocketPort
     this.token = options.token
+    this.tokenDigest = this.token
+      ? normalizedTokenDigest(this.token)
+      : undefined
     this.slowRequestThresholdMs = options.slowRequestThresholdMs ?? 500
     this.slowRequestPath = options.slowRequestPath ?? slowHttpLogPath
     this.login = options.login
@@ -55,7 +61,8 @@ export class QQBridgeServer {
       const requestId = ++this.requestSequence
       const startedAt = Date.now()
       const method = request.method ?? '<unknown>'
-      const target = request.url ?? '/'
+      const target = httpLogTarget(method, request.url ?? '/'
+      )
       const observe = (completed: boolean) => {
         const durationMs = Date.now() - startedAt
         if (durationMs <= this.slowRequestThresholdMs) return
@@ -186,12 +193,17 @@ export class QQBridgeServer {
     })
   }
 
-  private async route(request: IncomingMessage, response: ServerResponse, requestId: number): Promise<void> {
+  private async route(
+    request: IncomingMessage,
+    response: ServerResponse,
+    requestId: number,
+  ): Promise<void> {
     if (!this.authorize(request)) {
       json(response, 401, { error: 'unauthorized' })
       return
     }
     const url = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`)
+
     const path = url.pathname
 
     if (request.method === 'GET' && path === '/v1/status') {
@@ -254,13 +266,36 @@ export class QQBridgeServer {
       json(response, 426, { error: 'WebSocket upgrade required' })
       return
     }
+    if (request.method === 'POST' && path === '/v1/calls/media-lease') {
+      const body = await readJson<{ callId?: unknown }>(request)
+      try {
+        const lease = this.bridge.issueMediaLease(body?.callId)
+        json(response, 200, {
+          version: lease.version,
+          socketPath: lease.socketPath,
+          leaseId: lease.leaseId,
+          token: lease.token.toString('base64url'),
+          expiry: lease.expiry,
+        })
+      } catch (error) {
+        if (error instanceof QQMediaLeaseUnavailableError)
+          json(response, 503, { error: 'media lease unavailable' })
+        else if (error instanceof QQMediaLeaseAuthorizationError)
+          json(response, 403, { error: 'media lease unauthorized' })
+        else throw error
+      }
+      return
+    }
     if (request.method === 'GET' && path === '/v1/dialogs') {
       const page = await this.bridge.getDialogs(
         url.searchParams.get('cursor') ?? undefined,
         numberParam(url, 'limit', 100),
         url.searchParams.get('afterId') ?? undefined,
       )
-      log('info', `HTTP API dialogs id=${requestId} count=${page.conversations.length} next=${page.nextCursor ?? ''}`)
+      log(
+        'info',
+        `HTTP API dialogs id=${requestId} count=${page.conversations.length} next=${page.nextCursor ?? ''}`,
+      )
       json(response, 200, page)
       return
     }
@@ -269,21 +304,31 @@ export class QQBridgeServer {
         url.searchParams.get('cursor') ?? undefined,
         numberParam(url, 'limit', 500),
       )
-      log('info', `HTTP API contacts id=${requestId} count=${page.users.length} next=${page.nextCursor ?? ''}`)
+      log(
+        'info',
+        `HTTP API contacts id=${requestId} count=${page.users.length} next=${page.nextCursor ?? ''}`,
+      )
       json(response, 200, page)
       return
     }
     if (request.method === 'GET' && path === '/v1/reactions/catalog') {
       const catalog = await this.bridge.getReactionCatalog()
-      log('info', `HTTP API reaction catalog id=${requestId} available=${catalog.available.length}`)
+      log(
+        'info',
+        `HTTP API reaction catalog id=${requestId} available=${catalog.available.length}`,
+      )
       json(response, 200, catalog)
       return
     }
     if (request.method === 'GET' && path === '/v1/stickers/packs') {
-      json(response, 200, await this.bridge.getStickerPacks(
+      json(
+        response,
+        200,
+        await this.bridge.getStickerPacks(
         url.searchParams.get('cursor') ?? undefined,
         numberParam(url, 'limit', 100),
-      ))
+        ),
+      )
       return
     }
     const stickerPackMatch = /^\/v1\/stickers\/packs\/([^/]+)$/.exec(path)
@@ -402,16 +447,7 @@ export class QQBridgeServer {
     if (request.method === 'POST' && path === '/v1/messages') {
       const manifest = decodeManifest(request.headers['x-qqnt-manifest'])
       log('info', `HTTP API send start id=${requestId} conversation=${manifest.conversationId} textLength=${manifest.text?.length ?? 0} media=${manifest.media?.map((item) => `${item.kind}:${item.name}:${item.size ?? '?'}`).join(',') || '<none>'}`)
-      let message
-      try {
-        message = await this.bridge.send(manifest, request)
-      } catch (error) {
-        if (error instanceof QQMessageSendRejectedError) {
-          json(response, 403, { error: error.message, result: error.result })
-          return
-        }
-        throw error
-      }
+      const message = await this.bridge.send(manifest, request)
       log('info', `HTTP API send complete id=${requestId} conversation=${manifest.conversationId} message=${message.id} parts=${message.parts.length}`)
       json(response, 200, message)
       return
@@ -429,16 +465,6 @@ export class QQBridgeServer {
       )
       log('info', `HTTP API delete messages id=${requestId} conversation=${body.conversationId} messages=${body.messageIds.join(',')} forEveryone=${body.forEveryone ?? true}`)
       json(response, 200, { ok: true })
-      return
-    }
-    if (request.method === 'POST' && path === '/v1/messages/inline-keyboard/click') {
-      const body = await readJson<import('./protocol.js').QQInlineKeyboardClick>(request)
-      if (!body || typeof body.conversationId !== 'string' || typeof body.messageId !== 'string'
-        || typeof body.buttonId !== 'string' || typeof body.callbackData !== 'string'
-        || typeof body.botAppid !== 'string') {
-        throw new Error('invalid inline keyboard click request')
-      }
-      json(response, 200, await this.bridge.clickInlineKeyboard(body))
       return
     }
     if (request.method === 'POST' && path === '/v1/messages/get') {
@@ -460,35 +486,18 @@ export class QQBridgeServer {
     if (request.method === 'GET' && path === '/v1/messages/reactions') {
       const conversation = this.bridge.getConversation(requiredParam(url, 'conversationId'))
       const messageId = requiredParam(url, 'messageId')
-      const context = await this.bridge.getMessageReactions(
-        conversation, messageId, url.searchParams.get('messageSequence') ?? undefined,
-      )
+      const context = await this.bridge.getMessageReactions(conversation, messageId)
       log('info', `HTTP API get reactions id=${requestId} conversation=${conversation.id} message=${messageId} reactions=${context.reactions.length}`)
       json(response, 200, context)
       return
     }
     if (request.method === 'POST' && path === '/v1/messages/reactions') {
-      const body = await readJson<{
-        conversationId: string
-        messageId: string
-        messageSequence?: string
-        reactionKeys: string[]
-      }>(request)
-      let context
-      try {
-        context = await this.bridge.setMessageReactions(
-          this.bridge.getConversation(body.conversationId),
-          body.messageId,
-          body.reactionKeys,
-          body.messageSequence,
-        )
-      } catch (error) {
-        if (error instanceof QQReactionTargetNotFoundError) {
-          json(response, 404, { error: error.message })
-          return
-        }
-        throw error
-      }
+      const body = await readJson<{ conversationId: string, messageId: string, reactionKeys: string[] }>(request)
+      const context = await this.bridge.setMessageReactions(
+        this.bridge.getConversation(body.conversationId),
+        body.messageId,
+        body.reactionKeys,
+      )
       log('info', `HTTP API set reactions id=${requestId} conversation=${body.conversationId} message=${body.messageId} requested=${body.reactionKeys.join(',')} resulting=${context.reactions.length}`)
       json(response, 200, context)
       return
@@ -506,7 +515,12 @@ export class QQBridgeServer {
       return
     }
     if (request.method === 'GET' && path.startsWith('/v1/users/')) {
-      const user = await this.bridge.getUser(decodeURIComponent(path.slice('/v1/users/'.length)))
+      const uid = decodeURIComponent(path.slice('/v1/users/'.length))
+      if (!uid.trim()) {
+        json(response, 400, { error: 'user ID is required' })
+        return
+      }
+      const user = await this.bridge.getUser(uid)
       log('info', `HTTP API user id=${requestId} found=${Boolean(user)} user=${user?.id ?? '<none>'} avatar=${user?.avatar?.id ?? '<none>'}`)
       if (!user) json(response, 404, { error: 'user not found' })
       else json(response, 200, user)
@@ -566,7 +580,11 @@ export class QQBridgeServer {
     json(response, 404, { error: 'not found' })
   }
 
-  private async eventsWebSocket(webSocket: WebSocket, requestId: number, lastEventId?: string): Promise<void> {
+  private async eventsWebSocket(
+    webSocket: WebSocket,
+    requestId: number,
+    lastEventId?: string,
+  ): Promise<void> {
     const queue = this.bridge.subscribe(lastEventId)
     log('info', `WebSocket subscriber connected request=${requestId} lastEventId=${JSON.stringify(lastEventId ?? '')} subscribers=${this.bridge.events.size}`)
     const heartbeat = setInterval(() => {
@@ -586,7 +604,12 @@ export class QQBridgeServer {
           replayWritten = replay.index
           replayTotal = replay.total
         }
-        if (event.type !== 'native-avsdk' && (!replay || replay.index === 1 || replay.last || replay.index % 100 === 0)) {
+        if (
+          !replay ||
+          replay.index === 1 ||
+          replay.last ||
+          replay.index % 100 === 0
+        ) {
           log('info', `WebSocket event write request=${requestId} replay=${replay ? `${replay.index}/${replay.total}` : 'live'} ${wireEventSummary(event)} streamEventId=${eventId ?? ''}`)
         }
         await sendWebSocket(webSocket, JSON.stringify({ id: eventId, event }))
@@ -606,9 +629,31 @@ export class QQBridgeServer {
   }
 
   private authorize(request: IncomingMessage): boolean {
-    if (!this.token) return true
-    return request.headers.authorization === `Bearer ${this.token}`
+    if (!this.tokenDigest) return true
+    const authorization = request.headers.authorization
+    const supplied =
+      typeof authorization === 'string' && authorization.startsWith('Bearer ')
+        ? authorization.slice('Bearer '.length)
+        : ''
+    return timingSafeEqual(normalizedTokenDigest(supplied), this.tokenDigest)
   }
+}
+
+function httpLogTarget(method: string, target: string): string {
+  if (method !== 'POST') return target
+  try {
+    if (
+      new URL(target, 'http://localhost').pathname === '/v1/calls/media-lease'
+    )
+      return '/v1/calls/media-lease'
+  } catch {
+    if (
+      target === '/v1/calls/media-lease' ||
+      target.startsWith('/v1/calls/media-lease?')
+    )
+      return '/v1/calls/media-lease'
+  }
+  return target
 }
 
 function isWebSocketEventsRequest(target: string): boolean {
@@ -625,7 +670,7 @@ function rejectUpgrade(socket: Duplex, status: number, reason: string): void {
 
 function sendWebSocket(webSocket: WebSocket, data: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    webSocket.send(data, (error) => error ? reject(error) : resolve())
+    webSocket.send(data, (error) => (error ? reject(error) : resolve()))
   })
 }
 
@@ -635,6 +680,10 @@ function yieldEventLoop(): Promise<void> {
 
 function wireEventSummary(event: { type: string, conversation?: { id?: string }, message?: { id?: string }, eventId?: string }): string {
   return `type=${event.type} conversation=${event.conversation?.id ?? ''} message=${event.message?.id ?? ''} eventId=${event.eventId ?? ''}`
+}
+
+function normalizedTokenDigest(token: string): Buffer {
+  return createHash('sha256').update(token).digest()
 }
 
 function json(response: ServerResponse, status: number, value: unknown): void {

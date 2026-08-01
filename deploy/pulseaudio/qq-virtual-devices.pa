@@ -1,0 +1,8 @@
+# QQ virtual audio devices. Include this file exactly once from the dedicated
+# PulseAudio daemon startup configuration; do not load it with `pactl` on a
+# running daemon. A second include or `pactl load-module` creates duplicates.
+load-module module-null-sink sink_name=qq_sink rate=48000 channels=2
+load-module module-null-sink sink_name=qq_mic_sink rate=48000 channels=1 channel_map=mono
+load-module module-remap-source source_name=qq_source master=qq_mic_sink.monitor channels=1 master_channel_map=mono channel_map=mono
+set-default-sink qq_sink
+set-default-source qq_source

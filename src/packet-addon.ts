@@ -34,7 +34,7 @@ export interface NativeSysFace {
 
 export interface NativeSendBindingLocation {
   moduleBase: string
-  locator: string
+  profile: string
   timeDateStamp: number
   sizeOfImage: number
   anchorRva: number
@@ -47,26 +47,49 @@ export interface NativeSendBindingLocation {
 export interface PacketBindingProbe {
   moduleBase: string
   modulePath: string
-  locator: string
+  profile: string
   buildId: string
   sha256: string
-  anchorRva: string
-  anchorXrefRva: string
+  nameSlotRva: string
+  bindingNameRva: string
+  bindingName: string
+  napiCallbackSlotRva: string
   napiCallbackRva: string
-  converterRva: string
-  resultAnchorRva: string
-  resultXrefRva: string
-  errMsgAnchorRva: string
-  errMsgXrefRva: string
-  rspAnchorRva: string
-  rspXrefRva: string
-  responseTableXrefRva: string
-  responseTableRva: string
+  napiCallbackFingerprint: string
   responseActionSlotRva: string
   responseActionRva: string
-  dispatchHelperRva: string
-  resolverThunkRva: string
+  responseActionFingerprint: string
+  converterRva: string
+  converterFingerprint: string
   resolveActionRva: string
+  resolveActionFingerprint: string
+}
+
+export type QrtcLifecycle = 'active' | 'closing' | 'destroyed'
+
+/** Fixed, identifier-free status for the compile-time AVSDK loader identity probe. */
+export interface AvsdkLoaderProbeStatus {
+  prepared: boolean
+  observed: boolean
+  unique: boolean
+  sameObject: boolean
+  sameNamespace: boolean
+  buildMatch: boolean
+  flagsCompatible: boolean
+  observationCount: number
+}
+
+/** Fixed, identifier-free QRTC lifecycle metadata for one authorized future observation. */
+export interface QrtcMetadataSnapshot {
+  lifecycle: QrtcLifecycle
+  sameThread: boolean
+  inFlight: number
+  shutdownWasIdle: boolean
+}
+
+/** Deliberately a fixed snapshot surface, not an invocation or hook API. */
+export interface QrtcMetadataAddon {
+  qrtcMetadataStatus(): QrtcMetadataSnapshot
 }
 
 export interface PacketAddon {
@@ -89,6 +112,7 @@ export interface PacketAddon {
   probePacketBinding(): PacketBindingProbe
   locateSendBinding(): NativeSendBindingLocation
   installSendHook(): NativeSendBindingLocation
+  avsdkLoaderProbeStatus?(): AvsdkLoaderProbeStatus
 }
 
 let loadedAddon: PacketAddon | undefined
@@ -112,10 +136,21 @@ export function loadPacketAddon(): PacketAddon {
     'encodeGroupFileDownloadRequest', 'decodeGroupFileDownloadResponse',
     'encodePrivateFileDownloadRequest', 'decodePrivateFileDownloadResponse',
     'refreshImageUrl', 'probePacketBinding', 'locateSendBinding', 'installSendHook',
+    'avsdkLoaderProbeStatus',
   ] satisfies Array<keyof PacketAddon>) {
     if (typeof required[name] !== 'function') throw new Error(`QQNT packet addon is missing ${name}`)
   }
   return loadedAddon = required as PacketAddon
+}
+
+export function loadQrtcMetadataAddon(
+  loadAddon: () => Partial<QrtcMetadataAddon> = () => loadPacketAddon() as PacketAddon & Partial<QrtcMetadataAddon>,
+): QrtcMetadataAddon {
+  const addon = loadAddon()
+  if (typeof addon.qrtcMetadataStatus !== 'function') {
+    throw new Error('QQNT packet addon is missing qrtcMetadataStatus')
+  }
+  return addon as QrtcMetadataAddon
 }
 
 export function packetAddonCandidates(

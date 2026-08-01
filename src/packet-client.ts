@@ -430,7 +430,7 @@ export class QQPacketClient {
     if (this.located) return
     const location = addon.installSendHook()
     this.located = true
-    log('info', `QQNT packet hook installed module=${location.moduleBase} locator=${location.locator} timeDateStamp=0x${location.timeDateStamp.toString(16)} sizeOfImage=0x${location.sizeOfImage.toString(16)} anchorRva=0x${location.anchorRva.toString(16)} xrefRva=0x${location.xrefRva.toString(16)} functionRva=0x${location.functionRva.toString(16)} converterRva=0x${location.converterRva.toString(16)} responseRva=0x${location.responseRva.toString(16)}`)
+    log('info', `QQNT packet hook installed module=${location.moduleBase} profile=${location.profile} timeDateStamp=0x${location.timeDateStamp.toString(16)} sizeOfImage=0x${location.sizeOfImage.toString(16)} anchorRva=0x${location.anchorRva.toString(16)} xrefRva=0x${location.xrefRva.toString(16)} functionRva=0x${location.functionRva.toString(16)} converterRva=0x${location.converterRva.toString(16)} responseRva=0x${location.responseRva.toString(16)}`)
   }
 }
 

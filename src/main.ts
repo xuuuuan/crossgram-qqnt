@@ -5,13 +5,13 @@ import type {
 } from './kernel-types.js'
 import { teeAVSDKService, teeBuddyService, teeGroupService, teeMsgService, teeProfileService, teeRecentService } from './listener-tee.js'
 import { log, logPath } from './log.js'
-import { QQLoginController, wrapLoginServiceConstructor } from './login-controller.js'
-import { createPacketBindingProber, createPacketHookInstaller, type PacketBindingProbe } from './packet-addon.js'
+import { createPacketBindingProber, createPacketHookInstaller, loadPacketAddon, type PacketBindingProbe } from './packet-addon.js'
 import { QQKernelBridge } from './qq-kernel.js'
+import {
+  localPCMMediaGatewayFromEnvironment,
+  type LocalPCMMediaGateway,
+} from './media-gateway.js'
 import { QQBridgeServer } from './server.js'
-import { closeLargestVisibleWindow, type ClosableWindow } from './headless-window.js'
-
-declare const __QQNT_BRIDGE_BUILD_MODE__: string | undefined
 
 const processType = (process as NodeJS.Process & { type?: string }).type
 const bootstrapKey = Symbol.for('qqnt-bridge.bootstrap')
@@ -21,15 +21,8 @@ const bootstrapState = globalThis as typeof globalThis & { [bootstrapKey]?: bool
 // Electron's browser (main) process; plain Node remains useful for diagnostics.
 if ((processType === undefined || processType === 'browser') && !bootstrapState[bootstrapKey]) {
   bootstrapState[bootstrapKey] = true
-  const bridge = new QQKernelBridge()
-  const headless = process.env.QQNT_BRIDGE_HEADLESS === '1'
-  const login = new QQLoginController({
-    autoRequestQRCode: headless && process.env.QQNT_BRIDGE_MANAGE_LOGIN !== '0',
-    enableAutoLogin: headless && process.env.QQNT_BRIDGE_AUTO_LOGIN !== '0',
-    onSessionReady: headless && process.env.QQNT_BRIDGE_CLOSE_MAIN_WINDOW !== '0'
-      ? scheduleMainWindowClose
-      : undefined,
-  })
+  const mediaGateway = createLocalPCMMediaGateway()
+  const bridge = new QQKernelBridge({ mediaGateway })
   const server = new QQBridgeServer(bridge, {
     host: process.env.QQNT_BRIDGE_HOST ?? '127.0.0.1',
     port: Number(process.env.QQNT_BRIDGE_PORT ?? 18767),
@@ -38,13 +31,13 @@ if ((processType === undefined || processType === 'browser') && !bootstrapState[
       ? undefined
       : Number(process.env.QQNT_BRIDGE_WS_PORT),
     token: process.env.QQNT_BRIDGE_TOKEN,
-    login,
   })
 
-  installKernelRequireHook(bridge, login)
+  installKernelRequireHook(bridge)
   void startServer(server)
-  const buildMode = typeof __QQNT_BRIDGE_BUILD_MODE__ === 'string' ? __QQNT_BRIDGE_BUILD_MODE__ : 'development'
-  log('info', `injected mode=${buildMode} processType=${processType ?? 'node'} pid=${process.pid}; log file: ${logPath}`)
+  startLocalPCMMediaGateway(mediaGateway)
+  log('info', `injected processType=${processType ?? 'node'} pid=${process.pid}; log file: ${logPath}`,
+  )
 }
 
 async function startServer(server: QQBridgeServer): Promise<void> {
@@ -59,6 +52,23 @@ async function startServer(server: QQBridgeServer): Promise<void> {
   }
 }
 
+function createLocalPCMMediaGateway(): LocalPCMMediaGateway | undefined {
+  try {
+    return localPCMMediaGatewayFromEnvironment()
+  } catch {
+    log('error', 'PCM media gateway configuration is invalid')
+  }
+}
+
+function startLocalPCMMediaGateway(
+  gateway: LocalPCMMediaGateway | undefined,
+): void {
+  if (!gateway) return
+  void gateway
+    .start()
+    .catch(() => log('error', 'PCM media gateway failed to start'))
+}
+
 /**
  * Native QQNT classes expose read-only prototypes, so assigning
  * NodeIQQNTWrapperSession.prototype.init is not possible. Intercept CommonJS
@@ -66,7 +76,7 @@ async function startServer(server: QQBridgeServer): Promise<void> {
  * session constructor is a construct proxy. The proxy wraps each new session
  * instance and observes init() without mutating the native object.
  */
-function installKernelRequireHook(bridge: QQKernelBridge, login: QQLoginController): void {
+function installKernelRequireHook(bridge: QQKernelBridge): void {
   type Loader = (request: string, parent: NodeModule | null, isMain: boolean) => unknown
   const moduleWithLoad = Module as unknown as { _load: Loader }
   const originalLoad = moduleWithLoad._load
@@ -80,7 +90,7 @@ function installKernelRequireHook(bridge: QQKernelBridge, login: QQLoginControll
     if (!isKernelModule(loaded)) return loaded
     const cached = wrappedModules.get(loaded)
     if (cached) return cached
-    const wrapped = wrapKernelModule(loaded, bridge, login)
+    const wrapped = wrapKernelModule(loaded, bridge)
     wrappedModules.set(loaded, wrapped)
     log('info', `wrapped QQNT kernel module requested as ${request}`)
     return wrapped
@@ -93,17 +103,27 @@ function installKernelRequireHook(bridge: QQKernelBridge, login: QQLoginControll
     const result = originalDlopen.apply(this, arguments as unknown as Parameters<typeof originalDlopen>)
     const nativeModule = module as { exports: unknown }
     if (isKernelModule(nativeModule.exports)) {
+      observeAvsdkLoaderProbe()
       probeLinuxPacketBinding()
       const raw = nativeModule.exports
       let wrapped = wrappedModules.get(raw)
       if (!wrapped) {
-        wrapped = wrapKernelModule(raw, bridge, login)
+        wrapped = wrapKernelModule(raw, bridge)
         wrappedModules.set(raw, wrapped)
       }
       nativeModule.exports = wrapped
       log('info', `wrapped QQNT kernel through process.dlopen: ${filename}`)
     }
     return result
+  }
+
+  function observeAvsdkLoaderProbe(): void {
+    if (process.platform !== 'linux') return
+    try {
+      void loadPacketAddon().avsdkLoaderProbeStatus?.()
+    } catch {
+      // Loader-identity evidence is diagnostic only and always fails closed.
+    }
   }
 
   function probeLinuxPacketBinding(): void {
@@ -122,7 +142,7 @@ function installKernelRequireHook(bridge: QQKernelBridge, login: QQLoginControll
     try {
       const location = installPacketHook()
       if (!location) return
-      log('info', `QQNT Linux packet hook installed module=${location.moduleBase} locator=${location.locator} converterRva=0x${location.converterRva.toString(16)} resolverRva=0x${location.responseRva.toString(16)}`)
+      log('info', `QQNT Linux packet hook installed module=${location.moduleBase} profile=${location.profile} converterRva=0x${location.converterRva.toString(16)} resolverRva=0x${location.responseRva.toString(16)}`)
     } catch (error) {
       log('error', 'QQNT Linux packet hook install failed; packet media URLs will be unavailable', error)
     }
@@ -130,7 +150,7 @@ function installKernelRequireHook(bridge: QQKernelBridge, login: QQLoginControll
 }
 
 function logLinuxPacketProbe(probe: PacketBindingProbe): void {
-  log('info', `QQNT Linux packet locator verified locator=${probe.locator} buildIdPrefix=${probe.buildId.slice(0, 16)} sha256Prefix=${probe.sha256.slice(0, 16)} anchorRva=${probe.anchorRva} anchorXrefRva=${probe.anchorXrefRva} napiCallbackRva=${probe.napiCallbackRva} converterRva=${probe.converterRva} responseTableXrefRva=${probe.responseTableXrefRva} responseActionRva=${probe.responseActionRva} dispatchHelperRva=${probe.dispatchHelperRva} resolverThunkRva=${probe.resolverThunkRva} resultXrefRva=${probe.resultXrefRva} errMsgXrefRva=${probe.errMsgXrefRva} rspXrefRva=${probe.rspXrefRva} resolveActionRva=${probe.resolveActionRva}`)
+  log('info', `QQNT Linux packet profile verified profile=${probe.profile} buildIdPrefix=${probe.buildId.slice(0, 16)} sha256Prefix=${probe.sha256.slice(0, 16)} nameSlotRva=${probe.nameSlotRva} bindingNameRva=${probe.bindingNameRva} napiCallbackSlotRva=${probe.napiCallbackSlotRva} napiCallbackRva=${probe.napiCallbackRva} responseActionSlotRva=${probe.responseActionSlotRva} responseActionRva=${probe.responseActionRva} converterRva=${probe.converterRva} resolveActionRva=${probe.resolveActionRva}`)
 }
 
 function isKernelModule(value: unknown): value is KernelModule & object {
@@ -139,14 +159,14 @@ function isKernelModule(value: unknown): value is KernelModule & object {
   return typeof candidate.NodeIQQNTWrapperSession === 'function'
 }
 
-function wrapKernelModule(kernel: KernelModule, bridge: QQKernelBridge, login: QQLoginController): KernelModule {
+function wrapKernelModule(kernel: KernelModule, bridge: QQKernelBridge): KernelModule {
   const NativeSession = kernel.NodeIQQNTWrapperSession as unknown as new (...args: unknown[]) => KernelSession
   const wrappedSessions = new WeakMap<object, KernelSession>()
   const wrapOnce = (session: KernelSession): KernelSession => {
     const object = session as object
     const cached = wrappedSessions.get(object)
     if (cached) return cached
-    const wrapped = wrapSession(kernel, session, bridge, login)
+    const wrapped = wrapSession(kernel, session, bridge)
     wrappedSessions.set(object, wrapped)
     return wrapped
   }
@@ -176,43 +196,13 @@ function wrapKernelModule(kernel: KernelModule, bridge: QQKernelBridge, login: Q
     ...descriptors.NodeIQQNTWrapperSession,
     value: SessionFacade,
   }
-  if (kernel.NodeIKernelLoginService && descriptors.NodeIKernelLoginService) {
-    descriptors.NodeIKernelLoginService = {
-      ...descriptors.NodeIKernelLoginService,
-      value: wrapLoginServiceConstructor(kernel.NodeIKernelLoginService, login, kernel),
-    }
-  }
   return Object.defineProperties({}, descriptors) as KernelModule
-}
-
-let closeMainWindowTimer: NodeJS.Timeout | undefined
-
-function scheduleMainWindowClose(): void {
-  if (closeMainWindowTimer) clearTimeout(closeMainWindowTimer)
-  const configured = Number(process.env.QQNT_BRIDGE_CLOSE_MAIN_WINDOW_DELAY_MS ?? 15_000)
-  const delay = Number.isFinite(configured) && configured >= 0 ? configured : 15_000
-  closeMainWindowTimer = setTimeout(() => {
-    closeMainWindowTimer = undefined
-    try {
-      const electron = Module.createRequire(__filename)('electron') as {
-        BrowserWindow?: { getAllWindows(): ClosableWindow[] }
-      }
-      const windows = electron.BrowserWindow?.getAllWindows() ?? []
-      const closed = closeLargestVisibleWindow(windows)
-      if (closed) log('info', `closed QQNT main window after login visibleWindows=${windows.length}`)
-      else log('info', `QQNT main window already hidden after login windows=${windows.length}`)
-    } catch (error) {
-      log('warn', 'failed to close QQNT main window after login', error)
-    }
-  }, delay)
-  closeMainWindowTimer.unref?.()
 }
 
 export function wrapSession(
   kernel: KernelModule,
   nativeSession: KernelSession,
   bridge: QQKernelBridge,
-  login?: QQLoginController,
 ): KernelSession {
   let attached = false
   let msgServiceFacade: KernelMsgService | undefined
@@ -229,7 +219,6 @@ export function wrapSession(
         return (config: InitSessionConfig, ...args: unknown[]) => {
           log('info', `QQNT session init invoked for ${config.selfUin}`)
           const result = Reflect.apply(value, target, [config, ...args])
-          login?.attachSession(facade)
           if (!attached) {
             attached = true
             try {
@@ -248,7 +237,7 @@ export function wrapSession(
           if (msgServiceFacade) return msgServiceFacade
           const nativeService = Reflect.apply(value, target, []) as KernelMsgService | undefined
           if (!nativeService) return nativeService
-          return msgServiceFacade = teeMsgService(nativeService)
+          return (msgServiceFacade = teeMsgService(nativeService))
         }
       }
       if (property === 'getBuddyService' && typeof value === 'function') {
@@ -256,7 +245,7 @@ export function wrapSession(
           if (buddyServiceFacade) return buddyServiceFacade
           const nativeService = Reflect.apply(value, target, []) as KernelBuddyService | undefined
           if (!nativeService) return nativeService
-          return buddyServiceFacade = teeBuddyService(nativeService)
+          return (buddyServiceFacade = teeBuddyService(nativeService))
         }
       }
       if (property === 'getProfileService' && typeof value === 'function') {
@@ -264,7 +253,7 @@ export function wrapSession(
           if (profileServiceFacade) return profileServiceFacade
           const nativeService = Reflect.apply(value, target, []) as KernelProfileService | undefined
           if (!nativeService) return nativeService
-          return profileServiceFacade = teeProfileService(nativeService)
+          return (profileServiceFacade = teeProfileService(nativeService))
         }
       }
       if (property === 'getGroupService' && typeof value === 'function') {
@@ -272,15 +261,17 @@ export function wrapSession(
           if (groupServiceFacade) return groupServiceFacade
           const nativeService = Reflect.apply(value, target, []) as KernelGroupService | undefined
           if (!nativeService) return nativeService
-          return groupServiceFacade = teeGroupService(nativeService)
+          return (groupServiceFacade = teeGroupService(nativeService))
         }
       }
-      if (property === 'getRecentContactService' && typeof value === 'function') {
+      if (
+        property === 'getRecentContactService' && typeof value === 'function'
+      ) {
         return () => {
           if (recentServiceFacade) return recentServiceFacade
           const nativeService = Reflect.apply(value, target, []) as KernelRecentService | undefined
           if (!nativeService) return nativeService
-          return recentServiceFacade = teeRecentService(nativeService)
+          return (recentServiceFacade = teeRecentService(nativeService))
         }
       }
       if (property === 'getAVSDKService' && typeof value === 'function') {
@@ -288,27 +279,7 @@ export function wrapSession(
           if (avsdkServiceFacade) return avsdkServiceFacade
           const nativeService = Reflect.apply(value, target, []) as KernelAVSDKService | undefined
           if (!nativeService) return nativeService
-          const listenerFacade = teeAVSDKService(nativeService)
-          return avsdkServiceFacade = new Proxy(listenerFacade, {
-            get(service, serviceProperty) {
-              const serviceValue = Reflect.get(service, serviceProperty, service)
-              if (serviceProperty === 'setActionFromAVSDK' && typeof serviceValue === 'function') {
-                return (...args: unknown[]) => {
-                  const result = Reflect.apply(serviceValue, service, args)
-                  const [action, bytes] = args
-                  if (typeof action === 'number' && bytes instanceof Uint8Array) {
-                    try {
-                      bridge.observeAVSDKAction(action, bytes)
-                    } catch {
-                      log('warn', 'avsdk-call projection outcome=failed source=action-intercept')
-                    }
-                  }
-                  return result
-                }
-              }
-              return serviceValue
-            },
-          })
+          return (avsdkServiceFacade = teeAVSDKService(nativeService))
         }
       }
       // Native methods reject a JS Proxy as their receiver. Always bind them
