@@ -703,5 +703,8 @@ export interface KernelModule {
 export interface InitSessionConfig {
   selfUin: string
   selfUid: string
-  userPath: string
+  // Some Linux QQ builds omit userPath at runtime even though the native
+  // declaration historically exposed it. Callers must retain a separate
+  // trusted root instead of assuming this field is always present.
+  userPath?: string
 }

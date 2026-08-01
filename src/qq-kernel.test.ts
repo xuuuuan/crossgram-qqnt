@@ -2,7 +2,7 @@ import { Readable } from 'node:stream'
 import { once } from 'node:events'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { basename, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import WebSocket from 'ws'
 import type { ContactMsgBoxInfo, KernelModule, KernelSession, MsgElement, MsgRecord } from './kernel-types.js'
@@ -3631,6 +3631,40 @@ describe('QQBridgeServer', () => {
     expect(response.status).toBe(206)
     expect(response.headers.get('content-range')).toBe('bytes 1-4/7')
     expect(Buffer.from(await response.arrayBuffer()).toString()).toBe('revi')
+    const denied = await fetch(`${base}/files/asset`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        messageId: 'message', elementId: 'outside', chatType: 2, peerUid: 'group',
+        kind: 'file', fileName: basename(process.execPath), filePath: process.execPath,
+      }),
+    })
+    expect(denied.status).toBe(404)
+    await rm(root, { recursive: true, force: true })
+  })
+
+  it('uses XDG_CONFIG_HOME as the trusted media root when Linux QQ omits userPath', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    const root = await mkdtemp(join(tmpdir(), 'qqnt-media-xdg-'))
+    const path = join(root, 'nt_data', 'Video', 'Thumb', 'preview.png')
+    await mkdir(dirname(path), { recursive: true })
+    await writeFile(path, Buffer.from('preview'))
+    vi.stubEnv('XDG_CONFIG_HOME', root)
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self' })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const base = `http://127.0.0.1:${server.address().port}/v1`
+
+    const response = await fetch(`${base}/files/asset`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        messageId: 'message', elementId: 'preview', chatType: 2, peerUid: 'group',
+        kind: 'image', fileName: 'preview.png', filePath: path,
+      }),
+    })
+    expect(response.status).toBe(200)
+    expect(Buffer.from(await response.arrayBuffer()).toString()).toBe('preview')
+
     const denied = await fetch(`${base}/files/asset`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({

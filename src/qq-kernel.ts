@@ -2138,16 +2138,19 @@ export class QQKernelBridge {
     locator: QQMediaLocator,
     range: { offset?: number, limit?: number } = {},
   ): Promise<{ stream: Readable, mimeType: string, size: number, offset: number, length: number } | undefined> {
-    if (!locator.filePath || !isPathInside(this.requireConfig().userPath, locator.filePath)
-      || !existsSync(locator.filePath)) return
-    const size = statSync(locator.filePath).size
+    const roots = [this.requireConfig().userPath, process.env.XDG_CONFIG_HOME]
+      .filter((root): root is string => typeof root === 'string' && root.length > 0)
+    const filePath = locator.filePath
+    if (!filePath || !roots.some((root) => isPathInside(root, filePath))
+      || !existsSync(filePath)) return
+    const size = statSync(filePath).size
     const offset = Math.max(0, Math.trunc(range.offset ?? 0))
     const available = Math.max(0, size - offset)
     const requested = range.limit === undefined ? available : Math.max(0, Math.trunc(range.limit))
     const length = Math.min(available, requested)
     return {
       stream: length
-        ? createReadStream(locator.filePath, { start: offset, end: offset + length - 1 })
+        ? createReadStream(filePath, { start: offset, end: offset + length - 1 })
         : Readable.from([]),
       mimeType: locator.kind === 'image'
         ? imageMimeType(locator.fileName, false)
