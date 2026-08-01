@@ -386,6 +386,7 @@ describe('QQKernelBridge', () => {
   const tempPaths: string[] = []
   afterEach(async () => {
     vi.unstubAllGlobals()
+    vi.unstubAllEnvs()
     vi.restoreAllMocks()
     await Promise.all(tempPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })))
   })
@@ -2929,6 +2930,34 @@ describe('QQKernelBridge', () => {
     expect(resource).toMatchObject({ mimeType: 'image/apng', size: png.length, offset: 1, length: 3 })
     expect(await readStream(resource!.stream)).toEqual(png.subarray(1, 4))
     await expect(bridge.openReactionResource('unknown')).resolves.toBeUndefined()
+  })
+
+  it('discovers the injected global reaction resources through XDG_CONFIG_HOME', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'qqnt-reactions-xdg-'))
+    tempPaths.push(root)
+    const configRoot = join(root, '.config')
+    const resourceRoot = join(
+      configRoot, 'qqnt-bridge-injection', 'global', 'nt_data', 'Emoji', 'emoji-resource',
+    )
+    await Promise.all([
+      mkdir(join(resourceRoot, 'sysface_res'), { recursive: true }),
+      mkdir(join(resourceRoot, 'emoji_res'), { recursive: true }),
+    ])
+    await writeFile(join(resourceRoot, 'face_config.json'), JSON.stringify({
+      emoji: [{ QSid: '👍', QCid: '76', AQLid: '76', QDes: '/赞' }],
+      sysface: [],
+    }))
+    vi.stubEnv('XDG_CONFIG_HOME', configRoot)
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, {
+      selfUin: '10000', selfUid: 'self', userPath: join(configRoot, 'QQ'),
+    })
+
+    await expect(bridge.getReactionCatalog()).resolves.toMatchObject({
+      available: [{ key: '2:76', presentation: { type: 'emoji', emoticon: '👍' } }],
+      maxSelected: 20,
+    })
   })
 
   it('does not expose or write reactions in direct conversations', async () => {
