@@ -3854,12 +3854,28 @@ export class QQKernelBridge {
   private findLocalReactionRoot(): string | undefined {
     const userPath = this.config?.userPath
     if (!userPath) return
-    const candidates = [
-      join(dirname(userPath), 'global', 'nt_data', 'Emoji', 'emoji-resource'),
-      join(userPath, '..', 'global', 'nt_data', 'Emoji', 'emoji-resource'),
-      join(userPath, '..', '..', 'global', 'nt_data', 'Emoji', 'emoji-resource'),
-    ]
-    return candidates.find((candidate) => existsSync(join(candidate, 'face_config.json')))
+    const candidates = new Set<string>()
+    const addGlobalRoot = (root: string | undefined) => {
+      if (!root) return
+      candidates.add(join(root, 'global', 'nt_data', 'Emoji', 'emoji-resource'))
+      candidates.add(join(root, 'qqnt-bridge-injection', 'global', 'nt_data', 'Emoji', 'emoji-resource'))
+    }
+    addGlobalRoot(process.env.XDG_CONFIG_HOME)
+    addGlobalRoot(process.env.HOME ? join(process.env.HOME, '.config') : undefined)
+
+    // QQNT has used both the account directory and its nt_data directory as
+    // userPath across Linux releases. Walk a bounded set of parents so the
+    // sibling global resource directory is found without a recursive scan.
+    let current = userPath
+    for (let depth = 0; depth < 8; depth++) {
+      addGlobalRoot(current)
+      candidates.add(join(current, 'nt_data', 'Emoji', 'emoji-resource'))
+      candidates.add(join(current, 'Emoji', 'emoji-resource'))
+      const parent = dirname(current)
+      if (parent === current) break
+      current = parent
+    }
+    return [...candidates].find((candidate) => existsSync(join(candidate, 'face_config.json')))
   }
 
   private async userAvatar(uid: string, force = true): Promise<QQMedia | undefined> {
