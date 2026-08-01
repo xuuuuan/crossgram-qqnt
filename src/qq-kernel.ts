@@ -975,7 +975,11 @@ export class QQKernelBridge {
       packId: String(item.epId), title: item.tabName || String(item.epId), version: 1,
       count: this.stickerPacks.get(String(item.epId))?.stickers.length,
     }))
-    if (favoritePack.stickers.length) packs.unshift({
+    // The QQ favorites collection is account-scoped and conceptually always
+    // exists, even when the current native snapshot is empty. Expose it as a
+    // stable pack so clients can render the collection and observe later
+    // additions without requiring an unrelated market pack refresh.
+    packs.unshift({
       packId: favoritePack.packId,
       title: favoritePack.title,
       count: favoritePack.count,
