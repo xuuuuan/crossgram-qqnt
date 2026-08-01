@@ -3642,14 +3642,16 @@ describe('QQBridgeServer', () => {
     await rm(root, { recursive: true, force: true })
   })
 
-  it('uses XDG_CONFIG_HOME as the trusted media root when Linux QQ omits userPath', async () => {
+  it('uses the Linux account config directory as a trusted media root when QQ omits userPath', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
-    const root = await mkdtemp(join(tmpdir(), 'qqnt-media-xdg-'))
+    const home = await mkdtemp(join(tmpdir(), 'qqnt-media-home-'))
+    const root = join(home, '.config')
     const path = join(root, 'nt_data', 'Video', 'Thumb', 'preview.png')
     await mkdir(dirname(path), { recursive: true })
     await writeFile(path, Buffer.from('preview'))
-    vi.stubEnv('XDG_CONFIG_HOME', root)
+    vi.stubEnv('XDG_CONFIG_HOME', '')
+    vi.stubEnv('HOME', home)
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self' })
     server = new QQBridgeServer(bridge, { port: 0 })
     await server.start()
@@ -3673,7 +3675,7 @@ describe('QQBridgeServer', () => {
       }),
     })
     expect(denied.status).toBe(404)
-    await rm(root, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true })
   })
 
   it('serves only catalog-keyed reaction assets with byte ranges', async () => {

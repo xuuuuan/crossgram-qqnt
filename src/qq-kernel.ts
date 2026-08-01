@@ -2138,7 +2138,11 @@ export class QQKernelBridge {
     locator: QQMediaLocator,
     range: { offset?: number, limit?: number } = {},
   ): Promise<{ stream: Readable, mimeType: string, size: number, offset: number, length: number } | undefined> {
-    const roots = [this.requireConfig().userPath, process.env.XDG_CONFIG_HOME]
+    const roots = [
+      this.requireConfig().userPath,
+      process.env.XDG_CONFIG_HOME,
+      process.env.HOME ? join(process.env.HOME, '.config') : undefined,
+    ]
       .filter((root): root is string => typeof root === 'string' && root.length > 0)
     const filePath = locator.filePath
     if (!filePath || !roots.some((root) => isPathInside(root, filePath))
