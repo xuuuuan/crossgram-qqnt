@@ -1098,12 +1098,25 @@ export class QQKernelBridge {
     packs: QQStickerPackSummary[]
     nextCursor?: string
   }> {
-    await this.loadStickerPackCatalog()
+    const [favoritePack] = await Promise.all([
+      this.loadFavoriteStickerPack(),
+      this.loadStickerPackCatalog(),
+    ])
     const offset = parseCursor(cursor)
     const packs = [...this.stickerPackInfo.values()].map((item) => ({
       packId: String(item.epId), title: item.tabName || String(item.epId), version: 1,
       count: this.stickerPacks.get(String(item.epId))?.stickers.length,
     }))
+    // The QQ favorites collection is account-scoped and conceptually always
+    // exists, even when the current native snapshot is empty. Expose it as a
+    // stable pack so clients can render the collection and observe later
+    // additions without requiring an unrelated market pack refresh.
+    packs.unshift({
+      packId: favoritePack.packId,
+      title: favoritePack.title,
+      count: favoritePack.count,
+      version: favoritePack.version,
+    })
     const selected = packs.slice(offset, offset + clamp(limit, 1, 200))
     return {
       packs: selected,

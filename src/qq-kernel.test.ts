@@ -2139,7 +2139,10 @@ describe('QQKernelBridge', () => {
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: directory })
 
     await expect(bridge.getStickerPacks()).resolves.toMatchObject({
-      packs: [{ packId: '42', title: 'QQ Waves' }],
+      packs: [
+        { packId: 'qq-favorites', title: 'QQ 收藏表情', count: 0 },
+        { packId: '42', title: 'QQ Waves' },
+      ],
     })
     const pack = await bridge.getStickerPack('42')
     expect(pack).toMatchObject({
@@ -2288,7 +2291,10 @@ describe('QQKernelBridge', () => {
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
 
     await expect(bridge.getStickerPacks()).resolves.toMatchObject({
-      packs: [{ packId: '41' }, { packId: '42' }, { packId: '43' }],
+      packs: [
+        { packId: 'qq-favorites', count: 0 },
+        { packId: '41' }, { packId: '42' }, { packId: '43' },
+      ],
     })
     expect(f.msg.fetchMarketEmoticonList).toHaveBeenNthCalledWith(2, 1, 0)
     expect(f.msg.fetchMarketEmoticonList).toHaveBeenNthCalledWith(3, 2, 0)
@@ -2320,6 +2326,7 @@ describe('QQKernelBridge', () => {
 
     await expect(bridge.getStickerPacks()).resolves.toMatchObject({
       packs: [
+        { packId: 'qq-favorites', title: 'QQ 收藏表情', count: 0 },
         { packId: '51', title: 'Installed' },
         { packId: '53', title: 'Second' },
       ],
