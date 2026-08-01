@@ -59,6 +59,8 @@ const AVSDK_LOG_OUT = 'trpc.qqrtc.av_appsvr.AvAppsvr.SsoLogOut'
 const AVSDK_ACCEPT_INVITE_BYTES = Buffer.from(AVSDK_ACCEPT_INVITE, 'ascii')
 const AVSDK_REFUSE_INVITE_BYTES = Buffer.from(AVSDK_REFUSE_INVITE, 'ascii')
 const AVSDK_LOG_OUT_BYTES = Buffer.from(AVSDK_LOG_OUT, 'ascii')
+const FAVORITE_STICKER_PACK_ID = 'qq-favorites'
+const FAVORITE_STICKER_PACK_TITLE = 'QQ 收藏表情'
 // Keep this in sync with Telegram's account-level reaction catalog. QQ emoji
 // outside this set are exposed as custom reactions backed by QQ's own icon.
 const TELEGRAM_STANDARD_REACTIONS = new Set([
@@ -217,6 +219,7 @@ export class QQKernelBridge {
   private readonly stickerPacks = new Map<string, QQStickerPack>()
   private readonly stickerPackInfo = new Map<string, MarketStickerPackInfo>()
   private readonly stickers = new Map<string, QQSticker>()
+  private favoriteStickerPackPromise?: Promise<QQStickerPack>
   private readonly pendingMessages = new Map<string, ReturnType<typeof deferred<MsgRecord>>>()
   private readonly pendingAcceptances = new Map<string, ReturnType<typeof deferred<void>>>()
   private readonly pendingMinimumStatuses = new Map<string, number>()
@@ -346,6 +349,7 @@ export class QQKernelBridge {
     this.stickerPacks.clear()
     this.stickerPackInfo.clear()
     this.stickers.clear()
+    this.favoriteStickerPackPromise = undefined
     this.buddySnapshotLoaded = false
     this.kernel = kernel
     this.session = session
@@ -1115,7 +1119,7 @@ export class QQKernelBridge {
       packId: favoritePack.packId,
       title: favoritePack.title,
       count: favoritePack.count,
-      version: favoritePack.version,
+      version: favoritePack.version ?? 1,
     })
     const selected = packs.slice(offset, offset + clamp(limit, 1, 200))
     return {
@@ -1125,6 +1129,7 @@ export class QQKernelBridge {
   }
 
   async getStickerPack(packId: string): Promise<QQStickerPack | null> {
+    if (packId === FAVORITE_STICKER_PACK_ID) return this.loadFavoriteStickerPack()
     const cached = this.stickerPacks.get(packId)
     if (cached) return cached
     await this.loadStickerPackCatalog()
@@ -1239,7 +1244,10 @@ export class QQKernelBridge {
     if (!service.fetchFavEmojiList) return { stickers: [] }
     const result = await service.fetchFavEmojiList(cursor ?? '', clamp(limit, 1, 200), true, false)
     if (result.result !== 0) throw new Error(`fetchFavEmojiList: ${result.errMsg} (${result.result})`)
-    const stickers = await mapConcurrent(result.emojiInfoList, 8, (item) => this.mapFavoriteSticker(item))
+    const stickers = await mapConcurrent(result.emojiInfoList, 8, async (item) => ({
+      ...await this.mapFavoriteSticker(item),
+      packId: FAVORITE_STICKER_PACK_ID,
+    }))
     for (const sticker of stickers) this.stickers.set(sticker.stickerId, sticker)
     return {
       stickers,
@@ -1338,9 +1346,19 @@ export class QQKernelBridge {
       if (!resId) return
       const result = await service.deleteFavEmoji([resId])
       if (result.result !== 0) throw new Error(`deleteFavEmoji: ${result.errMsg} (${result.result})`)
+      this.stickers.delete(favoriteStickerId(resId))
+      this.invalidateFavoriteStickerPack()
       return
     }
     if (!service.addFavEmoji) throw new Error('QQ favorite creation is unavailable')
+    if (reference.kind === 'market' && service.fetchMarketEmoticonAuthDetail) {
+      const authorization = await service.fetchMarketEmoticonAuthDetail({
+        epId: Number(reference.packageId), eId: reference.stickerId, scene: 0,
+      })
+      if (authorization.result !== 0) {
+        throw new Error(`fetchMarketEmoticonAuthDetail: ${authorization.errMsg} (${authorization.result})`)
+      }
+    }
     const path = reference.kind === 'favorite'
       ? reference.path
       : (await this.resolveMarketStickerPath(reference)).path
@@ -1354,6 +1372,7 @@ export class QQKernelBridge {
       fileName: reference.name, md5: reference.md5 ?? '', isMarkFace: false, isOrigin: true,
     })
     if (result.result !== 0) throw new Error(`addFavEmoji: ${result.errMsg} (${result.result})`)
+    this.invalidateFavoriteStickerPack()
   }
 
   async prepareMediaUpload(conversationId: string, spec: QQSendMediaSpec): Promise<QQMediaUploadPlan> {
@@ -4182,6 +4201,45 @@ export class QQKernelBridge {
     throw new Error('QQ sticker pack pagination exceeded 100 pages')
   }
 
+  private loadFavoriteStickerPack(): Promise<QQStickerPack> {
+    if (this.favoriteStickerPackPromise) return this.favoriteStickerPackPromise
+    const loading = this.fetchFavoriteStickerPack()
+    this.favoriteStickerPackPromise = loading
+    void loading.finally(() => {
+      if (this.favoriteStickerPackPromise === loading) this.favoriteStickerPackPromise = undefined
+    }).catch(() => {})
+    return loading
+  }
+
+  private async fetchFavoriteStickerPack(): Promise<QQStickerPack> {
+    const stickers: QQSticker[] = []
+    let cursor: string | undefined
+    const seenCursors = new Set<string>()
+    for (let pageIndex = 0; pageIndex < 100; pageIndex++) {
+      const page = await this.getSavedStickers(cursor, 200)
+      stickers.push(...page.stickers)
+      if (!page.nextCursor) break
+      if (seenCursors.has(page.nextCursor)) {
+        throw new Error(`QQ favorite sticker pagination repeated cursor: ${page.nextCursor}`)
+      }
+      seenCursors.add(page.nextCursor)
+      cursor = page.nextCursor
+      if (pageIndex === 99) throw new Error('QQ favorite sticker pagination exceeded 100 pages')
+    }
+    return {
+      packId: FAVORITE_STICKER_PACK_ID,
+      title: FAVORITE_STICKER_PACK_TITLE,
+      count: stickers.length,
+      version: favoritePackVersion(stickers),
+      stickers,
+    }
+  }
+
+  private invalidateFavoriteStickerPack(): void {
+    this.stickerPacks.delete(FAVORITE_STICKER_PACK_ID)
+    this.favoriteStickerPackPromise = undefined
+  }
+
   private async mapFavoriteSticker(
     item: CustomEmotionData,
   ): Promise<QQSticker> {
@@ -4829,6 +4887,18 @@ function favoriteStickerId(resId: string): string {
   return `favorite:${resId}`
 }
 
+function favoritePackVersion(stickers: QQSticker[]): number {
+  let hash = 0x811c9dc5
+  for (const sticker of stickers) {
+    const value = `${sticker.stickerId}:${sticker.version ?? 0}\u0000`
+    for (let index = 0; index < value.length; index++) {
+      hash ^= value.charCodeAt(index)
+      hash = Math.imul(hash, 0x01000193)
+    }
+  }
+  return hash >>> 0
+}
+
 function matchesElementKind(
   element: MsgElement, kind: 'image' | 'file' | 'sticker',
 ): boolean {
@@ -4876,6 +4946,24 @@ function videoMimeType(path: string, format?: number): string {
   if (extension === '.ts' || extension === '.mts') return 'video/mp2t'
   if (extension === '.webm') return 'video/webm'
   return 'video/mp4'
+}
+
+function fileVideoMimeType(path: string): string | undefined {
+  const extension = extname(path).toLowerCase()
+  if (extension === '.mp4' || extension === '.m4v' || extension === '.f4v') return 'video/mp4'
+  if (extension === '.avi') return 'video/x-msvideo'
+  if (extension === '.wmv') return 'video/x-ms-wmv'
+  if (extension === '.mkv') return 'video/x-matroska'
+  if (extension === '.mov') return 'video/quicktime'
+  if (extension === '.ts' || extension === '.mts' || extension === '.m2ts') return 'video/mp2t'
+  if (extension === '.webm') return 'video/webm'
+  if (extension === '.mpeg' || extension === '.mpg' || extension === '.mpe') return 'video/mpeg'
+  if (extension === '.ogv') return 'video/ogg'
+  if (extension === '.3gp') return 'video/3gpp'
+  if (extension === '.3g2') return 'video/3gpp2'
+  if (extension === '.flv') return 'video/x-flv'
+  if (extension === '.asf') return 'video/x-ms-asf'
+  if (extension === '.mod') return 'video/mod'
 }
 
 function isAnimatedPicture(
