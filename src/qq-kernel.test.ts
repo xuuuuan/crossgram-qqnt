@@ -2420,6 +2420,25 @@ describe('QQKernelBridge', () => {
     })
   })
 
+  it.each([
+    ['placeholder-undefined', '10001', ' \tUnDeFiNeD '],
+    ['placeholder-null', '10002', ' NuLl '],
+  ])('does not expose a literal placeholder name through getContacts or getUser', async (uid, uin, name) => {
+    const f = fixture()
+    f.buddy.getBuddyNick.mockReturnValue(new Map())
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.emitBuddyList([{ buddyList: [{ uid, uin, nick: name, remark: '', avatarUrl: '' }] }])
+
+    await expect(bridge.getContacts()).resolves.toMatchObject({
+      users: expect.arrayContaining([expect.objectContaining({ id: uid, name: uin })]),
+    })
+    const user = await bridge.getUser(uid)
+    if (!user) throw new Error(`Expected getUser(${uid}) to return a user`)
+    expect(user).toMatchObject({ id: uid })
+    expect(user.name.trim().toLowerCase()).not.toMatch(/^(undefined|null)$/)
+  })
+
   it('keeps the canonical group name and avatar on message events', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()

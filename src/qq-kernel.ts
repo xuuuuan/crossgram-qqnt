@@ -613,6 +613,7 @@ export class QQKernelBridge {
     // cold-cache miss does not stay permanent.
     const users = await mapConcurrent(selected, 4, async (user) => ({
       ...user,
+      name: firstUsefulTitle(user.id, user.name, user.numericId, user.id),
       avatar: await this.userAvatar(user.id, false),
     }))
     return { users, nextCursor: offset + users.length < all.length ? String(offset + users.length) : undefined }
