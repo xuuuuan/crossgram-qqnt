@@ -462,6 +462,30 @@ describe('QQKernelBridge', () => {
     expect(f.msg.sendMsg).not.toHaveBeenCalled()
   })
 
+  it('emits an incoming call signal for an uncached direct peer', async () => {
+    const f = fixture()
+    f.recent.getRecentContactInfos.mockResolvedValue({ result: 0, errMsg: '', relation: [] })
+    const bridge = new QQKernelBridge()
+    const subscription = bridge.subscribe()
+    const events = subscription[Symbol.asyncIterator]()
+    try {
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      f.emitAVSDK('OnInviteActionToAVSDK', {
+        relation_id: '20001', invite_type: 1, from_uid: 'fixture-incoming-peer',
+      }, 0, 'fixture-call-payload')
+
+      await expect(nextCallSignal(events)).resolves.toMatchObject({
+        signal: 'incoming',
+        conversation: {
+          id: 'fixture-incoming-peer', kind: 'direct', peerUid: 'fixture-incoming-peer', peerUin: '20001',
+        },
+      })
+    } finally {
+      bridge.unsubscribe(subscription)
+      bridge.detach()
+    }
+  })
+
   it.each([
     'QQNT_BRIDGE_AVSDK_TAP',
     'QQNT_BRIDGE_AVSDK_RAW',

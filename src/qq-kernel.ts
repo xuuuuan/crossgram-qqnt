@@ -2645,8 +2645,7 @@ export class QQKernelBridge {
       id: conversationId(CHAT_C2C, peerUid), kind: 'direct', title: buddy?.name ?? numericId,
       peerUid, peerUin: numericId, chatType: CHAT_C2C,
     }
-    return
-    this.mergeConversation(created)
+    return this.mergeConversation(created)
   }
 
   private createCallId(fingerprintDigest: Buffer): string {
