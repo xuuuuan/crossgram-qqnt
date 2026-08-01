@@ -330,7 +330,7 @@ function fixture() {
       return { sequence: 1n, clientSequence: 2n, sendTime: 3 }
     })
   return {
-    kernel, session, msg, recent, profile, group, search, avsdk, richMedia, uix, message, sentBodies,
+    kernel, session, msg, recent, buddy, profile, group, search, avsdk, richMedia, uix, message, sentBodies,
     imageUpload, fileUpload, protocolSend,
     emitMessages(records: MsgRecord[]) {
       return msgHandlers.onMsgInfoListUpdate?.(records)
@@ -369,6 +369,15 @@ function fixture() {
       memberRole?: number
     }>) {
       groupHandlers.onGroupListUpdate?.(1, groups)
+    },
+    emitGroupDetail(group: {
+      groupCode: string
+      groupName: string
+      remarkName?: string
+      memberCount?: number
+      memberRole?: number
+    }) {
+      groupHandlers.onGroupDetailInfoChange?.(group)
     },
     emitMemberList(info: {
       sceneId: string
@@ -2394,6 +2403,37 @@ describe('QQKernelBridge', () => {
     await expect(readFile(sourcePath)).resolves.toEqual(png)
   })
 
+  it.each(['', ' \t '])('fails closed for blank user ID %j', async (uid) => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.uix.getUin.mockClear()
+    f.profile.getUserSimpleInfo.mockClear()
+
+    await expect(bridge.getUser(uid)).resolves.toBeUndefined()
+
+    expect(f.uix.getUin).not.toHaveBeenCalled()
+    expect(f.profile.getUserSimpleInfo).not.toHaveBeenCalled()
+  })
+
+  it('filters blank UIDs from the buddy snapshot', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.emitBuddyList([{ buddyList: [
+      { uid: '', uin: '1', nick: 'Empty', remark: '', avatarUrl: '' },
+      { uid: ' \t ', uin: '2', nick: 'Blank', remark: '', avatarUrl: '' },
+      { uid: 'friend', uin: '3', nick: 'Friend', remark: '', avatarUrl: '' },
+    ] }])
+
+    await expect(bridge.getContacts()).resolves.toMatchObject({
+      users: expect.arrayContaining([expect.objectContaining({ id: 'friend' })]),
+    })
+    const users = (bridge as unknown as { users: Map<string, unknown> }).users
+    expect(users.has('')).toBe(false)
+    expect(users.has(' \t ')).toBe(false)
+  })
+
   it('returns every buddy as a contact without adding the full buddy list to dialogs', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
@@ -2437,6 +2477,30 @@ describe('QQKernelBridge', () => {
     if (!user) throw new Error(`Expected getUser(${uid}) to return a user`)
     expect(user).toMatchObject({ id: uid })
     expect(user.name.trim().toLowerCase()).not.toMatch(/^(undefined|null)$/)
+  })
+
+  it('refreshes a placeholder group dialog title through getDialogs', async () => {
+    const f = fixture()
+    f.recent.getRecentContactInfos.mockResolvedValue({
+      result: 0, errMsg: '', relation: [{
+        chatType: 2, peerUid: '1058754719', peerUin: '1058754719', peerName: ' NuLl ', remark: '',
+        avatarUrl: '', unreadCnt: '0', msgId: 'm1', msgTime: '1800000000', senderUid: 'member', senderUin: '42',
+        abstractContent: [],
+      }],
+    })
+    f.group.getGroupDetailInfo.mockImplementation(async (groupCode, _source) => {
+      f.emitGroupDetail({ groupCode, groupName: 'Bridge Test Group' })
+      return { result: 0, errMsg: '' }
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    const dialogs = await bridge.getDialogs()
+
+    expect(f.group.getGroupDetailInfo).toHaveBeenCalledWith('1058754719', 5)
+    expect(dialogs.conversations).toContainEqual(expect.objectContaining({
+      id: '1058754719', title: 'Bridge Test Group',
+    }))
   })
 
   it('keeps the canonical group name and avatar on message events', async () => {
