@@ -1399,6 +1399,9 @@ describe('QQKernelBridge', () => {
 
   it('hides recalled records, maps native and file-sent videos, and renders unsupported elements as text fallbacks', async () => {
     const f = fixture()
+    const videoThumbnailDir = await mkdtemp(join(tmpdir(), 'qqnt-video-thumb-'))
+    const videoThumbnailPath = join(videoThumbnailDir, 'preview.jpg')
+    await writeFile(videoThumbnailPath, Buffer.from([0xff, 0xd8, 0xff, 0xd9]))
     f.msg.getLatestDbMsgs.mockResolvedValueOnce({
       result: 0, errMsg: '', msgList: [
         { ...f.message, msgId: 'recalled', elements: [{
@@ -1411,6 +1414,7 @@ describe('QQKernelBridge', () => {
           { elementType: 5, elementId: 'video', videoElement: {
             filePath: '/missing/clip.mp4', fileName: 'clip.mp4', fileTime: 4,
             fileFormat: 2, fileSize: '1048576', thumbWidth: 1280, thumbHeight: 720,
+            thumbSize: 4, thumbMd5: 'thumb-md5', thumbPath: new Map([[0, videoThumbnailPath]]),
             videoMd5: 'video-md5', fileUuid: 'video-uuid', fileSubId: 'video-sub-id', fileBizId: 4601,
             sourceVideoCodecFormat: 1,
           } },
@@ -1441,6 +1445,14 @@ describe('QQKernelBridge', () => {
       { type: 'media', media: {
         id: 'video', kind: 'file', name: 'clip.mp4', mimeType: 'video/mp4',
         size: 1048576, width: 1280, height: 720, duration: 4,
+        preview: {
+          mimeType: 'image/jpeg', size: 4, width: 1280, height: 720,
+          locator: {
+            messageId: 'fallbacks', elementId: 'video', chatType: 1, peerUid: 'uid-1715311957',
+            kind: 'image', fileName: 'preview.jpg',
+            fileSize: '4', filePath: videoThumbnailPath, md5: 'thumb-md5',
+          },
+        },
         locator: {
           messageId: 'fallbacks', elementId: 'video', chatType: 1, peerUid: 'uid-1715311957',
           kind: 'file', fileName: 'clip.mp4', fileSize: '1048576', filePath: '/missing/clip.mp4',
@@ -1469,6 +1481,7 @@ describe('QQKernelBridge', () => {
       { type: 'text', text: '**Markdown**' },
       { type: 'text', text: '[暂不支持的消息 999]' },
     ] })
+    await rm(videoThumbnailDir, { recursive: true, force: true })
   })
 
   it('parses legacy and current mini-app Ark payloads into structured cards', async () => {

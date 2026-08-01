@@ -4186,6 +4186,11 @@ function mapMedia(record: MsgRecord, element: MsgElement): QQMedia | undefined {
 
   if (element.videoElement) {
     const video = element.videoElement
+    const thumbnailPath = [...(video.thumbPath?.values() ?? [])]
+      .find((path) => path && existsSync(path) && statSync(path).size > 0)
+    const thumbnailSize = thumbnailPath ? statSync(thumbnailPath).size : 0
+    const thumbnailWidth = video.thumbWidth || undefined
+    const thumbnailHeight = video.thumbHeight || undefined
     return {
       id: element.elementId || `${record.msgId}:video`,
       kind: 'file',
@@ -4195,6 +4200,20 @@ function mapMedia(record: MsgRecord, element: MsgElement): QQMedia | undefined {
       width: video.thumbWidth || undefined,
       height: video.thumbHeight || undefined,
       duration: Number.isFinite(video.fileTime) && video.fileTime >= 0 ? video.fileTime : undefined,
+      preview: thumbnailPath && thumbnailWidth && thumbnailHeight ? {
+        mimeType: imageMimeType(thumbnailPath, false),
+        size: thumbnailSize,
+        width: thumbnailWidth,
+        height: thumbnailHeight,
+        locator: {
+          ...base,
+          kind: 'image',
+          fileName: basename(thumbnailPath),
+          fileSize: String(thumbnailSize),
+          filePath: thumbnailPath,
+          md5: video.thumbMd5,
+        },
+      } : undefined,
       locator: {
         ...base, kind: 'file', fileName: video.fileName, fileSize: video.fileSize,
         filePath: video.filePath, fileUuid: video.fileUuid, fileSubId: video.fileSubId,

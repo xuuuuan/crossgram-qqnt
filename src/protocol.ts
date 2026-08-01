@@ -45,6 +45,14 @@ export interface QQMedia {
   height?: number
   /** Playback duration in seconds. Present for native QQ video elements. */
   duration?: number
+  /** Native QQ thumbnail that can be fetched without downloading the full media. */
+  preview?: {
+    mimeType?: string
+    size: number
+    width: number
+    height: number
+    locator: QQMediaLocator
+  }
   locator: QQMediaLocator
 }
 
