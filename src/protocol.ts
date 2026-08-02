@@ -123,6 +123,7 @@ export type QQStickerReference =
       width?: number
       height?: number
       animated: boolean
+      url?: string
       locator?: QQMediaLocator
     }
 

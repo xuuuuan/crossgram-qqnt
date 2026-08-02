@@ -2362,7 +2362,7 @@ describe('QQKernelBridge', () => {
     await writeFile(path, png)
     f.msg.fetchFavEmojiList.mockResolvedValue({
       result: 0, errMsg: '', emojiInfoList: [{
-        emoPath: path, isExist: true, resId: 'fav-res', url: '', md5: 'fav-md5',
+        emoPath: path, isExist: true, resId: 'fav-res', url: 'https://cdn.example/fav-res.png', md5: 'fav-md5',
         emoOriginalPath: path, thumbPath: path, isAPNG: false, isMarkFace: false,
         eId: '', epId: '', desc: 'Saved image',
       }],
@@ -2376,6 +2376,7 @@ describe('QQKernelBridge', () => {
     }])
     expect(f.msg.fetchFavEmojiList).toHaveBeenCalledWith('', 200, true, true)
     const reference = page.stickers[0].reference
+    expect(reference).toMatchObject({ url: 'https://cdn.example/fav-res.png' })
     await bridge.setSavedSticker(reference, true)
     expect(f.msg.addFavEmoji).toHaveBeenCalledWith(expect.objectContaining({
       emojiPath: path, isMarkFace: false, md5: 'fav-md5',
@@ -3371,6 +3372,35 @@ describe('QQBridgeServer', () => {
       expect(response.status).toBe(404)
       await expect(response.json()).resolves.toMatchObject({ error: expect.stringContaining('favorite sticker') })
     }
+    expect(fetchAsset).toHaveBeenCalledOnce()
+  })
+
+  it('streams a QQ favorite from its native CDN URL when the local collection file is absent', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const originalFetch = globalThis.fetch
+    const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47])
+    const fetchAsset = vi.fn(async () => new Response(bytes, {
+      status: 200, headers: { 'content-type': 'image/png', 'content-length': String(bytes.length) },
+    }))
+    vi.stubGlobal('fetch', (input: string | URL | Request, init?: RequestInit) =>
+      String(input) === 'https://cdn.example/favorite.png'
+        ? fetchAsset()
+        : originalFetch(input, init))
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const base = `http://127.0.0.1:${server.address().port}/v1`
+
+    const response = await fetch(`${base}/stickers/asset`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+        kind: 'favorite', resId: 'cdn-favorite', path: '/missing/favorite.png',
+        name: 'favorite.png', animated: false, url: 'https://cdn.example/favorite.png',
+      }),
+    })
+
+    expect(response.status).toBe(200)
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(bytes)
     expect(fetchAsset).toHaveBeenCalledOnce()
   })
 

@@ -1294,17 +1294,35 @@ export class QQKernelBridge {
       }
     }
     if (reference.kind === 'favorite') {
+      // A forced collection refresh may replace an earlier unresolved entry
+      // with a real local file. Prefer that authoritative path before
+      // consulting the short negative cache.
+      if (reference.path && existsSync(reference.path)) {
+        return {
+          stream: fileStream(reference.path, false),
+          mimeType: imageMimeType(reference.path, reference.animated),
+          size: statSync(reference.path).size,
+        }
+      }
       const cacheKey = favoriteStickerAssetKey(reference)
       const missingUntil = this.missingStickerAssets.get(cacheKey) ?? 0
       if (missingUntil > Date.now()) {
         throw new QQStickerAssetNotFoundError(`QQ favorite sticker asset is temporarily unavailable: ${reference.resId}`)
       }
       this.missingStickerAssets.delete(cacheKey)
-      if (reference.path && existsSync(reference.path)) {
+      if (reference.url) {
+        const response = await fetch(reference.url)
+        if (!response.ok || !response.body) {
+          if (response.status === 404 || response.status === 410) {
+            this.missingStickerAssets.set(cacheKey, Date.now() + this.stickerMissingCacheTtlMs)
+            throw new QQStickerAssetNotFoundError(`QQ favorite sticker download failed: ${response.status}`)
+          }
+          throw new Error(`QQ favorite sticker download failed: ${response.status}`)
+        }
         return {
-          stream: fileStream(reference.path, false),
-          mimeType: imageMimeType(reference.path, reference.animated),
-          size: statSync(reference.path).size,
+          stream: Readable.fromWeb(response.body),
+          mimeType: imageMimeType(reference.name, reference.animated),
+          size: numberOrUndefined(response.headers.get('content-length') ?? undefined) ?? reference.size,
         }
       }
       if (reference.locator) {
@@ -4286,6 +4304,7 @@ export class QQKernelBridge {
       md5: item.md5 || undefined,
       size: path && existsSync(path) ? statSync(path).size : undefined,
       width: dimensions?.width, height: dimensions?.height, animated,
+      url: item.url || undefined,
     }
     return {
       stickerId: favoriteStickerId(item.resId), title: item.desc || undefined,
@@ -4814,6 +4833,7 @@ function mergeKnownSticker(known: QQSticker | undefined, current: QQSticker): QQ
       path: current.reference.path || known.reference.path,
       name: current.reference.name || known.reference.name,
       animated,
+      url: current.reference.url || known.reference.url,
       locator: current.reference.locator || known.reference.locator,
     }
     return {
@@ -6139,6 +6159,7 @@ function imagePicType(name: string): number {
 function favoriteStickerAssetKey(reference: Extract<QQStickerReference, { kind: 'favorite' }>): string {
   return [
     reference.resId,
+    reference.url ?? '',
     reference.locator?.messageId ?? '',
     reference.locator?.elementId ?? '',
     reference.locator?.fileUuid ?? '',
