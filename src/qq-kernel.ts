@@ -1242,7 +1242,13 @@ export class QQKernelBridge {
   }> {
     const service = this.requireMsgService()
     if (!service.fetchFavEmojiList) return { stickers: [] }
-    const result = await service.fetchFavEmojiList(cursor ?? '', clamp(limit, 1, 200), true, false)
+    // QQNT can retain an empty favorite snapshot when the kernel service was
+    // attached after the desktop client performed its initial collection
+    // load. Force a native refresh for the first page, matching QQNT's own UI
+    // and NapCat. Continuing pages must not refresh or the cursor can be reset.
+    const result = await service.fetchFavEmojiList(
+      cursor ?? '', clamp(limit, 1, 200), true, cursor === undefined || cursor === '',
+    )
     if (result.result !== 0) throw new Error(`fetchFavEmojiList: ${result.errMsg} (${result.result})`)
     const stickers = await mapConcurrent(result.emojiInfoList, 8, async (item) => ({
       ...await this.mapFavoriteSticker(item),
@@ -4361,9 +4367,9 @@ export class QQKernelBridge {
   ): Promise<string | undefined> {
     const service = this.requireMsgService()
     if (!service.fetchFavEmojiList) return
-    let cursor = ''
+    let cursor: string | undefined
     for (let page = 0; page < 20; page++) {
-      const result = await service.fetchFavEmojiList(cursor, 200, true, false)
+      const result = await service.fetchFavEmojiList(cursor ?? '', 200, true, cursor === undefined)
       if (result.result !== 0) throw new Error(`fetchFavEmojiList: ${result.errMsg} (${result.result})`)
       const found = result.emojiInfoList.find((item) =>
         item.isMarkFace && item.epId === reference.packageId && item.eId === reference.stickerId)

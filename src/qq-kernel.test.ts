@@ -2374,6 +2374,7 @@ describe('QQKernelBridge', () => {
     expect(page.stickers).toMatchObject([{
       stickerId: 'favorite:fav-res', format: 'static', width: 1, height: 1,
     }])
+    expect(f.msg.fetchFavEmojiList).toHaveBeenCalledWith('', 200, true, true)
     const reference = page.stickers[0].reference
     await bridge.setSavedSticker(reference, true)
     expect(f.msg.addFavEmoji).toHaveBeenCalledWith(expect.objectContaining({
@@ -2381,6 +2382,18 @@ describe('QQKernelBridge', () => {
     }))
     await bridge.setSavedSticker(reference, false)
     expect(f.msg.deleteFavEmoji).toHaveBeenCalledWith(['fav-res'])
+  })
+
+  it('refreshes only the first page of the native QQ favorite collection', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await bridge.getSavedStickers(undefined, 40)
+    await bridge.getSavedStickers('next-favorite', 40)
+
+    expect(f.msg.fetchFavEmojiList).toHaveBeenNthCalledWith(1, '', 40, true, true)
+    expect(f.msg.fetchFavEmojiList).toHaveBeenNthCalledWith(2, 'next-favorite', 40, true, false)
   })
 
   it('stages favorite stickers with their final subtype and preserves the collection file', async () => {
