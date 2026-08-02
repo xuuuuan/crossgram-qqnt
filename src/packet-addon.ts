@@ -129,6 +129,10 @@ export function loadPacketAddon(): PacketAddon {
     throw new Error(`QQNT packet addon was not found; tried: ${packetAddonCandidates().join(', ')}`)
   }
   const required = createRequire(moduleFilename)(candidate) as Partial<PacketAddon>
+  return loadedAddon = validatePacketAddon(required)
+}
+
+export function validatePacketAddon(required: Partial<PacketAddon>): PacketAddon {
   for (const name of [
     'sendPacket', 'encodeFetchRkeyRequest', 'decodeFetchRkeyResponse',
     'encodeFetchSysFacesRequest', 'decodeFetchSysFacesResponse',
@@ -136,11 +140,13 @@ export function loadPacketAddon(): PacketAddon {
     'encodeGroupFileDownloadRequest', 'decodeGroupFileDownloadResponse',
     'encodePrivateFileDownloadRequest', 'decodePrivateFileDownloadResponse',
     'refreshImageUrl', 'probePacketBinding', 'locateSendBinding', 'installSendHook',
-    'avsdkLoaderProbeStatus',
   ] satisfies Array<keyof PacketAddon>) {
     if (typeof required[name] !== 'function') throw new Error(`QQNT packet addon is missing ${name}`)
   }
-  return loadedAddon = required as PacketAddon
+  // AVSDK loader probing is diagnostic-only. Older production packet addons
+  // legitimately omit it and must remain usable for ordinary message/media
+  // packet operations.
+  return required as PacketAddon
 }
 
 export function loadQrtcMetadataAddon(

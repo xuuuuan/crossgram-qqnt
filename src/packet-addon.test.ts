@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { dirname, join } from 'node:path'
-import { createPacketBindingProber, createPacketHookInstaller, loadPacketAddon, loadQrtcMetadataAddon, packetAddonCandidates, type NativeSendBindingLocation, type PacketBindingProbe, type QrtcMetadataAddon, type QrtcMetadataSnapshot } from './packet-addon.js'
+import { createPacketBindingProber, createPacketHookInstaller, loadPacketAddon, loadQrtcMetadataAddon, packetAddonCandidates, validatePacketAddon, type NativeSendBindingLocation, type PacketAddon, type PacketBindingProbe, type QrtcMetadataAddon, type QrtcMetadataSnapshot } from './packet-addon.js'
 
 class FakeQrtcMetadataAddon implements QrtcMetadataAddon {
   private lifecycle: QrtcMetadataSnapshot['lifecycle'] = 'active'
@@ -70,6 +70,15 @@ describe('native packet addon', () => {
     )
     expect(candidates[0]).toBe(join(dirname(filename), `qqnt_packet.${suffix}.node`))
     expect(candidates).toContain(join(dist, `qqnt_packet.${suffix}.node`))
+  })
+
+  it('accepts an older message-capable addon without the optional AVSDK probe', () => {
+    const addon = new Proxy({}, {
+      get: (_target, name) => name === 'avsdkLoaderProbeStatus' ? undefined : vi.fn(),
+    }) as Partial<PacketAddon>
+
+    expect(validatePacketAddon(addon)).toBe(addon)
+    expect(addon.avsdkLoaderProbeStatus).toBeUndefined()
   })
 
   it('prevents synchronous recursive probes and restores the prober state', () => {
