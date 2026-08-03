@@ -69,6 +69,66 @@ describe.skipIf(!enabled)('live QQNT bridge E2E', () => {
     }
   }, 60_000)
 
+  it.runIf(Boolean(process.env.QQNT_BRIDGE_E2E_MARKET_STICKER))(
+    'preserves a real APNG market sticker MIME through the native send echo',
+    async () => {
+      const stickerId = process.env.QQNT_BRIDGE_E2E_MARKET_STICKER!
+      const stickerResponse = await fetch(`${base}/stickers/${encodeURIComponent(stickerId)}`, {
+        headers: headers(),
+      })
+      expect(stickerResponse.status, await stickerResponse.clone().text()).toBe(200)
+      const sticker = await stickerResponse.json() as {
+        stickerId: string, format: string, mimeType: string, reference: unknown
+      }
+      expect(sticker).toMatchObject({
+        stickerId, format: 'animated',
+      })
+
+      const originalAsset = await fetch(`${base}/stickers/asset`, {
+        method: 'POST', headers: headers({ 'content-type': 'application/json' }),
+        body: JSON.stringify(sticker.reference),
+      })
+      expect(originalAsset.status, await originalAsset.clone().text()).toBe(200)
+      const originalContentType = originalAsset.headers.get('content-type')
+      const originalBytes = Buffer.from(await originalAsset.arrayBuffer())
+      expect(originalBytes.length).toBeGreaterThan(0)
+
+      const conversation = await resolve('direct', allowedDirect)
+      // This reproduces the relay document that triggered the regression: its
+      // authoritative locator MIME is APNG even when the currently cached QQ
+      // asset can be sniffed as another animation container.
+      const reference = { ...(sticker.reference as Record<string, unknown>), mimeType: 'image/apng' }
+      const manifest = Buffer.from(JSON.stringify({
+        conversationId: conversation.id, sticker: reference,
+      })).toString('base64url')
+      const sentResponse = await fetch(`${base}/messages`, {
+        method: 'POST', headers: headers({ 'x-qqnt-manifest': manifest }), body: new Uint8Array(),
+      })
+      const sentBody = await sentResponse.text()
+      expect(sentResponse.status, sentBody).toBe(200)
+      const sent = JSON.parse(sentBody) as {
+        id: string
+        parts: Array<{
+          type: string
+          sticker?: { stickerId: string, mimeType: string, reference: unknown }
+        }>
+      }
+      expect(sent.parts).toMatchObject([{ type: 'sticker', sticker: {
+        stickerId, mimeType: 'image/apng', reference: { mimeType: 'image/apng' },
+      } }])
+
+      const echoed = sent.parts[0]!.sticker!
+      const echoedAsset = await fetch(`${base}/stickers/asset`, {
+        method: 'POST', headers: headers({ 'content-type': 'application/json' }),
+        body: JSON.stringify(echoed.reference),
+      })
+      expect(echoedAsset.status, await echoedAsset.clone().text()).toBe(200)
+      expect(echoedAsset.headers.get('content-type')).toBe(originalContentType)
+      expect(Buffer.from(await echoedAsset.arrayBuffer())).toEqual(originalBytes)
+    },
+    180_000,
+  )
+
   it('returns the real QQ top message in dialogs instead of recent-contact abstract text', async () => {
     const dialogsResponse = await fetch(`${base}/dialogs?limit=20`, { headers: headers() })
     expect(dialogsResponse.status, await dialogsResponse.clone().text()).toBe(200)

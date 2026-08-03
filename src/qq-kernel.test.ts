@@ -2287,6 +2287,34 @@ describe('QQKernelBridge', () => {
     const asset = await bridge.openSticker(pack!.stickers[0].reference)
     expect(asset.mimeType).toBe('image/apng')
     expect(await readStream(asset.stream)).toEqual(apng)
+
+    // QQ's outgoing confirmation can omit APNG hints after the local dynamic
+    // cache path has disappeared. Keep the MIME from the submitted document;
+    // inferring again from the historical `.gif.encrypt` path would otherwise
+    // downgrade this exact APNG sticker to image/gif in updateNewMessage.
+    await rm(dynamicPath)
+    const echo = {
+      ...f.message,
+      sendStatus: 2,
+      elements: [{
+        elementType: 11, elementId: 'market-apng-echo', marketFaceElement: {
+          itemType: 6, faceInfo: 1, emojiPackageId: 44, subType: 3, mediaType: 0,
+          imageWidth: 320, imageHeight: 180, faceName: '[APNG]', emojiId: 'apng-a',
+          key: '', staticFacePath: staticPath,
+        },
+      }],
+    } satisfies MsgRecord
+    f.protocolSend.mockImplementation(async () => {
+      queueMicrotask(() => f.emitMessages([echo]))
+      return { sequence: 1n, clientSequence: 2n, sendTime: 3 }
+    })
+    const sent = await bridge.send({
+      conversationId: 'uid-1715311957', sticker: pack!.stickers[0].reference,
+    }, Readable.from([]))
+    expect(sent.parts).toMatchObject([{ type: 'sticker', sticker: {
+      stickerId: 'market:44:apng-a', format: 'animated', mimeType: 'image/apng',
+      reference: { mimeType: 'image/apng' },
+    } }])
   })
 
   it('maps every QQ expression picture subtype as a sticker and keeps only normal/QZone pictures as media', async () => {

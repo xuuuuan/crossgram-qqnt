@@ -4837,6 +4837,10 @@ function mergeKnownSticker(known: QQSticker | undefined, current: QQSticker): QQ
     }
   }
   if (known.reference.kind === 'market' && current.reference.kind === 'market') {
+    const knownMimeType = animatedMarketMimeType(known.reference.mimeType)
+      ?? animatedMarketMimeType(known.mimeType)
+    const currentMimeType = animatedMarketMimeType(current.reference.mimeType)
+      ?? animatedMarketMimeType(current.mimeType)
     const reference: QQStickerReference = {
       ...known.reference,
       ...current.reference,
@@ -4846,13 +4850,16 @@ function mergeKnownSticker(known: QQSticker | undefined, current: QQSticker): QQ
       staticPath: current.reference.staticPath || known.reference.staticPath,
       dynamicPath: current.reference.dynamicPath || known.reference.dynamicPath,
       favoriteResId: current.reference.favoriteResId || known.reference.favoriteResId,
+      mimeType: knownMimeType ?? currentMimeType,
     }
+    const mimeType = reference.mimeType ?? marketStickerMimeType(reference)
+    reference.mimeType = mimeType
     return {
       ...known,
       ...current,
       title: current.title || known.title,
       format: animated ? 'animated' : 'static',
-      mimeType: marketStickerMimeType(reference),
+      mimeType,
       reference,
     }
   }
@@ -4969,6 +4976,10 @@ function matchesElementKind(
     )
   }
   return Boolean(element.picElement)
+}
+
+function animatedMarketMimeType(value: string | undefined): 'image/gif' | 'image/apng' | undefined {
+  return value === 'image/gif' || value === 'image/apng' ? value : undefined
 }
 
 function imageMimeType(path: string, animated: boolean): string {
