@@ -1107,10 +1107,29 @@ export class QQKernelBridge {
       this.loadStickerPackCatalog(),
     ])
     const offset = parseCursor(cursor)
-    const packs = [...this.stickerPackInfo.values()].map((item) => ({
-      packId: String(item.epId), title: item.tabName || String(item.epId), version: 1,
-      count: this.stickerPacks.get(String(item.epId))?.stickers.length,
-    }))
+    const packsById = new Map<string, QQStickerPackSummary>()
+    for (const item of this.stickerPackInfo.values()) {
+      const packId = String(item.epId)
+      const loaded = this.stickerPacks.get(packId)
+      packsById.set(packId, {
+        packId, title: loaded?.title || item.tabName || packId,
+        version: loaded?.version ?? 1,
+        count: loaded?.count ?? loaded?.stickers.length,
+      })
+    }
+    // Direct pack lookup is how the relay resolves a persisted installed set.
+    // QQNT can expose an empty bottom-table snapshot in headless mode, so keep
+    // every successfully resolved market pack in this process' catalog. The
+    // relay remains authoritative about which catalog rows are installed.
+    for (const loaded of this.stickerPacks.values()) {
+      if (loaded.packId === FAVORITE_STICKER_PACK_ID) continue
+      packsById.set(loaded.packId, {
+        packId: loaded.packId, title: loaded.title,
+        version: loaded.version ?? 1,
+        count: loaded.count ?? loaded.stickers.length,
+      })
+    }
+    const packs = [...packsById.values()]
     // The QQ favorites collection is account-scoped and conceptually always
     // exists, even when the current native snapshot is empty. Expose it as a
     // stable pack so clients can render the collection and observe later
@@ -4182,9 +4201,7 @@ export class QQKernelBridge {
           throw new Error(`fetchBottomEmojiTableList: ${result.errMsg} (${result.result})`)
         }
         const table = result.marketEmoticonInfo
-        const legacyTable = (table as typeof table & { roamEmojiTab?: {
-          ordinaryTabinfoList?: unknown[], magicTabinfoList?: unknown[], smallTabinfoList?: unknown[]
-        } }).roamEmojiTab
+        const legacyTable = table.roamEmojiTab
         log('info', `native API complete name=fetchBottomEmojiTableList segment=${segment} next=${table.segmentFlag} tabs=${table.emojiNewTabs?.length ?? 0} legacyTabs=${(legacyTable?.ordinaryTabinfoList?.length ?? 0) + (legacyTable?.magicTabinfoList?.length ?? 0) + (legacyTable?.smallTabinfoList?.length ?? 0)} keys=${JSON.stringify(Object.keys(table))}`)
         for (const item of table.emojiNewTabs ?? []) {
           if (item.isHide || item.bottomEmojitabType !== 0) continue
@@ -4195,12 +4212,21 @@ export class QQKernelBridge {
             tabName: item.tabName,
           })
         }
-        if (table.segmentFlag === -1) return
+        for (const item of [
+          ...(legacyTable?.ordinaryTabinfoList ?? []),
+          ...(legacyTable?.magicTabinfoList ?? []),
+          ...(legacyTable?.smallTabinfoList ?? []),
+        ]) this.stickerPackInfo.set(String(item.epId), item)
+        if (table.segmentFlag === -1) break
         sameSegmentTimes = table.segmentFlag === segment ? sameSegmentTimes + 1 : 0
-        if (sameSegmentTimes >= 4) return
+        if (sameSegmentTimes >= 4) break
         segment = table.segmentFlag
       }
-      throw new Error('QQ bottom sticker table pagination exceeded 100 pages')
+      if (this.stickerPackInfo.size) return
+      // Some QQNT builds expose fetchBottomEmojiTableList but return an empty
+      // business-specific table for a headless kernel session. The older roam
+      // API still returns the account's installed market packs, so do not let
+      // the presence of the newer method suppress that compatible fallback.
     }
     if (!service.fetchMarketEmoticonList) return
     let timestamp = 0

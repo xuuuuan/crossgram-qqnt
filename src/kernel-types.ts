@@ -516,6 +516,18 @@ export interface KernelMsgService {
     result: number
     errMsg: string
     marketEmoticonInfo: {
+      /**
+       * QQ 9.9.33 may return the installed market tabs through the legacy
+       * roam table while leaving emojiNewTabs empty.
+       */
+      roamEmojiTab?: {
+        timesTamp: number
+        segmentFlag: number
+        ordinaryTabinfoList: MarketStickerPackInfo[]
+        magicTabinfoList: MarketStickerPackInfo[]
+        smallTabinfoList: MarketStickerPackInfo[]
+        epIds: number[]
+      }
       segmentFlag: number
       emojiNewTabs: BottomEmojiTabInfo[]
     }

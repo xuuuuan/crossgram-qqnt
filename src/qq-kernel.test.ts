@@ -2218,6 +2218,13 @@ describe('QQKernelBridge', () => {
       stickers: [{ packId: '43', stickerId: 'market:43:emoji-a', title: 'Downloaded QQ Waves' }],
     })
     expect(f.msg.fetchMarketEmotionJsonFile).toHaveBeenCalledWith(43)
+    await expect(bridge.getStickerPacks()).resolves.toMatchObject({
+      packs: [
+        { packId: 'qq-favorites' },
+        { packId: '42', title: 'QQ Waves' },
+        { packId: '43', title: 'Downloaded QQ Waves', count: 1 },
+      ],
+    })
   })
 
   it('detects encrypted APNG market bytes for both pack and received-message sticker metadata', async () => {
@@ -2413,6 +2420,56 @@ describe('QQKernelBridge', () => {
     })
     expect(f.msg.fetchBottomEmojiTableList).toHaveBeenNthCalledWith(2, {
       commonReqInfo: { appVersion: '', businessId: 0 }, timeStamp: 0, segmentFlag: 7,
+    })
+    expect(f.msg.fetchMarketEmoticonList).not.toHaveBeenCalled()
+  })
+
+  it('falls back to the roam market table when the current bottom table is empty', async () => {
+    const f = fixture()
+    f.msg.fetchBottomEmojiTableList = vi.fn(async () => ({
+      result: 0, errMsg: '', marketEmoticonInfo: {
+        segmentFlag: -1, emojiNewTabs: [],
+      },
+    }))
+    f.msg.fetchMarketEmoticonList.mockResolvedValue({
+      result: 0, errMsg: '', marketEmoticonInfo: { roamEmojiTab: {
+        timesTamp: 1, segmentFlag: -1,
+        ordinaryTabinfoList: [{ epId: 11474, wordingId: 9, tabType: 3, tabName: 'Installed Market Pack' }],
+        magicTabinfoList: [], smallTabinfoList: [], epIds: [11474],
+      } },
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.getStickerPacks()).resolves.toMatchObject({
+      packs: [
+        { packId: 'qq-favorites', title: 'QQ 收藏表情', count: 0 },
+        { packId: '11474', title: 'Installed Market Pack' },
+      ],
+    })
+    expect(f.msg.fetchBottomEmojiTableList).toHaveBeenCalledTimes(1)
+    expect(f.msg.fetchMarketEmoticonList).toHaveBeenCalledWith(0, 0)
+  })
+
+  it('accepts installed market tabs returned inside the current API roam table', async () => {
+    const f = fixture()
+    f.msg.fetchBottomEmojiTableList = vi.fn(async () => ({
+      result: 0, errMsg: '', marketEmoticonInfo: {
+        segmentFlag: -1, emojiNewTabs: [], roamEmojiTab: {
+          timesTamp: 1, segmentFlag: -1,
+          ordinaryTabinfoList: [{ epId: 11474, wordingId: 9, tabType: 3, tabName: 'Nested Installed Pack' }],
+          magicTabinfoList: [], smallTabinfoList: [], epIds: [11474],
+        },
+      },
+    }))
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.getStickerPacks()).resolves.toMatchObject({
+      packs: [
+        { packId: 'qq-favorites' },
+        { packId: '11474', title: 'Nested Installed Pack' },
+      ],
     })
     expect(f.msg.fetchMarketEmoticonList).not.toHaveBeenCalled()
   })
