@@ -1237,7 +1237,7 @@ export class QQKernelBridge {
         version: 1,
         reference,
       }
-      this.stickers.set(sticker.stickerId, sticker)
+      this.rememberSticker(sticker)
       return sticker
     })
     const pack: QQStickerPack = {
@@ -1269,6 +1269,15 @@ export class QQKernelBridge {
     return null
   }
 
+  private rememberSticker(sticker: QQSticker): void {
+    this.stickers.set(sticker.stickerId, sticker)
+    if (sticker.reference.kind !== 'favorite' || !sticker.reference.md5) return
+    const md5 = sticker.reference.md5
+    this.stickers.set(favoriteStickerId(md5), sticker)
+    this.stickers.set(favoriteStickerId(md5.toLowerCase()), sticker)
+    this.stickers.set(favoriteStickerId(md5.toUpperCase()), sticker)
+  }
+
   async getSavedStickers(cursor?: string, limit = 200): Promise<{
     stickers: QQSticker[]
     nextCursor?: string
@@ -1287,7 +1296,7 @@ export class QQKernelBridge {
       ...await this.mapFavoriteSticker(item),
       packId: FAVORITE_STICKER_PACK_ID,
     }))
-    for (const sticker of stickers) this.stickers.set(sticker.stickerId, sticker)
+    for (const sticker of stickers) this.rememberSticker(sticker)
     return {
       stickers,
       nextCursor: stickers.length >= clamp(limit, 1, 200)
@@ -1489,7 +1498,7 @@ export class QQKernelBridge {
       }
       if (manifest.sticker && manifest.media?.length) throw new Error('a message cannot contain both sticker and media')
       if (manifest.sticker?.kind === 'sysface') {
-        this.stickers.set(sysFaceStickerId(manifest.sticker.faceId), stickerFromReference(manifest.sticker))
+        this.rememberSticker(stickerFromReference(manifest.sticker))
         protocolParts.push({ kind: 'face', face: {
           faceId: Number(manifest.sticker.faceId), faceType: manifest.sticker.faceType,
           packId: manifest.sticker.packId, stickerId: manifest.sticker.stickerId,
@@ -1497,9 +1506,7 @@ export class QQKernelBridge {
           resultId: manifest.sticker.resultId,
         } })
       } else if (manifest.sticker?.kind === 'market') {
-        this.stickers.set(marketStickerId(
-          manifest.sticker.packageId, manifest.sticker.stickerId,
-        ), stickerFromReference(manifest.sticker))
+        this.rememberSticker(stickerFromReference(manifest.sticker))
         protocolParts.push({ kind: 'market-face', face: {
           name: manifest.sticker.name, emojiId: manifest.sticker.stickerId,
           packageId: Number(manifest.sticker.packageId), key: manifest.sticker.key,
@@ -1507,7 +1514,7 @@ export class QQKernelBridge {
         } })
       } else if (manifest.sticker?.kind === 'favorite') {
         manifest.sticker.mimeType = this.resolveFavoriteStickerMimeType(manifest.sticker)
-        this.stickers.set(favoriteStickerId(manifest.sticker.resId), stickerFromReference(manifest.sticker))
+        this.rememberSticker(stickerFromReference(manifest.sticker))
         const stickerPath = manifest.sticker.path && existsSync(manifest.sticker.path)
           ? manifest.sticker.path
           : ''
@@ -3643,7 +3650,7 @@ export class QQKernelBridge {
       const mappedSticker = mapSticker(record, element)
       if (mappedSticker) {
         const sticker = mergeKnownSticker(this.stickers.get(mappedSticker.stickerId), mappedSticker)
-        this.stickers.set(sticker.stickerId, sticker)
+        this.rememberSticker(sticker)
         parts.push({ type: 'sticker', sticker })
       } else if (element.elementType === ELEMENT_TEXT && element.textElement?.content) {
         const text = element.textElement

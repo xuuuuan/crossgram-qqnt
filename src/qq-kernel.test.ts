@@ -2428,7 +2428,7 @@ describe('QQKernelBridge', () => {
       f.msg.fetchFavEmojiList.mockResolvedValue({
         result: 0, errMsg: '', emojiInfoList: [...paths].map(([resId, path]) => ({
           emoPath: path, emoOriginalPath: path, thumbPath: path,
-          isExist: existsSync(path), resId, url: '', md5: resId,
+          isExist: existsSync(path), resId, url: '', md5: resId === 'gif-favorite' ? 'gif-md5' : resId,
           // A false APNG hint must not hide real acTL bytes, while the static
           // PNG filename deliberately carries a misleading animated suffix.
           isAPNG: false, isMarkFace: false, eId: '', epId: '', desc: resId,
@@ -2465,7 +2465,7 @@ describe('QQKernelBridge', () => {
         ...firstFixture.message, chatType, peerUid, peerUin, sendStatus: 2,
         elements: [{ elementType: 2, elementId: 'gif-image', picElement: {
           fileName: 'still-wrong.jpg', fileSize: String(gif.length), sourcePath: paths.get('gif-favorite'),
-          fileUuid: 'gif-uuid', fileSubId: '', md5HexStr: 'gif-favorite',
+          fileUuid: 'gif-uuid', fileSubId: '', md5HexStr: 'gif-md5',
           picWidth: 1, picHeight: 1, picSubType: 1,
         } }],
       }))
@@ -2476,7 +2476,7 @@ describe('QQKernelBridge', () => {
       1, 'uid-1715311957', '10000', expect.objectContaining({ picType: 2000 }), expect.anything(),
     )
     expect(sent.parts).toMatchObject([{ type: 'sticker', sticker: {
-      stickerId: 'favorite:gif-favorite', format: 'animated', mimeType: 'image/gif',
+      stickerId: 'favorite:gif-md5', format: 'animated', mimeType: 'image/gif',
       reference: { mimeType: 'image/gif', animated: true },
     } }])
 
