@@ -2160,9 +2160,14 @@ describe('QQKernelBridge', () => {
     const pack = await bridge.getStickerPack('42')
     expect(pack).toMatchObject({
       packId: '42', count: 1,
-      stickers: [{ stickerId: 'market:42:emoji-a', format: 'animated', width: 320, height: 180 }],
+      stickers: [{
+        stickerId: 'market:42:emoji-a', format: 'animated', mimeType: 'image/gif',
+        width: 320, height: 180,
+      }],
     })
-    expect(await readStream((await bridge.openSticker(pack!.stickers[0].reference)).stream)).toEqual(gif)
+    const opened = await bridge.openSticker(pack!.stickers[0].reference)
+    expect(opened.mimeType).toBe('image/gif')
+    expect(await readStream(opened.stream)).toEqual(gif)
 
     const record = {
       ...f.message,
@@ -2213,6 +2218,68 @@ describe('QQKernelBridge', () => {
       stickers: [{ packId: '43', stickerId: 'market:43:emoji-a', title: 'Downloaded QQ Waves' }],
     })
     expect(f.msg.fetchMarketEmotionJsonFile).toHaveBeenCalledWith(43)
+  })
+
+  it('detects encrypted APNG market bytes for both pack and received-message sticker metadata', async () => {
+    const f = fixture()
+    const directory = await mkdtemp(join(tmpdir(), 'qqnt-market-apng-'))
+    tempPaths.push(directory)
+    const detailPath = join(directory, 'pack.json')
+    const staticPath = join(directory, 'sticker.png')
+    const dynamicPath = join(directory, 'sticker.gif.encrypt')
+    const apng = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAwAAAAICAYAAADN5B7xAAAACXBIWXMAAAABAAAAAQBPJcTWAAAACGFjVEwAAAACAAAAAPONk3AAAAAaZmNUTAAAAAAAAAAMAAAACAAAAAAAAAAAAAEACgAAGya3gAAAABRJREFUeJxj+MPA8J8UzDCqgRYaAJjXviFq8lROAAAAGmZjVEwAAAABAAAADAAAAAgAAAAAAAAAAAABAAoAAIBVXVQAAAAXZmRBVAAAAAJ4nGNgYPj7nzQ8qoEGGgAlJ76BvcErGQAAAABJRU5ErkJggg==',
+      'base64',
+    )
+    await writeFile(detailPath, JSON.stringify({
+      name: 'APNG Pack', isApng: 1,
+      imgs: [{ id: 'apng-a', wWidthInPhone: 320, wHeightInPhone: 180, isApng: 1 }],
+    }))
+    await writeFile(staticPath, Buffer.from('static'))
+    await writeFile(dynamicPath, apng.map((byte, index) => index % 50 < 20 ? ~byte : byte))
+    f.msg.fetchMarketEmoticonList.mockResolvedValue({
+      result: 0, errMsg: '', marketEmoticonInfo: { roamEmojiTab: {
+        timesTamp: 7, segmentFlag: -1,
+        ordinaryTabinfoList: [{ epId: 44, wordingId: 9, tabType: 3, tabName: 'APNG Pack' }],
+        magicTabinfoList: [], smallTabinfoList: [], epIds: [44],
+      } },
+    })
+    f.msg.getMarketEmoticonPath.mockImplementation(async (epId, ids, serviceType) => {
+      let pathMap = new Map<string, { isExist: boolean, path: string }>()
+      if (serviceType === 1) pathMap = new Map([[String(epId), { isExist: true, path: detailPath }]])
+      if (serviceType === 3) pathMap = new Map(ids.map((id: string) => [id, { isExist: true, path: staticPath }]))
+      if (serviceType === 5) pathMap = new Map(ids.map((id: string) => [id, { isExist: true, path: dynamicPath }]))
+      return { result: 0, errMsg: '', pathMap }
+    })
+    f.msg.getMarketEmoticonEncryptKeys.mockResolvedValue({
+      result: 0, errMsg: '', encryptKeyMap: new Map([['apng-a', 'secret']]),
+    })
+    f.message.elements = [{
+      elementType: 11, elementId: 'market-apng', marketFaceElement: {
+        itemType: 6, faceInfo: 1, emojiPackageId: 44, subType: 3, mediaType: 0,
+        imageWidth: 320, imageHeight: 180, faceName: '[APNG]', emojiId: 'apng-a',
+        emojiType: 2, key: 'secret', staticFacePath: staticPath, dynamicFacePath: dynamicPath,
+      },
+    }]
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: directory })
+
+    await bridge.getStickerPacks()
+    const pack = await bridge.getStickerPack('44')
+    expect(pack).toMatchObject({
+      stickers: [{
+        stickerId: 'market:44:apng-a', format: 'animated', mimeType: 'image/apng',
+        reference: { mimeType: 'image/apng', dynamicPath },
+      }],
+    })
+    const [message] = (await bridge.getHistory(bridge.getConversation('uid-1715311957'))).messages
+    expect(message.parts).toMatchObject([{ type: 'sticker', sticker: {
+      stickerId: 'market:44:apng-a', format: 'animated', mimeType: 'image/apng',
+      reference: { mimeType: 'image/apng', dynamicPath },
+    } }])
+    const asset = await bridge.openSticker(pack!.stickers[0].reference)
+    expect(asset.mimeType).toBe('image/apng')
+    expect(await readStream(asset.stream)).toEqual(apng)
   })
 
   it('maps every QQ expression picture subtype as a sticker and keeps only normal/QZone pictures as media', async () => {

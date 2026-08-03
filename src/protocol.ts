@@ -109,6 +109,7 @@ export type QQStickerReference =
       width: number
       height: number
       animated: boolean
+      mimeType?: 'image/gif' | 'image/apng' | 'image/png'
       staticPath?: string
       dynamicPath?: string
       favoriteResId?: string

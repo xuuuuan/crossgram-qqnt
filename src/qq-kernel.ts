@@ -1,5 +1,5 @@
 import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto'
-import { createReadStream, createWriteStream, existsSync, mkdirSync, statSync } from 'node:fs'
+import { closeSync, createReadStream, createWriteStream, existsSync, mkdirSync, openSync, readSync, statSync } from 'node:fs'
 import { open as openFile, readFile, rm, stat } from 'node:fs/promises'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { pipeline } from 'node:stream/promises'
@@ -1193,12 +1193,13 @@ export class QQKernelBridge {
         staticPath,
         dynamicPath,
       }
+      reference.mimeType = marketStickerMimeType(reference, detail.isApng === 1 || Boolean(item.isApng))
       const sticker: QQSticker = {
         stickerId: marketStickerId(packId, item.id),
         packId,
         title: item.name || info?.tabName || detail.name || packId,
         format: animated ? 'animated' : 'static',
-        mimeType: animated ? 'image/gif' : 'image/png',
+        mimeType: reference.mimeType,
         width: reference.width,
         height: reference.height,
         version: 1,
@@ -1349,9 +1350,10 @@ export class QQKernelBridge {
       throw new QQStickerAssetNotFoundError(`QQ favorite sticker file is missing: ${reference.resId}`)
     }
     const resolved = await this.resolveMarketStickerPath(reference)
+    reference.mimeType = stickerFileMimeType(resolved.path, resolved.encrypted, resolved.animated)
     return {
       stream: fileStream(resolved.path, resolved.encrypted),
-      mimeType: resolved.animated ? 'image/gif' : imageMimeType(resolved.path, false),
+      mimeType: reference.mimeType,
       size: statSync(resolved.path).size,
     }
   }
@@ -4287,10 +4289,11 @@ export class QQKernelBridge {
         dynamicPath: item.emoOriginalPath || item.emoPath || undefined,
         favoriteResId: item.resId,
       }
+      reference.mimeType = marketStickerMimeType(reference, Boolean(item.isAPNG))
       return {
         stickerId: marketStickerId(packageId, item.eId), packId: packageId,
         title: reference.name, format: animated ? 'animated' : 'static',
-        mimeType: animated ? 'image/gif' : imageMimeType(reference.staticPath ?? '', false),
+        mimeType: reference.mimeType,
         width: reference.width, height: reference.height, version: 1, reference,
       }
     }
@@ -4709,10 +4712,11 @@ function mapSticker(record: MsgRecord, element: MsgElement): QQSticker | undefin
       height: positiveInteger(market.imageHeight, 240),
       animated, staticPath: market.staticFacePath, dynamicPath: market.dynamicFacePath,
     }
+    reference.mimeType = marketStickerMimeType(reference, market.emojiType === 2)
     return {
       stickerId: marketStickerId(packageId, market.emojiId), packId: packageId,
       title: reference.name, format: animated ? 'animated' : 'static',
-      mimeType: animated ? 'image/gif' : 'image/png',
+      mimeType: reference.mimeType,
       width: reference.width, height: reference.height, version: 1, reference,
     }
   }
@@ -4756,7 +4760,7 @@ function stickerFromReference(reference: QQStickerReference): QQSticker {
       packId: reference.packageId,
       title: reference.name,
       format: reference.animated ? 'animated' : 'static',
-      mimeType: reference.animated ? 'image/gif' : 'image/png',
+      mimeType: reference.mimeType ?? marketStickerMimeType(reference),
       width: reference.width,
       height: reference.height,
       version: 1,
@@ -4822,7 +4826,7 @@ function mergeKnownSticker(known: QQSticker | undefined, current: QQSticker): QQ
       ...current,
       title: current.title || known.title,
       format: animated ? 'animated' : 'static',
-      mimeType: animated ? 'image/gif' : current.mimeType,
+      mimeType: marketStickerMimeType(reference),
       reference,
     }
   }
@@ -4949,6 +4953,56 @@ function imageMimeType(path: string, animated: boolean): string {
   if (extension === '.jpg' || extension === '.jpeg') return 'image/jpeg'
   if (extension === '.bmp') return 'image/bmp'
   return 'image/png'
+}
+
+function marketStickerMimeType(
+  reference: Extract<QQStickerReference, { kind: 'market' }>,
+  apngHint = false,
+): 'image/gif' | 'image/apng' | 'image/png' {
+  if (!reference.animated) return 'image/png'
+  const path = reference.dynamicPath || reference.staticPath
+  if (path && existsSync(path)) return stickerFileMimeType(path, path === reference.dynamicPath, true)
+  const pathHint = encryptedImageMimeType(path ?? '', true)
+  if (pathHint === 'image/gif' || pathHint === 'image/apng') return pathHint
+  if (reference.mimeType === 'image/gif' || reference.mimeType === 'image/apng') return reference.mimeType
+  return apngHint ? 'image/apng' : 'image/gif'
+}
+
+function stickerFileMimeType(
+  path: string,
+  encrypted: boolean,
+  animated: boolean,
+): 'image/gif' | 'image/apng' | 'image/png' {
+  const signature = readStickerSignature(path, encrypted)
+  if (signature?.subarray(0, 6).toString('ascii') === 'GIF87a'
+    || signature?.subarray(0, 6).toString('ascii') === 'GIF89a') return 'image/gif'
+  if (signature?.equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
+    return animated ? 'image/apng' : 'image/png'
+  }
+  const hinted = encryptedImageMimeType(path, animated)
+  return hinted === 'image/gif' || hinted === 'image/apng' ? hinted : 'image/png'
+}
+
+function encryptedImageMimeType(path: string, animated: boolean): string {
+  return imageMimeType(path.replace(/\.(?:encrypt|encrypted)$/i, ''), animated)
+}
+
+function readStickerSignature(path: string, encrypted: boolean): Buffer | undefined {
+  let descriptor: number | undefined
+  try {
+    descriptor = openSync(path, 'r')
+    const bytes = Buffer.alloc(8)
+    const length = readSync(descriptor, bytes, 0, bytes.length, 0)
+    if (length < 6) return bytes.subarray(0, length)
+    if (encrypted) {
+      for (let index = 0; index < length; index++) bytes[index] = ~bytes[index]!
+    }
+    return bytes.subarray(0, length)
+  } catch {
+    return
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor)
+  }
 }
 
 function isPathInside(root: string, candidate: string): boolean {

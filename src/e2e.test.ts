@@ -28,6 +28,47 @@ async function resolve(kind: 'direct' | 'group', id: string) {
 }
 
 describe.skipIf(!enabled)('live QQNT bridge E2E', () => {
+  it('keeps a real animated market sticker MIME aligned with the raw asset bytes', async () => {
+    const packsResponse = await fetch(`${base}/stickers/packs?limit=100`, { headers: headers() })
+    expect(packsResponse.status, await packsResponse.clone().text()).toBe(200)
+    const page = await packsResponse.json() as {
+      packs: Array<{ packId: string, title: string }>
+    }
+    let selected: {
+      stickerId: string
+      mimeType: string
+      reference: unknown
+    } | undefined
+    for (const summary of page.packs.filter((pack) => pack.packId !== 'qq-favorites')) {
+      const response = await fetch(`${base}/stickers/packs/${encodeURIComponent(summary.packId)}`, {
+        headers: headers(),
+      })
+      if (!response.ok) continue
+      const pack = await response.json() as {
+        stickers: Array<{
+          stickerId: string, format: string, mimeType: string, reference: unknown
+        }>
+      }
+      selected = pack.stickers.find((sticker) => sticker.format === 'animated'
+        && (sticker.mimeType === 'image/gif' || sticker.mimeType === 'image/apng'))
+      if (selected) break
+    }
+    expect(selected, 'expected at least one installed animated QQ market sticker').toBeDefined()
+
+    const assetResponse = await fetch(`${base}/stickers/asset`, {
+      method: 'POST', headers: headers({ 'content-type': 'application/json' }),
+      body: JSON.stringify(selected!.reference),
+    })
+    expect(assetResponse.status, await assetResponse.clone().text()).toBe(200)
+    expect(assetResponse.headers.get('content-type')).toBe(selected!.mimeType)
+    const bytes = Buffer.from(await assetResponse.arrayBuffer())
+    if (selected!.mimeType === 'image/gif') {
+      expect(bytes.subarray(0, 6).toString('ascii')).toMatch(/^GIF8[79]a$/)
+    } else {
+      expect(bytes.subarray(0, 8)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+    }
+  }, 60_000)
+
   it('returns the real QQ top message in dialogs instead of recent-contact abstract text', async () => {
     const dialogsResponse = await fetch(`${base}/dialogs?limit=20`, { headers: headers() })
     expect(dialogsResponse.status, await dialogsResponse.clone().text()).toBe(200)
