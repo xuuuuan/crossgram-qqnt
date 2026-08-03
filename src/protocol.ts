@@ -124,6 +124,7 @@ export type QQStickerReference =
       width?: number
       height?: number
       animated: boolean
+      mimeType?: 'image/gif' | 'image/apng' | 'image/png' | 'image/jpeg' | 'image/webp' | 'image/bmp'
       url?: string
       locator?: QQMediaLocator
     }

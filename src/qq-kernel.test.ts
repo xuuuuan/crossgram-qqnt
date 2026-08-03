@@ -2398,6 +2398,115 @@ describe('QQKernelBridge', () => {
     expect(secondFixture.msg.fetchMarketEmoticonAioImage).not.toHaveBeenCalled()
   })
 
+  it('byte-sniffs and persists favorite GIF, JPEG, PNG, and APNG MIME through asset open and send echo', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'qqnt-favorite-mime-cache-'))
+    tempPaths.push(directory)
+    const cacheDir = join(directory, 'mime-cache')
+    const gif = Buffer.from('GIF89a-favorite-animation')
+    const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, ...Buffer.from('JFIF-favorite')])
+    const png = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+      'base64',
+    )
+    const apng = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAwAAAAICAYAAADN5B7xAAAACXBIWXMAAAABAAAAAQBPJcTWAAAACGFjVEwAAAACAAAAAPONk3AAAAAaZmNUTAAAAAAAAAAMAAAACAAAAAAAAAAAAAEACgAAGya3gAAAABRJREFUeJxj+MPA8J8UzDCqgRYaAJjXviFq8lROAAAAGmZjVEwAAAABAAAADAAAAAgAAAAAAAAAAAABAAoAAIBVXVQAAAAXZmRBVAAAAAJ4nGNgYPj7nzQ8qoEGGgAlJ76BvcErGQAAAABJRU5ErkJggg==',
+      'base64',
+    )
+    const paths = new Map([
+      ['gif-favorite', join(directory, 'gif-wrong.jpg')],
+      ['jpeg-favorite', join(directory, 'jpeg-wrong.png')],
+      ['png-favorite', join(directory, 'png-animated-hint.gif')],
+      ['apng-favorite', join(directory, 'apng-wrong.jpg')],
+    ])
+    await Promise.all([
+      writeFile(paths.get('gif-favorite')!, gif),
+      writeFile(paths.get('jpeg-favorite')!, jpeg),
+      writeFile(paths.get('png-favorite')!, png),
+      writeFile(paths.get('apng-favorite')!, apng),
+    ])
+    const configure = (f: ReturnType<typeof fixture>) => {
+      f.msg.fetchFavEmojiList.mockResolvedValue({
+        result: 0, errMsg: '', emojiInfoList: [...paths].map(([resId, path]) => ({
+          emoPath: path, emoOriginalPath: path, thumbPath: path,
+          isExist: existsSync(path), resId, url: '', md5: resId,
+          // A false APNG hint must not hide real acTL bytes, while the static
+          // PNG filename deliberately carries a misleading animated suffix.
+          isAPNG: false, isMarkFace: false, eId: '', epId: '', desc: resId,
+        })),
+      })
+    }
+
+    const firstFixture = fixture()
+    configure(firstFixture)
+    const first = new QQKernelBridge({ marketStickerMimeCacheDir: cacheDir })
+    first.attach(firstFixture.kernel, firstFixture.session, {
+      selfUin: '10000', selfUid: 'self', userPath: directory,
+    })
+    const firstPack = await first.getStickerPack('qq-favorites')
+    expect(firstPack).not.toBeNull()
+    const firstStickers = firstPack!.stickers
+    expect(firstStickers).toMatchObject([
+      { stickerId: 'favorite:gif-favorite', format: 'animated', mimeType: 'image/gif', reference: { mimeType: 'image/gif', animated: true } },
+      { stickerId: 'favorite:jpeg-favorite', format: 'static', mimeType: 'image/jpeg', reference: { mimeType: 'image/jpeg', animated: false } },
+      { stickerId: 'favorite:png-favorite', format: 'static', mimeType: 'image/png', reference: { mimeType: 'image/png', animated: false } },
+      { stickerId: 'favorite:apng-favorite', format: 'animated', mimeType: 'image/apng', reference: { mimeType: 'image/apng', animated: true } },
+    ])
+    for (const [index, expected] of [gif, jpeg, png, apng].entries()) {
+      const opened = await first.openSticker(firstStickers[index]!.reference)
+      const chunks: Buffer[] = []
+      for await (const chunk of opened.stream) chunks.push(Buffer.from(chunk))
+      expect(Buffer.concat(chunks)).toEqual(expected)
+      expect(opened.mimeType).toBe(firstStickers[index]!.mimeType)
+    }
+
+    const gifReference = firstStickers[0]!.reference
+    firstFixture.protocolSend.mockImplementationOnce(async (chatType, peerUid, peerUin) => {
+      queueMicrotask(() => firstFixture.emitSent({
+        ...firstFixture.message, chatType, peerUid, peerUin, sendStatus: 2,
+        elements: [{ elementType: 2, elementId: 'gif-image', picElement: {
+          fileName: 'still-wrong.jpg', fileSize: String(gif.length), sourcePath: paths.get('gif-favorite'),
+          fileUuid: 'gif-uuid', fileSubId: '', md5HexStr: 'gif-favorite',
+          picWidth: 1, picHeight: 1, picSubType: 1,
+        } }],
+      }))
+      return { sequence: 1n, clientSequence: 2n, sendTime: 3 }
+    })
+    const sent = await first.send({ conversationId: 'uid-1715311957', sticker: gifReference }, Readable.from([]))
+    expect(firstFixture.imageUpload).toHaveBeenCalledWith(
+      1, 'uid-1715311957', '10000', expect.objectContaining({ picType: 2000 }), expect.anything(),
+    )
+    expect(sent.parts).toMatchObject([{ type: 'sticker', sticker: {
+      stickerId: 'favorite:gif-favorite', format: 'animated', mimeType: 'image/gif',
+      reference: { mimeType: 'image/gif', animated: true },
+    } }])
+
+    const cached = JSON.parse(await readFile(join(cacheDir, '10000.json'), 'utf8')) as {
+      mimeTypes: Record<string, string>
+    }
+    expect(cached.mimeTypes).toMatchObject({
+      'favorite:gif-favorite': 'image/gif',
+      'favorite:jpeg-favorite': 'image/jpeg',
+      'favorite:png-favorite': 'image/png',
+      'favorite:apng-favorite': 'image/apng',
+    })
+
+    await Promise.all([...paths.values()].map((path) => rm(path)))
+    const secondFixture = fixture()
+    configure(secondFixture)
+    const second = new QQKernelBridge({ marketStickerMimeCacheDir: cacheDir })
+    second.attach(secondFixture.kernel, secondFixture.session, {
+      selfUin: '10000', selfUid: 'self', userPath: directory,
+    })
+    await expect(second.getStickerPack('qq-favorites')).resolves.toMatchObject({
+      stickers: [
+        { stickerId: 'favorite:gif-favorite', format: 'animated', mimeType: 'image/gif' },
+        { stickerId: 'favorite:jpeg-favorite', format: 'static', mimeType: 'image/jpeg' },
+        { stickerId: 'favorite:png-favorite', format: 'static', mimeType: 'image/png' },
+        { stickerId: 'favorite:apng-favorite', format: 'animated', mimeType: 'image/apng' },
+      ],
+    })
+  })
+
   it('maps every QQ expression picture subtype as a sticker and keeps only normal/QZone pictures as media', async () => {
     const f = fixture()
     f.message.elements = Array.from({ length: 14 }, (_, picSubType) => ({

@@ -19,6 +19,26 @@ function headers(extra: Record<string, string> = {}) {
   return { ...(token ? { authorization: `Bearer ${token}` } : {}), ...extra }
 }
 
+function sniffStickerMime(bytes: Buffer): string | undefined {
+  if (/^GIF8[79]a$/.test(bytes.subarray(0, 6).toString('ascii'))) return 'image/gif'
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg'
+  if (bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
+    let offset = 8
+    while (offset + 12 <= bytes.length) {
+      const length = bytes.readUInt32BE(offset)
+      const type = bytes.subarray(offset + 4, offset + 8).toString('ascii')
+      if (type === 'acTL') return 'image/apng'
+      if (type === 'IDAT' || type === 'IEND') return 'image/png'
+      offset += 12 + length
+    }
+    return 'image/png'
+  }
+  if (bytes.length >= 12 && bytes.subarray(0, 4).toString('ascii') === 'RIFF'
+    && bytes.subarray(8, 12).toString('ascii') === 'WEBP') return 'image/webp'
+  if (bytes.subarray(0, 2).toString('ascii') === 'BM') return 'image/bmp'
+  return undefined
+}
+
 async function resolve(kind: 'direct' | 'group', id: string) {
   if (kind === 'direct' && id !== allowedDirect) throw new Error(`E2E direct target is not allowed: ${id}`)
   if (kind === 'group' && !allowedGroups.has(id)) throw new Error(`E2E group target is not allowed: ${id}`)
@@ -68,6 +88,64 @@ describe.skipIf(!enabled)('live QQNT bridge E2E', () => {
       expect(bytes.subarray(0, 8)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
     }
   }, 60_000)
+
+  it('keeps real QQ favorites byte-sniffed through catalog, asset, and native send echo', async () => {
+    const packResponse = await fetch(`${base}/stickers/packs/qq-favorites`, { headers: headers() })
+    expect(packResponse.status, await packResponse.clone().text()).toBe(200)
+    const pack = await packResponse.json() as {
+      stickers: Array<{
+        stickerId: string, format: string, mimeType: string
+        reference: Record<string, unknown>
+      }>
+    }
+    expect(pack.stickers.length).toBeGreaterThan(0)
+    let animated: typeof pack.stickers[number] | undefined
+    let animatedBytes: Buffer | undefined
+    for (const sticker of pack.stickers) {
+      const assetResponse = await fetch(`${base}/stickers/asset`, {
+        method: 'POST', headers: headers({ 'content-type': 'application/json' }),
+        body: JSON.stringify(sticker.reference),
+      })
+      expect(assetResponse.status, await assetResponse.clone().text()).toBe(200)
+      const bytes = Buffer.from(await assetResponse.arrayBuffer())
+      const sniffed = sniffStickerMime(bytes)
+      expect(sniffed, `unrecognized favorite bytes: ${sticker.stickerId}`).toBeDefined()
+      expect(assetResponse.headers.get('content-type')).toBe(sniffed)
+      expect(sticker.mimeType).toBe(sniffed)
+      expect(sticker.reference.mimeType).toBe(sniffed)
+      expect(sticker.format).toBe(sniffed === 'image/gif' || sniffed === 'image/apng' ? 'animated' : 'static')
+      if (!animated && (sniffed === 'image/gif' || sniffed === 'image/apng')) {
+        animated = sticker
+        animatedBytes = bytes
+      }
+    }
+    expect(animated, 'expected at least one animated QQ favorite').toBeDefined()
+
+    const conversation = await resolve('direct', allowedDirect)
+    const manifest = Buffer.from(JSON.stringify({
+      conversationId: conversation.id, sticker: animated!.reference,
+    })).toString('base64url')
+    const sentResponse = await fetch(`${base}/messages`, {
+      method: 'POST', headers: headers({ 'x-qqnt-manifest': manifest }), body: new Uint8Array(),
+    })
+    const sentText = await sentResponse.text()
+    expect(sentResponse.status, sentText).toBe(200)
+    const sent = JSON.parse(sentText) as {
+      parts: Array<{ type: string, sticker?: { mimeType: string, reference: Record<string, unknown> } }>
+    }
+    const echoed = sent.parts[0]?.sticker
+    expect(echoed).toMatchObject({
+      mimeType: animated!.mimeType,
+      reference: { mimeType: animated!.mimeType },
+    })
+    const echoedAssetResponse = await fetch(`${base}/stickers/asset`, {
+      method: 'POST', headers: headers({ 'content-type': 'application/json' }),
+      body: JSON.stringify(echoed!.reference),
+    })
+    expect(echoedAssetResponse.status, await echoedAssetResponse.clone().text()).toBe(200)
+    expect(echoedAssetResponse.headers.get('content-type')).toBe(animated!.mimeType)
+    expect(Buffer.from(await echoedAssetResponse.arrayBuffer())).toEqual(animatedBytes)
+  }, 180_000)
 
   it.runIf(Boolean(process.env.QQNT_BRIDGE_E2E_MARKET_STICKER))(
     'preserves a real APNG market sticker MIME through the native send echo',

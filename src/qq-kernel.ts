@@ -60,6 +60,7 @@ const AVSDK_ACCEPT_INVITE_BYTES = Buffer.from(AVSDK_ACCEPT_INVITE, 'ascii')
 const AVSDK_REFUSE_INVITE_BYTES = Buffer.from(AVSDK_REFUSE_INVITE, 'ascii')
 const AVSDK_LOG_OUT_BYTES = Buffer.from(AVSDK_LOG_OUT, 'ascii')
 const FAVORITE_STICKER_PACK_ID = 'qq-favorites'
+type StickerImageMimeType = 'image/gif' | 'image/apng' | 'image/png' | 'image/jpeg' | 'image/webp' | 'image/bmp'
 const FAVORITE_STICKER_PACK_TITLE = 'QQ 收藏表情'
 // Keep this in sync with Telegram's account-level reaction catalog. QQ emoji
 // outside this set are exposed as custom reactions backed by QQ's own icon.
@@ -220,7 +221,7 @@ export class QQKernelBridge {
   private readonly stickerPacks = new Map<string, QQStickerPack>()
   private readonly stickerPackInfo = new Map<string, MarketStickerPackInfo>()
   private readonly stickers = new Map<string, QQSticker>()
-  private readonly marketStickerMimeTypes = new Map<string, 'image/gif' | 'image/apng'>()
+  private readonly stickerMimeTypes = new Map<string, StickerImageMimeType>()
   private favoriteStickerPackPromise?: Promise<QQStickerPack>
   private readonly pendingMessages = new Map<string, ReturnType<typeof deferred<MsgRecord>>>()
   private readonly pendingAcceptances = new Map<string, ReturnType<typeof deferred<void>>>()
@@ -356,7 +357,7 @@ export class QQKernelBridge {
     this.stickerPacks.clear()
     this.stickerPackInfo.clear()
     this.stickers.clear()
-    this.marketStickerMimeTypes.clear()
+    this.stickerMimeTypes.clear()
     this.favoriteStickerPackPromise = undefined
     this.buddySnapshotLoaded = false
     this.kernel = kernel
@@ -1330,9 +1331,10 @@ export class QQKernelBridge {
       // with a real local file. Prefer that authoritative path before
       // consulting the short negative cache.
       if (reference.path && existsSync(reference.path)) {
+        const mimeType = this.resolveFavoriteStickerMimeType(reference)
         return {
           stream: fileStream(reference.path, false),
-          mimeType: imageMimeType(reference.path, reference.animated),
+          mimeType,
           size: statSync(reference.path).size,
         }
       }
@@ -1351,11 +1353,8 @@ export class QQKernelBridge {
           }
           throw new Error(`QQ favorite sticker download failed: ${response.status}`)
         }
-        return {
-          stream: Readable.fromWeb(response.body),
-          mimeType: imageMimeType(reference.name, reference.animated),
-          size: numberOrUndefined(response.headers.get('content-length') ?? undefined) ?? reference.size,
-        }
+        return this.openFavoriteStickerResponse(reference, response,
+          numberOrUndefined(response.headers.get('content-length') ?? undefined) ?? reference.size)
       }
       if (reference.locator) {
         const direct = await this.getDirectUrl(reference.locator)
@@ -1371,11 +1370,7 @@ export class QQKernelBridge {
           }
           throw new Error(`QQ favorite sticker download failed: ${response.status}`)
         }
-        return {
-          stream: Readable.fromWeb(response.body),
-          mimeType: imageMimeType(reference.name, reference.animated),
-          size: reference.size,
-        }
+        return this.openFavoriteStickerResponse(reference, response, reference.size)
       }
       this.missingStickerAssets.set(cacheKey, Date.now() + this.stickerMissingCacheTtlMs)
       throw new QQStickerAssetNotFoundError(`QQ favorite sticker file is missing: ${reference.resId}`)
@@ -1511,6 +1506,7 @@ export class QQKernelBridge {
           width: manifest.sticker.width, height: manifest.sticker.height,
         } })
       } else if (manifest.sticker?.kind === 'favorite') {
+        manifest.sticker.mimeType = this.resolveFavoriteStickerMimeType(manifest.sticker)
         this.stickers.set(favoriteStickerId(manifest.sticker.resId), stickerFromReference(manifest.sticker))
         const stickerPath = manifest.sticker.path && existsSync(manifest.sticker.path)
           ? manifest.sticker.path
@@ -1529,7 +1525,7 @@ export class QQKernelBridge {
           {
             name: manifest.sticker.name, size, md5, sha1,
             width: manifest.sticker.width, height: manifest.sticker.height,
-            picType: imagePicType(manifest.sticker.name), picSubType: 1,
+            picType: imagePicTypeForMime(manifest.sticker.mimeType, manifest.sticker.name), picSubType: 1,
           },
           createReadStream(stickerPath),
         )
@@ -4350,9 +4346,10 @@ export class QQKernelBridge {
       width: dimensions?.width, height: dimensions?.height, animated,
       url: item.url || undefined,
     }
+    const mimeType = this.resolveFavoriteStickerMimeType(reference)
     return {
       stickerId: favoriteStickerId(item.resId), title: item.desc || undefined,
-      format: animated ? 'animated' : 'static', mimeType: imageMimeType(path, animated),
+      format: reference.animated ? 'animated' : 'static', mimeType,
       width: dimensions?.width, height: dimensions?.height, size: reference.size,
       version: 1, reference,
     }
@@ -4419,8 +4416,8 @@ export class QQKernelBridge {
       this.rememberMarketStickerMime(reference, sniffed)
       return sniffed
     }
-    const cached = this.marketStickerMimeTypes.get(marketStickerId(reference.packageId, reference.stickerId))
-    if (cached) return cached
+    const cached = this.stickerMimeTypes.get(marketStickerId(reference.packageId, reference.stickerId))
+    if (cached === 'image/gif' || cached === 'image/apng') return cached
     if (reference.animated) {
       try {
         const resolved = await this.resolveMarketStickerPath(reference)
@@ -4438,6 +4435,67 @@ export class QQKernelBridge {
     return marketStickerMimeType(reference, apngHint)
   }
 
+  private resolveFavoriteStickerMimeType(
+    reference: Extract<QQStickerReference, { kind: 'favorite' }>,
+  ): StickerImageMimeType {
+    const sniffed = reference.path && existsSync(reference.path)
+      ? sniffStickerFileMimeType(reference.path, false, reference.animated)
+      : undefined
+    const mimeType = sniffed
+      ?? this.stickerMimeTypes.get(favoriteStickerId(reference.resId))
+      ?? normalizeStickerImageMimeType(reference.mimeType)
+      ?? normalizeStickerImageMimeType(imageMimeType(reference.name || reference.path, reference.animated))
+      ?? 'image/png'
+    reference.mimeType = mimeType
+    reference.animated = isAnimatedStickerMimeType(mimeType)
+    if (sniffed) this.rememberStickerMime(favoriteStickerId(reference.resId), mimeType)
+    return mimeType
+  }
+
+  private async openFavoriteStickerResponse(
+    reference: Extract<QQStickerReference, { kind: 'favorite' }>,
+    response: Response,
+    size?: number,
+  ): Promise<{ stream: Readable, mimeType: string, size?: number }> {
+    if (!response.body) throw new Error(`QQ favorite sticker response has no body: ${reference.resId}`)
+    const reader = response.body.getReader()
+    const prefixChunks: Buffer[] = []
+    let prefixLength = 0
+    let responseDone = false
+    let sniffed: StickerImageMimeType | undefined
+    while (prefixLength < STICKER_MIME_SNIFF_BYTES) {
+      const chunk = await reader.read()
+      responseDone = chunk.done
+      if (chunk.value?.length) {
+        const bytes = Buffer.from(chunk.value)
+        prefixChunks.push(bytes)
+        prefixLength += bytes.length
+      }
+      const prefix = Buffer.concat(prefixChunks, prefixLength)
+      sniffed = sniffStickerBytesMimeType(prefix)
+      if (sniffed || responseDone || !stickerMimeNeedsMoreBytes(prefix)) break
+    }
+    const headerMimeType = normalizeStickerImageMimeType(response.headers.get('content-type')?.split(';', 1)[0])
+    const mimeType = sniffed ?? headerMimeType ?? this.resolveFavoriteStickerMimeType(reference)
+    reference.mimeType = mimeType
+    reference.animated = isAnimatedStickerMimeType(mimeType)
+    if (sniffed || headerMimeType) this.rememberStickerMime(favoriteStickerId(reference.resId), mimeType)
+    const stream = Readable.from((async function* () {
+      try {
+        for (const chunk of prefixChunks) yield chunk
+        if (responseDone) return
+        while (true) {
+          const chunk = await reader.read()
+          if (chunk.done) return
+          if (chunk.value?.length) yield Buffer.from(chunk.value)
+        }
+      } finally {
+        try { await reader.cancel() } catch {}
+      }
+    })())
+    return { stream, mimeType, size }
+  }
+
   private loadMarketStickerMimeCache(): void {
     const path = this.marketStickerMimeCachePath()
     if (!path || !existsSync(path)) return
@@ -4448,9 +4506,10 @@ export class QQKernelBridge {
       }
       if (parsed.version !== 1 || !parsed.mimeTypes || typeof parsed.mimeTypes !== 'object') return
       for (const [stickerId, mimeType] of Object.entries(parsed.mimeTypes)) {
-        if (!parseMarketStickerId(stickerId)) continue
-        if (mimeType === 'image/gif' || mimeType === 'image/apng') {
-          this.marketStickerMimeTypes.set(stickerId, mimeType)
+        if (parseMarketStickerId(stickerId) && (mimeType === 'image/gif' || mimeType === 'image/apng')) {
+          this.stickerMimeTypes.set(stickerId, mimeType)
+        } else if (parseFavoriteStickerId(stickerId) && normalizeStickerImageMimeType(mimeType)) {
+          this.stickerMimeTypes.set(stickerId, normalizeStickerImageMimeType(mimeType)!)
         }
       }
     } catch (error) {
@@ -4464,15 +4523,19 @@ export class QQKernelBridge {
   ): void {
     const stickerId = marketStickerId(reference.packageId, reference.stickerId)
     reference.mimeType = mimeType
-    if (this.marketStickerMimeTypes.get(stickerId) === mimeType) return
-    this.marketStickerMimeTypes.set(stickerId, mimeType)
+    this.rememberStickerMime(stickerId, mimeType)
+  }
+
+  private rememberStickerMime(stickerId: string, mimeType: StickerImageMimeType): void {
+    if (this.stickerMimeTypes.get(stickerId) === mimeType) return
+    this.stickerMimeTypes.set(stickerId, mimeType)
     const path = this.marketStickerMimeCachePath()
     if (!path) return
     try {
       mkdirSync(dirname(path), { recursive: true })
       writeFileSync(path, `${JSON.stringify({
         version: 1,
-        mimeTypes: Object.fromEntries([...this.marketStickerMimeTypes].sort(([left], [right]) =>
+        mimeTypes: Object.fromEntries([...this.stickerMimeTypes].sort(([left], [right]) =>
           left.localeCompare(right))),
       }, null, 2)}\n`, 'utf8')
     } catch (error) {
@@ -4851,9 +4914,14 @@ function mapSticker(record: MsgRecord, element: MsgElement): QQSticker | undefin
     size: numberOrUndefined(picture.fileSize), width: picture.picWidth || undefined,
     height: picture.picHeight || undefined, animated, locator: media.locator,
   }
+  const mimeType = reference.path && existsSync(reference.path)
+    ? favoriteStickerFileMimeType(reference.path, animated)
+    : imageMimeType(picture.fileName, animated)
+  reference.mimeType = normalizeStickerImageMimeType(mimeType)
+  reference.animated = isAnimatedStickerMimeType(mimeType)
   return {
-    stickerId: favoriteStickerId(resId), format: animated ? 'animated' : 'static',
-    mimeType: imageMimeType(picture.fileName, animated), width: reference.width,
+    stickerId: favoriteStickerId(resId), format: reference.animated ? 'animated' : 'static',
+    mimeType, width: reference.width,
     height: reference.height, size: reference.size, version: 1, reference,
   }
 }
@@ -4888,7 +4956,7 @@ function stickerFromReference(reference: QQStickerReference): QQSticker {
     stickerId: favoriteStickerId(reference.resId),
     title: reference.name,
     format: reference.animated ? 'animated' : 'static',
-    mimeType: imageMimeType(reference.name, reference.animated),
+    mimeType: reference.mimeType ?? imageMimeType(reference.name, reference.animated),
     width: reference.width,
     height: reference.height,
     size: reference.size,
@@ -4955,12 +5023,16 @@ function mergeKnownSticker(known: QQSticker | undefined, current: QQSticker): QQ
     }
   }
   if (known.reference.kind === 'favorite' && current.reference.kind === 'favorite') {
+    const mimeType = known.reference.mimeType ?? normalizeStickerImageMimeType(known.mimeType)
+      ?? current.reference.mimeType ?? normalizeStickerImageMimeType(current.mimeType)
+      ?? normalizeStickerImageMimeType(imageMimeType(current.reference.name, animated)) ?? 'image/png'
     const reference: QQStickerReference = {
       ...known.reference,
       ...current.reference,
       path: current.reference.path || known.reference.path,
       name: current.reference.name || known.reference.name,
-      animated,
+      animated: isAnimatedStickerMimeType(mimeType),
+      mimeType,
       url: current.reference.url || known.reference.url,
       locator: current.reference.locator || known.reference.locator,
     }
@@ -4968,8 +5040,8 @@ function mergeKnownSticker(known: QQSticker | undefined, current: QQSticker): QQ
       ...known,
       ...current,
       title: current.title || known.title,
-      format: animated ? 'animated' : 'static',
-      mimeType: imageMimeType(reference.name, animated),
+      format: reference.animated ? 'animated' : 'static',
+      mimeType,
       reference,
     }
   }
@@ -5041,6 +5113,12 @@ function favoriteStickerId(resId: string): string {
   return `favorite:${resId}`
 }
 
+function parseFavoriteStickerId(value: string): string | undefined {
+  return value.startsWith('favorite:') && value.length > 'favorite:'.length
+    ? value.slice('favorite:'.length)
+    : undefined
+}
+
 function favoritePackVersion(stickers: QQSticker[]): number {
   let hash = 0x811c9dc5
   for (const sticker of stickers) {
@@ -5097,6 +5175,23 @@ function marketStickerMimeType(
   return apngHint ? 'image/apng' : 'image/gif'
 }
 
+function normalizeStickerImageMimeType(value: unknown): StickerImageMimeType | undefined {
+  return value === 'image/gif' || value === 'image/apng' || value === 'image/png'
+    || value === 'image/jpeg' || value === 'image/webp' || value === 'image/bmp'
+    ? value
+    : undefined
+}
+
+function isAnimatedStickerMimeType(value: string): boolean {
+  return value === 'image/gif' || value === 'image/apng'
+}
+
+function favoriteStickerFileMimeType(path: string, animated: boolean): StickerImageMimeType {
+  return sniffStickerFileMimeType(path, false, animated)
+    ?? normalizeStickerImageMimeType(imageMimeType(path, animated))
+    ?? 'image/png'
+}
+
 function sniffMarketStickerMimeType(
   reference: Extract<QQStickerReference, { kind: 'market' }>,
 ): 'image/gif' | 'image/apng' | undefined {
@@ -5110,14 +5205,59 @@ function stickerFileMimeType(
   encrypted: boolean,
   animated: boolean,
 ): 'image/gif' | 'image/apng' | 'image/png' {
-  const signature = readStickerSignature(path, encrypted)
-  if (signature?.subarray(0, 6).toString('ascii') === 'GIF87a'
-    || signature?.subarray(0, 6).toString('ascii') === 'GIF89a') return 'image/gif'
-  if (signature?.equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
-    return animated ? 'image/apng' : 'image/png'
-  }
+  const signature = sniffStickerFileMimeType(path, encrypted, animated)
+  if (signature === 'image/gif' || signature === 'image/apng' || signature === 'image/png') return signature
   const hinted = encryptedImageMimeType(path, animated)
   return hinted === 'image/gif' || hinted === 'image/apng' ? hinted : 'image/png'
+}
+
+function sniffStickerFileMimeType(
+  path: string,
+  encrypted: boolean,
+  animated: boolean,
+): StickerImageMimeType | undefined {
+  const signature = readStickerSignature(path, encrypted)
+  return signature ? sniffStickerBytesMimeType(signature) : undefined
+}
+
+const STICKER_MIME_SNIFF_BYTES = 64 * 1024
+
+function sniffStickerBytesMimeType(bytes: Uint8Array): StickerImageMimeType | undefined {
+  if (bytes.length >= 6) {
+    const gif = ascii(bytes, 0, 6)
+    if (gif === 'GIF87a' || gif === 'GIF89a') return 'image/gif'
+  }
+  if (isPngSignature(bytes)) return sniffPngMimeType(bytes)
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg'
+  if (bytes.length >= 12 && ascii(bytes, 0, 4) === 'RIFF' && ascii(bytes, 8, 4) === 'WEBP') return 'image/webp'
+  if (bytes.length >= 2 && ascii(bytes, 0, 2) === 'BM') return 'image/bmp'
+  return undefined
+}
+
+function stickerMimeNeedsMoreBytes(bytes: Uint8Array): boolean {
+  if (bytes.length < 12) return true
+  return isPngSignature(bytes) && sniffPngMimeType(bytes) === undefined
+}
+
+function isPngSignature(bytes: Uint8Array): boolean {
+  return bytes.length >= 8 && Buffer.from(bytes.subarray(0, 8)).equals(
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+  )
+}
+
+function sniffPngMimeType(bytes: Uint8Array): 'image/apng' | 'image/png' | undefined {
+  let offset = 8
+  while (offset + 12 <= bytes.length) {
+    const length = readU32BE(bytes, offset)
+    const type = ascii(bytes, offset + 4, 4)
+    if (type === 'acTL') return 'image/apng'
+    if (type === 'IDAT' || type === 'IEND') return 'image/png'
+    if (!Number.isSafeInteger(length) || length > STICKER_MIME_SNIFF_BYTES) return undefined
+    const chunkEnd = offset + 12 + length
+    if (chunkEnd > bytes.length) return undefined
+    offset = chunkEnd
+  }
+  return undefined
 }
 
 function encryptedImageMimeType(path: string, animated: boolean): string {
@@ -5128,11 +5268,13 @@ function readStickerSignature(path: string, encrypted: boolean): Buffer | undefi
   let descriptor: number | undefined
   try {
     descriptor = openSync(path, 'r')
-    const bytes = Buffer.alloc(8)
+    const bytes = Buffer.alloc(STICKER_MIME_SNIFF_BYTES)
     const length = readSync(descriptor, bytes, 0, bytes.length, 0)
     if (length < 6) return bytes.subarray(0, length)
     if (encrypted) {
-      for (let index = 0; index < length; index++) bytes[index] = ~bytes[index]!
+      for (let index = 0; index < length; index++) {
+        if (index % 50 < 20) bytes[index] = ~bytes[index]!
+      }
     }
     return bytes.subarray(0, length)
   } catch {
@@ -6347,6 +6489,18 @@ function imagePicType(name: string): number {
   )
 }
 
+function imagePicTypeForMime(mimeType: StickerImageMimeType | undefined, fallbackName: string): number {
+  const type = ({
+    'image/jpeg': 1000,
+    'image/png': 1001,
+    'image/webp': 1002,
+    'image/bmp': 1005,
+    'image/gif': 2000,
+    'image/apng': 2001,
+  } as Record<StickerImageMimeType, number>)[mimeType ?? 'image/png']
+  return mimeType ? type : imagePicType(fallbackName)
+}
+
 function favoriteStickerAssetKey(reference: Extract<QQStickerReference, { kind: 'favorite' }>): string {
   return [
     reference.resId,
@@ -6372,4 +6526,9 @@ function readU16LE(bytes: Uint8Array, offset: number): number {
 function readU24LE(bytes: Uint8Array, offset: number): number {
   return ( bytes[offset]! + bytes[offset + 1]! * 0x100 + bytes[offset + 2]! * 0x10000
   )
+}
+
+function readU32BE(bytes: Uint8Array, offset: number): number {
+  return bytes[offset]! * 0x1000000 + bytes[offset + 1]! * 0x10000
+    + bytes[offset + 2]! * 0x100 + bytes[offset + 3]!
 }
