@@ -1,5 +1,5 @@
 import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto'
-import { closeSync, createReadStream, createWriteStream, existsSync, mkdirSync, openSync, readSync, statSync } from 'node:fs'
+import { closeSync, createReadStream, createWriteStream, existsSync, mkdirSync, openSync, readFileSync, readSync, statSync, writeFileSync } from 'node:fs'
 import { open as openFile, readFile, rm, stat } from 'node:fs/promises'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { pipeline } from 'node:stream/promises'
@@ -7,7 +7,7 @@ import { Readable } from 'node:stream'
 import { types } from 'node:util'
 import { AsyncQueue, deferred } from './async.js'
 import { markBridgeListener } from './listener-tee.js'
-import { log } from './log.js'
+import { log, logPath } from './log.js'
 import { resolveMultiForwardParticipants } from './multi-forward-participants.js'
 import type { PCMMediaLease } from './media-gateway.js'
 import { QQPacketClient, type DirectHighwayUpload, type QQPacketClientOptions } from './packet-client.js'
@@ -84,6 +84,7 @@ export interface QQKernelOptions {
   packetClient?: QQPacketClientOptions
   deleteDedupTtlMs?: number
   stickerMissingCacheTtlMs?: number
+  marketStickerMimeCacheDir?: string | false
 mediaGateway?: QQMediaLeaseIssuer
 }
 
@@ -219,6 +220,7 @@ export class QQKernelBridge {
   private readonly stickerPacks = new Map<string, QQStickerPack>()
   private readonly stickerPackInfo = new Map<string, MarketStickerPackInfo>()
   private readonly stickers = new Map<string, QQSticker>()
+  private readonly marketStickerMimeTypes = new Map<string, 'image/gif' | 'image/apng'>()
   private favoriteStickerPackPromise?: Promise<QQStickerPack>
   private readonly pendingMessages = new Map<string, ReturnType<typeof deferred<MsgRecord>>>()
   private readonly pendingAcceptances = new Map<string, ReturnType<typeof deferred<void>>>()
@@ -271,6 +273,7 @@ export class QQKernelBridge {
   private readonly packetClientOptions: QQPacketClientOptions
   private readonly deleteDedupTtlMs: number
   private readonly stickerMissingCacheTtlMs: number
+  private readonly marketStickerMimeCacheDir?: string
 
   private readonly mediaGateway?: QQMediaLeaseIssuer
 
@@ -281,6 +284,10 @@ export class QQKernelBridge {
     this.packetClientOptions = options.packetClient ?? {}
     this.deleteDedupTtlMs = options.deleteDedupTtlMs ?? DELETE_DEDUP_TTL_MS
     this.stickerMissingCacheTtlMs = options.stickerMissingCacheTtlMs ?? STICKER_MISSING_CACHE_TTL_MS
+    this.marketStickerMimeCacheDir = options.marketStickerMimeCacheDir === false
+      || (options.marketStickerMimeCacheDir === undefined && Boolean(process.env.VITEST))
+      ? undefined
+      : options.marketStickerMimeCacheDir ?? join(dirname(logPath), 'sticker-mime')
     this.mediaGateway = options.mediaGateway
     try {
       this.callSignalSecret = randomBytes(CALL_SIGNAL_SECRET_BYTES)
@@ -349,11 +356,13 @@ export class QQKernelBridge {
     this.stickerPacks.clear()
     this.stickerPackInfo.clear()
     this.stickers.clear()
+    this.marketStickerMimeTypes.clear()
     this.favoriteStickerPackPromise = undefined
     this.buddySnapshotLoaded = false
     this.kernel = kernel
     this.session = session
     this.config = config
+    this.loadMarketStickerMimeCache()
     mkdirSync(this.stagingPath(), { recursive: true })
     this.users.set(config.selfUid, {
       id: config.selfUid,
@@ -1199,7 +1208,7 @@ export class QQKernelBridge {
       service.getMarketEmoticonEncryptKeys?.(epId, ids),
     ])
     const keyMap = keys?.result === 0 ? keys.encryptKeyMap : new Map<string, string>()
-    const stickers = rows.map((item): QQSticker => {
+    const stickers = await mapConcurrent(rows, 4, async (item): Promise<QQSticker> => {
       const staticPath = staticPaths.get(item.id)?.path || undefined
       const dynamicPath = dynamicPaths.get(item.id)?.path || undefined
       const animated = detail.isApng === 1 || Boolean(item.isApng) || info?.tabType === 3 || Boolean(dynamicPath)
@@ -1212,7 +1221,10 @@ export class QQKernelBridge {
         staticPath,
         dynamicPath,
       }
-      reference.mimeType = marketStickerMimeType(reference, detail.isApng === 1 || Boolean(item.isApng))
+      reference.mimeType = await this.resolveMarketStickerMimeType(
+        reference,
+        detail.isApng === 1 || Boolean(item.isApng),
+      )
       const sticker: QQSticker = {
         stickerId: marketStickerId(packId, item.id),
         packId,
@@ -1370,6 +1382,9 @@ export class QQKernelBridge {
     }
     const resolved = await this.resolveMarketStickerPath(reference)
     reference.mimeType = stickerFileMimeType(resolved.path, resolved.encrypted, resolved.animated)
+    if (reference.mimeType === 'image/gif' || reference.mimeType === 'image/apng') {
+      this.rememberMarketStickerMime(reference, reference.mimeType)
+    }
     return {
       stream: fileStream(resolved.path, resolved.encrypted),
       mimeType: reference.mimeType,
@@ -4315,7 +4330,7 @@ export class QQKernelBridge {
         dynamicPath: item.emoOriginalPath || item.emoPath || undefined,
         favoriteResId: item.resId,
       }
-      reference.mimeType = marketStickerMimeType(reference, Boolean(item.isAPNG))
+      reference.mimeType = await this.resolveMarketStickerMimeType(reference, Boolean(item.isAPNG))
       return {
         stickerId: marketStickerId(packageId, item.eId), packId: packageId,
         title: reference.name, format: animated ? 'animated' : 'static',
@@ -4393,6 +4408,82 @@ export class QQKernelBridge {
     }
     reference.staticPath = staticPath
     return { path: staticPath, encrypted: false, animated: false }
+  }
+
+  private async resolveMarketStickerMimeType(
+    reference: Extract<QQStickerReference, { kind: 'market' }>,
+    apngHint = false,
+  ): Promise<'image/gif' | 'image/apng' | 'image/png'> {
+    const sniffed = sniffMarketStickerMimeType(reference)
+    if (sniffed) {
+      this.rememberMarketStickerMime(reference, sniffed)
+      return sniffed
+    }
+    const cached = this.marketStickerMimeTypes.get(marketStickerId(reference.packageId, reference.stickerId))
+    if (cached) return cached
+    if (reference.animated) {
+      try {
+        const resolved = await this.resolveMarketStickerPath(reference)
+        if (resolved.animated) {
+          const detected = stickerFileMimeType(resolved.path, resolved.encrypted, true)
+          if (detected === 'image/gif' || detected === 'image/apng') {
+            this.rememberMarketStickerMime(reference, detected)
+            return detected
+          }
+        }
+      } catch (error) {
+        log('warn', `QQ market sticker MIME probe failed pack=${reference.packageId} sticker=${reference.stickerId}`, error)
+      }
+    }
+    return marketStickerMimeType(reference, apngHint)
+  }
+
+  private loadMarketStickerMimeCache(): void {
+    const path = this.marketStickerMimeCachePath()
+    if (!path || !existsSync(path)) return
+    try {
+      const parsed = JSON.parse(readFileSync(path, 'utf8')) as {
+        version?: unknown
+        mimeTypes?: Record<string, unknown>
+      }
+      if (parsed.version !== 1 || !parsed.mimeTypes || typeof parsed.mimeTypes !== 'object') return
+      for (const [stickerId, mimeType] of Object.entries(parsed.mimeTypes)) {
+        if (!parseMarketStickerId(stickerId)) continue
+        if (mimeType === 'image/gif' || mimeType === 'image/apng') {
+          this.marketStickerMimeTypes.set(stickerId, mimeType)
+        }
+      }
+    } catch (error) {
+      log('warn', `QQ market sticker MIME cache load failed path=${path}`, error)
+    }
+  }
+
+  private rememberMarketStickerMime(
+    reference: Extract<QQStickerReference, { kind: 'market' }>,
+    mimeType: 'image/gif' | 'image/apng',
+  ): void {
+    const stickerId = marketStickerId(reference.packageId, reference.stickerId)
+    reference.mimeType = mimeType
+    if (this.marketStickerMimeTypes.get(stickerId) === mimeType) return
+    this.marketStickerMimeTypes.set(stickerId, mimeType)
+    const path = this.marketStickerMimeCachePath()
+    if (!path) return
+    try {
+      mkdirSync(dirname(path), { recursive: true })
+      writeFileSync(path, `${JSON.stringify({
+        version: 1,
+        mimeTypes: Object.fromEntries([...this.marketStickerMimeTypes].sort(([left], [right]) =>
+          left.localeCompare(right))),
+      }, null, 2)}\n`, 'utf8')
+    } catch (error) {
+      log('warn', `QQ market sticker MIME cache write failed path=${path}`, error)
+    }
+  }
+
+  private marketStickerMimeCachePath(): string | undefined {
+    if (!this.marketStickerMimeCacheDir) return
+    const selfUin = this.config?.selfUin.replace(/[^0-9A-Za-z_-]/g, '')
+    return selfUin ? join(this.marketStickerMimeCacheDir, `${selfUin}.json`) : undefined
   }
 
   private async getMarketEmoticonPaths(
@@ -4997,12 +5088,21 @@ function marketStickerMimeType(
   apngHint = false,
 ): 'image/gif' | 'image/apng' | 'image/png' {
   if (!reference.animated) return 'image/png'
+  const sniffed = sniffMarketStickerMimeType(reference)
+  if (sniffed) return sniffed
   const path = reference.dynamicPath || reference.staticPath
-  if (path && existsSync(path)) return stickerFileMimeType(path, path === reference.dynamicPath, true)
   const pathHint = encryptedImageMimeType(path ?? '', true)
   if (pathHint === 'image/gif' || pathHint === 'image/apng') return pathHint
   if (reference.mimeType === 'image/gif' || reference.mimeType === 'image/apng') return reference.mimeType
   return apngHint ? 'image/apng' : 'image/gif'
+}
+
+function sniffMarketStickerMimeType(
+  reference: Extract<QQStickerReference, { kind: 'market' }>,
+): 'image/gif' | 'image/apng' | undefined {
+  if (!reference.animated || !reference.dynamicPath || !existsSync(reference.dynamicPath)) return
+  const detected = stickerFileMimeType(reference.dynamicPath, true, true)
+  return detected === 'image/gif' || detected === 'image/apng' ? detected : undefined
 }
 
 function stickerFileMimeType(

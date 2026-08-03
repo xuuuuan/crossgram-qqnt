@@ -1,5 +1,6 @@
 import { Readable } from 'node:stream'
 import { once } from 'node:events'
+import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
@@ -2315,6 +2316,86 @@ describe('QQKernelBridge', () => {
       stickerId: 'market:44:apng-a', format: 'animated', mimeType: 'image/apng',
       reference: { mimeType: 'image/apng' },
     } }])
+  })
+
+  it('persists byte-sniffed GIF and APNG market MIME across a bridge restart', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'qqnt-market-mime-cache-'))
+    tempPaths.push(directory)
+    const cacheDir = join(directory, 'mime-cache')
+    const detailPath = join(directory, 'pack.json')
+    const staticPath = join(directory, 'sticker.png')
+    const gifPath = join(directory, 'gif.gif.encrypt')
+    const apngPath = join(directory, 'apng.gif.encrypt')
+    const gif = Buffer.from('GIF89a-persisted-animation')
+    const apng = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAwAAAAICAYAAADN5B7xAAAACXBIWXMAAAABAAAAAQBPJcTWAAAACGFjVEwAAAACAAAAAPONk3AAAAAaZmNUTAAAAAAAAAAMAAAACAAAAAAAAAAAAAEACgAAGya3gAAAABRJREFUeJxj+MPA8J8UzDCqgRYaAJjXviFq8lROAAAAGmZjVEwAAAABAAAADAAAAAgAAAAAAAAAAAABAAoAAIBVXVQAAAAXZmRBVAAAAAJ4nGNgYPj7nzQ8qoEGGgAlJ76BvcErGQAAAABJRU5ErkJggg==',
+      'base64',
+    )
+    await writeFile(detailPath, JSON.stringify({
+      name: 'Persistent MIME Pack', isApng: 0,
+      imgs: [
+        { id: 'gif-a', wWidthInPhone: 200, wHeightInPhone: 200 },
+        { id: 'apng-a', wWidthInPhone: 200, wHeightInPhone: 200 },
+      ],
+    }))
+    await writeFile(staticPath, Buffer.from('static'))
+    await writeFile(gifPath, gif.map((byte, index) => index % 50 < 20 ? ~byte : byte))
+    await writeFile(apngPath, apng.map((byte, index) => index % 50 < 20 ? ~byte : byte))
+
+    const configure = (f: ReturnType<typeof fixture>) => {
+      f.msg.fetchMarketEmoticonList.mockResolvedValue({
+        result: 0, errMsg: '', marketEmoticonInfo: { roamEmojiTab: {
+          timesTamp: 1, segmentFlag: -1,
+          ordinaryTabinfoList: [{ epId: 45, wordingId: 1, tabType: 3, tabName: 'Persistent MIME Pack' }],
+          magicTabinfoList: [], smallTabinfoList: [], epIds: [45],
+        } },
+      })
+      f.msg.getMarketEmoticonPath.mockImplementation(async (epId, ids, serviceType) => {
+        let pathMap = new Map<string, { isExist: boolean, path: string }>()
+        if (serviceType === 1) pathMap = new Map([[String(epId), { isExist: true, path: detailPath }]])
+        if (serviceType === 3) pathMap = new Map(ids.map((id: string) => [id, { isExist: true, path: staticPath }]))
+        if (serviceType === 5) pathMap = new Map(ids.map((id: string) => [
+          id, { isExist: existsSync(id === 'gif-a' ? gifPath : apngPath), path: id === 'gif-a' ? gifPath : apngPath },
+        ]))
+        return { result: 0, errMsg: '', pathMap }
+      })
+    }
+
+    const firstFixture = fixture()
+    configure(firstFixture)
+    const first = new QQKernelBridge({ marketStickerMimeCacheDir: cacheDir })
+    first.attach(firstFixture.kernel, firstFixture.session, {
+      selfUin: '10000', selfUid: 'self', userPath: directory,
+    })
+    await first.getStickerPacks()
+    await expect(first.getStickerPack('45')).resolves.toMatchObject({
+      stickers: [
+        { stickerId: 'market:45:gif-a', mimeType: 'image/gif', reference: { mimeType: 'image/gif' } },
+        { stickerId: 'market:45:apng-a', mimeType: 'image/apng', reference: { mimeType: 'image/apng' } },
+      ],
+    })
+    await expect(readFile(join(cacheDir, '10000.json'), 'utf8')).resolves.toContain(
+      '"market:45:apng-a": "image/apng"',
+    )
+
+    await Promise.all([rm(gifPath), rm(apngPath)])
+    const secondFixture = fixture()
+    configure(secondFixture)
+    secondFixture.msg.fetchMarketEmoticonAioImage = vi.fn(async () => {
+      throw new Error('cached MIME must not redownload the asset')
+    })
+    const second = new QQKernelBridge({ marketStickerMimeCacheDir: cacheDir })
+    second.attach(secondFixture.kernel, secondFixture.session, {
+      selfUin: '10000', selfUid: 'self', userPath: directory,
+    })
+    await second.getStickerPacks()
+    await expect(second.getStickerPack('45')).resolves.toMatchObject({
+      stickers: [
+        { stickerId: 'market:45:gif-a', mimeType: 'image/gif', reference: { mimeType: 'image/gif' } },
+        { stickerId: 'market:45:apng-a', mimeType: 'image/apng', reference: { mimeType: 'image/apng' } },
+      ],
+    })
+    expect(secondFixture.msg.fetchMarketEmoticonAioImage).not.toHaveBeenCalled()
   })
 
   it('maps every QQ expression picture subtype as a sticker and keeps only normal/QZone pictures as media', async () => {
