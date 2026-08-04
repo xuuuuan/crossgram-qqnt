@@ -2952,6 +2952,39 @@ describe('QQKernelBridge', () => {
     await expect(readFile(sourcePath)).resolves.toEqual(png)
   })
 
+  it('downloads and stages a remote-only favorite sticker before native send', async () => {
+    const f = fixture()
+    const directory = await mkdtemp(join(tmpdir(), 'qqnt-remote-favorite-send-'))
+    tempPaths.push(directory)
+    const png = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+      'base64',
+    )
+    const fetch = vi.fn(async () => new Response(png, {
+      headers: { 'content-type': 'image/png', 'content-length': String(png.length) },
+    }))
+    vi.stubGlobal('fetch', fetch)
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: directory })
+
+    await bridge.send({
+      conversationId: 'uid-1715311957',
+      sticker: {
+        kind: 'favorite', resId: 'remote-favorite', path: join(directory, 'missing.png'),
+        url: 'https://cdn.example/remote-favorite.png', name: 'remote-favorite.png', animated: false,
+      },
+    }, Readable.from([]))
+
+    expect(fetch).toHaveBeenCalledWith('https://cdn.example/remote-favorite.png')
+    expect(f.imageUpload).toHaveBeenCalledWith(
+      1, 'uid-1715311957', '10000', expect.objectContaining({
+        name: 'remote-favorite.png', size: png.length, picSubType: 1,
+        md5: 'e44e7ecfec99356632c13cd3eaa3e250', picType: 1001,
+      }), expect.anything(),
+    )
+    expect(f.sentBodies).toEqual([png])
+  })
+
   it.each(['', ' \t '])('fails closed for blank user ID %j', async (uid) => {
     const f = fixture()
     const bridge = new QQKernelBridge()

@@ -1545,14 +1545,27 @@ export class QQKernelBridge {
           width: manifest.sticker.width, height: manifest.sticker.height,
         } })
       } else if (manifest.sticker?.kind === 'favorite') {
+        let stickerPath = manifest.sticker.path && existsSync(manifest.sticker.path)
+          ? manifest.sticker.path
+          : undefined
+        if (!stickerPath) {
+          const asset = await this.openSticker(manifest.sticker)
+          const stagingRoot = this.stagingPath('image')
+          mkdirSync(stagingRoot, { recursive: true })
+          stickerPath = join(stagingRoot, `${randomUUID()}${safeExtension(manifest.sticker.name)}`)
+          cleanup.push(stickerPath)
+          await pipeline(asset.stream, createWriteStream(stickerPath, { flags: 'wx' }))
+          manifest.sticker.size = statSync(stickerPath).size
+          manifest.sticker.mimeType = normalizeStickerImageMimeType(asset.mimeType)
+            ?? this.resolveFavoriteStickerMimeType(manifest.sticker)
+          if (!manifest.sticker.width || !manifest.sticker.height) {
+            const dimensions = await imageFileDimensions(stickerPath)
+            manifest.sticker.width ??= dimensions?.width
+            manifest.sticker.height ??= dimensions?.height
+          }
+        }
         manifest.sticker.mimeType = this.resolveFavoriteStickerMimeType(manifest.sticker)
         this.rememberSticker(stickerFromReference(manifest.sticker))
-        const stickerPath = manifest.sticker.path && existsSync(manifest.sticker.path)
-          ? manifest.sticker.path
-          : ''
-        if (!stickerPath) {
-          throw new Error(`QQ favorite sticker file is missing: ${manifest.sticker.resId}`)
-        }
         const size = statSync(stickerPath).size
         const [md5, sha1] = await Promise.all([
           hashFile(stickerPath, 'md5'), hashFile(stickerPath, 'sha1'),
