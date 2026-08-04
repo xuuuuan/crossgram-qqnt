@@ -1,10 +1,11 @@
 import { Readable } from 'node:stream'
 import { once } from 'node:events'
 import { existsSync } from 'node:fs'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, truncate, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
-import { types } from 'node:util'
+import { execFile } from 'node:child_process'
+import { promisify, types } from 'node:util'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import WebSocket from 'ws'
 import type { ContactMsgBoxInfo, KernelGroupService, KernelModule, KernelMsgService, KernelSession, MsgElement, MsgRecord } from './kernel-types.js'
@@ -14,7 +15,9 @@ import { QQKernelBridge } from './qq-kernel.js'
 import { QQBridgeServer } from './server.js'
 import { QQPacketClient } from './packet-client.js'
 import { HIGHWAY_BLOCK_SIZE, type DirectMessagePart } from './upload-protocol.js'
+import { encodePtt } from './silk-audio.js'
 
+const execFileAsync = promisify(execFile)
 const avatarFixturePath = process.platform === 'win32' ? process.execPath : '/dev/null'
 
 function packetAddonFixture(): PacketAddon {
@@ -1472,6 +1475,176 @@ describe('QQKernelBridge', () => {
       value: { type: 'message-delete', conversation: { id: 'group-a' } },
     })
     bridge.unsubscribe(queue)
+  })
+
+  it('prepares trusted Silk PTT as stable OGG metadata and serves exact ranged bytes', async () => {
+    const f = fixture()
+    const root = await mkdtemp(join(tmpdir(), 'qqnt-voice-source-'))
+    tempPaths.push(root)
+    const wav = join(root, 'voice.wav')
+    const silk = join(root, 'voice.silk')
+    await execFileAsync('ffmpeg', ['-nostdin', '-y', '-v', 'error', '-f', 'lavfi', '-i', 'anullsrc=r=24000:cl=mono', '-t', '0.04', wav])
+    await encodePtt(wav, silk)
+    f.message.elements = [{ elementType: 4, elementId: 'voice', pttElement: {
+      duration: 1, fileName: 'voice.silk', filePath: silk, fileSize: String((await readFile(silk)).length),
+    } }]
+    const bridge = new QQKernelBridge({ tempPath: join(root, 'cache-root') })
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: root })
+
+    const history = await bridge.getHistory(bridge.getConversation('uid-1715311957'))
+    const part = history.messages[0]!.parts[0]
+    expect(part?.type).toBe('media')
+    if (!part || part.type !== 'media') throw new Error('expected prepared voice media')
+    expect(part.media).toMatchObject({ voice: true, name: 'voice.ogg', mimeType: 'audio/ogg', duration: 1 })
+    expect(part.media.size).toBeGreaterThan(0)
+    expect(part.media.locator).toMatchObject({ kind: 'voice', sourcePath: silk, fileSize: String(part.media.size) })
+    const opened = await bridge.openMedia(part.media.locator, { offset: 1, limit: 4 })
+    expect(opened).toMatchObject({ mimeType: 'audio/ogg', size: part.media.size, offset: 1, length: 4 })
+    expect(await readStream(opened!.stream)).toEqual((await readFile(part.media.locator.filePath!)).subarray(1, 5))
+  })
+
+  it('recreates a cleared voice cache from an unchanged persisted locator source', async () => {
+    const f = fixture()
+    const root = await mkdtemp(join(tmpdir(), 'qqnt-voice-reopen-'))
+    tempPaths.push(root)
+    const wav = join(root, 'voice.wav')
+    const silk = join(root, 'voice.silk')
+    await execFileAsync('ffmpeg', ['-nostdin', '-y', '-v', 'error', '-f', 'lavfi', '-i', 'anullsrc=r=24000:cl=mono', '-t', '0.04', wav])
+    await encodePtt(wav, silk)
+    f.message.elements = [{ elementType: 4, elementId: 'voice', pttElement: {
+      duration: 1, fileName: 'voice.silk', filePath: silk, fileSize: String((await readFile(silk)).length),
+    } }]
+    const options = { selfUin: '10000', selfUid: 'self', userPath: root }
+    const bridge = new QQKernelBridge({ tempPath: join(root, 'cache-root') })
+    bridge.attach(f.kernel, f.session, options)
+    const part = (await bridge.getHistory(bridge.getConversation('uid-1715311957'))).messages[0]!.parts[0]
+    if (!part || part.type !== 'media') throw new Error('expected prepared voice media')
+    const locator = { ...part.media.locator }
+    const firstPath = locator.filePath
+    bridge.detach()
+    bridge.attach(f.kernel, f.session, options)
+
+    const opened = await bridge.openMedia(locator)
+    expect(opened).toMatchObject({ mimeType: 'audio/ogg', size: part.media.size })
+    expect(locator.filePath).toBe(firstPath)
+    const bytes = await readStream(opened!.stream)
+    expect(bytes).toHaveLength(part.media.size!)
+    expect(bytes).not.toEqual(await readFile(silk))
+
+    bridge.detach()
+    await writeFile(silk, Buffer.from('changed'))
+    bridge.attach(f.kernel, f.session, options)
+    await expect(bridge.openMedia(locator)).resolves.toBeUndefined()
+  })
+
+  it('renders missing, untrusted, and symlink-escaped PTT paths as text fallbacks', async () => {
+    const f = fixture()
+    const root = await mkdtemp(join(tmpdir(), 'qqnt-voice-trusted-'))
+    const outside = await mkdtemp(join(tmpdir(), 'qqnt-voice-outside-'))
+    tempPaths.push(root, outside)
+    const outsidePath = join(outside, 'voice.silk')
+    const linkPath = join(root, 'escaped.silk')
+    await writeFile(outsidePath, Buffer.from('not trusted'))
+    await symlink(outsidePath, linkPath)
+    f.message.elements = [
+      { elementType: 4, elementId: 'missing', pttElement: { duration: 1, filePath: join(root, 'missing.silk') } },
+      { elementType: 4, elementId: 'outside', pttElement: { duration: 2, filePath: outsidePath } },
+      { elementType: 4, elementId: 'escape', pttElement: { duration: 3, filePath: linkPath } },
+    ]
+    const bridge = new QQKernelBridge({ tempPath: join(root, 'cache-root') })
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: root })
+
+    const history = await bridge.getHistory(bridge.getConversation('uid-1715311957'))
+    expect(history.messages[0]!.parts).toEqual([
+      { type: 'text', text: '[语音 1秒]' },
+      { type: 'text', text: '[语音 2秒]' },
+      { type: 'text', text: '[语音 3秒]' },
+    ])
+  })
+
+  it('falls back from an invalid trusted PTT and removes failed conversion artifacts', async () => {
+    const f = fixture()
+    const root = await mkdtemp(join(tmpdir(), 'qqnt-voice-invalid-'))
+    tempPaths.push(root)
+    const invalid = join(root, 'invalid.silk')
+    await writeFile(invalid, Buffer.from('not-a-voice'))
+    f.message.elements = [{ elementType: 4, elementId: 'voice', pttElement: {
+      duration: 4, fileName: 'invalid.silk', filePath: invalid, fileSize: '11',
+    } }]
+    const bridge = new QQKernelBridge({ tempPath: join(root, 'cache-root') })
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: root })
+
+    await expect(bridge.getHistory(bridge.getConversation('uid-1715311957'))).resolves.toMatchObject({
+      messages: [{ parts: [{ type: 'text', text: '[语音 4秒]' }] }],
+    })
+    await expect(readdir(join(root, 'cache-root', 'voice-cache'))).resolves.toEqual([])
+  })
+
+  it('rejects oversized inbound PTT before decoding or fallback transcoding', async () => {
+    const f = fixture()
+    const root = await mkdtemp(join(tmpdir(), 'qqnt-voice-oversized-'))
+    tempPaths.push(root)
+    const oversized = join(root, 'oversized.silk')
+    await writeFile(oversized, Buffer.alloc(0))
+    await truncate(oversized, 32 * 1024 * 1024 + 1)
+    f.message.elements = [{ elementType: 4, elementId: 'voice', pttElement: {
+      duration: 4, fileName: 'oversized.silk', filePath: oversized, fileSize: String(32 * 1024 * 1024 + 1),
+    } }]
+    const bridge = new QQKernelBridge({ tempPath: join(root, 'cache-root') })
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: root })
+
+    await expect(bridge.getHistory(bridge.getConversation('uid-1715311957'))).resolves.toMatchObject({
+      messages: [{ parts: [{ type: 'text', text: '[语音 4秒]' }] }],
+    })
+    await expect(readdir(join(root, 'cache-root', 'voice-cache'))).resolves.toEqual([])
+  })
+
+  it('rejects voice manifests with either reply identity before accepting bytes', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    for (const manifest of [
+      { conversationId: 'uid-1715311957', replyToId: 'message', media: [{ kind: 'voice' as const, name: 'voice.ogg' }] },
+      { conversationId: 'uid-1715311957', replyToSequence: '42', media: [{ kind: 'voice' as const, name: 'voice.ogg' }] },
+    ]) {
+      await expect(bridge.send(manifest, Readable.from(Uint8Array.of(1)))).rejects.toThrow('voice messages cannot be replies')
+    }
+    expect(f.msg.sendMsg).not.toHaveBeenCalled()
+  })
+
+  it('sends one OGG voice item through the native PTT element with seconds duration', async () => {
+    const f = fixture()
+    const root = await mkdtemp(join(tmpdir(), 'qqnt-voice-send-'))
+    tempPaths.push(root)
+    const ogg = join(root, 'voice.ogg')
+    await execFileAsync('ffmpeg', ['-nostdin', '-y', '-v', 'error', '-f', 'lavfi', '-i', 'anullsrc=r=24000:cl=mono', '-t', '0.04', ogg])
+    f.msg.sendMsg.mockImplementationOnce(async (_id, _peer, elements) => {
+      const ptt = elements[0]?.pttElement
+      expect(elements).toMatchObject([{ elementType: 4, pttElement: { duration: expect.any(Number) } }])
+      expect(ptt?.filePath).toMatch(/\.silk$/)
+      expect((await readFile(ptt!.filePath)).length).toBeGreaterThan(0)
+      queueMicrotask(() => f.emitSent({ ...f.message, sendStatus: 2, elements: [{
+        elementType: 4, elementId: 'voice', pttElement: { filePath: ptt!.filePath, fileName: 'voice.silk', fileSize: '1', duration: ptt!.duration },
+      }] }))
+      return { result: 0, errMsg: '' }
+    })
+    const bridge = new QQKernelBridge({ tempPath: join(root, 'cache-root') })
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: root })
+
+    const sent = await bridge.send({
+      conversationId: 'uid-1715311957', media: [{ kind: 'voice', name: 'voice.ogg', mimeType: 'audio/ogg' }],
+    }, Readable.from(await readFile(ogg)))
+    expect(f.msg.sendMsg).toHaveBeenCalledOnce()
+    const voice = sent.parts.find((part) => part.type === 'media' && part.media.voice)
+    expect(voice).toBeDefined()
+    if (!voice || voice.type !== 'media') throw new Error('expected prepared sent voice media')
+    expect(voice.media.locator.filePath).toMatch(/voice-cache\/[^/]+\.ogg$/)
+    expect(voice.media.locator.filePath).not.toMatch(/\.silk$/)
+    const opened = await bridge.openMedia(voice.media.locator)
+    expect(opened).toMatchObject({ mimeType: 'audio/ogg', size: voice.media.size })
+    const bytes = await readStream(opened!.stream)
+    expect(bytes).toEqual(await readFile(voice.media.locator.filePath!))
+    expect(bytes).toHaveLength(voice.media.size!)
   })
 
   it('hides recalled records, maps native videos, and renders unsupported elements as text fallbacks', async () => {
@@ -3611,6 +3784,41 @@ describe('QQBridgeServer', () => {
     expect(JSON.stringify(slowRecord)).not.toContain(callId)
   })
 
+  it('rejects oversized voice bodies before staging, including chunked requests', async () => {
+    const f = fixture()
+    const root = await mkdtemp(join(tmpdir(), 'qqnt-voice-http-limit-'))
+    tempPaths.push(root)
+    const bridge = new QQKernelBridge({ tempPath: join(root, 'cache-root'), voiceInputLimitBytes: 4 })
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: root })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const endpoint = `http://127.0.0.1:${server.address().port}/v1/messages`
+    const manifest = Buffer.from(JSON.stringify({
+      conversationId: 'uid-1715311957', media: [{ kind: 'voice', name: 'voice.ogg' }],
+    })).toString('base64url')
+
+    const declared = await fetch(endpoint, {
+      method: 'POST', headers: { 'x-qqnt-manifest': manifest, 'content-length': '5' }, body: Uint8Array.of(1, 2, 3, 4, 5),
+    })
+    expect(declared.status).toBe(413)
+
+    const chunked = await fetch(endpoint, {
+      method: 'POST', headers: { 'x-qqnt-manifest': manifest },
+      body: new ReadableStream({
+        start(controller) {
+          controller.enqueue(Uint8Array.of(1, 2, 3))
+          controller.enqueue(Uint8Array.of(4, 5, 6))
+          controller.close()
+        },
+      }),
+      duplex: 'half',
+    } as RequestInit & { duplex: 'half' })
+    expect(chunked.status).toBe(500)
+    await expect(chunked.json()).resolves.toMatchObject({ error: expect.stringContaining('voice input exceeds') })
+    await expect(readdir(join(root, '.qqnt-bridge-staging', 'voice')).catch(() => [])).resolves.toEqual([])
+    expect(f.msg.sendMsg).not.toHaveBeenCalled()
+  })
+
   it('serves status, dialogs, and a chunked send endpoint', async () => {
     const f = fixture()
     f.search.searchChatMsgs.mockImplementation(() => {
@@ -3629,7 +3837,7 @@ describe('QQBridgeServer', () => {
     const { port } = server.address()
     const base = `http://127.0.0.1:${port}/v1`
     await expect(fetch(`${base}/status`).then((response) => response.json())).resolves.toMatchObject({
-      protocolVersion: 20, ready: true, selfUin: '10000',
+      protocolVersion: 21, ready: true, selfUin: '10000',
     })
     await expect(fetch(`${base}/dialogs`).then((response) => response.json())).resolves.toMatchObject({
       conversations: [{ peerUin: '1715311957' }],

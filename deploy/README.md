@@ -29,7 +29,7 @@ curl -fsSL https://raw.githubusercontent.com/xuuuuan/crossgram-qqnt/master/deplo
 The QQ executable and resources must be readable by the dedicated
 `qqnt-bridge` service user. AppImages are not injectable in place; install an
 unpacked/native package or point the variables at an extracted QQ tree.
-The API listens on `127.0.0.1:18767` with a random bearer token by default.
+The installer also installs `ffmpeg`, which is required for recorded QQ voice-message (PTT) conversion. The API listens on `127.0.0.1:18767` with a random bearer token by default.
 
 ```sh
 sudo qqntctl qr

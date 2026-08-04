@@ -1,9 +1,9 @@
 import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto'
-import { closeSync, createReadStream, createWriteStream, existsSync, mkdirSync, openSync, readFileSync, readSync, statSync, writeFileSync } from 'node:fs'
-import { open as openFile, readFile, rm, stat } from 'node:fs/promises'
+import { closeSync, createReadStream, createWriteStream, existsSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { open as openFile, readFile, rename, rm, stat } from 'node:fs/promises'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { pipeline } from 'node:stream/promises'
-import { Readable } from 'node:stream'
+import { Readable, Transform } from 'node:stream'
 import { types } from 'node:util'
 import { AsyncQueue, deferred } from './async.js'
 import { markBridgeListener } from './listener-tee.js'
@@ -12,6 +12,7 @@ import { resolveMultiForwardParticipants } from './multi-forward-participants.js
 import type { PCMMediaLease } from './media-gateway.js'
 import { QQPacketClient, type DirectHighwayUpload, type QQPacketClientOptions } from './packet-client.js'
 import { HIGHWAY_BLOCK_SIZE, type DirectMessagePart } from './upload-protocol.js'
+import { decodePttTo, encodePtt, MAX_VOICE_INPUT_BYTES, transcodePttFallbackTo } from './silk-audio.js'
 import type {
   CustomEmotionData, EmojiLikesUserInfo, FileTransNotifyInfo, GroupProfileInfo, InitSessionConfig, KernelAVSDKService, KernelModule, KernelSession,
   MarketStickerPackInfo, MemberInfo, MsgElement, MsgRecord, ProfileSimpleInfo, RecentContactInfo, SearchMsgKeywordsResult,
@@ -86,7 +87,9 @@ export interface QQKernelOptions {
   deleteDedupTtlMs?: number
   stickerMissingCacheTtlMs?: number
   marketStickerMimeCacheDir?: string | false
-mediaGateway?: QQMediaLeaseIssuer
+  /** Test-only override; production uses the 32 MiB voice body limit. */
+  voiceInputLimitBytes?: number
+  mediaGateway?: QQMediaLeaseIssuer
 }
 
 export class QQMediaLeaseUnavailableError extends Error {
@@ -130,6 +133,12 @@ interface MessagePosition {
   id: string
   timestamp: number
   msgSeq?: string
+}
+
+interface PreparedVoiceSource {
+  path: string
+  size: number
+  mtimeMs: number
 }
 
 interface CallSignalState {
@@ -237,7 +246,7 @@ export class QQKernelBridge {
     startedAt: number
     expectedText?: string
     expectedMediaName?: string
-    expectedMediaKind?: 'image' | 'file' | 'sticker'
+    expectedMediaKind?: 'image' | 'file' | 'voice' | 'sticker'
     originRequestId?: string
     assignedMessageId?: string
   }> = []
@@ -269,22 +278,30 @@ export class QQKernelBridge {
   private listenerRetry?: NodeJS.Timeout
   private avsdkListenerRetry?: NodeJS.Timeout
   private readonly tempPath: string
+  private readonly voiceCachePath: string
+  private readonly voicePreparations = new Map<string, Promise<QQMedia | undefined>>()
   private readonly sendTimeoutMs: number
   private readonly userResolveTimeoutMs: number
   private readonly packetClientOptions: QQPacketClientOptions
   private readonly deleteDedupTtlMs: number
   private readonly stickerMissingCacheTtlMs: number
   private readonly marketStickerMimeCacheDir?: string
+  private readonly voiceInputLimitBytes: number
 
   private readonly mediaGateway?: QQMediaLeaseIssuer
 
   constructor(options: QQKernelOptions = {}) {
     this.tempPath = options.tempPath ?? join(process.env.TMPDIR ?? '/tmp', 'qqnt-mtproto-bridge')
+    this.voiceCachePath = join(this.tempPath, 'voice-cache')
     this.sendTimeoutMs = options.sendTimeoutMs ?? 60_000
     this.userResolveTimeoutMs = options.userResolveTimeoutMs ?? 2_000
     this.packetClientOptions = options.packetClient ?? {}
     this.deleteDedupTtlMs = options.deleteDedupTtlMs ?? DELETE_DEDUP_TTL_MS
     this.stickerMissingCacheTtlMs = options.stickerMissingCacheTtlMs ?? STICKER_MISSING_CACHE_TTL_MS
+    this.voiceInputLimitBytes = options.voiceInputLimitBytes ?? MAX_VOICE_INPUT_BYTES
+    if (!Number.isSafeInteger(this.voiceInputLimitBytes) || this.voiceInputLimitBytes <= 0) {
+      throw new Error('voice input limit must be a positive integer')
+    }
     this.marketStickerMimeCacheDir = options.marketStickerMimeCacheDir === false
       || (options.marketStickerMimeCacheDir === undefined && Boolean(process.env.VITEST))
       ? undefined
@@ -297,6 +314,7 @@ export class QQKernelBridge {
       // Incoming call projection fails closed when instance crypto is unavailable.
     }
     mkdirSync(this.tempPath, { recursive: true })
+    this.clearVoiceCache()
   }
 
   get status() {
@@ -305,6 +323,10 @@ export class QQKernelBridge {
       selfUin: this.config?.selfUin,
       selfUid: this.config?.selfUid,
     }
+  }
+
+  get voiceInputLimit(): number {
+    return this.voiceInputLimitBytes
   }
 
   issueMediaLease(callId: unknown): PCMMediaLease {
@@ -325,6 +347,7 @@ export class QQKernelBridge {
   attach(kernel: KernelModule, session: KernelSession, config: InitSessionConfig,
   ): void {
     this.detach()
+    this.clearVoiceCache()
     log('info', `bridge attach start selfUin=${config.selfUin} selfUid=${config.selfUid} listenerConstructors=msg:${Boolean(kernel.NodeIKernelMsgListener)},buddy:${Boolean(kernel.NodeIKernelBuddyListener)},group:${Boolean(kernel.NodeIKernelGroupListener)},recent:${Boolean(kernel.NodeIKernelRecentContactListener)}`)
     // A native wrapper can be re-initialized after logout/account switching.
     // Never leak the previous account's seen peers into the new address book.
@@ -465,6 +488,7 @@ export class QQKernelBridge {
     for (const pending of this.pendingMemberPages.values()) pending.reject(new Error('QQNT session detached'))
     this.pendingMemberPages.clear()
     this.reactionAssets.clear()
+    this.clearVoiceCache()
   }
 
   subscribe(lastEventId?: string): AsyncQueue<QQEvent> {
@@ -744,7 +768,7 @@ export class QQKernelBridge {
     const visibleRecords = response.msgList.filter((record) => !isRecalledRecord(record))
     await this.resolveReplyTargets(visibleRecords)
     await this.resolveGrayTipUsers(visibleRecords)
-    const messages = visibleRecords.map((record) => this.mapMessage(record))
+    const messages = await Promise.all(visibleRecords.map((record) => this.mapMessagePrepared(record)))
     for (const message of messages) this.rememberMessage(message)
     if (!messages.length && !query.beforeId && !query.afterId && !query.cursor) {
       const cached = this.messages.get(conversation.id) ?? []
@@ -819,7 +843,7 @@ export class QQKernelBridge {
     if (!record) return null
     await this.resolveReplyTargets([record])
     await this.resolveGrayTipUsers([record])
-    const message = this.mapMessage(record)
+    const message = await this.mapMessagePrepared(record)
     this.rememberMessage(message)
     return message
   }
@@ -965,11 +989,11 @@ export class QQKernelBridge {
     })
     await this.resolveReplyTargets(ordered)
     await this.resolveGrayTipUsers(ordered)
-    return ordered.map((record) => {
-      const message = this.mapMessage(record)
+    return Promise.all(ordered.map(async (record) => {
+      const message = await this.mapMessagePrepared(record)
       this.rememberMessage(message)
       return message
-    })
+    }))
   }
 
   private async waitForSearchPage(
@@ -1077,9 +1101,9 @@ export class QQKernelBridge {
     if (response.result !== 0) throw new Error(`getMultiMsg: ${response.errMsg} (${response.result})`)
     const records = response.msgList.filter((record) => !isRecalledRecord(record))
     const participants = resolveMultiForwardParticipants(locator, records)
-    return records.map((record) => {
+    return Promise.all(records.map(async (record) => {
       const participant = participants.get(record)!
-      return this.mapMessage(record, {
+      return this.mapMessagePrepared(record, {
         multiForwardRootId: locator.rootMessageId,
         multiForwardConversationId: locator.conversationId,
         sender: {
@@ -1094,7 +1118,7 @@ export class QQKernelBridge {
         // account is a participant in that archive, not the live account peer.
         outgoing: false,
       })
-    })
+    }))
   }
 
   private async getMessageRecord(conversation: QQConversation, id: string): Promise<MsgRecord | null> {
@@ -1482,6 +1506,10 @@ export class QQKernelBridge {
   }
 
   async send(manifest: SendManifest, body: Readable): Promise<QQMessage> {
+    const voice = manifest.media?.find((media) => media.kind === 'voice')
+    if (voice && (manifest.replyToId || manifest.replyToSequence)) {
+      throw new Error('voice messages cannot be replies')
+    }
     const conversation = this.getConversation(manifest.conversationId)
     const peerUin = await this.requireProtocolPeerUin(conversation)
     const protocolParts: DirectMessagePart[] = []
@@ -1491,12 +1519,16 @@ export class QQKernelBridge {
     } else if (manifest.text) protocolParts.push({ kind: 'text', text: manifest.text })
     const cleanup: string[] = []
     const sentMediaPaths: Array<string | undefined> = []
+    let voicePtt: { filePath: string, duration: number } | undefined
     let preserveUntil: number | undefined
     try {
       if (manifest.uploadedMedia && !manifest.media?.length) {
         throw new Error('uploaded media requires matching media metadata')
       }
       if (manifest.sticker && manifest.media?.length) throw new Error('a message cannot contain both sticker and media')
+      if (voice && (manifest.media?.length !== 1 || manifest.text || manifest.textParts?.length || manifest.sticker || manifest.uploadedMedia)) {
+        throw new Error('voice messages must contain exactly one voice item')
+      }
       if (manifest.sticker?.kind === 'sysface') {
         this.rememberSticker(stickerFromReference(manifest.sticker))
         protocolParts.push({ kind: 'face', face: {
@@ -1550,6 +1582,24 @@ export class QQKernelBridge {
           : undefined
         if (manifest.uploadedMedia) body.resume()
         for (const [index, spec] of manifest.media.entries()) {
+          if (spec.kind === 'voice') {
+            const stagingRoot = this.stagingPath('voice')
+            mkdirSync(stagingRoot, { recursive: true })
+            const inputPath = join(stagingRoot, `${randomUUID()}${safeExtension(spec.name)}`)
+            const silkPath = `${inputPath}.silk`
+            cleanup.push(inputPath, silkPath)
+            try {
+              await pipeline(body, byteLimitTransform(this.voiceInputLimitBytes), createWriteStream(inputPath, { flags: 'wx' }))
+            } catch (error) {
+              await rm(inputPath, { force: true })
+              throw error
+            }
+            const duration = await encodePtt(inputPath, silkPath)
+            if (!Number.isFinite(duration) || duration < 0) throw new Error('voice duration is invalid')
+            voicePtt = { filePath: silkPath, duration }
+            sentMediaPaths.push(silkPath)
+            continue
+          }
           const prepared = manifest.uploadedMedia?.[index]
           if (prepared) {
             if (prepared.kind !== spec.kind) throw new Error(`uploaded media ${index} kind does not match`)
@@ -1652,7 +1702,7 @@ export class QQKernelBridge {
       } else {
         body.resume()
       }
-      if (!protocolParts.length) throw new Error('message must contain text, media, or sticker')
+      if (!protocolParts.length && !voicePtt) throw new Error('message must contain text, media, or sticker')
       const startedAt = Math.floor(Date.now() / 1000)
       const id = '0'
       const pending = deferred<MsgRecord>()
@@ -1665,18 +1715,20 @@ export class QQKernelBridge {
         minimumStatus,
         startedAt,
         expectedText: manifest.textParts?.map((part) => part.text).join('') || manifest.text,
-        expectedMediaName: manifest.media?.[0]?.name,
+        expectedMediaName: manifest.media?.[0]?.kind === 'voice' ? undefined : manifest.media?.[0]?.name,
         expectedMediaKind: manifest.sticker ? 'sticker' : manifest.media?.[0]?.kind,
         originRequestId: manifest.originRequestId,
       })
-      log('info', `protocol API start name=MessageSvc.PbSendMsg conversation=${conversation.id} parts=${protocolParts.length} minimumStatus=${minimumStatus}`)
-      const sendRequest = this.packetClientForSession().sendDirectMessage(
-        conversation.chatType as 1 | 2,
-        conversation.peerUid,
-        peerUin,
-        protocolParts,
-        this.requireConfig().selfUid,
-      )
+      const sendRequest = voicePtt
+        ? this.sendNativeVoice(conversation, voicePtt)
+        : this.packetClientForSession().sendDirectMessage(
+          conversation.chatType as 1 | 2,
+          conversation.peerUid,
+          peerUin,
+          protocolParts,
+          this.requireConfig().selfUid,
+        )
+      log('info', `protocol API start name=${voicePtt ? 'KernelMsgService.sendMsg' : 'MessageSvc.PbSendMsg'} conversation=${conversation.id} parts=${protocolParts.length} minimumStatus=${minimumStatus}`)
       const sendResponse = await Promise.race([
         sendRequest,
         pending.promise.then(() => undefined),
@@ -1691,10 +1743,10 @@ export class QQKernelBridge {
         manifest.textParts?.map((part) => part.text).join('') || manifest.text,
         startedAt,
         manifest.sticker ? 'sticker' : manifest.media?.[0]?.kind,
-        manifest.media?.[0]?.name,
+        manifest.media?.[0]?.kind === 'voice' ? undefined : manifest.media?.[0]?.name,
         minimumStatus,
         pollController.signal,
-        sendResponse
+        !voicePtt && sendResponse
           ? String(conversation.chatType === CHAT_C2C
               ? sendResponse.clientSequence || sendResponse.sequence
               : sendResponse.sequence || sendResponse.clientSequence)
@@ -1712,14 +1764,14 @@ export class QQKernelBridge {
           removePending(this.pendingUnassigned, pending)
         })
       this.rememberMessageOrigin(record.msgId, manifest.originRequestId)
-      const message = this.mapMessage(record)
+      const message = await this.mapMessagePrepared(record)
       log('info', `protocol API confirmed name=MessageSvc.PbSendMsg conversation=${conversation.id} requestedMessage=${id} confirmedMessage=${message.id} status=${record.sendStatus}`)
       if (manifest.media?.length && sentMediaPaths.length) {
         const mediaParts = message.parts.filter((part) => part.type === 'media')
         for (const [index, media] of mediaParts.entries()) {
           const spec = manifest.media[index]
           const path = sentMediaPaths[index]
-          if (!spec || !path || media.type !== 'media') continue
+          if (!spec || !path || media.type !== 'media' || spec.kind === 'voice') continue
           media.media.locator.filePath = path
           media.media.size ??= spec.size
           media.media.width ??= spec.width
@@ -1740,6 +1792,21 @@ export class QQKernelBridge {
       } else {
         await Promise.all(cleanup.map((path) => rm(path, { force: true }).catch(() => undefined)))
       }
+    }
+  }
+
+  private async sendNativeVoice(
+    conversation: QQConversation,
+    ptt: { filePath: string, duration: number },
+  ): Promise<void> {
+    const service = this.requireMsgService()
+    const sendMsg = (service as { sendMsg?: unknown }).sendMsg
+    if (typeof sendMsg !== 'function') throw new Error('native QQ voice sending is unavailable (KernelMsgService.sendMsg)')
+    const result = await sendMsg.call(service, randomUUID(), {
+      chatType: conversation.chatType, peerUid: conversation.peerUid, guildId: '',
+    }, [{ elementType: 4, elementId: '', pttElement: ptt }], new Map<number, unknown>())
+    if (!result || typeof result !== 'object' || result.result !== 0) {
+      throw new Error(`native QQ voice send failed: ${result?.errMsg ?? 'unknown error'}`)
     }
   }
 
@@ -1851,7 +1918,7 @@ export class QQKernelBridge {
         .sort((left, right) => Number(right.msgTime) - Number(left.msgTime))[0]
       : undefined
     if (previous) {
-      const readInboxMaxMessage = this.mapMessage(previous)
+      const readInboxMaxMessage = await this.mapMessagePrepared(previous)
       this.rememberMessage(readInboxMaxMessage)
       this.mergeConversation({ ...conversation, readInboxMaxMessage })
       log('info', `native API complete name=readMarker conversation=${conversation.id} firstUnreadSeq=${unreadSeq} readMessage=${readInboxMaxMessage.id}`)
@@ -2008,7 +2075,7 @@ export class QQKernelBridge {
       'QQ reaction lookup timed out',
     )
     if (!record) return { reactions: [], maxSelected: 20 }
-    const message = this.mapMessage(record)
+    const message = await this.mapMessagePrepared(record)
     const previous = (this.messages.get(conversation.id) ?? []).find((item) => item.id === messageId)
     if (record.emojiLikesList === undefined && previous?.reactionContext) {
       message.reactionContext = previous.reactionContext
@@ -2147,7 +2214,7 @@ export class QQKernelBridge {
       await delay(200)
       record = await this.getMessageRecord(conversation, messageId).catch(() => record)
     }
-    const message = record ? this.mapMessage(record) : (cached ?? null)
+    const message = record ? await this.mapMessagePrepared(record) : (cached ?? null)
     if (!message) throw new Error(`QQ reaction target not found: ${messageId}`)
     const current = new Set((message.reactionContext?.reactions ?? []).filter((item) => item.selected)
       .map((item) => item.key))
@@ -2317,19 +2384,173 @@ export class QQKernelBridge {
     return this.packetClientForSession().getMediaDirectUrl(locator, this.requireConfig().selfUid)
   }
 
+  private clearVoiceCache(): void {
+    this.voicePreparations.clear()
+    rmSync(this.voiceCachePath, { recursive: true, force: true })
+    mkdirSync(this.voiceCachePath, { recursive: true, mode: 0o700 })
+  }
+
+  private trustedMediaRoots(): string[] {
+    return [
+      this.config?.userPath,
+      process.env.XDG_CONFIG_HOME,
+      process.env.HOME ? join(process.env.HOME, '.config') : undefined,
+    ].flatMap((root) => {
+      try { return typeof root === 'string' && root.length ? [realpathSync(root)] : [] } catch { return [] }
+    })
+  }
+
+  private trustedVoiceSource(path: string | undefined): PreparedVoiceSource | undefined {
+    try {
+      const canonical = path && realpathSync(path)
+      if (!canonical || !this.trustedMediaRoots().some((root) => isPathInside(root, canonical))) return
+      const info = statSync(canonical)
+      return info.isFile() && info.size > 0 ? { path: canonical, size: info.size, mtimeMs: info.mtimeMs } : undefined
+    } catch {
+      return
+    }
+  }
+
+  private trustedVoiceCache(path: string | undefined): string | undefined {
+    try {
+      const canonical = path && realpathSync(path)
+      if (!canonical || !isPathInside(realpathSync(this.voiceCachePath), canonical) || !statSync(canonical).isFile()) return
+      return canonical
+    } catch {
+      return
+    }
+  }
+
+  private mapMedia(record: MsgRecord, element: MsgElement): QQMedia | undefined {
+    const media = mapMedia(record, element)
+    return media?.voice && !this.trustedVoiceSource(media.locator.filePath) ? undefined : media
+  }
+
+  private async prepareVoiceMedia(media: QQMedia): Promise<QQMedia | undefined> {
+    const source = this.trustedVoiceSource(media.locator.filePath)
+    if (!source) return
+    const key = createHash('sha256').update(source.path).update('\0').update(String(source.size)).update('\0').update(String(source.mtimeMs)).digest('hex')
+    let preparation = this.voicePreparations.get(key)
+    if (!preparation) {
+      preparation = this.convertVoiceMedia(media, source, key)
+        .catch((error) => {
+          log('warn', `QQ voice conversion failed source=${source.path}`, error)
+          return undefined
+        })
+        .finally(() => this.voicePreparations.delete(key))
+      this.voicePreparations.set(key, preparation)
+    }
+    return preparation
+  }
+
+  private async prepareVoiceMediaFromLocator(locator: QQMediaLocator): Promise<QQMedia | undefined> {
+    const { sourcePath, sourceSize, sourceMtimeMs } = locator
+    if (typeof sourcePath !== 'string'
+      || typeof sourceSize !== 'number'
+      || !Number.isSafeInteger(sourceSize)
+      || sourceSize <= 0
+      || typeof sourceMtimeMs !== 'number'
+      || !Number.isFinite(sourceMtimeMs)) return
+    const source = this.trustedVoiceSource(sourcePath)
+    if (!source
+      || source.path !== sourcePath
+      || source.size !== sourceSize
+      || source.mtimeMs !== sourceMtimeMs) return
+    return this.prepareVoiceMedia({
+      id: locator.elementId || `${locator.messageId}:voice`, kind: 'file', voice: true,
+      name: locator.fileName || 'voice.ogg', mimeType: 'audio/ogg',
+      locator: { ...locator, filePath: source.path },
+    })
+  }
+
+  private async convertVoiceMedia(media: QQMedia, source: PreparedVoiceSource, key: string): Promise<QQMedia> {
+    const outputPath = join(this.voiceCachePath, `${key}.ogg`)
+    const existing = this.trustedVoiceCache(outputPath)
+    if (!existing) {
+      const temporaryPath = `${outputPath}.${randomUUID()}.tmp`
+      try {
+        try {
+          await decodePttTo(source.path, temporaryPath)
+        } catch {
+          await rm(temporaryPath, { force: true }).catch(() => undefined)
+          await transcodePttFallbackTo(source.path, temporaryPath)
+        }
+        await rename(temporaryPath, outputPath)
+      } catch (error) {
+        await rm(temporaryPath, { force: true }).catch(() => undefined)
+        throw error
+      }
+    }
+    const preparedPath = this.trustedVoiceCache(outputPath)
+    if (!preparedPath) throw new Error('prepared QQ voice cache file is unavailable')
+    const size = statSync(preparedPath).size
+    const name = media.name?.replace(/(?:\.[^./\\]+)?$/, '.ogg') || 'voice.ogg'
+    return {
+      ...media,
+      name,
+      mimeType: 'audio/ogg',
+      size,
+      locator: {
+        ...media.locator,
+        fileName: name,
+        fileSize: String(size),
+        filePath: preparedPath,
+        sourcePath: source.path,
+        sourceSize: source.size,
+        sourceMtimeMs: source.mtimeMs,
+      },
+    }
+  }
+
+  private async mapMessagePrepared(
+    record: MsgRecord,
+    context: MessageMappingContext = {},
+  ): Promise<QQMessage> {
+    const message = this.mapMessage(record, context)
+    let changed = false
+    const parts = await Promise.all(message.parts.map(async (part) => {
+      if (part.type !== 'media' || !part.media.voice) return part
+      const media = await this.prepareVoiceMedia(part.media)
+      if (media) {
+        changed = true
+        return { type: 'media' as const, media }
+      }
+      changed = true
+      return { type: 'text' as const, text: part.media.duration ? `[语音 ${part.media.duration}秒]` : '[语音]' }
+    }))
+    return changed ? { ...message, parts } : message
+  }
+
   async openMedia(
     locator: QQMediaLocator,
     range: { offset?: number, limit?: number } = {},
   ): Promise<{ stream: Readable, mimeType: string, size: number, offset: number, length: number } | undefined> {
-    const roots = [
-      this.requireConfig().userPath,
-      process.env.XDG_CONFIG_HOME,
-      process.env.HOME ? join(process.env.HOME, '.config') : undefined,
-    ]
-      .filter((root): root is string => typeof root === 'string' && root.length > 0)
-    const filePath = locator.filePath
-    if (!filePath || !roots.some((root) => isPathInside(root, filePath))
-      || !existsSync(filePath)) return
+    if (locator.kind === 'voice') {
+      let filePath = this.trustedVoiceCache(locator.filePath)
+      if (!filePath) {
+        const prepared = await this.prepareVoiceMediaFromLocator(locator)
+        filePath = this.trustedVoiceCache(prepared?.locator.filePath)
+      }
+      if (!filePath) return
+      const size = statSync(filePath).size
+      const offset = Math.max(0, Math.trunc(range.offset ?? 0))
+      const available = Math.max(0, size - offset)
+      const requested = range.limit === undefined ? available : Math.max(0, Math.trunc(range.limit))
+      const length = Math.min(available, requested)
+      return {
+        stream: length
+          ? createReadStream(filePath, { start: offset, end: offset + length - 1 })
+          : Readable.from([]),
+        mimeType: 'audio/ogg', size, offset, length,
+      }
+    }
+    let filePath: string | undefined
+    try {
+      filePath = locator.filePath && realpathSync(locator.filePath)
+    } catch {
+      return
+    }
+    if (!filePath || !this.trustedMediaRoots().some((root) => isPathInside(root, filePath)) || !statSync(filePath).isFile()) return
     const size = statSync(filePath).size
     const offset = Math.max(0, Math.trunc(range.offset ?? 0))
     const available = Math.max(0, size - offset)
@@ -3098,7 +3319,8 @@ export class QQKernelBridge {
             matchesElementKind(element, item.expectedMediaKind!)))
           && (!item.expectedMediaName || record.elements.some((element) =>
             element.fileElement?.fileName === item.expectedMediaName
-            || element.picElement?.fileName === item.expectedMediaName)
+            || element.picElement?.fileName === item.expectedMediaName
+            || element.pttElement?.fileName === item.expectedMediaName)
             || item.expectedMediaKind === 'image'))
         // Current QQNT builds can return no usable ID from getMsgUniqueId().
         // Their first onAddSendMsg callback for images and stickers also omits
@@ -3131,8 +3353,8 @@ export class QQKernelBridge {
           this.pendingUnassigned.splice(index, 1)[0].pending.resolve(record)
         }
       }
-      const conversation = this.conversationFromRecord(record)
-      const message = this.mapMessage(record)
+      const message = await this.mapMessagePrepared(record)
+      const conversation = this.conversationFromRecord(record, message)
       const pendingMerged = outgoing && this.pendingMergedForwards.some((item) =>
         item.conversationId === conversation.id
         && Number(record.msgTime) >= item.startedAt - 1)
@@ -3224,7 +3446,7 @@ export class QQKernelBridge {
     const targetRecord = record
     const previous = cached
       ?? (this.messages.get(conversation.id) ?? []).find((message) => message.id === targetRecord.msgId)
-    const refreshed = this.mapMessage(targetRecord)
+    const refreshed = await this.mapMessagePrepared(targetRecord)
     if (targetRecord.emojiLikesList === undefined && previous?.reactionContext) {
       refreshed.reactionContext = previous.reactionContext
     }
@@ -3346,7 +3568,7 @@ export class QQKernelBridge {
     conversation: QQConversation,
     expectedText: string | undefined,
     startedAt: number,
-    expectedMediaKind: 'image' | 'file' | 'sticker' | undefined,
+    expectedMediaKind: 'image' | 'file' | 'voice' | 'sticker' | undefined,
     expectedMediaName: string | undefined,
     minimumStatus: number,
     signal: AbortSignal,
@@ -3392,7 +3614,8 @@ export class QQKernelBridge {
         && (expectedMediaKind === undefined || record.elements.some((element) =>
           matchesElementKind(element, expectedMediaKind)))
         && (expectedMediaName === undefined || expectedMediaKind === 'image' || record.elements.some((element) =>
-          element.fileElement?.fileName === expectedMediaName)))
+          element.fileElement?.fileName === expectedMediaName
+          || element.pttElement?.fileName === expectedMediaName)))
       if (found?.sendStatus === 0) throw new Error(`QQ send failed: ${found.msgId}`)
       if (found && found.sendStatus >= minimumStatus) return found
       await new Promise((resolve) => setTimeout(resolve, 500))
@@ -3621,10 +3844,9 @@ export class QQKernelBridge {
     })
   }
 
-  private conversationFromRecord(record: MsgRecord): QQConversation {
+  private conversationFromRecord(record: MsgRecord, message = this.mapMessage(record)): QQConversation {
     const id = conversationId(record.chatType as 1 | 2, record.peerUid)
     const current = this.contacts.get(id)
-    const message = this.mapMessage(record)
     const conversation: QQConversation = {
       id,
       kind: record.chatType === CHAT_GROUP ? 'group' : 'direct',
@@ -3722,7 +3944,7 @@ export class QQKernelBridge {
           if ((!senderId || senderId === '0') && action.actorId) senderId = action.actorId
           continue
         }
-        const media = mapMedia(record, element)
+        const media = this.mapMedia(record, element)
         if (media) parts.push({ type: 'media', media })
         else {
           const fallback = fallbackElementText(element, this.config?.selfUid)
@@ -4131,7 +4353,7 @@ export class QQKernelBridge {
       }, }
   }
 
-  private stagingPath(kind?: 'image' | 'file'): string {
+  private stagingPath(kind?: 'image' | 'file' | 'voice'): string {
     if (kind === 'image') {
       try {
         const nativeDir = this.requireSession().getRichMediaService().getRichMediaFileDir?.(
@@ -4618,11 +4840,11 @@ export class QQKernelBridge {
             (record.sendStatus >= 2 && isMultiForwardRecord(record))),
       )
       if (forwarded.length >= expected) {
-        return forwarded.slice(0, expected).reverse().map((record) => {
-          const message = this.mapMessage(record)
+        return Promise.all(forwarded.slice(0, expected).reverse().map(async (record) => {
+          const message = await this.mapMessagePrepared(record)
           this.rememberMessage(message)
           return message
-        })
+        }))
       }
       await delay(100)
     } while (Date.now() < deadline)
@@ -4773,6 +4995,16 @@ async function imageFileDimensions(path: string): Promise<{ width: number, heigh
   }
 }
 
+function byteLimitTransform(limit: number): Transform {
+  let received = 0
+  return new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      received += chunk.length
+      callback(received > limit ? new Error(`voice input exceeds the ${limit} byte limit`) : null, chunk)
+    },
+  })
+}
+
 async function hashFile(path: string, algorithm: string): Promise<string> {
   const hash = createHash(algorithm)
   for await (const chunk of createReadStream(path)) hash.update(chunk)
@@ -4792,6 +5024,22 @@ function mapMedia(record: MsgRecord, element: MsgElement): QQMedia | undefined {
     elementId: element.elementId,
     chatType: record.chatType as 1 | 2,
     peerUid: record.peerUid,
+  }
+  if (element.pttElement) {
+    const ptt = element.pttElement
+    const filePath = ptt.filePath
+    if (!filePath || !existsSync(filePath) || statSync(filePath).size <= 0) return
+    const duration = numberOrUndefined(ptt.duration)
+    return {
+      id: element.elementId || `${record.msgId}:voice`,
+      kind: 'file', voice: true, name: ptt.fileName || 'voice.ogg', mimeType: 'audio/ogg',
+      size: numberOrUndefined(ptt.fileSize) ?? statSync(filePath).size,
+      duration: duration !== undefined && duration >= 0 ? duration : undefined,
+      locator: {
+        ...base, kind: 'voice', fileName: ptt.fileName || basename(filePath), fileSize: ptt.fileSize === undefined ? undefined : String(ptt.fileSize),
+        filePath, fileUuid: ptt.fileUuid, md5: ptt.md5HexStr,
+      },
+    }
   }
   if (element.picElement) {
     const picture = element.picElement
@@ -5096,7 +5344,7 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, Math.trunc(value)))
 }
 
-function numberOrUndefined(value?: string): number | undefined {
+function numberOrUndefined(value?: string | number): number | undefined {
   const parsed = Number(value)
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined
 }
@@ -5139,8 +5387,9 @@ function favoritePackVersion(stickers: QQSticker[]): number {
 }
 
 function matchesElementKind(
-  element: MsgElement, kind: 'image' | 'file' | 'sticker',
+  element: MsgElement, kind: 'image' | 'file' | 'voice' | 'sticker',
 ): boolean {
+  if (kind === 'voice') return Boolean(element.pttElement)
   if (kind === 'file') return Boolean(element.fileElement)
   if (kind === 'sticker') {
     return ( Boolean(element.marketFaceElement)
@@ -5746,8 +5995,9 @@ function decodeXmlText(text: string): string {
 function fallbackElementText(element: MsgElement, selfUid?: string): string {
   if (element.pttElement) {
     const transcript = element.pttElement.text?.trim()
-    return transcript ? `[语音] ${transcript}` : element.pttElement.duration > 0
-      ? `[语音 ${element.pttElement.duration}秒]`
+    const duration = numberOrUndefined(element.pttElement.duration)
+    return transcript ? `[语音] ${transcript}` : duration !== undefined && duration > 0
+      ? `[语音 ${duration}秒]`
       : '[语音]'
   }
   if (element.videoElement) return element.videoElement.fileName

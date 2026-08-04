@@ -64,19 +64,19 @@ install_runtime_dependencies() {
     package_manager=apt
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
-    apt-get install -y --no-install-recommends ca-certificates curl dbus-x11 qrencode xvfb
+    apt-get install -y --no-install-recommends ca-certificates curl dbus-x11 ffmpeg qrencode xvfb
   elif command -v dnf >/dev/null 2>&1; then
     package_manager=dnf
-    dnf install -y ca-certificates curl dbus-daemon qrencode xorg-x11-server-Xvfb shadow-utils
+    dnf install -y ca-certificates curl dbus-daemon ffmpeg qrencode xorg-x11-server-Xvfb shadow-utils
   elif command -v yum >/dev/null 2>&1; then
     package_manager=yum
-    yum install -y ca-certificates curl dbus-daemon qrencode xorg-x11-server-Xvfb shadow-utils
+    yum install -y ca-certificates curl dbus-daemon ffmpeg qrencode xorg-x11-server-Xvfb shadow-utils
   elif command -v pacman >/dev/null 2>&1; then
     package_manager=pacman
-    pacman -Sy --needed --noconfirm ca-certificates curl dbus qrencode xorg-server-xvfb shadow
+    pacman -Sy --needed --noconfirm ca-certificates curl dbus ffmpeg qrencode xorg-server-xvfb shadow
   elif command -v zypper >/dev/null 2>&1; then
     package_manager=zypper
-    zypper --non-interactive install ca-certificates curl dbus-1 qrencode xorg-x11-server-Xvfb shadow
+    zypper --non-interactive install ca-certificates curl dbus-1 ffmpeg qrencode xorg-x11-server-Xvfb shadow
   else
     package_manager=manual
     echo "No supported package manager was found; checking preinstalled dependencies..." >&2
@@ -85,14 +85,17 @@ install_runtime_dependencies() {
 
 install_runtime_dependencies
 missing_commands=
-for command_name in curl tar Xvfb dbus-run-session qrencode systemctl getent groupadd useradd; do
+for command_name in curl tar Xvfb dbus-run-session qrencode ffmpeg systemctl getent groupadd useradd; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
     missing_commands="$missing_commands $command_name"
   fi
 done
 if [ -n "$missing_commands" ]; then
   echo "missing required commands:$missing_commands" >&2
-  echo "install the matching Xvfb, D-Bus, qrencode, curl, tar, systemd and shadow-utils packages, then rerun" >&2
+  echo "install the matching Xvfb, D-Bus, qrencode, ffmpeg, curl, tar, systemd and shadow-utils packages, then rerun" >&2
+  if ! command -v ffmpeg >/dev/null 2>&1; then
+    echo "ffmpeg is required for QQ voice messages. The $package_manager install did not provide it; enable a repository that supplies ffmpeg or install it manually, then rerun." >&2
+  fi
   exit 1
 fi
 

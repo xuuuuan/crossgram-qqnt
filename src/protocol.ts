@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 20
+export const PROTOCOL_VERSION = 21
 
 /** Local Unix-socket PCM media protocol. Audio frames use a 1-byte type plus a 4-byte big-endian length. */
 export const PCM_MEDIA_PROTOCOL_VERSION = 1
@@ -42,9 +42,13 @@ export interface QQMediaLocator {
   elementId: string
   chatType: QQChatType
   peerUid: string
-  kind: 'image' | 'file'
+  kind: 'image' | 'file' | 'voice'
   fileName: string
   fileSize?: string
+  /** For prepared voice media, the trusted original PTT identity. */
+  sourcePath?: string
+  sourceSize?: number
+  sourceMtimeMs?: number
   filePath?: string
   fileUuid?: string
   fileSubId?: string
@@ -65,6 +69,8 @@ export interface QQMediaLocator {
 export interface QQMedia {
   id: string
   kind: 'image' | 'file'
+  /** Recorded PTT rather than an ordinary audio file. */
+  voice?: boolean
   name?: string
   mimeType?: string
   size?: number
@@ -318,7 +324,7 @@ export interface QQReactionSummary {
 }
 
 export interface QQSendMediaSpec {
-  kind: 'image' | 'file'
+  kind: 'image' | 'file' | 'voice'
   name: string
   mimeType?: string
   size?: number
@@ -370,6 +376,7 @@ export interface SendManifest {
   text?: string
   textParts?: QQTextPart[]
   replyToId?: string
+  replyToSequence?: string
   originRequestId?: string
   sticker?: QQStickerReference
   /** Length-prefixed chunks terminated by a zero-length frame for each media item. */

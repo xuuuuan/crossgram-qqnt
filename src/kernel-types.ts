@@ -170,7 +170,17 @@ export interface MsgElement {
       }
     }
   }
-  pttElement?: { duration: number, text?: string }
+  pttElement?: {
+    duration: number | string
+    fileName?: string
+    filePath?: string
+    fileSize?: number | string
+    fileUuid?: string
+    formatType?: number | string
+    md5HexStr?: string
+    text?: string
+    waveAmplitudes?: number[]
+  }
   videoElement?: {
     filePath?: string
     fileName: string

@@ -446,6 +446,14 @@ export class QQBridgeServer {
     }
     if (request.method === 'POST' && path === '/v1/messages') {
       const manifest = decodeManifest(request.headers['x-qqnt-manifest'])
+      const contentLength = Number(request.headers['content-length'])
+      if (manifest.media?.some((media) => media.kind === 'voice')
+        && Number.isSafeInteger(contentLength)
+        && contentLength > this.bridge.voiceInputLimit) {
+        request.resume()
+        json(response, 413, { error: `voice input exceeds the ${this.bridge.voiceInputLimit} byte limit` })
+        return
+      }
       log('info', `HTTP API send start id=${requestId} conversation=${manifest.conversationId} textLength=${manifest.text?.length ?? 0} media=${manifest.media?.map((item) => `${item.kind}:${item.name}:${item.size ?? '?'}`).join(',') || '<none>'}`)
       const message = await this.bridge.send(manifest, request)
       log('info', `HTTP API send complete id=${requestId} conversation=${manifest.conversationId} message=${message.id} parts=${message.parts.length}`)
