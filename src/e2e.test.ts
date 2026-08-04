@@ -48,6 +48,36 @@ async function resolve(kind: 'direct' | 'group', id: string) {
 }
 
 describe.skipIf(!enabled)('live QQNT bridge E2E', () => {
+  it('publishes non-zero sizes for every custom reaction and serves their first byte range', async () => {
+    const catalogResponse = await fetch(`${base}/reactions/catalog`, { headers: headers() })
+    expect(catalogResponse.status, await catalogResponse.clone().text()).toBe(200)
+    const catalog = await catalogResponse.json() as {
+      available: Array<{
+        key: string
+        presentation: { type: 'emoji' } | {
+          type: 'custom'
+          resource: { size?: number }
+        }
+      }>
+    }
+    const custom = catalog.available.filter((item) => item.presentation.type === 'custom')
+    expect(custom.length).toBeGreaterThan(0)
+    const missingSizes = custom.flatMap((definition) => definition.presentation.type === 'custom'
+      && (definition.presentation.resource.size ?? 0) <= 0 ? [definition.key] : [])
+    expect(missingSizes, `custom reactions missing byte sizes: ${missingSizes.slice(0, 20).join(', ')}`).toEqual([])
+    for (const definition of custom) {
+      if (definition.presentation.type !== 'custom') continue
+      const response = await fetch(`${base}/reactions/asset`, {
+        method: 'POST',
+        headers: headers({ 'content-type': 'application/json', range: 'bytes=0-1' }),
+        body: JSON.stringify({ reactionKey: definition.key }),
+      })
+      expect(response.status, definition.key).toBe(206)
+      expect(response.headers.get('content-range'), definition.key).toMatch(/^bytes 0-1\//)
+      expect(new Uint8Array(await response.arrayBuffer()), definition.key).toHaveLength(2)
+    }
+  }, 180_000)
+
   it('keeps a real animated market sticker MIME aligned with the raw asset bytes', async () => {
     const packsResponse = await fetch(`${base}/stickers/packs?limit=100`, { headers: headers() })
     expect(packsResponse.status, await packsResponse.clone().text()).toBe(200)

@@ -3533,7 +3533,8 @@ describe('QQKernelBridge', () => {
         presentation: expect.objectContaining({
           type: 'custom', alt: '🙂',
           resource: expect.objectContaining({
-            format: 'video', mimeType: 'video/webm', locator: { reactionKey: '1:14' },
+            format: 'video', mimeType: 'video/webm', size: png.length,
+            locator: { reactionKey: '1:14' },
           }),
         }),
       }),

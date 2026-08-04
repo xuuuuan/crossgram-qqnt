@@ -4193,7 +4193,11 @@ export class QQKernelBridge {
             mimeType: animated ? 'video/webm' : 'image/png',
             width: dimensions?.width ?? 128,
             height: dimensions?.height ?? 128,
-            size: animated ? undefined : info.size,
+            // The HTTP resource is the raw APNG file even though the wire
+            // catalog keeps the legacy video/webm marker for compatibility.
+            // Telegram clients refuse to schedule zero-sized custom emoji
+            // documents, so always expose the actual on-disk byte length.
+            size: info.size,
             locator: { reactionKey: key },
           },
         },
