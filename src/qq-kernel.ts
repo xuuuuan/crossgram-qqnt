@@ -7,7 +7,7 @@ import { pipeline } from 'node:stream/promises'
 import { Readable, Transform } from 'node:stream'
 import { types } from 'node:util'
 import { AsyncQueue, deferred } from './async.js'
-import { markBridgeListener } from './listener-tee.js'
+import { markBridgeListener, observeAVSDKActions } from './listener-tee.js'
 import { log, logPath } from './log.js'
 import { resolveMultiForwardParticipants } from './multi-forward-participants.js'
 import type { PCMMediaLease } from './media-gateway.js'
@@ -124,6 +124,13 @@ export interface QQKernelOptions {
   /** Test-only override; production uses the 32 MiB voice body limit. */
   voiceInputLimitBytes?: number
   mediaGateway?: QQMediaLeaseIssuer
+  callController?: QQCallController
+}
+
+export type QQCallOperation = 'accept' | 'reject' | 'hangup'
+
+export interface QQCallController {
+  control(operation: QQCallOperation): Promise<void>
 }
 
 export class QQMediaLeaseUnavailableError extends Error {
@@ -137,6 +144,20 @@ export class QQMediaLeaseAuthorizationError extends Error {
   constructor() {
     super('media lease unauthorized')
     this.name = 'QQMediaLeaseAuthorizationError'
+  }
+}
+
+export class QQCallControlAuthorizationError extends Error {
+  constructor() {
+    super('call control is not authorized')
+    this.name = 'QQCallControlAuthorizationError'
+  }
+}
+
+export class QQCallControlUnavailableError extends Error {
+  constructor() {
+    super('QQ renderer call control is unavailable')
+    this.name = 'QQCallControlUnavailableError'
   }
 }
 
@@ -436,6 +457,7 @@ export class QQKernelBridge {
   private readonly groupJoinContractProbeEnabled: boolean
   private readonly groupJoinWrapperPath?: string
   private groupJoinContractProbe: QQGroupJoinContractProbe = DISABLED_GROUP_JOIN_CONTRACT_PROBE
+  private readonly callController?: QQCallController
 
   constructor(options: QQKernelOptions = {}) {
     this.groupJoinContractProbeEnabled = process.env.QQNT_BRIDGE_GROUP_JOIN_CONTRACT_PROBE === '1'
@@ -461,6 +483,7 @@ export class QQKernelBridge {
       ? undefined
       : options.marketStickerMimeCacheDir ?? join(dirname(logPath), 'sticker-mime')
     this.mediaGateway = options.mediaGateway
+    this.callController = options.callController
     try {
       this.requestCursorSecret = randomBytes(32)
       this.callSignalSecret = randomBytes(CALL_SIGNAL_SECRET_BYTES)
@@ -471,6 +494,7 @@ export class QQKernelBridge {
     mkdirSync(this.tempPath, { recursive: true })
     this.clearVoiceCache()
     this.pruneFlashTransferFiles()
+    observeAVSDKActions((payload) => this.onObservedCallAction(payload))
   }
 
   get status() {
@@ -576,6 +600,34 @@ export class QQKernelBridge {
       throw new QQMediaLeaseAuthorizationError()
     }
     return this.mediaGateway.issueLease({ callId: state.callId })
+  }
+
+  /**
+   * Control the exact active QQ call through QQ's mounted renderer handlers.
+   * The opaque call ID prevents a stale Telegram call from accepting or ending
+   * a newer invite.
+   */
+  async controlCall(callId: unknown, operation: QQCallOperation): Promise<void> {
+    const state = this.callSignalState
+    if (typeof callId !== 'string' || !state || state.callId !== callId || state.signal === 'ended') {
+      throw new QQCallControlAuthorizationError()
+    }
+    if (!this.callController) throw new QQCallControlUnavailableError()
+    log('info', `QQ renderer call control start operation=${operation}`)
+    try {
+      await this.callController.control(operation)
+    } catch {
+      throw new QQCallControlUnavailableError()
+    }
+    const signal = operation === 'accept'
+      ? 'accept-requested'
+      : operation === 'reject' ? 'refuse-requested' : 'logout-requested'
+    if (state.signal === 'incoming'
+      || (state.signal === 'accept-requested' && signal === 'logout-requested')) {
+      state.signal = signal
+      this.dispatchCallSignal(signal)
+    }
+    log('info', `QQ renderer call control complete operation=${operation}`)
   }
 
   attach(kernel: KernelModule, session: KernelSession, config: InitSessionConfig,
@@ -4007,13 +4059,15 @@ export class QQKernelBridge {
       } catch {
         return
       }
-      if (result.ok) this.enqueueCallSignal({ kind: 'invite',
+      if (result.ok) {
+        this.enqueueCallSignal({ kind: 'invite',
           generation: this.callSignalGeneration, invite: result.invite, })
+      }
       return
     }
     if (callback === 'setActionFromAVSDK') {
-      const kind = callSignalActionKind(args[1])
-      if (kind) this.enqueueCallSignal({ kind, generation: this.callSignalGeneration })
+      const payload = asUint8Array(args[1])
+      if (payload) this.onObservedCallAction(payload)
       return
     }
     if (callback === 'onS2CActionToAVSDK' && hasDestroyReason(args[0])) { this.enqueueCallSignal({ kind: 'ended',
@@ -4198,6 +4252,11 @@ export class QQKernelBridge {
     this.dispatchCallSignal('ended')
     this.revokeCurrentCallMediaLeases()
     this.callSignalState = undefined
+  }
+
+  private onObservedCallAction(payload: Uint8Array): void {
+    const kind = callSignalActionKind(payload)
+    if (kind) this.enqueueCallSignal({ kind, generation: this.callSignalGeneration })
   }
 
   private revokeCurrentCallMediaLeases(): void {

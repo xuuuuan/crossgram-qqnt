@@ -10,9 +10,12 @@ import {
 } from './protocol.js'
 import { GroupMsgMask } from './kernel-types.js'
 import { QQMediaUploadRejectedError } from './upload-protocol.js'
-import { QQFlashTransferError, QQFlashTransferUnavailableError, QQKernelBridge, QQMediaLeaseAuthorizationError,
-  QQMediaLeaseUnavailableError, QQRequestApiUnavailableError, QQRequestConflictError, QQRequestCursorError, QQRequestRefreshError, QQRequestResolutionError, QQRequestSessionChangedError, QQRequestUnsupportedError,
-  QQStickerAssetNotFoundError ,
+import {
+  QQCallControlAuthorizationError, QQCallControlUnavailableError, QQFlashTransferError,
+  QQFlashTransferUnavailableError, QQKernelBridge, QQMediaLeaseAuthorizationError,
+  QQMediaLeaseUnavailableError, QQRequestApiUnavailableError, QQRequestConflictError, QQRequestCursorError,
+  QQRequestRefreshError, QQRequestResolutionError, QQRequestSessionChangedError, QQRequestUnsupportedError,
+  QQStickerAssetNotFoundError,
 } from './qq-kernel.js'
 import { log, recordSlowHttpRequest, slowHttpLogPath } from './log.js'
 import type { QQLoginController } from './login-controller.js'
@@ -354,6 +357,25 @@ export class QQBridgeServer {
         else if (error instanceof QQRequestConflictError) json(response, 409, { error: error.message })
         else if (error instanceof Error && error.message === 'request not found') json(response, 404, { error: error.message })
         else if (error instanceof Error && error.message === 'invalid request resolution') json(response, 400, { error: error.message })
+        else throw error
+      }
+      return
+    }
+    if (request.method === 'POST' && path === '/v1/calls/control') {
+      const body = await readJson<{ callId?: unknown, operation?: unknown }>(request)
+      if (typeof body.callId !== 'string'
+        || (body.operation !== 'accept' && body.operation !== 'reject' && body.operation !== 'hangup')) {
+        json(response, 400, { error: 'callId and a valid operation are required' })
+        return
+      }
+      try {
+        await this.bridge.controlCall(body.callId, body.operation)
+        json(response, 200, { ok: true })
+      } catch (error) {
+        if (error instanceof QQCallControlAuthorizationError)
+          json(response, 403, { error: 'call control unauthorized' })
+        else if (error instanceof QQCallControlUnavailableError)
+          json(response, 503, { error: 'call control unavailable' })
         else throw error
       }
       return

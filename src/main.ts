@@ -13,6 +13,7 @@ import {
   type LocalPCMMediaGateway,
 } from './media-gateway.js'
 import { QQBridgeServer } from './server.js'
+import { ElectronCallController } from './call-controller.js'
 
 const processType = (process as NodeJS.Process & { type?: string }).type
 const bootstrapKey = Symbol.for('qqnt-bridge.bootstrap')
@@ -22,8 +23,14 @@ const bootstrapState = globalThis as typeof globalThis & { [bootstrapKey]?: bool
 // Electron's browser (main) process; plain Node remains useful for diagnostics.
 if ((processType === undefined || processType === 'browser') && !bootstrapState[bootstrapKey]) {
   bootstrapState[bootstrapKey] = true
+  const electron = loadElectron()
   const mediaGateway = createLocalPCMMediaGateway()
-  const bridge = new QQKernelBridge({ mediaGateway })
+  const callController = electron?.webContents
+    ? new ElectronCallController({
+      webContents: electron.webContents,
+    } as ConstructorParameters<typeof ElectronCallController>[0])
+    : undefined
+  const bridge = new QQKernelBridge({ mediaGateway, callController })
   const login = new QQLoginController({
     autoRequestQRCode: process.env.QQNT_BRIDGE_MANAGE_LOGIN !== '0',
     enableAutoLogin: process.env.QQNT_BRIDGE_AUTO_LOGIN !== '0',
@@ -44,6 +51,18 @@ if ((processType === undefined || processType === 'browser') && !bootstrapState[
   startLocalPCMMediaGateway(mediaGateway)
   log('info', `injected processType=${processType ?? 'node'} pid=${process.pid}; log file: ${logPath}`,
   )
+}
+
+function loadElectron(): {
+  webContents?: unknown
+} | undefined {
+  try {
+    return Module.createRequire(import.meta.url)('electron') as {
+      webContents?: unknown
+    }
+  } catch {
+    return undefined
+  }
 }
 
 async function startServer(server: QQBridgeServer): Promise<void> {

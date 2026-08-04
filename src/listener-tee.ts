@@ -8,6 +8,12 @@ type ListenerService = Record<PropertyKey, unknown>
 
 const services = new WeakMap<object, object>()
 const bridgeListeners = new WeakSet<object>()
+let avsdkActionObserver: ((payload: Uint8Array) => void) | undefined
+
+/** Install the single process-local observer owned by QQKernelBridge. */
+export function observeAVSDKActions(observer: ((payload: Uint8Array) => void) | undefined): void {
+  avsdkActionObserver = observer
+}
 
 export function markBridgeListener<T>(listener: T): T {
   if (listener && (typeof listener === 'object' || typeof listener === 'function')) {
@@ -44,7 +50,25 @@ export function teeRecentService(nativeService: KernelRecentService): KernelRece
 }
 
 export function teeAVSDKService(nativeService: KernelAVSDKService): KernelAVSDKService {
-  return teeListenerService(nativeService, 'avsdk', 'addKernelAVSDKListener', 'removeKernelAVSDKListener')
+  const teed = teeListenerService(
+    nativeService, 'avsdk', 'addKernelAVSDKListener', 'removeKernelAVSDKListener',
+  )
+  return new Proxy(teed, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver)
+      if (property !== 'setActionFromAVSDK' || typeof value !== 'function') return value
+      return (action: number, payload: Uint8Array) => {
+        if (action === 2 && ArrayBuffer.isView(payload)) {
+          try {
+            avsdkActionObserver?.(new Uint8Array(payload.buffer, payload.byteOffset, payload.byteLength))
+          } catch {
+            // Observation must never alter QQ's own call-control path.
+          }
+        }
+        return Reflect.apply(value as (...args: unknown[]) => unknown, target, [action, payload])
+      }
+    },
+  })
 }
 
 function teeListenerService<T extends object>(

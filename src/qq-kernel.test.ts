@@ -805,6 +805,40 @@ describe('QQKernelBridge', () => {
     }
   })
 
+  it('controls only the exact active call through QQ renderer handlers', async () => {
+    const f = fixture()
+    const control = vi.fn().mockResolvedValue(undefined)
+    const bridge = new QQKernelBridge({ callController: { control } })
+    const subscription = bridge.subscribe()
+    const events = subscription[Symbol.asyncIterator]()
+    try {
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      f.emitAVSDK('OnInviteActionToAVSDK', {
+        relation_id: '1715311957', invite_type: 1, from_uid: 'uid-1715311957',
+      }, 0, 'renderer-control')
+      const incoming = await nextCallSignal(events)
+
+      await expect(bridge.controlCall('stale-call', 'accept')).rejects
+        .toThrow('not authorized')
+      expect(control).not.toHaveBeenCalled()
+      await expect(bridge.controlCall(incoming.callId, 'accept')).resolves.toBeUndefined()
+      expect(control).toHaveBeenCalledOnce()
+      expect(control).toHaveBeenCalledWith('accept')
+      await expect(nextCallSignal(events)).resolves.toMatchObject({
+        signal: 'accept-requested', callId: incoming.callId,
+      })
+
+      await expect(bridge.controlCall(incoming.callId, 'hangup')).resolves.toBeUndefined()
+      expect(control).toHaveBeenLastCalledWith('hangup')
+      await expect(nextCallSignal(events)).resolves.toMatchObject({
+        signal: 'logout-requested', callId: incoming.callId,
+      })
+    } finally {
+      bridge.unsubscribe(subscription)
+      bridge.detach()
+    }
+  })
+
   it.each([
     'QQNT_BRIDGE_AVSDK_TAP',
     'QQNT_BRIDGE_AVSDK_RAW',
@@ -5747,6 +5781,42 @@ describe('QQBridgeServer', () => {
     expect(unavailable.status).toBe(503)
     await expect(unavailable.json()).resolves.toEqual({ error: 'media lease unavailable' })
     disabled.detach()
+  })
+
+  it('controls only the exact active call through the authenticated HTTP route', async () => {
+    const f = fixture()
+    const control = vi.fn().mockResolvedValue(undefined)
+    const bridge = new QQKernelBridge({ callController: { control } })
+    const subscription = bridge.subscribe()
+    const events = subscription[Symbol.asyncIterator]()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    server = new QQBridgeServer(bridge, { port: 0, token: 'bridge-token' })
+    await server.start()
+    const endpoint = `http://127.0.0.1:${server.address().port}/v1/calls/control`
+    const request = (callId: unknown, operation: unknown, token = 'bridge-token') => fetch(endpoint, {
+      method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify({ callId, operation }),
+    })
+
+    expect((await request('inactive', 'accept', 'wrong')).status).toBe(401)
+    expect((await request('inactive', 'answer')).status).toBe(400)
+    expect((await request('inactive', 'accept')).status).toBe(403)
+    f.emitAVSDK('OnInviteActionToAVSDK', {
+      relation_id: '1715311957', invite_type: 1, from_uid: 'uid-1715311957',
+    }, 0, 'http-renderer-control')
+    const incoming = await nextCallSignal(events)
+
+    expect((await request('stale-call', 'accept')).status).toBe(403)
+    const accepted = await request(incoming.callId, 'accept')
+    expect(accepted.status).toBe(200)
+    await expect(accepted.json()).resolves.toEqual({ ok: true })
+    expect(control).toHaveBeenCalledOnce()
+    expect(control).toHaveBeenCalledWith('accept')
+
+    expect((await request(incoming.callId, 'hangup')).status).toBe(200)
+    expect(control).toHaveBeenLastCalledWith('hangup')
+    bridge.unsubscribe(subscription)
+    bridge.detach()
   })
 
   it('redacts media lease query values from every request log target', async () => {

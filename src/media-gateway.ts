@@ -43,6 +43,9 @@ export type PulseCommand = (command: string, args: readonly string[]) => Promise
 
 export interface LocalPCMMediaGatewayOptions {
   socketPath?: string
+  socketMode?: 0o600 | 0o660
+  pulseServer?: string
+  captureMonitor?: string
   microphoneSink?: string
   processSpawner?: MediaProcessSpawner
   pulseCommand?: PulseCommand
@@ -86,6 +89,9 @@ export class LocalPCMMediaGateway {
   private readonly processSpawner: MediaProcessSpawner
   private readonly pulseCommand: PulseCommand
   private readonly socketPath: string
+  private readonly socketMode: 0o600 | 0o660
+  private readonly pulseServer: string
+  private readonly captureMonitor: string
   private readonly microphoneSink: string
   private readonly now: () => number
   private readonly leases = new Map<string, Lease>()
@@ -95,9 +101,17 @@ export class LocalPCMMediaGateway {
 
   constructor(options: LocalPCMMediaGatewayOptions = {}) {
     this.socketPath = options.socketPath ?? DEFAULT_SOCKET_PATH
+    this.socketMode = options.socketMode ?? 0o600
+    this.pulseServer = options.pulseServer ?? PULSE_SERVER
+    this.captureMonitor = options.captureMonitor ?? PULSE_MONITOR
     this.microphoneSink = options.microphoneSink ?? DEFAULT_PULSE_MICROPHONE_SINK
     if (!isAbsolute(this.socketPath)) throw new Error('PCM media socket path must be absolute')
-    if (!isCandidatePulseSink(this.microphoneSink)) throw new Error('PCM media gateway configuration is invalid')
+    if ((this.socketMode !== 0o600 && this.socketMode !== 0o660)
+      || !isCandidatePulseServer(this.pulseServer)
+      || !isCandidatePulseMonitor(this.captureMonitor)
+      || !isCandidatePulseSink(this.microphoneSink)) {
+      throw new Error('PCM media gateway configuration is invalid')
+    }
     this.processSpawner = options.processSpawner ?? spawnMediaProcess
     this.pulseCommand = options.pulseCommand ?? runPulseCommand
     this.now = options.now ?? performance.now.bind(performance)
@@ -145,7 +159,7 @@ export class LocalPCMMediaGateway {
         server.once('error', reject)
         server.listen(this.socketPath, resolve)
       })
-      await chmod(this.socketPath, 0o600)
+      await chmod(this.socketPath, this.socketMode)
       process.once('exit', this.exitHandler)
     } catch (error) {
       this.server = undefined
@@ -165,7 +179,7 @@ export class LocalPCMMediaGateway {
 
   private async validateMicrophoneSink(): Promise<void> {
     try {
-      const output = await this.pulseCommand('pactl', ['--server', PULSE_SERVER, 'list', 'short', 'sinks'])
+      const output = await this.pulseCommand('pactl', ['--server', this.pulseServer, 'list', 'short', 'sinks'])
       if (!listPulseSinks(output).has(this.microphoneSink)) throw new Error('not a sink')
     } catch {
       throw new Error('PCM media playback target is unavailable')
@@ -264,8 +278,12 @@ export class LocalPCMMediaGateway {
     let capture: MediaProcess | undefined
     let playback: MediaProcess | undefined
     try {
-      capture = this.processSpawner('parecord', pulseArgs(PULSE_MONITOR, false, PCM_CAPTURE_CHANNELS))
-      playback = this.processSpawner('pacat', pulseArgs(this.microphoneSink, true, PCM_MEDIA_CHANNELS))
+      capture = this.processSpawner(
+        'parecord', pulseArgs(this.pulseServer, this.captureMonitor, false, PCM_CAPTURE_CHANNELS),
+      )
+      playback = this.processSpawner(
+        'pacat', pulseArgs(this.pulseServer, this.microphoneSink, true, PCM_MEDIA_CHANNELS),
+      )
       if (!capture.stdout || !playback.stdin) {
         stopProcess(capture)
         stopProcess(playback)
@@ -379,6 +397,9 @@ export function localPCMMediaGatewayFromEnvironment(): LocalPCMMediaGateway | un
   if (process.env.QQNT_BRIDGE_MEDIA_GATEWAY !== '1') return undefined
   return new LocalPCMMediaGateway({
     socketPath: process.env.QQNT_BRIDGE_MEDIA_SOCKET ?? DEFAULT_SOCKET_PATH,
+    socketMode: mediaSocketMode(process.env.QQNT_BRIDGE_MEDIA_SOCKET_MODE),
+    pulseServer: process.env.QQNT_BRIDGE_MEDIA_PULSE_SERVER ?? PULSE_SERVER,
+    captureMonitor: process.env.QQNT_BRIDGE_MEDIA_CAPTURE_MONITOR ?? PULSE_MONITOR,
     microphoneSink: process.env.QQNT_BRIDGE_MEDIA_MIC_SINK ?? DEFAULT_PULSE_MICROPHONE_SINK,
   })
 }
@@ -393,9 +414,9 @@ export function downmixStereoS16le(stereoFrame: Buffer): Buffer {
   return monoFrame
 }
 
-function pulseArgs(device: string, playback: boolean, channels: number): string[] {
+function pulseArgs(server: string, device: string, playback: boolean, channels: number): string[] {
   return [
-    ...(playback ? ['--playback'] : []), '--raw', `--server=${PULSE_SERVER}`, `--device=${device}`,
+    ...(playback ? ['--playback'] : []), '--raw', `--server=${server}`, `--device=${device}`,
     `--format=${PCM_MEDIA_SAMPLE_FORMAT}`, `--rate=${PCM_MEDIA_SAMPLE_RATE}`, `--channels=${channels}`,
   ]
 }
@@ -416,6 +437,21 @@ function runPulseCommand(command: string, args: readonly string[]): Promise<stri
 function isCandidatePulseSink(value: string): boolean {
   return Boolean(value) && !value.includes('\0') && value !== 'qq_source'
     && value !== '@DEFAULT_SOURCE@' && value !== '@DEFAULT_MONITOR@' && !value.endsWith('.monitor')
+}
+
+function isCandidatePulseServer(value: string): boolean {
+  return value.startsWith('unix:/') && !value.includes('\0')
+}
+
+function isCandidatePulseMonitor(value: string): boolean {
+  return Boolean(value) && value.endsWith('.monitor') && !value.includes('\0')
+    && value !== '@DEFAULT_MONITOR@'
+}
+
+function mediaSocketMode(value: string | undefined): 0o600 | 0o660 {
+  if (value === undefined || value === '' || value === '0600' || value === '600') return 0o600
+  if (value === '0660' || value === '660') return 0o660
+  throw new Error('PCM media gateway configuration is invalid')
 }
 
 function listPulseSinks(output: string): Set<string> {

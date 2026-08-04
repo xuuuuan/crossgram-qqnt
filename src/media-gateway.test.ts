@@ -75,6 +75,60 @@ describe.skipIf(process.platform === 'win32')('LocalPCMMediaGateway', () => {
     expect(localPCMMediaGatewayFromEnvironment()).toBeUndefined()
   })
 
+  it('configures an existing Pulse daemon and a group-readable authenticated socket explicitly', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'qq-pcm-gateway-'))
+    directories.push(directory)
+    const socketPath = join(directory, 'media.sock')
+    vi.stubEnv('QQNT_BRIDGE_MEDIA_GATEWAY', '1')
+    vi.stubEnv('QQNT_BRIDGE_MEDIA_SOCKET', socketPath)
+    vi.stubEnv('QQNT_BRIDGE_MEDIA_SOCKET_MODE', '0660')
+    vi.stubEnv('QQNT_BRIDGE_MEDIA_PULSE_SERVER', 'unix:/run/user/1000/pulse/native')
+    vi.stubEnv('QQNT_BRIDGE_MEDIA_CAPTURE_MONITOR', 'qq_out.monitor')
+    vi.stubEnv('QQNT_BRIDGE_MEDIA_MIC_SINK', 'qq_mic_sink')
+    const pulseCalls: string[][] = []
+    const processes: Array<{ command: string, args: readonly string[], process: FakeMediaProcess }> = []
+    const gateway = localPCMMediaGatewayFromEnvironment()!
+    const internal = gateway as unknown as {
+      pulseCommand: (command: string, args: readonly string[]) => Promise<string>
+      processSpawner: (command: string, args: readonly string[]) => MediaProcess
+    }
+    internal.pulseCommand = async (_command, args) => {
+      pulseCalls.push([...args])
+      return pulseSinks()
+    }
+    internal.processSpawner = (command, args) => {
+      const process = new FakeMediaProcess()
+      processes.push({ command, args, process })
+      return process
+    }
+    gateways.push(gateway)
+    const lease = gateway.issueLease()
+
+    await gateway.start()
+    expect((await lstat(socketPath)).mode & 0o777).toBe(0o660)
+    expect(pulseCalls).toEqual([[
+      '--server', 'unix:/run/user/1000/pulse/native', 'list', 'short', 'sinks',
+    ]])
+    const socket = await connectedSocket(socketPath, sockets)
+    socket.write(frame(AUTH_FRAME, authPayload(lease)))
+    await vi.waitFor(() => expect(processes).toHaveLength(2))
+    expect(processes[0]).toMatchObject({ command: 'parecord', args: expect.arrayContaining([
+      '--server=unix:/run/user/1000/pulse/native', '--device=qq_out.monitor',
+    ]) })
+    expect(processes[1]).toMatchObject({ command: 'pacat', args: expect.arrayContaining([
+      '--server=unix:/run/user/1000/pulse/native', '--device=qq_mic_sink',
+    ]) })
+  })
+
+  it('rejects unsafe media socket modes and non-Unix Pulse endpoints', () => {
+    vi.stubEnv('QQNT_BRIDGE_MEDIA_GATEWAY', '1')
+    vi.stubEnv('QQNT_BRIDGE_MEDIA_SOCKET_MODE', '0666')
+    expect(() => localPCMMediaGatewayFromEnvironment()).toThrow('configuration is invalid')
+    vi.stubEnv('QQNT_BRIDGE_MEDIA_SOCKET_MODE', '0600')
+    vi.stubEnv('QQNT_BRIDGE_MEDIA_PULSE_SERVER', 'tcp:remote')
+    expect(() => localPCMMediaGatewayFromEnvironment()).toThrow('configuration is invalid')
+  })
+
   it('downmixes one stereo capture frame into exactly one mono frame with bounded signed samples', () => {
     const stereo = Buffer.alloc(PCM_MEDIA_FRAME_BYTES * 2)
     stereo.writeInt16LE(12_000, 0)
