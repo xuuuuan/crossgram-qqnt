@@ -146,6 +146,15 @@ describe.skipIf(process.platform === 'win32')('LocalPCMMediaGateway', () => {
     expect(mono.readInt16LE(4)).toBe(-32_768)
   })
 
+  it('issues an integer lease expiry when the monotonic clock is fractional', () => {
+    const gateway = new LocalPCMMediaGateway({ now: () => 12.25 })
+
+    const lease = gateway.issueLease()
+
+    expect(lease.expiry).toBe(10_013)
+    expect(Number.isSafeInteger(lease.expiry)).toBe(true)
+  })
+
   it('authenticates a valid lease, captures stereo, downmixes it, and plays uplink into qq_mic_sink', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'qq-pcm-gateway-'))
     directories.push(directory)

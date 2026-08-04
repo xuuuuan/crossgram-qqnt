@@ -127,7 +127,10 @@ export class LocalPCMMediaGateway {
     const leaseIdBytes = randomBytes(LEASE_ID_BYTES)
     const leaseId = leaseIdBytes.toString('hex')
     const token = randomBytes(LEASE_TOKEN_BYTES)
-    const expiry = this.now() + LEASE_TTL_MS
+    // The lease is serialized over JSON and consumed by Crossgram as a
+    // protocol integer. performance.now() is fractional on real hosts, so
+    // round the deadline up while retaining the monotonic clock internally.
+    const expiry = Math.ceil(this.now() + LEASE_TTL_MS)
     const expiryTimer = setTimeout(() => this.revokeLease(leaseId), LEASE_TTL_MS)
     expiryTimer.unref()
     this.leases.set(leaseId, { callIdentity: this.callIdentity(callContext?.callId), token, expiry, expiryTimer })
