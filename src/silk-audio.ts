@@ -14,8 +14,8 @@ const MAX_PCM_BYTES = SAMPLE_RATE * 2 * MAX_DURATION_MS / 1_000
 const FFMPEG_TIMEOUT_MS = 30_000
 
 export async function encodePtt(inputPath: string, outputPath: string): Promise<number> {
-  await assertFfmpegAvailable()
   if ((await stat(inputPath)).size > MAX_VOICE_INPUT_BYTES) throw new Error('voice input exceeds the 32 MiB limit')
+  await assertFfmpegAvailable()
   const pcm = await ffmpegBytes(['-i', inputPath, '-ac', '1', '-ar', String(SAMPLE_RATE), '-f', 's16le', 'pipe:1'])
   const encoded = await encode(pcm, SAMPLE_RATE)
   if (!encoded.data.byteLength || !Number.isFinite(encoded.duration) || encoded.duration < 0 || encoded.duration > MAX_DURATION_MS) {
@@ -26,8 +26,8 @@ export async function encodePtt(inputPath: string, outputPath: string): Promise<
 }
 
 export async function decodePttTo(inputPath: string, outputPath: string): Promise<void> {
-  await assertFfmpegAvailable()
   await assertPttInput(inputPath)
+  await assertFfmpegAvailable()
   const pcmPath = `${outputPath}.${randomUUID()}.pcm`
   await mkdir(dirname(outputPath), { recursive: true, mode: 0o700 })
   try {
@@ -52,8 +52,8 @@ export async function decodePttTo(inputPath: string, outputPath: string): Promis
 }
 
 export async function transcodePttFallbackTo(inputPath: string, outputPath: string): Promise<void> {
-  await assertFfmpegAvailable()
   await assertPttInput(inputPath)
+  await assertFfmpegAvailable()
   await mkdir(dirname(outputPath), { recursive: true, mode: 0o700 })
   try {
     await ffmpegFile(['-i', inputPath, '-ac', '1', '-ar', String(SAMPLE_RATE), '-c:a', 'libopus', '-f', 'ogg', outputPath])
