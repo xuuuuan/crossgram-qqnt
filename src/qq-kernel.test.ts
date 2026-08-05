@@ -1638,7 +1638,7 @@ describe('QQKernelBridge', () => {
     const voice = sent.parts.find((part) => part.type === 'media' && part.media.voice)
     expect(voice).toBeDefined()
     if (!voice || voice.type !== 'media') throw new Error('expected prepared sent voice media')
-    expect(voice.media.locator.filePath).toMatch(/voice-cache\/[^/]+\.ogg$/)
+    expect(voice.media.locator.filePath.replaceAll('\\', '/')).toMatch(/voice-cache\/[^/]+\.ogg$/)
     expect(voice.media.locator.filePath).not.toMatch(/\.silk$/)
     const opened = await bridge.openMedia(voice.media.locator)
     expect(opened).toMatchObject({ mimeType: 'audio/ogg', size: voice.media.size })

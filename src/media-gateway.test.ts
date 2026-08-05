@@ -58,7 +58,7 @@ async function connectedSocket(socketPath: string, sockets: Socket[]): Promise<S
   return socket
 }
 
-describe('LocalPCMMediaGateway', () => {
+describe.skipIf(process.platform === 'win32')('LocalPCMMediaGateway', () => {
   const gateways: LocalPCMMediaGateway[] = []
   const directories: string[] = []
   const sockets: Socket[] = []
