@@ -5061,7 +5061,16 @@ function mapMedia(record: MsgRecord, element: MsgElement): QQMedia | undefined {
   if (element.picElement) {
     const picture = element.picElement
     const animated = isAnimatedPicture(picture)
-    const preview = animated ? undefined : nativeImagePreview(base, picture)
+    const locator: QQMediaLocator = {
+      ...base, kind: 'image', fileName: picture.fileName, fileSize: picture.fileSize,
+      // Keep sourcePath only when QQ did not provide a remote identity. When a
+      // CDN locator exists, every image tier must stay on the direct-link path.
+      filePath: picture.originImageUrl ? undefined : picture.sourcePath,
+      fileUuid: picture.fileUuid, fileSubId: picture.fileSubId,
+      fileBizId: picture.fileBizId, md5: picture.md5HexStr,
+      originImageUrl: picture.originImageUrl, imageSpec: 0,
+    }
+    const preview = animated ? undefined : nativeImagePreview(locator, picture)
     return {
       id: element.elementId || `${record.msgId}:image`,
       kind: 'image',
@@ -5071,14 +5080,7 @@ function mapMedia(record: MsgRecord, element: MsgElement): QQMedia | undefined {
       height: picture.picHeight || undefined,
       mimeType: imageMimeType(picture.fileName, animated),
       preview,
-      locator: {
-        ...base, kind: 'image', fileName: picture.fileName, fileSize: picture.fileSize,
-        // A thumbPath can point at a thumbnail that QQ is still writing. It is
-        // not a valid substitute for the original requested by this locator.
-        filePath: picture.sourcePath, fileUuid: picture.fileUuid, fileSubId: picture.fileSubId,
-        fileBizId: picture.fileBizId, md5: picture.md5HexStr,
-        originImageUrl: picture.originImageUrl,
-      },
+      locator,
     }
   }
 
@@ -5138,73 +5140,22 @@ function mapMedia(record: MsgRecord, element: MsgElement): QQMedia | undefined {
 }
 
 function nativeImagePreview(
-  base: Pick<QQMediaLocator, 'messageId' | 'elementId' | 'chatType' | 'peerUid'>,
+  original: QQMediaLocator,
   picture: NonNullable<MsgElement['picElement']>,
 ): QQMedia['preview'] | undefined {
-  const candidates = [...new Set(picture.thumbPath?.values() ?? [])]
-    .flatMap((path) => {
-      const targetSide = /_720(?:\.[^./\\]+)?$/i.test(path) ? 1280 : 648
-      const metadata = completeLocalImage(
-        path,
-        scaledImageDimensions(picture.picWidth, picture.picHeight, targetSide),
-      )
-      return metadata ? [{ path, ...metadata }] : []
-    })
-    .sort((left, right) => {
-      const left720 = /_720(?:\.[^./\\]+)?$/i.test(left.path)
-      const right720 = /_720(?:\.[^./\\]+)?$/i.test(right.path)
-      if (left720 !== right720) return left720 ? -1 : 1
-      return Math.max(right.width, right.height) - Math.max(left.width, left.height)
-        || left.size - right.size
-    })
-  const selected = candidates[0]
-  if (!selected) return
+  if (!original.originImageUrl) return
+  const dimensions = scaledImageDimensions(picture.picWidth, picture.picHeight, 1280)
+  if (!dimensions) return
+  const thumbnailSize = numberOrUndefined(picture.thumbFileSize) ?? 0
   return {
-    mimeType: selected.mimeType,
-    size: selected.size,
-    width: selected.width,
-    height: selected.height,
+    size: thumbnailSize,
+    ...dimensions,
     locator: {
-      ...base,
-      kind: 'image',
-      fileName: basename(selected.path),
-      fileSize: String(selected.size),
-      filePath: selected.path,
+      ...original,
+      filePath: undefined,
+      fileSize: thumbnailSize > 0 ? String(thumbnailSize) : undefined,
+      imageSpec: 720,
     },
-  }
-}
-
-function completeLocalImage(
-  path: string,
-  declaredDimensions?: { width: number, height: number },
-): {
-  size: number
-  width: number
-  height: number
-  mimeType: string
-} | undefined {
-  let resolved: string
-  let size: number
-  try {
-    resolved = realpathSync(path)
-    const info = statSync(resolved)
-    if (!info.isFile() || info.size <= 0) return
-    size = info.size
-  } catch {
-    return
-  }
-
-  const handle = openSync(resolved, 'r')
-  try {
-    const header = Buffer.alloc(Math.min(size, declaredDimensions ? 16 : 64 * 1024))
-    const headerRead = readSync(handle, header, 0, header.length, 0)
-    const bytes = header.subarray(0, headerRead)
-    const dimensions = declaredDimensions ?? encodedImageDimensions(bytes)
-    const mimeType = encodedImageMimeType(bytes)
-    if (!dimensions || !mimeType || !hasCompleteImageTail(handle, size, mimeType, bytes)) return
-    return { size, ...dimensions, mimeType }
-  } finally {
-    closeSync(handle)
   }
 }
 
@@ -5235,27 +5186,6 @@ function localImageMimeType(path: string): string | undefined {
   }
 }
 
-function hasCompleteImageTail(
-  handle: number,
-  size: number,
-  mimeType: string,
-  header: Uint8Array,
-): boolean {
-  if (mimeType === 'image/webp') {
-    return header.length >= 12 && readU32LE(header, 4) + 8 <= size
-  }
-  const tailLength = Math.min(size, 4096)
-  const tail = Buffer.alloc(tailLength)
-  readSync(handle, tail, 0, tail.length, size - tail.length)
-  if (mimeType === 'image/jpeg') return tail.lastIndexOf(Buffer.from([0xff, 0xd9])) >= 0
-  if (mimeType === 'image/png') {
-    return tail.length >= 12 && tail.subarray(-12).equals(
-      Buffer.from([0, 0, 0, 0, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82]),
-    )
-  }
-  if (mimeType === 'image/gif') return tail.at(-1) === 0x3b
-  return false
-}
 
 function mapSticker(record: MsgRecord, element: MsgElement): QQSticker | undefined {
   const face = element.faceElement

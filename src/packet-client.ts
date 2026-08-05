@@ -224,6 +224,9 @@ export class QQPacketClient {
       // older builds include the multimedia host. Normalize both shapes before
       // selecting and appending the refreshed RKey.
       const original = new URL(locator.originImageUrl, QQ_IMAGE_ORIGIN)
+      if (locator.imageSpec !== undefined) {
+        original.searchParams.set('spec', String(locator.imageSpec))
+      }
       const kind = original.searchParams.get('appid') === PRIVATE_IMAGE_APP_ID
         ? PRIVATE_IMAGE_RKEY_KIND
         : GROUP_IMAGE_RKEY_KIND

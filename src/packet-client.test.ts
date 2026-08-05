@@ -123,6 +123,18 @@ describe('QQPacketClient', () => {
     )
   })
 
+  it('selects QQ image quality through the native CDN spec before refreshing RKey', async () => {
+    const f = fixture()
+    const locator = image('/download?appid=1407&fileid=group&spec=0&rkey=old')
+    locator.imageSpec = 720
+
+    await expect(f.client.getImageDirectUrl(locator)).resolves.toContain('spec=720')
+    expect(f.addon.refreshImageUrl).toHaveBeenCalledWith(
+      'https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=group&spec=720&rkey=old',
+      '&rkey=group',
+    )
+  })
+
   it('single-flights refreshes and expires the whole cache at the shortest TTL', async () => {
     const f = fixture()
     let resolve!: (value: unknown) => void
