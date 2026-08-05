@@ -20,6 +20,18 @@ import { encodePtt } from './silk-audio.js'
 const execFileAsync = promisify(execFile)
 const avatarFixturePath = process.platform === 'win32' ? process.execPath : '/dev/null'
 
+function completePng(width: number, height: number, padding = 0): Buffer {
+  const bytes = Buffer.alloc(24 + padding + 12)
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(bytes)
+  bytes.writeUInt32BE(13, 8)
+  bytes.write('IHDR', 12, 'ascii')
+  bytes.writeUInt32BE(width, 16)
+  bytes.writeUInt32BE(height, 20)
+  Buffer.from([0, 0, 0, 0, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82])
+    .copy(bytes, bytes.length - 12)
+  return bytes
+}
+
 function packetAddonFixture(): PacketAddon {
   const binding = {
     moduleBase: '0x180000000', profile: 'xref-v1', timeDateStamp: 0x1122_3344,
@@ -2721,6 +2733,44 @@ describe('QQKernelBridge', () => {
         originImageUrl: 'https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=image&rkey=expired',
       } },
     }])
+  })
+
+  it('exposes QQ\'s complete 720-tier image as a separately downloadable preview', async () => {
+    const f = fixture()
+    const directory = await mkdtemp(join(tmpdir(), 'qqnt-native-image-preview-'))
+    tempPaths.push(directory)
+    const compactPath = join(directory, 'image_0.jpg')
+    const displayPath = join(directory, 'image_720.jpg')
+    await writeFile(compactPath, completePng(648, 365, 8))
+    const displayBytes = completePng(1280, 579, 32)
+    await writeFile(displayPath, displayBytes)
+    f.message.elements = [{
+      elementType: 2, elementId: 'picture-with-native-tiers',
+      picElement: {
+        fileName: 'original.jpg', fileSize: '320332', picWidth: 2832, picHeight: 1280,
+        md5HexStr: 'image-md5', fileUuid: 'image-uuid', fileSubId: '', picSubType: 0,
+        originImageUrl: 'https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=image&rkey=expired',
+        thumbPath: new Map([[0, compactPath], [720, displayPath]]),
+      },
+    }]
+    const bridge = new QQKernelBridge({ tempPath: directory })
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: directory })
+
+    const [message] = (await bridge.getHistory(bridge.getConversation('uid-1715311957'))).messages
+    const part = message.parts[0]
+    if (part?.type !== 'media' || !part.media.preview) throw new Error('expected native image preview')
+    expect(part.media).toMatchObject({
+      width: 2832,
+      height: 1280,
+      preview: {
+        mimeType: 'image/png', width: 1280, height: 579, size: displayBytes.length,
+        locator: { fileName: 'image_720.jpg', filePath: displayPath, fileSize: String(displayBytes.length) },
+      },
+      locator: { filePath: undefined, fileUuid: 'image-uuid' },
+    })
+    const opened = await bridge.openMedia(part.media.preview.locator)
+    expect(opened).toMatchObject({ mimeType: 'image/png', size: displayBytes.length })
+    expect(await readStream(opened!.stream)).toEqual(displayBytes)
   })
 
   it('maps animated pictures as animated stickers even with a normal picture subtype', async () => {

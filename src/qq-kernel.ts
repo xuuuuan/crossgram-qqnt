@@ -2574,7 +2574,7 @@ export class QQKernelBridge {
         ? createReadStream(filePath, { start: offset, end: offset + length - 1 })
         : Readable.from([]),
       mimeType: locator.kind === 'image'
-        ? imageMimeType(locator.fileName, false)
+        ? localImageMimeType(filePath) ?? imageMimeType(locator.fileName, false)
         : fileVideoMimeType(locator.fileName) ?? 'application/octet-stream',
       size,
       offset,
@@ -5061,6 +5061,7 @@ function mapMedia(record: MsgRecord, element: MsgElement): QQMedia | undefined {
   if (element.picElement) {
     const picture = element.picElement
     const animated = isAnimatedPicture(picture)
+    const preview = animated ? undefined : nativeImagePreview(base, picture)
     return {
       id: element.elementId || `${record.msgId}:image`,
       kind: 'image',
@@ -5069,6 +5070,7 @@ function mapMedia(record: MsgRecord, element: MsgElement): QQMedia | undefined {
       width: picture.picWidth || undefined,
       height: picture.picHeight || undefined,
       mimeType: imageMimeType(picture.fileName, animated),
+      preview,
       locator: {
         ...base, kind: 'image', fileName: picture.fileName, fileSize: picture.fileSize,
         // A thumbPath can point at a thumbnail that QQ is still writing. It is
@@ -5133,6 +5135,126 @@ function mapMedia(record: MsgRecord, element: MsgElement): QQMedia | undefined {
       },
     }
   }
+}
+
+function nativeImagePreview(
+  base: Pick<QQMediaLocator, 'messageId' | 'elementId' | 'chatType' | 'peerUid'>,
+  picture: NonNullable<MsgElement['picElement']>,
+): QQMedia['preview'] | undefined {
+  const candidates = [...new Set(picture.thumbPath?.values() ?? [])]
+    .flatMap((path) => {
+      const targetSide = /_720(?:\.[^./\\]+)?$/i.test(path) ? 1280 : 648
+      const metadata = completeLocalImage(
+        path,
+        scaledImageDimensions(picture.picWidth, picture.picHeight, targetSide),
+      )
+      return metadata ? [{ path, ...metadata }] : []
+    })
+    .sort((left, right) => {
+      const left720 = /_720(?:\.[^./\\]+)?$/i.test(left.path)
+      const right720 = /_720(?:\.[^./\\]+)?$/i.test(right.path)
+      if (left720 !== right720) return left720 ? -1 : 1
+      return Math.max(right.width, right.height) - Math.max(left.width, left.height)
+        || left.size - right.size
+    })
+  const selected = candidates[0]
+  if (!selected) return
+  return {
+    mimeType: selected.mimeType,
+    size: selected.size,
+    width: selected.width,
+    height: selected.height,
+    locator: {
+      ...base,
+      kind: 'image',
+      fileName: basename(selected.path),
+      fileSize: String(selected.size),
+      filePath: selected.path,
+    },
+  }
+}
+
+function completeLocalImage(
+  path: string,
+  declaredDimensions?: { width: number, height: number },
+): {
+  size: number
+  width: number
+  height: number
+  mimeType: string
+} | undefined {
+  let resolved: string
+  let size: number
+  try {
+    resolved = realpathSync(path)
+    const info = statSync(resolved)
+    if (!info.isFile() || info.size <= 0) return
+    size = info.size
+  } catch {
+    return
+  }
+
+  const handle = openSync(resolved, 'r')
+  try {
+    const header = Buffer.alloc(Math.min(size, declaredDimensions ? 16 : 64 * 1024))
+    const headerRead = readSync(handle, header, 0, header.length, 0)
+    const bytes = header.subarray(0, headerRead)
+    const dimensions = declaredDimensions ?? encodedImageDimensions(bytes)
+    const mimeType = encodedImageMimeType(bytes)
+    if (!dimensions || !mimeType || !hasCompleteImageTail(handle, size, mimeType, bytes)) return
+    return { size, ...dimensions, mimeType }
+  } finally {
+    closeSync(handle)
+  }
+}
+
+function scaledImageDimensions(
+  width: number,
+  height: number,
+  maxSide: number,
+): { width: number, height: number } | undefined {
+  if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(height) || height <= 0) return
+  const scale = Math.min(1, maxSide / Math.max(width, height))
+  return {
+    width: Math.max(1, Math.round(width * scale)),
+    height: Math.max(1, Math.round(height * scale)),
+  }
+}
+
+function localImageMimeType(path: string): string | undefined {
+  let handle: number | undefined
+  try {
+    handle = openSync(path, 'r')
+    const header = Buffer.alloc(16)
+    const length = readSync(handle, header, 0, header.length, 0)
+    return encodedImageMimeType(header.subarray(0, length))
+  } catch {
+    return
+  } finally {
+    if (handle !== undefined) closeSync(handle)
+  }
+}
+
+function hasCompleteImageTail(
+  handle: number,
+  size: number,
+  mimeType: string,
+  header: Uint8Array,
+): boolean {
+  if (mimeType === 'image/webp') {
+    return header.length >= 12 && readU32LE(header, 4) + 8 <= size
+  }
+  const tailLength = Math.min(size, 4096)
+  const tail = Buffer.alloc(tailLength)
+  readSync(handle, tail, 0, tail.length, size - tail.length)
+  if (mimeType === 'image/jpeg') return tail.lastIndexOf(Buffer.from([0xff, 0xd9])) >= 0
+  if (mimeType === 'image/png') {
+    return tail.length >= 12 && tail.subarray(-12).equals(
+      Buffer.from([0, 0, 0, 0, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82]),
+    )
+  }
+  if (mimeType === 'image/gif') return tail.at(-1) === 0x3b
+  return false
 }
 
 function mapSticker(record: MsgRecord, element: MsgElement): QQSticker | undefined {
@@ -6684,6 +6806,21 @@ function encodedImageDimensions(
   )
 }
 
+function encodedImageMimeType(bytes: Uint8Array): string | undefined {
+  if (bytes.length >= 8
+    && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) {
+    return 'image/png'
+  }
+  if (bytes.length >= 6) {
+    const signature = ascii(bytes, 0, 6)
+    if (signature === 'GIF87a' || signature === 'GIF89a') return 'image/gif'
+  }
+  if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xd8) return 'image/jpeg'
+  if (bytes.length >= 12 && ascii(bytes, 0, 4) === 'RIFF' && ascii(bytes, 8, 4) === 'WEBP') {
+    return 'image/webp'
+  }
+}
+
 function gifDimensions(bytes: Uint8Array): { width: number, height: number } | undefined {
   if (bytes.length < 10) return
   const signature = String.fromCharCode(...bytes.subarray(0, 6))
@@ -6730,6 +6867,13 @@ function webpDimensions(
 
 function positiveDimensions(width: number, height: number): { width: number, height: number } | undefined {
   return width > 0 && height > 0 ? { width, height } : undefined
+}
+
+function readU32LE(bytes: Uint8Array, offset: number): number {
+  return (bytes[offset]!
+    + bytes[offset + 1]! * 0x100
+    + bytes[offset + 2]! * 0x10000
+    + bytes[offset + 3]! * 0x1000000) >>> 0
 }
 
 function wireHighwayUpload(
