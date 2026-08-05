@@ -3,6 +3,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { once } from 'node:events'
 import type { Duplex } from 'node:stream'
 import type { Readable } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
 import WebSocket, { WebSocketServer } from 'ws'
 import {
   PROTOCOL_VERSION, type QQMediaLocator, type QQMultiForwardLocator, type QQSendMediaSpec, type QQStickerReference, type SendManifest,
@@ -360,6 +361,12 @@ export class QQBridgeServer {
     }
     if (request.method === 'POST' && path === '/v1/stickers/asset') {
       const reference = await readJson<QQStickerReference>(request)
+      const range = parseByteRange(request.headers.range)
+      if (range === false) {
+        response.writeHead(416, { 'content-range': 'bytes */*', 'cache-control': 'no-store' })
+        response.end()
+        return
+      }
       let asset
       try {
         asset = await this.bridge.openSticker(reference)
@@ -370,13 +377,29 @@ export class QQBridgeServer {
         }
         throw error
       }
-      response.writeHead(200, {
+      if (range && asset.size !== undefined && range.offset >= asset.size) {
+        response.writeHead(416, {
+          'content-range': `bytes */${asset.size}`, 'accept-ranges': 'bytes', 'cache-control': 'no-store',
+        })
+        response.end()
+        asset.stream.destroy()
+        return
+      }
+      const offset = range?.offset ?? 0
+      const length = asset.size === undefined
+        ? undefined
+        : Math.min(range?.limit ?? asset.size - offset, asset.size - offset)
+      response.writeHead(range && asset.size !== undefined ? 206 : 200, {
         'content-type': asset.mimeType,
         'x-qqnt-size': String(asset.size ?? ''),
         'cache-control': 'no-store',
-        'transfer-encoding': 'chunked',
+        'accept-ranges': 'bytes',
+        ...(length !== undefined ? { 'content-length': String(length) } : { 'transfer-encoding': 'chunked' }),
+        ...(range && asset.size !== undefined
+          ? { 'content-range': `bytes ${offset}-${offset + length! - 1}/${asset.size}` }
+          : {}),
       })
-      await pipe(asset.stream, response)
+      await pipe(asset.stream, response, range ?? {})
       return
     }
     if (request.method === 'GET' && path === '/v1/conversations/resolve') {
@@ -785,11 +808,37 @@ function parseByteRange(value: string | undefined): { offset: number, limit?: nu
   return { offset, ...(end === undefined ? {} : { limit: end - offset + 1 }) }
 }
 
-async function pipe(source: Readable, destination: ServerResponse): Promise<void> {
-  for await (const chunk of source) {
-    if (!destination.write(chunk)) await once(destination, 'drain')
+async function pipe(
+  source: Readable,
+  destination: ServerResponse,
+  range: { offset?: number, limit?: number } = {},
+): Promise<void> {
+  try {
+    await pipeline(
+      source,
+      async function* (chunks) {
+        let skipped = 0
+        let remaining = range.limit ?? Number.POSITIVE_INFINITY
+        for await (const raw of chunks) {
+          const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw)
+          if (skipped + chunk.length <= (range.offset ?? 0)) {
+            skipped += chunk.length
+            continue
+          }
+          const start = Math.max(0, (range.offset ?? 0) - skipped)
+          const accepted = chunk.subarray(start, start + remaining)
+          skipped += chunk.length
+          if (!accepted.length) continue
+          remaining -= accepted.length
+          yield accepted
+          if (remaining <= 0) return
+        }
+      },
+      destination,
+    )
+  } catch (error) {
+    if (!destination.destroyed) throw error
   }
-  destination.end()
 }
 
 function errorMessage(error: unknown): string {

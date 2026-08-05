@@ -4354,6 +4354,59 @@ describe('QQBridgeServer', () => {
     expect(open).toHaveBeenCalledWith('1:14', { offset: 1, limit: 3 })
   })
 
+  it('serves sticker assets with byte ranges', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const open = vi.spyOn(bridge, 'openSticker').mockResolvedValue({
+      stream: Readable.from(Buffer.from('abcdefgh')), mimeType: 'image/png', size: 8,
+    })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const base = `http://127.0.0.1:${server.address().port}/v1`
+
+    const response = await fetch(`${base}/stickers/asset`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', range: 'bytes=2-5' },
+      body: JSON.stringify({
+        kind: 'favorite', resId: 'saved', path: '/saved/sticker.png', name: 'sticker.png', animated: false,
+      }),
+    })
+
+    expect(response.status).toBe(206)
+    expect(response.headers.get('content-range')).toBe('bytes 2-5/8')
+    expect(response.headers.get('content-length')).toBe('4')
+    expect(Buffer.from(await response.arrayBuffer()).toString()).toBe('cdef')
+    expect(open).toHaveBeenCalledOnce()
+  })
+
+  it('destroys the sticker source when the HTTP client abandons its response', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    let sourceClosed = false
+    const source = new Readable({
+      read() { this.push(Buffer.alloc(64 * 1024, 0x5a)) },
+    })
+    source.once('close', () => { sourceClosed = true })
+    vi.spyOn(bridge, 'openSticker').mockResolvedValue({
+      stream: source, mimeType: 'image/png', size: 16 * 1024 * 1024,
+    })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/v1/stickers/asset`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        kind: 'favorite', resId: 'saved', path: '/saved/sticker.png', name: 'sticker.png', animated: false,
+      }),
+    })
+    const reader = response.body!.getReader()
+    await reader.read()
+    await reader.cancel()
+
+    await vi.waitFor(() => expect(sourceClosed).toBe(true))
+  })
+
   it('serves a packet-resolved video direct URL and its expiry', async () => {
     const originalPlatform = process.platform
     Object.defineProperty(process, 'platform', { configurable: true, value: 'win32' })
