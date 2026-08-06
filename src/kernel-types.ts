@@ -211,7 +211,14 @@ export interface MsgElement {
   liveGiftElement?: { kStrGiftName: string, kUInt64GiftNum: string }
   textGiftElement?: { giftName: string }
   calendarElement?: { summary: string, msg: string }
-  avRecordElement?: { text: string, time: string }
+  avRecordElement?: {
+    type?: number
+    time?: string
+    text?: string
+    mainType?: number
+    hasRead?: boolean
+    extraType?: number
+  }
   faceBubbleElement?: { content?: string, faceSummary?: string, oldVersionStr?: string }
   shareLocationElement?: { text?: string }
   tofuRecordElement?: {

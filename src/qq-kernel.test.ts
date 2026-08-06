@@ -1409,6 +1409,23 @@ describe('QQKernelBridge', () => {
     expect(messages.every((message) => message.telegramMessageId === undefined)).toBe(true)
   })
 
+  it('maps AV record elements to structured phone-call service actions', async () => {
+    const f = fixture()
+    f.message.elements = [{
+      elementType: 21,
+      elementId: 'av-record',
+      avRecordElement: {
+        type: 1, time: 'unknown', text: '通话未接听', mainType: 2, hasRead: false, extraType: 3,
+      },
+    }]
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.getHistory(bridge.getConversation('uid-1715311957'))).resolves.toMatchObject({
+      messages: [{ parts: [], serviceAction: { type: 'phone-call' } }],
+    })
+  })
+
   it('deletes recalled messages by msgId for both recall callback shapes', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
@@ -1650,12 +1667,14 @@ describe('QQKernelBridge', () => {
     const voice = sent.parts.find((part) => part.type === 'media' && part.media.voice)
     expect(voice).toBeDefined()
     if (!voice || voice.type !== 'media') throw new Error('expected prepared sent voice media')
-    expect(voice.media.locator.filePath.replaceAll('\\', '/')).toMatch(/voice-cache\/[^/]+\.ogg$/)
-    expect(voice.media.locator.filePath).not.toMatch(/\.silk$/)
+    const voiceFilePath = voice.media.locator.filePath
+    if (!voiceFilePath) throw new Error('expected prepared sent voice path')
+    expect(voiceFilePath.replaceAll('\\', '/')).toMatch(/voice-cache\/[^/]+\.ogg$/)
+    expect(voiceFilePath).not.toMatch(/\.silk$/)
     const opened = await bridge.openMedia(voice.media.locator)
     expect(opened).toMatchObject({ mimeType: 'audio/ogg', size: voice.media.size })
     const bytes = await readStream(opened!.stream)
-    expect(bytes).toEqual(await readFile(voice.media.locator.filePath!))
+    expect(bytes).toEqual(await readFile(voiceFilePath))
     expect(bytes).toHaveLength(voice.media.size!)
   })
 

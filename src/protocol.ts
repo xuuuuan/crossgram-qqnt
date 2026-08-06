@@ -184,8 +184,8 @@ export interface QQMessage {
   originRequestId?: string
   /** Opaque QQ msgId referenced by a native reply element. */
   replyToId?: string
-  /** QQ gray-tip/poke projected as a Telegram service message by the relay. */
-  serviceAction?: { type: 'custom', text: string }
+  /** QQ service message rendered by the relay as a Telegram MessageService. */
+  serviceAction?: { type: 'custom', text: string } | { type: 'phone-call' }
   parts: Array<
     | QQTextPart
     | { type: 'media', media: QQMedia }

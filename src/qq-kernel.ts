@@ -31,6 +31,7 @@ const ELEMENT_FACE = 6
 const ELEMENT_REPLY = 7
 const ELEMENT_MARKET_FACE = 11
 const ELEMENT_MULTI_FORWARD = 16
+const ELEMENT_AV_RECORD = 21
 const SEND_FROM_SELF = new Set([1, 2])
 const MEMBER_ADMIN = 3
 const MEMBER_OWNER = 4
@@ -3913,6 +3914,8 @@ export class QQKernelBridge {
             }],
           })
         }
+      } else if (element.elementType === ELEMENT_AV_RECORD && element.avRecordElement) {
+        serviceAction = { type: 'phone-call' }
       } else if (element.elementType === ELEMENT_REPLY && element.replyElement) {
         replyToId = this.resolvedReplyTargets.get(record.msgId)
           ?? replyTargetId(record, element.replyElement)
@@ -3984,9 +3987,8 @@ export class QQKernelBridge {
       outgoing: context.outgoing
         ?? (SEND_FROM_SELF.has(record.sendType) || record.senderUid === this.config?.selfUid),
       msgSeq: record.msgSeq,
-      // Gray tips (poke, joins, reaction notices, etc.) reuse the msgSeq of a
-      // related content message, so only content messages can claim msgSeq as
-      // their Telegram megagroup message ID.
+      // Service messages reuse the msgSeq of related content, so only content
+      // messages can claim msgSeq as their Telegram megagroup message ID.
       telegramMessageId: record.chatType === CHAT_GROUP && !serviceAction
         ? telegramMessageId(record.msgSeq)
         : undefined,
