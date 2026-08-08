@@ -5,7 +5,7 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { isSilk } from 'silk-wasm'
 import { describe, expect, it } from 'vitest'
-import { encodePtt, transcodePttFallbackTo } from './silk-audio.js'
+import { decodePttTo, encodePtt, transcodePttFallbackTo } from './silk-audio.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -18,6 +18,27 @@ describe('recorded PTT conversion', () => {
       await execFileAsync('ffmpeg', ['-nostdin', '-y', '-v', 'error', '-f', 'lavfi', '-i', 'anullsrc=r=24000:cl=mono', '-t', '0.04', wav])
       expect(await encodePtt(wav, silk)).toBeGreaterThan(0)
       expect(isSilk(await readFile(silk))).toBe(true)
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('decodes QQ Silk with the desktop 0x03 framing byte', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'qqnt-silk-framing-test-'))
+    const wav = join(directory, 'voice.wav')
+    const silk = join(directory, 'voice.amr')
+    const ogg = join(directory, 'voice.ogg')
+    try {
+      await execFileAsync('ffmpeg', ['-nostdin', '-y', '-v', 'error', '-f', 'lavfi', '-i', 'anullsrc=r=24000:cl=mono', '-t', '0.04', wav])
+      await encodePtt(wav, silk)
+      const framed = await readFile(silk)
+      expect(framed.subarray(0, 10).toString('ascii')).toBe('\u0002#!SILK_V3')
+      framed[0] = 0x03
+      await writeFile(silk, framed)
+
+      await decodePttTo(silk, ogg)
+
+      expect((await readFile(ogg)).subarray(0, 4).toString()).toBe('OggS')
     } finally {
       await rm(directory, { recursive: true, force: true })
     }
