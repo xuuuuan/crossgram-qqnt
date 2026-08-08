@@ -1,6 +1,6 @@
 import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto'
 import { closeSync, createReadStream, createWriteStream, existsSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { open as openFile, readFile, rename, rm, stat } from 'node:fs/promises'
+import { copyFile, open as openFile, readFile, rename, rm, stat } from 'node:fs/promises'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { Readable, Transform } from 'node:stream'
@@ -32,6 +32,7 @@ const ELEMENT_REPLY = 7
 const ELEMENT_MARKET_FACE = 11
 const ELEMENT_MULTI_FORWARD = 16
 const ELEMENT_AV_RECORD = 21
+const QQ_VOICE_WAVE_AMPLITUDES = [0, 18, 9, 23, 16, 17, 16, 15, 44, 17, 24, 20, 14, 15, 17]
 const SEND_FROM_SELF = new Set([1, 2])
 const MEMBER_ADMIN = 3
 const MEMBER_OWNER = 4
@@ -1816,11 +1817,58 @@ export class QQKernelBridge {
     const service = this.requireMsgService()
     const sendMsg = (service as { sendMsg?: unknown }).sendMsg
     if (typeof sendMsg !== 'function') throw new Error('native QQ voice sending is unavailable (KernelMsgService.sendMsg)')
-    const result = await sendMsg.call(service, randomUUID(), {
-      chatType: conversation.chatType, peerUid: conversation.peerUid, guildId: '',
-    }, [{ elementType: 4, elementId: '', pttElement: ptt }], new Map<number, unknown>())
+    const fileName = basename(ptt.filePath)
+    const fileSize = statSync(ptt.filePath).size
+    const md5HexStr = await hashFile(ptt.filePath, 'md5')
+    const getRichMediaFilePath = service.getRichMediaFilePathForGuild
+    if (typeof getRichMediaFilePath !== 'function') {
+      throw new Error('native QQ voice staging is unavailable (KernelMsgService.getRichMediaFilePathForGuild)')
+    }
+    const filePath = getRichMediaFilePath.call(service, {
+      md5HexStr,
+      fileName,
+      elementType: 4,
+      elementSubType: 0,
+      thumbSize: 0,
+      needCreate: true,
+      downloadType: 1,
+      file_uuid: '',
+    })
+    if (!filePath || !isAbsolute(filePath)) throw new Error('native QQ voice staging returned an invalid path')
+    await copyFile(ptt.filePath, filePath)
+    const element: MsgElement = {
+      elementType: 4,
+      elementId: '',
+      pttElement: {
+        fileName,
+        filePath,
+        md5HexStr,
+        fileSize: String(fileSize),
+        duration: ptt.duration,
+        formatType: 1,
+        voiceType: 1,
+        voiceChangeType: 0,
+        canConvert2Text: true,
+        waveAmplitudes: [...QQ_VOICE_WAVE_AMPLITUDES],
+        fileSubId: '',
+        playState: 1,
+        autoConvertText: 0,
+        storeID: 0,
+        otherBusinessInfo: { aiVoiceType: 0 },
+      },
+    }
+    const serverTime = String(Math.floor(Date.now() / 1_000))
+    const generatedMessageId = typeof service.generateMsgUniqueId === 'function'
+      ? service.generateMsgUniqueId(conversation.chatType, serverTime)
+      : service.getMsgUniqueId?.(serverTime)
+    if (!generatedMessageId || generatedMessageId === '0') {
+      throw new Error('native QQ voice sending could not generate a message ID')
+    }
+    const result = await sendMsg.call(service, '0', {
+      chatType: conversation.chatType, peerUid: conversation.peerUid, guildId: generatedMessageId,
+    }, [element], new Map<number, unknown>())
     if (!result || typeof result !== 'object' || result.result !== 0) {
-      throw new Error(`native QQ voice send failed: ${result?.errMsg ?? 'unknown error'}`)
+      throw new Error(`native QQ voice send failed (${String(result?.result ?? 'unknown')}): ${result?.errMsg || 'unknown error'}`)
     }
   }
 

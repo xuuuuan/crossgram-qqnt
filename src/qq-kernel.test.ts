@@ -142,6 +142,7 @@ function fixture() {
       return 'msg-listener'
     }),
     removeKernelMsgListener: vi.fn(),
+    generateMsgUniqueId: vi.fn(() => 'generated-m1'),
     getMsgUniqueId: vi.fn(() => 'm1'),
     sendSsoCmdReqByContend: vi.fn<NonNullable<KernelMsgService['sendSsoCmdReqByContend']>>(),
     sendMsg: vi.fn(async (_id, _peer, elements) => {
@@ -170,6 +171,7 @@ function fixture() {
       result: 0, errMsg: '', contactMsgBoxInfos: [] as ContactMsgBoxInfo[],
     })),
     getRichMediaFilePath: vi.fn(() => ''),
+    getRichMediaFilePathForGuild: vi.fn<NonNullable<KernelMsgService['getRichMediaFilePathForGuild']>>(() => ''),
     getMsgsBySeqAndCount: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [message] })),
     getMsgsByMsgId: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [message] })),
     getSourceOfReplyMsg: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [] as MsgRecord[] })),
@@ -1646,12 +1648,44 @@ describe('QQKernelBridge', () => {
     const root = await mkdtemp(join(tmpdir(), 'qqnt-voice-send-'))
     tempPaths.push(root)
     const ogg = join(root, 'voice.ogg')
+    const stagedSilk = join(root, 'qq-media', 'voice.silk')
+    await mkdir(dirname(stagedSilk), { recursive: true })
     await execFileAsync('ffmpeg', ['-nostdin', '-y', '-v', 'error', '-f', 'lavfi', '-i', 'anullsrc=r=24000:cl=mono', '-t', '0.04', ogg])
-    f.msg.sendMsg.mockImplementationOnce(async (_id, _peer, elements) => {
+    f.msg.getRichMediaFilePathForGuild.mockImplementationOnce((file) => {
+      expect(file).toMatchObject({
+        md5HexStr: expect.stringMatching(/^[0-9a-f]{32}$/),
+        fileName: expect.stringMatching(/\.silk$/),
+        elementType: 4,
+        elementSubType: 0,
+        thumbSize: 0,
+        needCreate: true,
+        downloadType: 1,
+        file_uuid: '',
+      })
+      return stagedSilk
+    })
+    f.msg.sendMsg.mockImplementationOnce(async (id, peer, elements) => {
+      expect(id).toBe('0')
+      expect(peer).toMatchObject({ chatType: 1, peerUid: 'uid-1715311957', guildId: 'generated-m1' })
       const ptt = elements[0]?.pttElement
-      expect(elements).toMatchObject([{ elementType: 4, pttElement: { duration: expect.any(Number) } }])
-      expect(ptt?.filePath).toMatch(/\.silk$/)
-      expect((await readFile(ptt!.filePath)).length).toBeGreaterThan(0)
+      expect(ptt).toMatchObject({
+        fileName: expect.stringMatching(/\.silk$/),
+        filePath: stagedSilk,
+        md5HexStr: expect.stringMatching(/^[0-9a-f]{32}$/),
+        fileSize: expect.stringMatching(/^[1-9]\d*$/),
+        duration: expect.any(Number),
+        formatType: 1,
+        voiceType: 1,
+        voiceChangeType: 0,
+        canConvert2Text: true,
+        waveAmplitudes: expect.any(Array),
+        fileSubId: '',
+        playState: 1,
+        autoConvertText: 0,
+        storeID: 0,
+        otherBusinessInfo: { aiVoiceType: 0 },
+      })
+      expect((await readFile(ptt!.filePath!)).length).toBe(Number(ptt!.fileSize))
       queueMicrotask(() => f.emitSent({ ...f.message, sendStatus: 2, elements: [{
         elementType: 4, elementId: 'voice', pttElement: { filePath: ptt!.filePath, fileName: 'voice.silk', fileSize: '1', duration: ptt!.duration },
       }] }))
@@ -1663,6 +1697,7 @@ describe('QQKernelBridge', () => {
     const sent = await bridge.send({
       conversationId: 'uid-1715311957', media: [{ kind: 'voice', name: 'voice.ogg', mimeType: 'audio/ogg' }],
     }, Readable.from(await readFile(ogg)))
+    expect(f.msg.generateMsgUniqueId).toHaveBeenCalledWith(1, expect.stringMatching(/^\d+$/))
     expect(f.msg.sendMsg).toHaveBeenCalledOnce()
     const voice = sent.parts.find((part) => part.type === 'media' && part.media.voice)
     expect(voice).toBeDefined()
