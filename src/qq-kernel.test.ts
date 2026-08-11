@@ -3919,9 +3919,32 @@ describe('QQBridgeServer', () => {
     await expect(fetch(`${base}/status`).then((response) => response.json())).resolves.toMatchObject({
       protocolVersion: 21, ready: true, selfUin: '10000',
     })
-    await expect(fetch(`${base}/dialogs`).then((response) => response.json())).resolves.toMatchObject({
+    const dialogs = await fetch(`${base}/dialogs`)
+    expect(dialogs.status).toBe(200)
+    expect(dialogs.headers.get('cache-control')).toBe('private, no-cache')
+    expect(dialogs.headers.get('vary')).toBe('authorization')
+    const dialogsEtag = dialogs.headers.get('etag')
+    expect(dialogsEtag).toMatch(/^"[A-Za-z0-9_-]+"$/)
+    await expect(dialogs.json()).resolves.toMatchObject({
       conversations: [{ peerUin: '1715311957' }],
     })
+    const unchangedDialogs = await fetch(`${base}/dialogs`, {
+      headers: { 'if-none-match': dialogsEtag! },
+    })
+    expect(unchangedDialogs.status).toBe(304)
+    expect(unchangedDialogs.headers.get('etag')).toBe(dialogsEtag)
+    expect(await unchangedDialogs.text()).toBe('')
+    const history = await fetch(`${base}/conversations/uid-1715311957/history?limit=20`)
+    expect(history.status).toBe(200)
+    const historyEtag = history.headers.get('etag')
+    expect(historyEtag).toMatch(/^"[A-Za-z0-9_-]+"$/)
+    await history.json()
+    const unchangedHistory = await fetch(`${base}/conversations/uid-1715311957/history?limit=20`, {
+      headers: { 'if-none-match': historyEtag! },
+    })
+    expect(unchangedHistory.status).toBe(304)
+    expect(unchangedHistory.headers.get('etag')).toBe(historyEtag)
+    expect(await unchangedHistory.text()).toBe('')
     await expect(fetch(`${base}/conversations/uid-1715311957/search?q=hello&limit=10`)
       .then((response) => response.json())).resolves.toMatchObject({
       messages: [{ id: 'http-search' }],

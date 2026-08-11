@@ -297,7 +297,7 @@ export class QQBridgeServer {
         'info',
         `HTTP API dialogs id=${requestId} count=${page.conversations.length} next=${page.nextCursor ?? ''}`,
       )
-      json(response, 200, page)
+      conditionalJson(request, response, page)
       return
     }
     if (request.method === 'GET' && path === '/v1/contacts') {
@@ -427,7 +427,7 @@ export class QQBridgeServer {
           limit: numberParam(url, 'limit', 50),
         })
         log('info', `HTTP API history id=${requestId} conversation=${conversation.id} count=${page.messages.length} next=${page.nextCursor ?? ''}`)
-        json(response, 200, page)
+        conditionalJson(request, response, page)
       } else if (conversationMatch[2] === 'search') {
         const requestedKind = url.searchParams.get('mediaKind')
         if (requestedKind && requestedKind !== 'image' && requestedKind !== 'file') {
@@ -756,6 +756,34 @@ function json(response: ServerResponse, status: number, value: unknown): void {
     'cache-control': 'no-store',
   })
   response.end(body)
+}
+
+function conditionalJson(request: IncomingMessage, response: ServerResponse, value: unknown): void {
+  const body = JSON.stringify(value)
+  const etag = `"${createHash('sha256').update(body).digest('base64url')}"`
+  const cacheControl = 'private, no-cache'
+  if (ifNoneMatch(request.headers['if-none-match'], etag)) {
+    response.writeHead(304, { etag, 'cache-control': cacheControl, vary: 'authorization' })
+    response.end()
+    return
+  }
+  response.writeHead(200, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': Buffer.byteLength(body),
+    'cache-control': cacheControl,
+    etag,
+    vary: 'authorization',
+  })
+  response.end(body)
+}
+
+function ifNoneMatch(value: string | string[] | undefined, etag: string): boolean {
+  if (value === undefined) return false
+  const header = Array.isArray(value) ? value.join(',') : value
+  return header.split(',').some((candidate) => {
+    const normalized = candidate.trim().replace(/^W\//, '')
+    return normalized === '*' || normalized === etag
+  })
 }
 
 function decodeManifest(value: string | string[] | undefined): SendManifest {
