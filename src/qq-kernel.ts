@@ -2153,10 +2153,9 @@ export class QQKernelBridge {
     conversation: QQConversation,
     record: MsgRecord,
     state: QQReactionState,
-    actorLimit = 100,
   ): Promise<QQReactionState> {
     const service = this.requireMsgService()
-    if (!service.getMsgEmojiLikesList || !record.msgSeq || actorLimit <= 0) return state
+    if (!service.getMsgEmojiLikesList || !record.msgSeq) return state
     const nativeByKey = new Map((record.emojiLikesList ?? []).map((item) => [
       this.reactionByKey.get(reactionKey(item.emojiType, item.emojiId))?.key
         ?? reactionKey(item.emojiType, item.emojiId),
@@ -2167,7 +2166,7 @@ export class QQKernelBridge {
       if (!native || reaction.count <= 0) return reaction
       try {
         const actors = await this.getReactionActors(
-          conversation, record.msgSeq!, native.emojiId, native.emojiType, actorLimit,
+          conversation, record.msgSeq!, native.emojiId, native.emojiType,
         )
         return { ...reaction, recentActors: actors.map((actor) => ({ userId: actor.tinyId })) }
       } catch (error) {
@@ -2183,16 +2182,15 @@ export class QQKernelBridge {
     msgSeq: string,
     emojiId: string,
     emojiType: string,
-    limit = 100,
   ): Promise<EmojiLikesUserInfo[]> {
     const service = this.requireMsgService()
-    if (!service.getMsgEmojiLikesList || limit <= 0) return []
+    if (!service.getMsgEmojiLikesList) return []
     const actors = new Map<string, EmojiLikesUserInfo>()
     let cookie = ''
-    for (let page = 0; page < 10 && actors.size < limit; page++) {
+    for (let page = 0; ; page++) {
       log('info', `native API start name=getMsgEmojiLikesList conversation=${conversation.id} seq=${msgSeq} emoji=${emojiType}:${emojiId} page=${page + 1}`)
       const result = await service.getMsgEmojiLikesList(
-        contact(conversation), msgSeq, emojiId, emojiType, cookie, false, Math.min(10, limit - actors.size),
+        contact(conversation), msgSeq, emojiId, emojiType, cookie, false, 10,
       )
       log('info', `native API complete name=getMsgEmojiLikesList conversation=${conversation.id} seq=${msgSeq} emoji=${emojiType}:${emojiId} result=${result.result} actors=${result.emojiLikesList.length} last=${result.isLastPage} err=${JSON.stringify(result.errMsg)}`)
       if (result.result !== 0) throw new Error(`getMsgEmojiLikesList: ${result.errMsg} (${result.result})`)
@@ -2200,10 +2198,14 @@ export class QQKernelBridge {
         if (!actor.tinyId || actors.has(actor.tinyId)) continue
         actors.set(actor.tinyId, actor)
       }
-      if (result.isLastPage || result.emojiLikesList.length === 0 || result.cookie === cookie) break
+      if (result.isLastPage || result.emojiLikesList.length === 0) break
+      if (!result.cookie || result.cookie === cookie) {
+        log('warn', `reaction actor pagination stopped without progress conversation=${conversation.id} seq=${msgSeq} emoji=${emojiType}:${emojiId} page=${page + 1}`)
+        break
+      }
       cookie = result.cookie
     }
-    return this.normalizeReactionActors([...actors.values()].slice(0, limit))
+    return this.normalizeReactionActors([...actors.values()])
   }
 
   private async normalizeReactionActors(
@@ -3435,11 +3437,11 @@ export class QQKernelBridge {
       if (record.emojiLikesList === undefined && previous?.reactionContext) {
         message.reactionContext = previous.reactionContext
       } else if (source === 'onMsgInfoListUpdate' && message.reactionContext) {
-        // Push updates must carry the small-group actor snapshot. Waiting until
-        // Telegram opens the member list leaves reaction avatars stale.
+        // Persist the authoritative actor list immediately. Telegram projection
+        // may send only the recent subset needed for inline avatars.
         message = {
           ...message,
-          reactionContext: await this.withReactionActors(conversation, record, message.reactionContext, 3),
+          reactionContext: await this.withReactionActors(conversation, record, message.reactionContext),
         }
       }
       if (record.sendStatus === 0) {
@@ -3537,7 +3539,7 @@ export class QQKernelBridge {
     } else if (refreshed.reactionContext) {
       refreshed = {
         ...refreshed,
-        reactionContext: await this.withReactionActors(conversation, targetRecord, refreshed.reactionContext, 3),
+        reactionContext: await this.withReactionActors(conversation, targetRecord, refreshed.reactionContext),
       }
     }
     this.rememberMessage(refreshed)

@@ -3402,26 +3402,34 @@ describe('QQKernelBridge', () => {
     })
   })
 
-  it('publishes first-seen reaction info separately with its recent actors', async () => {
+  it('publishes first-seen reaction info separately with every actor page', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
     const events = bridge.subscribe()[Symbol.asyncIterator]()
-    f.msg.getMsgEmojiLikesList.mockResolvedValue({
-      result: 0, errMsg: '', cookie: '', isFirstPage: true, isLastPage: true,
-      emojiLikesList: [
-        { tinyId: 'actor-a', nickName: 'Alice', headUrl: 'https://example.com/a.jpg' },
-        { tinyId: 'actor-b', nickName: 'Bob', headUrl: '' },
-        { tinyId: 'actor-c', nickName: 'Carol', headUrl: '' },
-      ],
-    })
+    f.msg.getMsgEmojiLikesList
+      .mockResolvedValueOnce({
+        result: 0, errMsg: '', cookie: 'next', isFirstPage: true, isLastPage: false,
+        emojiLikesList: [
+          { tinyId: 'actor-a', nickName: 'Alice', headUrl: 'https://example.com/a.jpg' },
+          { tinyId: 'actor-b', nickName: 'Bob', headUrl: '' },
+          { tinyId: 'actor-c', nickName: 'Carol', headUrl: '' },
+        ],
+      })
+      .mockResolvedValueOnce({
+        result: 0, errMsg: '', cookie: 'done', isFirstPage: false, isLastPage: true,
+        emojiLikesList: [
+          { tinyId: 'actor-d', nickName: 'Dave', headUrl: '' },
+          { tinyId: 'actor-e', nickName: 'Eve', headUrl: '' },
+        ],
+      })
 
     f.emitMessages([{
       ...f.message,
       chatType: 2,
       peerUid: '1058754719',
       peerUin: '1058754719',
-      emojiLikesList: [{ emojiType: '2', emojiId: '128522', likesCnt: '3', isClicked: false }],
+      emojiLikesList: [{ emojiType: '2', emojiId: '128522', likesCnt: '5', isClicked: false }],
     }])
 
     await expect(events.next()).resolves.toMatchObject({
@@ -3434,15 +3442,19 @@ describe('QQKernelBridge', () => {
         context: {
           reactions: [{
             key: '2:128522',
-            count: 3,
-            recentActors: [{ userId: 'actor-a' }, { userId: 'actor-b' }, { userId: 'actor-c' }],
+            count: 5,
+            recentActors: [
+              { userId: 'actor-a' }, { userId: 'actor-b' }, { userId: 'actor-c' },
+              { userId: 'actor-d' }, { userId: 'actor-e' },
+            ],
           }],
         },
       },
     })
-    expect(f.msg.getMsgEmojiLikesList).toHaveBeenCalledWith(
-      expect.objectContaining({ peerUid: '1058754719' }), 'seq1', '128522', '2', '', false, 3,
-    )
+    expect(f.msg.getMsgEmojiLikesList.mock.calls).toEqual([
+      [expect.objectContaining({ peerUid: '1058754719' }), 'seq1', '128522', '2', '', false, 10],
+      [expect.objectContaining({ peerUid: '1058754719' }), 'seq1', '128522', '2', 'next', false, 10],
+    ])
   })
 
   it('retracts an optimistic outgoing event when QQ later rejects it', async () => {
