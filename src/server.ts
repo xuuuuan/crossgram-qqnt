@@ -514,6 +514,20 @@ export class QQBridgeServer {
       json(response, 200, { messages })
       return
     }
+    if (request.method === 'GET' && path === '/v1/messages/reactions/list') {
+      const conversation = this.bridge.getConversation(requiredParam(url, 'conversationId'))
+      const messageId = requiredParam(url, 'messageId')
+      const page = await this.bridge.getMessageReactionActors(
+        conversation,
+        messageId,
+        url.searchParams.get('reactionKey') || undefined,
+        url.searchParams.get('offset') || undefined,
+        numberParam(url, 'limit', 100),
+      )
+      log('info', `HTTP API get reaction actors id=${requestId} conversation=${conversation.id} message=${messageId} actors=${page.actors.length} next=${Boolean(page.nextOffset)}`)
+      json(response, 200, page)
+      return
+    }
     if (request.method === 'GET' && path === '/v1/messages/reactions') {
       const conversation = this.bridge.getConversation(requiredParam(url, 'conversationId'))
       const messageId = requiredParam(url, 'messageId')

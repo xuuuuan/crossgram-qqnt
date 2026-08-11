@@ -325,6 +325,12 @@ export interface QQReactionSummary {
   recentActors?: Array<{ userId: string }>
 }
 
+export interface QQReactionActorPage {
+  state: QQReactionState
+  actors: Array<{ reactionKey: string, actor: { userId: string } }>
+  nextOffset?: string
+}
+
 export interface QQSendMediaSpec {
   kind: 'image' | 'file' | 'voice'
   name: string

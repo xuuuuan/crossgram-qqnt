@@ -18,7 +18,7 @@ import type {
   MarketStickerPackInfo, MemberInfo, MsgElement, MsgRecord, ProfileSimpleInfo, RecentContactInfo, SearchMsgKeywordsResult,
 } from './kernel-types.js'
 import {
-  conversationId, parseConversationId, type HistoryQuery, type MemberPage, type QQCallSignalEvent, type QQCard, type QQConversation, type QQEvent, type QQMedia, type QQMediaLocator, type QQMediaUploadPlan, type QQMessage, type QQMultiForwardLocator, type QQReactionContext, type QQReactionDefinition, type QQReactionState,
+  conversationId, parseConversationId, type HistoryQuery, type MemberPage, type QQCallSignalEvent, type QQCard, type QQConversation, type QQEvent, type QQMedia, type QQMediaLocator, type QQMediaUploadPlan, type QQMessage, type QQMultiForwardLocator, type QQReactionActorPage, type QQReactionContext, type QQReactionDefinition, type QQReactionState,
   type QQSendMediaSpec, type QQSticker, type QQStickerPack, type QQStickerPackSummary, type QQStickerReference, type QQTextPart, type SearchPage, type SearchQuery, type SendManifest,
 } from './protocol.js'
 
@@ -2149,13 +2149,82 @@ export class QQKernelBridge {
     return message.reactionContext ?? { reactions: [], maxSelected: 20 }
   }
 
+  async getMessageReactionActors(
+    conversation: QQConversation,
+    messageId: string,
+    filterReactionKey: string | undefined,
+    offset: string | undefined,
+    limit: number,
+  ): Promise<QQReactionActorPage> {
+    if (conversation.chatType !== CHAT_GROUP) {
+      return { state: { reactions: [], maxSelected: 0 }, actors: [] }
+    }
+    const record = await withTimeout(
+      this.getMessageRecord(conversation, messageId),
+      5_000,
+      'QQ reaction lookup timed out',
+    )
+    if (!record) return { state: { reactions: [], maxSelected: 20 }, actors: [] }
+    const message = await this.mapMessagePrepared(record)
+    const previous = (this.messages.get(conversation.id) ?? []).find((item) => item.id === messageId)
+    const state = record.emojiLikesList === undefined && previous?.reactionContext
+      ? previous.reactionContext
+      : message.reactionContext ?? { reactions: [], maxSelected: 20 }
+    const nativeByKey = new Map((record.emojiLikesList ?? []).map((item) => [
+      this.reactionByKey.get(reactionKey(item.emojiType, item.emojiId))?.key
+        ?? reactionKey(item.emojiType, item.emojiId),
+      item,
+    ]))
+    const summaries = state.reactions.filter((reaction) =>
+      reaction.count > 0 && (filterReactionKey === undefined || reaction.key === filterReactionKey))
+    const cursor = decodeReactionActorOffset(offset)
+    let index = cursor ? summaries.findIndex((summary) => summary.key === cursor.reactionKey) : 0
+    if (cursor && index < 0) throw new Error('invalid reaction actor offset')
+    let cookie = cursor?.cookie ?? ''
+    const pageLimit = Math.max(1, Math.min(100, Math.trunc(limit)))
+    const actors: QQReactionActorPage['actors'] = []
+    let nextOffset: string | undefined
+    while (index < summaries.length && actors.length < pageLimit) {
+      const summary = summaries[index]!
+      const native = nativeByKey.get(summary.key)
+      if (!native) {
+        index++
+        cookie = ''
+        continue
+      }
+      const page = await this.getReactionActorsPage(
+        conversation, record.msgSeq ?? '', native.emojiId, native.emojiType,
+        cookie, pageLimit - actors.length,
+      )
+      actors.push(...page.actors.map((actor) => ({
+        reactionKey: summary.key,
+        actor: { userId: actor.tinyId },
+      })))
+      if (page.nextCookie) {
+        cookie = page.nextCookie
+        if (actors.length >= pageLimit) {
+          nextOffset = encodeReactionActorOffset({ reactionKey: summary.key, cookie })
+          break
+        }
+        continue
+      }
+      index++
+      cookie = ''
+      if (actors.length >= pageLimit && index < summaries.length) {
+        nextOffset = encodeReactionActorOffset({ reactionKey: summaries[index]!.key, cookie: '' })
+      }
+    }
+    return { state, actors, nextOffset }
+  }
+
   private async withReactionActors(
     conversation: QQConversation,
     record: MsgRecord,
     state: QQReactionState,
+    actorLimit?: number,
   ): Promise<QQReactionState> {
     const service = this.requireMsgService()
-    if (!service.getMsgEmojiLikesList || !record.msgSeq) return state
+    if (!service.getMsgEmojiLikesList || !record.msgSeq || actorLimit === 0) return state
     const nativeByKey = new Map((record.emojiLikesList ?? []).map((item) => [
       this.reactionByKey.get(reactionKey(item.emojiType, item.emojiId))?.key
         ?? reactionKey(item.emojiType, item.emojiId),
@@ -2166,7 +2235,7 @@ export class QQKernelBridge {
       if (!native || reaction.count <= 0) return reaction
       try {
         const actors = await this.getReactionActors(
-          conversation, record.msgSeq!, native.emojiId, native.emojiType,
+          conversation, record.msgSeq!, native.emojiId, native.emojiType, actorLimit,
         )
         return { ...reaction, recentActors: actors.map((actor) => ({ userId: actor.tinyId })) }
       } catch (error) {
@@ -2182,30 +2251,47 @@ export class QQKernelBridge {
     msgSeq: string,
     emojiId: string,
     emojiType: string,
+    limit?: number,
   ): Promise<EmojiLikesUserInfo[]> {
-    const service = this.requireMsgService()
-    if (!service.getMsgEmojiLikesList) return []
     const actors = new Map<string, EmojiLikesUserInfo>()
     let cookie = ''
-    for (let page = 0; ; page++) {
-      log('info', `native API start name=getMsgEmojiLikesList conversation=${conversation.id} seq=${msgSeq} emoji=${emojiType}:${emojiId} page=${page + 1}`)
-      const result = await service.getMsgEmojiLikesList(
-        contact(conversation), msgSeq, emojiId, emojiType, cookie, false, 10,
+    while (limit === undefined || actors.size < limit) {
+      const page = await this.getReactionActorsPage(
+        conversation, msgSeq, emojiId, emojiType, cookie,
+        limit === undefined ? 10 : Math.min(10, limit - actors.size),
       )
-      log('info', `native API complete name=getMsgEmojiLikesList conversation=${conversation.id} seq=${msgSeq} emoji=${emojiType}:${emojiId} result=${result.result} actors=${result.emojiLikesList.length} last=${result.isLastPage} err=${JSON.stringify(result.errMsg)}`)
-      if (result.result !== 0) throw new Error(`getMsgEmojiLikesList: ${result.errMsg} (${result.result})`)
-      for (const actor of result.emojiLikesList) {
-        if (!actor.tinyId || actors.has(actor.tinyId)) continue
-        actors.set(actor.tinyId, actor)
-      }
-      if (result.isLastPage || result.emojiLikesList.length === 0) break
-      if (!result.cookie || result.cookie === cookie) {
-        log('warn', `reaction actor pagination stopped without progress conversation=${conversation.id} seq=${msgSeq} emoji=${emojiType}:${emojiId} page=${page + 1}`)
-        break
-      }
-      cookie = result.cookie
+      for (const actor of page.actors) if (!actors.has(actor.tinyId)) actors.set(actor.tinyId, actor)
+      if (!page.nextCookie) break
+      cookie = page.nextCookie
     }
-    return this.normalizeReactionActors([...actors.values()])
+    return [...actors.values()]
+  }
+
+  private async getReactionActorsPage(
+    conversation: QQConversation,
+    msgSeq: string,
+    emojiId: string,
+    emojiType: string,
+    cookie: string,
+    limit: number,
+  ): Promise<{ actors: EmojiLikesUserInfo[], nextCookie?: string }> {
+    const service = this.requireMsgService()
+    if (!service.getMsgEmojiLikesList || !msgSeq || limit <= 0) return { actors: [] }
+    log('info', `native API start name=getMsgEmojiLikesList conversation=${conversation.id} seq=${msgSeq} emoji=${emojiType}:${emojiId}`)
+    const result = await service.getMsgEmojiLikesList(
+      contact(conversation), msgSeq, emojiId, emojiType, cookie, false, Math.min(100, limit),
+    )
+    log('info', `native API complete name=getMsgEmojiLikesList conversation=${conversation.id} seq=${msgSeq} emoji=${emojiType}:${emojiId} result=${result.result} actors=${result.emojiLikesList.length} last=${result.isLastPage} err=${JSON.stringify(result.errMsg)}`)
+    if (result.result !== 0) throw new Error(`getMsgEmojiLikesList: ${result.errMsg} (${result.result})`)
+    const actors = await this.normalizeReactionActors(result.emojiLikesList)
+    const nextCookie = !result.isLastPage && result.emojiLikesList.length > 0
+      && result.cookie && result.cookie !== cookie
+      ? result.cookie
+      : undefined
+    if (!result.isLastPage && !nextCookie) {
+      log('warn', `reaction actor pagination stopped without progress conversation=${conversation.id} seq=${msgSeq} emoji=${emojiType}:${emojiId}`)
+    }
+    return { actors, nextCookie }
   }
 
   private async normalizeReactionActors(
@@ -3437,11 +3523,9 @@ export class QQKernelBridge {
       if (record.emojiLikesList === undefined && previous?.reactionContext) {
         message.reactionContext = previous.reactionContext
       } else if (source === 'onMsgInfoListUpdate' && message.reactionContext) {
-        // Persist the authoritative actor list immediately. Telegram projection
-        // may send only the recent subset needed for inline avatars.
         message = {
           ...message,
-          reactionContext: await this.withReactionActors(conversation, record, message.reactionContext),
+          reactionContext: await this.withReactionActors(conversation, record, message.reactionContext, 3),
         }
       }
       if (record.sendStatus === 0) {
@@ -3497,65 +3581,9 @@ export class QQKernelBridge {
       } else {
         log('info', `native message duplicate suppressed source=${source} id=${message.id} peer=${record.peerUid} status=${record.sendStatus}`)
       }
-      const reactionGrayTipSeq = reactionGrayTipSequence(record)
-      if (reactionGrayTipSeq) {
-        await this.refreshReactionsFromGrayTip(conversation, reactionGrayTipSeq).catch((error) => {
-          log('error', `reaction gray-tip refresh failed conversation=${conversation.id} seq=${reactionGrayTipSeq}`, error)
-        })
-      }
     }
   }
 
-  private async refreshReactionsFromGrayTip(
-    conversation: QQConversation,
-    msgSeq: string,
-  ): Promise<void> {
-    const cached = (this.messages.get(conversation.id) ?? [])
-      .find((message) => message.msgSeq === msgSeq && !message.serviceAction)
-    const service = this.requireMsgService()
-    let record: MsgRecord | undefined
-    if (cached) {
-      const response = await retryTransientInvalidArgument(() =>
-        service.getMsgsByMsgId(contact(conversation), [cached.id]))
-      record = response.msgList.find((item) => item.msgId === cached.id)
-    } else if (service.getMsgsBySeqAndCount) {
-      const peer = contact(conversation)
-      const responses = await Promise.all([true, false].map((queryOrder) =>
-        retryHistoryCall(() => service.getMsgsBySeqAndCount!(peer, msgSeq, 4, queryOrder, true))))
-      record = responses.flatMap((response) => response.msgList)
-        .find((item) => item.msgSeq === msgSeq && !isGrayTipRecord(item) && !isRecalledRecord(item))
-    }
-    if (!record) {
-      log('warn', `reaction gray-tip target lookup failed conversation=${conversation.id} seq=${msgSeq}`)
-      return
-    }
-
-    const targetRecord = record
-    const previous = cached
-      ?? (this.messages.get(conversation.id) ?? []).find((message) => message.id === targetRecord.msgId)
-    let refreshed = await this.mapMessagePrepared(targetRecord)
-    if (targetRecord.emojiLikesList === undefined && previous?.reactionContext) {
-      refreshed.reactionContext = previous.reactionContext
-    } else if (refreshed.reactionContext) {
-      refreshed = {
-        ...refreshed,
-        reactionContext: await this.withReactionActors(conversation, targetRecord, refreshed.reactionContext),
-      }
-    }
-    this.rememberMessage(refreshed)
-    if (JSON.stringify(previous?.reactionContext?.reactions)
-      === JSON.stringify(refreshed.reactionContext?.reactions)) return
-    if (!refreshed.reactionContext) return
-
-    this.dispatch({
-      type: 'message-reactions',
-      eventId: `reaction-graytip:${refreshed.id}:${Date.now()}:${++this.reactionEventSequence}`,
-      conversation,
-      target: { conversationId: conversation.id, messageId: refreshed.id, targetId: refreshed.id },
-      context: refreshed.reactionContext,
-      timestamp: Math.floor(Date.now() / 1000),
-    })
-  }
 
   private onDelete(chatType: number, peerUid: string, ids: string[]): void {
     if (chatType !== CHAT_C2C && chatType !== CHAT_GROUP) return
@@ -6708,6 +6736,27 @@ function splitReactionKey(key: string): [string, string] {
   return [key.slice(0, separator), key.slice(separator + 1)]
 }
 
+interface ReactionActorOffset {
+  reactionKey: string
+  cookie: string
+}
+
+function encodeReactionActorOffset(offset: ReactionActorOffset): string {
+  return Buffer.from(JSON.stringify(offset)).toString('base64url')
+}
+
+function decodeReactionActorOffset(value: string | undefined): ReactionActorOffset | undefined {
+  if (!value) return
+  try {
+    const parsed = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')) as Partial<ReactionActorOffset>
+    if (typeof parsed.reactionKey !== 'string' || !parsed.reactionKey
+      || typeof parsed.cookie !== 'string') throw new Error('invalid shape')
+    return { reactionKey: parsed.reactionKey, cookie: parsed.cookie }
+  } catch {
+    throw new Error('invalid reaction actor offset')
+  }
+}
+
 function cleanFaceName(value?: string): string | undefined {
   const name = value?.replace(/^\//, '').trim()
   return name || undefined
@@ -6736,18 +6785,6 @@ function telegramMessageId(value?: string): number | undefined {
   return Number.isSafeInteger(id) && id > 0 && id <= 0x7fffffff ? id : undefined
 }
 
-function reactionGrayTipSequence(record: MsgRecord): string | undefined {
-  if (record.chatType !== CHAT_GROUP) return
-  const xml = record.elements.find((element) =>
-    element.grayTipElement?.xmlElement?.templId === '10382')?.grayTipElement?.xmlElement
-  if (!xml) return
-  return xmlTagAttribute(xml.content, 'url', 'msgseq') || record.msgSeq
-}
-
-function xmlTagAttribute(xml: string, tag: string, attribute: string): string {
-  const match = new RegExp(`<${tag}\\b([^>]*)`, 'i').exec(xml)
-  return match ? xmlAttribute(match[1] ?? '', attribute) : ''
-}
 
 function isGrayTipRecord(record: MsgRecord): boolean {
   return record.elements.some((element) => Boolean(element.grayTipElement))

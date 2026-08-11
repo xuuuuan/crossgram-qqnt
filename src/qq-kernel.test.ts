@@ -3402,27 +3402,19 @@ describe('QQKernelBridge', () => {
     })
   })
 
-  it('publishes first-seen reaction info separately with every actor page', async () => {
+  it('publishes first-seen reaction info with only the inline actor preview', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
     const events = bridge.subscribe()[Symbol.asyncIterator]()
-    f.msg.getMsgEmojiLikesList
-      .mockResolvedValueOnce({
-        result: 0, errMsg: '', cookie: 'next', isFirstPage: true, isLastPage: false,
-        emojiLikesList: [
-          { tinyId: 'actor-a', nickName: 'Alice', headUrl: 'https://example.com/a.jpg' },
-          { tinyId: 'actor-b', nickName: 'Bob', headUrl: '' },
-          { tinyId: 'actor-c', nickName: 'Carol', headUrl: '' },
-        ],
-      })
-      .mockResolvedValueOnce({
-        result: 0, errMsg: '', cookie: 'done', isFirstPage: false, isLastPage: true,
-        emojiLikesList: [
-          { tinyId: 'actor-d', nickName: 'Dave', headUrl: '' },
-          { tinyId: 'actor-e', nickName: 'Eve', headUrl: '' },
-        ],
-      })
+    f.msg.getMsgEmojiLikesList.mockResolvedValue({
+      result: 0, errMsg: '', cookie: 'next', isFirstPage: true, isLastPage: false,
+      emojiLikesList: [
+        { tinyId: 'actor-a', nickName: 'Alice', headUrl: 'https://example.com/a.jpg' },
+        { tinyId: 'actor-b', nickName: 'Bob', headUrl: '' },
+        { tinyId: 'actor-c', nickName: 'Carol', headUrl: '' },
+      ],
+    })
 
     f.emitMessages([{
       ...f.message,
@@ -3445,16 +3437,14 @@ describe('QQKernelBridge', () => {
             count: 5,
             recentActors: [
               { userId: 'actor-a' }, { userId: 'actor-b' }, { userId: 'actor-c' },
-              { userId: 'actor-d' }, { userId: 'actor-e' },
             ],
           }],
         },
       },
     })
-    expect(f.msg.getMsgEmojiLikesList.mock.calls).toEqual([
-      [expect.objectContaining({ peerUid: '1058754719' }), 'seq1', '128522', '2', '', false, 10],
-      [expect.objectContaining({ peerUid: '1058754719' }), 'seq1', '128522', '2', 'next', false, 10],
-    ])
+    expect(f.msg.getMsgEmojiLikesList).toHaveBeenCalledWith(
+      expect.objectContaining({ peerUid: '1058754719' }), 'seq1', '128522', '2', '', false, 3,
+    )
   })
 
   it('retracts an optimistic outgoing event when QQ later rejects it', async () => {
@@ -3567,6 +3557,64 @@ describe('QQKernelBridge', () => {
     await expect(bridge.getUser('actor-a')).resolves.toMatchObject({
       id: 'actor-a', name: 'Alice', avatarUrl: 'https://example.com/a.jpg',
     })
+  })
+
+  it('continues reaction actor pages from the opaque Telegram offset', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const conversation = await bridge.resolveConversation(2, '1058754719')
+    const groupMessage = {
+      ...f.message,
+      chatType: 2 as const,
+      peerUid: '1058754719',
+      peerUin: '1058754719',
+      emojiLikesList: [{ emojiType: '2', emojiId: '128522', likesCnt: '5', isClicked: false }],
+    }
+    f.msg.getMsgsByMsgId.mockResolvedValue({ result: 0, errMsg: '', msgList: [groupMessage] })
+    f.msg.getMsgEmojiLikesList
+      .mockResolvedValueOnce({
+        result: 0, errMsg: '', cookie: 'next', isFirstPage: true, isLastPage: false,
+        emojiLikesList: [
+          { tinyId: 'actor-a', nickName: 'Alice', headUrl: '' },
+          { tinyId: 'actor-b', nickName: 'Bob', headUrl: '' },
+        ],
+      })
+      .mockResolvedValueOnce({
+        result: 0, errMsg: '', cookie: 'done', isFirstPage: false, isLastPage: true,
+        emojiLikesList: [
+          { tinyId: 'actor-c', nickName: 'Carol', headUrl: '' },
+          { tinyId: 'actor-d', nickName: 'Dave', headUrl: '' },
+          { tinyId: 'actor-e', nickName: 'Eve', headUrl: '' },
+        ],
+      })
+
+    const first = await bridge.getMessageReactionActors(
+      conversation, 'm1', '2:128522', undefined, 2,
+    )
+    expect(first).toMatchObject({
+      state: { reactions: [{ key: '2:128522', count: 5 }] },
+      actors: [
+        { reactionKey: '2:128522', actor: { userId: 'actor-a' } },
+        { reactionKey: '2:128522', actor: { userId: 'actor-b' } },
+      ],
+      nextOffset: expect.any(String),
+    })
+    const second = await bridge.getMessageReactionActors(
+      conversation, 'm1', '2:128522', first.nextOffset, 3,
+    )
+    expect(second).toMatchObject({
+      actors: [
+        { reactionKey: '2:128522', actor: { userId: 'actor-c' } },
+        { reactionKey: '2:128522', actor: { userId: 'actor-d' } },
+        { reactionKey: '2:128522', actor: { userId: 'actor-e' } },
+      ],
+    })
+    expect(second.nextOffset).toBeUndefined()
+    expect(f.msg.getMsgEmojiLikesList.mock.calls).toEqual([
+      [expect.objectContaining({ peerUid: '1058754719' }), 'seq1', '128522', '2', '', false, 2],
+      [expect.objectContaining({ peerUid: '1058754719' }), 'seq1', '128522', '2', 'next', false, 3],
+    ])
   })
 
   it('normalizes numeric reaction actors to QQ UIDs and exposes profile names and qlogo avatars', async () => {
@@ -3772,58 +3820,6 @@ describe('QQKernelBridge', () => {
     })
   })
 
-  it('uses a reaction gray-tip target sequence to publish an immediate authoritative snapshot', async () => {
-    const f = fixture()
-    const bridge = new QQKernelBridge()
-    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
-    const conversation = await bridge.resolveConversation(2, '1058754719')
-    const target = {
-      ...f.message,
-      msgId: 'reaction-target', msgSeq: '9001', chatType: 2 as const,
-      peerUid: '1058754719', peerUin: '1058754719', peerName: 'Test Group',
-      sendType: 1, senderUid: 'self', senderUin: '10000', emojiLikesList: [],
-    }
-    f.msg.getLatestDbMsgs.mockResolvedValue({ result: 0, errMsg: '', msgList: [target] })
-    await bridge.getHistory(conversation)
-    f.msg.getMsgsByMsgId.mockResolvedValue({
-      result: 0, errMsg: '', msgList: [{
-        ...target,
-        emojiLikesList: [{ emojiType: '1', emojiId: '14', likesCnt: '1', isClicked: false }],
-      }],
-    })
-    const events = bridge.subscribe()[Symbol.asyncIterator]()
-    const startedAt = Math.floor(Date.now() / 1000)
-
-    f.emitReceived([{
-      ...target,
-      msgId: 'reaction-graytip', msgSeq: 'notice-seq', sendType: 0,
-      senderUid: 'alice', senderUin: '42', sendNickName: 'Alice', emojiLikesList: undefined,
-      elements: [{ elementType: 8, elementId: 'reaction-notice', grayTipElement: {
-        xmlElement: {
-          templId: '10382',
-          content: '<gtip><qq jp="Alice"/><nor txt="回应了你的消息："/><url msgseq="9001"/><face id="14"/></gtip>',
-        },
-      } }],
-    }])
-
-    await expect(events.next()).resolves.toMatchObject({
-      value: {
-        type: 'message',
-        message: { id: 'reaction-graytip', serviceAction: { text: 'Alice回应了你的消息：' } },
-      },
-    })
-    const reaction = await events.next()
-    expect(reaction).toMatchObject({ value: {
-      type: 'message-reactions', timestamp: expect.any(Number),
-      target: { messageId: 'reaction-target', targetId: 'reaction-target' },
-      context: { reactions: [{ key: '1:14', count: 1 }] },
-    } })
-    expect(reaction.value?.type === 'message-reactions' ? reaction.value.timestamp : 0)
-      .toBeGreaterThanOrEqual(startedAt)
-    expect(f.msg.getMsgsByMsgId).toHaveBeenCalledWith(
-      expect.objectContaining({ chatType: 2, peerUid: '1058754719' }), ['reaction-target'],
-    )
-  })
 
   it('revokes active call media on detach and account switch without logging the call ID', async () => {
     const f = fixture()
@@ -4276,6 +4272,43 @@ describe('QQBridgeServer', () => {
     expect(f.msg.getMsgsByMsgId).toHaveBeenCalledOnce()
   })
 
+  it('passes opaque reaction actor offsets through the HTTP API', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const message = {
+      ...f.message,
+      chatType: 2 as const,
+      peerUid: '1058754719',
+      peerUin: '1058754719',
+      emojiLikesList: [{ emojiType: '2', emojiId: '128522', likesCnt: '2', isClicked: false }],
+    }
+    f.msg.getMsgsByMsgId.mockResolvedValue({ result: 0, errMsg: '', msgList: [message] })
+    f.msg.getMsgEmojiLikesList
+      .mockResolvedValueOnce({
+        result: 0, errMsg: '', cookie: 'next', isFirstPage: true, isLastPage: false,
+        emojiLikesList: [{ tinyId: 'actor-a', nickName: 'Alice', headUrl: '' }],
+      })
+      .mockResolvedValueOnce({
+        result: 0, errMsg: '', cookie: 'done', isFirstPage: false, isLastPage: true,
+        emojiLikesList: [{ tinyId: 'actor-b', nickName: 'Bob', headUrl: '' }],
+      })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const base = `http://127.0.0.1:${server.address().port}/v1/messages/reactions/list`
+    const first = await fetch(`${base}?conversationId=1058754719&messageId=m1&reactionKey=2%3A128522&limit=1`)
+      .then((response) => response.json()) as { actors: unknown[], nextOffset?: string }
+    expect(first).toMatchObject({
+      actors: [{ reactionKey: '2:128522', actor: { userId: 'actor-a' } }],
+      nextOffset: expect.any(String),
+    })
+    const second = await fetch(`${base}?conversationId=1058754719&messageId=m1&reactionKey=2%3A128522&limit=1&offset=${encodeURIComponent(first.nextOffset!)}`)
+      .then((response) => response.json())
+    expect(second).toMatchObject({
+      actors: [{ reactionKey: '2:128522', actor: { userId: 'actor-b' } }],
+    })
+  })
+
   it('streams events over WebSocket, resumes by event id, and removes closed subscribers', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
@@ -4369,53 +4402,6 @@ describe('QQBridgeServer', () => {
     await vi.waitFor(() => expect(bridge.events.size).toBe(0))
   })
 
-  it('streams a gray-tip-triggered reaction refresh over WebSocket without waiting for an info update', async () => {
-    const f = fixture()
-    const bridge = new QQKernelBridge()
-    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
-    const conversation = await bridge.resolveConversation(2, '1058754719')
-    const target = {
-      ...f.message,
-      msgId: 'ws-reaction-target', msgSeq: '7001', chatType: 2 as const,
-      peerUid: '1058754719', peerUin: '1058754719', peerName: 'Test Group',
-      emojiLikesList: [],
-    }
-    f.msg.getLatestDbMsgs.mockResolvedValue({ result: 0, errMsg: '', msgList: [target] })
-    await bridge.getHistory(conversation)
-    f.msg.getMsgsByMsgId.mockResolvedValue({
-      result: 0, errMsg: '', msgList: [{
-        ...target,
-        emojiLikesList: [{ emojiType: '2', emojiId: '128522', likesCnt: '2', isClicked: false }],
-      }],
-    })
-    server = new QQBridgeServer(bridge, { port: 0 })
-    await server.start()
-    const socket = new WebSocket(`ws://127.0.0.1:${server.address().port}/v1/events/ws`)
-    await once(socket, 'open')
-
-    const frames: unknown[] = []
-    socket.on('message', (raw) => frames.push(JSON.parse(raw.toString())))
-    f.emitReceived([{
-      ...target,
-      msgId: 'ws-reaction-graytip', sendType: 0, senderUid: 'alice', senderUin: '42',
-      emojiLikesList: undefined,
-      elements: [{ elementType: 8, elementId: 'reaction-notice', grayTipElement: {
-        xmlElement: {
-          templId: '10382',
-          content: '<gtip><nor txt="Alice回应了你的消息："/><url msgseq="7001"/></gtip>',
-        },
-      } }],
-    }])
-
-    await vi.waitFor(() => expect(frames).toHaveLength(2))
-    expect(frames[1]).toMatchObject({ event: {
-      type: 'message-reactions',
-      target: { messageId: 'ws-reaction-target' },
-      context: { reactions: [{ key: '2:128522', count: 2 }] },
-    } })
-    socket.close()
-    await once(socket, 'close')
-  })
 
   it('can listen for WebSocket events on a separately configured address', async () => {
     const f = fixture()
