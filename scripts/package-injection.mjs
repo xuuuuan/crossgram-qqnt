@@ -2,12 +2,14 @@ import { createPackageWithOptions } from '@electron/asar'
 import { build } from 'esbuild'
 import { execFile } from 'node:child_process'
 import { cp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
 import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
 
 const execFileAsync = promisify(execFile)
 const root = dirname(dirname(fileURLToPath(import.meta.url)))
+const require = createRequire(import.meta.url)
 const mode = process.argv.find((argument) => argument.startsWith('--mode='))?.slice(7) ?? 'release'
 if (mode !== 'release' && mode !== 'debug') throw new Error(`invalid package mode: ${mode}`)
 
@@ -51,6 +53,7 @@ await build({
 })
 
 await cp(join(artifactDir, addon), join(app, addon))
+await cp(require.resolve('silk-wasm/lib/silk.wasm'), join(app, 'silk.wasm'))
 await writeFile(join(app, 'package.json'), `${JSON.stringify({
   name: 'qqnt-bridge-injection',
   version: JSON.parse(await readFile(join(root, 'package.json'), 'utf8')).version,

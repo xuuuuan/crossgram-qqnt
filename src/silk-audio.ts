@@ -31,7 +31,7 @@ export async function decodePttTo(inputPath: string, outputPath: string): Promis
   const pcmPath = `${outputPath}.${randomUUID()}.pcm`
   await mkdir(dirname(outputPath), { recursive: true, mode: 0o700 })
   try {
-    const silk = await readFile(inputPath)
+    const silk = normalizeSilkPayload(await readFile(inputPath))
     const decoded = await decode(silk, SAMPLE_RATE)
     if (!decoded.data.byteLength
       || decoded.data.byteLength > MAX_PCM_BYTES
@@ -62,6 +62,15 @@ export async function transcodePttFallbackTo(inputPath: string, outputPath: stri
     await rm(outputPath, { force: true })
     throw error
   }
+}
+
+function normalizeSilkPayload(input: Buffer): Buffer {
+  // QQ desktop sometimes stores Tencent Silk with a 0x03 framing byte even
+  // though the decoder accepts the otherwise identical 0x02 framing variant.
+  if (input[0] !== 0x03 || input.subarray(1, 10).toString('ascii') !== '#!SILK_V3') return input
+  const normalized = Buffer.from(input)
+  normalized[0] = 0x02
+  return normalized
 }
 
 export async function assertFfmpegAvailable(): Promise<void> {

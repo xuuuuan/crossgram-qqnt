@@ -142,6 +142,7 @@ function fixture() {
       return 'msg-listener'
     }),
     removeKernelMsgListener: vi.fn(),
+    generateMsgUniqueId: vi.fn(() => 'generated-m1'),
     getMsgUniqueId: vi.fn(() => 'm1'),
     sendSsoCmdReqByContend: vi.fn<NonNullable<KernelMsgService['sendSsoCmdReqByContend']>>(),
     sendMsg: vi.fn(async (_id, _peer, elements) => {
@@ -170,6 +171,7 @@ function fixture() {
       result: 0, errMsg: '', contactMsgBoxInfos: [] as ContactMsgBoxInfo[],
     })),
     getRichMediaFilePath: vi.fn(() => ''),
+    getRichMediaFilePathForGuild: vi.fn<NonNullable<KernelMsgService['getRichMediaFilePathForGuild']>>(() => ''),
     getMsgsBySeqAndCount: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [message] })),
     getMsgsByMsgId: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [message] })),
     getSourceOfReplyMsg: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [] as MsgRecord[] })),
@@ -1409,6 +1411,23 @@ describe('QQKernelBridge', () => {
     expect(messages.every((message) => message.telegramMessageId === undefined)).toBe(true)
   })
 
+  it('maps AV record elements to structured phone-call service actions', async () => {
+    const f = fixture()
+    f.message.elements = [{
+      elementType: 21,
+      elementId: 'av-record',
+      avRecordElement: {
+        type: 1, time: 'unknown', text: '通话未接听', mainType: 2, hasRead: false, extraType: 3,
+      },
+    }]
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.getHistory(bridge.getConversation('uid-1715311957'))).resolves.toMatchObject({
+      messages: [{ parts: [], serviceAction: { type: 'phone-call' } }],
+    })
+  })
+
   it('deletes recalled messages by msgId for both recall callback shapes', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
@@ -1629,12 +1648,44 @@ describe('QQKernelBridge', () => {
     const root = await mkdtemp(join(tmpdir(), 'qqnt-voice-send-'))
     tempPaths.push(root)
     const ogg = join(root, 'voice.ogg')
+    const stagedSilk = join(root, 'qq-media', 'voice.silk')
+    await mkdir(dirname(stagedSilk), { recursive: true })
     await execFileAsync('ffmpeg', ['-nostdin', '-y', '-v', 'error', '-f', 'lavfi', '-i', 'anullsrc=r=24000:cl=mono', '-t', '0.04', ogg])
-    f.msg.sendMsg.mockImplementationOnce(async (_id, _peer, elements) => {
+    f.msg.getRichMediaFilePathForGuild.mockImplementationOnce((file) => {
+      expect(file).toMatchObject({
+        md5HexStr: expect.stringMatching(/^[0-9a-f]{32}$/),
+        fileName: expect.stringMatching(/\.silk$/),
+        elementType: 4,
+        elementSubType: 0,
+        thumbSize: 0,
+        needCreate: true,
+        downloadType: 1,
+        file_uuid: '',
+      })
+      return stagedSilk
+    })
+    f.msg.sendMsg.mockImplementationOnce(async (id, peer, elements) => {
+      expect(id).toBe('0')
+      expect(peer).toMatchObject({ chatType: 1, peerUid: 'uid-1715311957', guildId: 'generated-m1' })
       const ptt = elements[0]?.pttElement
-      expect(elements).toMatchObject([{ elementType: 4, pttElement: { duration: expect.any(Number) } }])
-      expect(ptt?.filePath).toMatch(/\.silk$/)
-      expect((await readFile(ptt!.filePath)).length).toBeGreaterThan(0)
+      expect(ptt).toMatchObject({
+        fileName: expect.stringMatching(/\.silk$/),
+        filePath: stagedSilk,
+        md5HexStr: expect.stringMatching(/^[0-9a-f]{32}$/),
+        fileSize: expect.stringMatching(/^[1-9]\d*$/),
+        duration: expect.any(Number),
+        formatType: 1,
+        voiceType: 1,
+        voiceChangeType: 0,
+        canConvert2Text: true,
+        waveAmplitudes: expect.any(Array),
+        fileSubId: '',
+        playState: 1,
+        autoConvertText: 0,
+        storeID: 0,
+        otherBusinessInfo: { aiVoiceType: 0 },
+      })
+      expect((await readFile(ptt!.filePath!)).length).toBe(Number(ptt!.fileSize))
       queueMicrotask(() => f.emitSent({ ...f.message, sendStatus: 2, elements: [{
         elementType: 4, elementId: 'voice', pttElement: { filePath: ptt!.filePath, fileName: 'voice.silk', fileSize: '1', duration: ptt!.duration },
       }] }))
@@ -1646,16 +1697,19 @@ describe('QQKernelBridge', () => {
     const sent = await bridge.send({
       conversationId: 'uid-1715311957', media: [{ kind: 'voice', name: 'voice.ogg', mimeType: 'audio/ogg' }],
     }, Readable.from(await readFile(ogg)))
+    expect(f.msg.generateMsgUniqueId).toHaveBeenCalledWith(1, expect.stringMatching(/^\d+$/))
     expect(f.msg.sendMsg).toHaveBeenCalledOnce()
     const voice = sent.parts.find((part) => part.type === 'media' && part.media.voice)
     expect(voice).toBeDefined()
     if (!voice || voice.type !== 'media') throw new Error('expected prepared sent voice media')
-    expect(voice.media.locator.filePath.replaceAll('\\', '/')).toMatch(/voice-cache\/[^/]+\.ogg$/)
-    expect(voice.media.locator.filePath).not.toMatch(/\.silk$/)
+    const voiceFilePath = voice.media.locator.filePath
+    if (!voiceFilePath) throw new Error('expected prepared sent voice path')
+    expect(voiceFilePath.replaceAll('\\', '/')).toMatch(/voice-cache\/[^/]+\.ogg$/)
+    expect(voiceFilePath).not.toMatch(/\.silk$/)
     const opened = await bridge.openMedia(voice.media.locator)
     expect(opened).toMatchObject({ mimeType: 'audio/ogg', size: voice.media.size })
     const bytes = await readStream(opened!.stream)
-    expect(bytes).toEqual(await readFile(voice.media.locator.filePath!))
+    expect(bytes).toEqual(await readFile(voiceFilePath))
     expect(bytes).toHaveLength(voice.media.size!)
   })
 

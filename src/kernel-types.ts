@@ -176,10 +176,18 @@ export interface MsgElement {
     filePath?: string
     fileSize?: number | string
     fileUuid?: string
+    fileSubId?: string
     formatType?: number | string
     md5HexStr?: string
     text?: string
+    voiceType?: number
+    voiceChangeType?: number
+    canConvert2Text?: boolean
     waveAmplitudes?: number[]
+    playState?: number
+    autoConvertText?: number
+    storeID?: number
+    otherBusinessInfo?: { aiVoiceType: number }
   }
   videoElement?: {
     filePath?: string
@@ -211,7 +219,14 @@ export interface MsgElement {
   liveGiftElement?: { kStrGiftName: string, kUInt64GiftNum: string }
   textGiftElement?: { giftName: string }
   calendarElement?: { summary: string, msg: string }
-  avRecordElement?: { text: string, time: string }
+  avRecordElement?: {
+    type?: number
+    time?: string
+    text?: string
+    mainType?: number
+    hasRead?: boolean
+    extraType?: number
+  }
   faceBubbleElement?: { content?: string, faceSummary?: string, oldVersionStr?: string }
   shareLocationElement?: { text?: string }
   tofuRecordElement?: {
@@ -388,6 +403,16 @@ export interface KernelMsgService {
   addKernelMsgListener(listener: unknown): string
   removeKernelMsgListener(listenerId: string): void
   sendMsg(msgId: string, peer: Contact, msgElements: MsgElement[], attrs: Map<number, unknown>): Promise<{ result: number, errMsg: string }>
+  getRichMediaFilePathForGuild?(file: {
+    md5HexStr: string
+    fileName: string
+    elementType: number
+    elementSubType: number
+    thumbSize: number
+    needCreate: boolean
+    downloadType: number
+    file_uuid: string
+  }): string
   recallMsg(peer: Contact, msgIds: string[]): Promise<{ result: number, errMsg: string }>
   setSpecificMsgReadAndReport?(peer: Contact, msgId: string): Promise<{ result: number, errMsg: string }>
   deleteMsg(peer: Contact, msgIds: string[]): Promise<{ result: number, errMsg: string }>
@@ -427,6 +452,7 @@ export interface KernelMsgService {
   getSourceOfReplyMsgByClientSeqAndTime?(
     peer: Contact, msgId: string, msgClientSeq: string, msgTime: string,
   ): Promise<{ result: number, errMsg: string, msgList: MsgRecord[] }>
+  generateMsgUniqueId?(chatType: number, time: string): string
   getMsgUniqueId?(time: string): string
   getLatestDbMsgs?(peer: Contact, count: number): Promise<{ result: number, errMsg: string, msgList: MsgRecord[] }>
   getFirstUnreadMsgSeq?(peer: Contact): Promise<{ result: number, errMsg: string, seq: string }>
