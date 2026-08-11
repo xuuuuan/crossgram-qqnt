@@ -2153,9 +2153,10 @@ export class QQKernelBridge {
     conversation: QQConversation,
     record: MsgRecord,
     state: QQReactionState,
+    actorLimit = 100,
   ): Promise<QQReactionState> {
     const service = this.requireMsgService()
-    if (!service.getMsgEmojiLikesList || !record.msgSeq) return state
+    if (!service.getMsgEmojiLikesList || !record.msgSeq || actorLimit <= 0) return state
     const nativeByKey = new Map((record.emojiLikesList ?? []).map((item) => [
       this.reactionByKey.get(reactionKey(item.emojiType, item.emojiId))?.key
         ?? reactionKey(item.emojiType, item.emojiId),
@@ -2166,7 +2167,7 @@ export class QQKernelBridge {
       if (!native || reaction.count <= 0) return reaction
       try {
         const actors = await this.getReactionActors(
-          conversation, record.msgSeq!, native.emojiId, native.emojiType,
+          conversation, record.msgSeq!, native.emojiId, native.emojiType, actorLimit,
         )
         return { ...reaction, recentActors: actors.map((actor) => ({ userId: actor.tinyId })) }
       } catch (error) {
@@ -2182,15 +2183,16 @@ export class QQKernelBridge {
     msgSeq: string,
     emojiId: string,
     emojiType: string,
+    limit = 100,
   ): Promise<EmojiLikesUserInfo[]> {
     const service = this.requireMsgService()
-    if (!service.getMsgEmojiLikesList) return []
+    if (!service.getMsgEmojiLikesList || limit <= 0) return []
     const actors = new Map<string, EmojiLikesUserInfo>()
     let cookie = ''
-    for (let page = 0; page < 10 && actors.size < 100; page++) {
+    for (let page = 0; page < 10 && actors.size < limit; page++) {
       log('info', `native API start name=getMsgEmojiLikesList conversation=${conversation.id} seq=${msgSeq} emoji=${emojiType}:${emojiId} page=${page + 1}`)
       const result = await service.getMsgEmojiLikesList(
-        contact(conversation), msgSeq, emojiId, emojiType, cookie, false, 10,
+        contact(conversation), msgSeq, emojiId, emojiType, cookie, false, Math.min(10, limit - actors.size),
       )
       log('info', `native API complete name=getMsgEmojiLikesList conversation=${conversation.id} seq=${msgSeq} emoji=${emojiType}:${emojiId} result=${result.result} actors=${result.emojiLikesList.length} last=${result.isLastPage} err=${JSON.stringify(result.errMsg)}`)
       if (result.result !== 0) throw new Error(`getMsgEmojiLikesList: ${result.errMsg} (${result.result})`)
@@ -2201,7 +2203,7 @@ export class QQKernelBridge {
       if (result.isLastPage || result.emojiLikesList.length === 0 || result.cookie === cookie) break
       cookie = result.cookie
     }
-    return this.normalizeReactionActors([...actors.values()].slice(0, 100))
+    return this.normalizeReactionActors([...actors.values()].slice(0, limit))
   }
 
   private async normalizeReactionActors(
@@ -3415,7 +3417,7 @@ export class QQKernelBridge {
           this.pendingUnassigned.splice(index, 1)[0].pending.resolve(record)
         }
       }
-      const message = await this.mapMessagePrepared(record)
+      let message = await this.mapMessagePrepared(record)
       const conversation = this.conversationFromRecord(record, message)
       const pendingMerged = outgoing && this.pendingMergedForwards.some((item) =>
         item.conversationId === conversation.id
@@ -3432,6 +3434,13 @@ export class QQKernelBridge {
       // reaction field altogether. Absence is not an authoritative clear.
       if (record.emojiLikesList === undefined && previous?.reactionContext) {
         message.reactionContext = previous.reactionContext
+      } else if (source === 'onMsgInfoListUpdate' && message.reactionContext) {
+        // Push updates must carry the small-group actor snapshot. Waiting until
+        // Telegram opens the member list leaves reaction avatars stale.
+        message = {
+          ...message,
+          reactionContext: await this.withReactionActors(conversation, record, message.reactionContext, 3),
+        }
       }
       if (record.sendStatus === 0) {
         if (previous) {
@@ -3457,6 +3466,20 @@ export class QQKernelBridge {
       }
       if (!previous) {
         this.dispatch({ type: 'message', conversation, message })
+        // A first-seen info update can target a message already persisted by
+        // Crossgram before this QQNT bridge process started. The duplicate
+        // message delivery is journal-deduplicated there, so send the mutation
+        // explicitly as well instead of losing its reaction state.
+        if (source === 'onMsgInfoListUpdate' && record.emojiLikesList !== undefined) {
+          this.dispatch({
+            type: 'message-reactions',
+            eventId: `reaction:${message.id}:${Date.now()}:${++this.reactionEventSequence}`,
+            conversation,
+            target: { conversationId: conversation.id, messageId: message.id, targetId: message.id },
+            context: message.reactionContext ?? { reactions: [], maxSelected: 20 },
+            timestamp: Math.floor(Date.now() / 1000),
+          })
+        }
       } else if (reactionsChanged) {
         this.dispatch({
           type: 'message-reactions',
@@ -3508,9 +3531,14 @@ export class QQKernelBridge {
     const targetRecord = record
     const previous = cached
       ?? (this.messages.get(conversation.id) ?? []).find((message) => message.id === targetRecord.msgId)
-    const refreshed = await this.mapMessagePrepared(targetRecord)
+    let refreshed = await this.mapMessagePrepared(targetRecord)
     if (targetRecord.emojiLikesList === undefined && previous?.reactionContext) {
       refreshed.reactionContext = previous.reactionContext
+    } else if (refreshed.reactionContext) {
+      refreshed = {
+        ...refreshed,
+        reactionContext: await this.withReactionActors(conversation, targetRecord, refreshed.reactionContext, 3),
+      }
     }
     this.rememberMessage(refreshed)
     if (JSON.stringify(previous?.reactionContext?.reactions)
