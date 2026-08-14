@@ -1,6 +1,7 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import type { KernelAVSDKService, KernelModule, KernelSession } from './kernel-types.js'
 import { markBridgeListener } from './listener-tee.js'
+import { QQLoginController } from './login-controller.js'
 import { QQKernelBridge } from './qq-kernel.js'
 
 let wrapSession: typeof import('./main.js').wrapSession
@@ -30,7 +31,7 @@ describe('wrapSession AVSDK listener facade', () => {
     } as unknown as KernelAVSDKService
     const nativeSession = { getAVSDKService: vi.fn(() => native) } as unknown as KernelSession
     const kernel = { NodeIQQNTWrapperSession: { prototype: { init() {} } } } as unknown as KernelModule
-    const service = wrapSession(kernel, nativeSession, {} as QQKernelBridge).getAVSDKService!()
+    const service = wrapSession(kernel, nativeSession, {} as QQKernelBridge, new QQLoginController({ autoRequestQRCode: false })).getAVSDKService!()
     const bridgeCallback = vi.fn()
     const primaryCallback = vi.fn()
 
@@ -66,7 +67,7 @@ describe('wrapSession AVSDK listener facade', () => {
     const bridge = new QQKernelBridge()
     const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => {})
 
-    const service = wrapSession(kernel, nativeSession, bridge).getAVSDKService!()
+    const service = wrapSession(kernel, nativeSession, bridge, new QQLoginController({ autoRequestQRCode: false })).getAVSDKService!()
     expect(service.setActionFromAVSDK(0, new Uint8Array())).toBe(result)
     expect(setActionFromAVSDK).toHaveBeenCalledOnce()
     expect(setActionFromAVSDK.mock.contexts[0]).toBe(native)
