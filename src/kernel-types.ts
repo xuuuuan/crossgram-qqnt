@@ -716,6 +716,13 @@ export interface KernelGroupService {
   getGroupList(force: boolean): Promise<{ result: number, errMsg: string }>
   getGroupDetailInfo?(groupCode: string, source: number): Promise<{ result: number, errMsg: string }>
   getGroupMsgMask?(): Promise<{ result: number, errMsg: string }>
+  /**
+   * Sets the group notification mask for a single group. Return shape mirrors
+   * getGroupMsgMask: NapCat/Yui stubs expose `(groupCode: string, mask: GroupMsgMask)`
+   * resolving to `{ result: 0, errMsg: 'success' }`; a non-zero result indicates
+   * a native failure. Verified against the public stub signature only.
+   */
+  setGroupMsgMask?(groupCode: string, mask: GroupMsgMask): Promise<{ result: number, errMsg: string }>
   createMemberListScene(groupCode: string, scene: string): string
   destroyMemberListScene(sceneId: string): void
   getNextMemberList(sceneId: string, lastId: { uid: string, index: number }, count: number): Promise<{

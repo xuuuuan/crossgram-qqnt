@@ -896,6 +896,21 @@ export class QQKernelBridge {
     log('info', `native API complete name=setSpecificMsgReadAndReport conversation=${conversation.id} message=${messageId}`)
   }
 
+  async setGroupMsgMask(groupCode: string, mask: GroupMsgMask): Promise<void> {
+    const groupService = this.requireGroupService()
+    const method = groupService.setGroupMsgMask
+    if (!method) throw new Error('QQNT does not expose setGroupMsgMask')
+    log('info', `native API start name=setGroupMsgMask group=${groupCode} mask=${mask}`)
+    const result = await method.call(groupService, groupCode, mask)
+    log('info', `native API complete name=setGroupMsgMask group=${groupCode} mask=${mask} result=${result.result} err=${JSON.stringify(result.errMsg)}`)
+    if (result.result !== 0) {
+      throw new Error(`setGroupMsgMask: ${result.errMsg} (${result.result})`)
+    }
+    // Reflect the change locally so the UI updates immediately; the registered
+    // onGroupsMsgMaskResult listener will deduplicate/overwrite when it arrives.
+    this.updateGroupMsgMask(groupCode, mask)
+  }
+
   private async hydrateRecentTopMessage(conversation: QQConversation): Promise<QQConversation> {
     const target = this.recentTopMessages.get(conversation.id)
     if (!target || conversation.lastMessage?.id === target.id) return conversation
