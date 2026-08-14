@@ -260,6 +260,31 @@ export interface QQConversation {
   readInboxMaxMessage?: QQMessage
 }
 
+export type QQRequestKind = 'friend' | 'group-join'
+export type QQRequestStatus = 'pending' | 'accepted' | 'rejected'
+
+/** Native QQ friend and administrator-approved group admission request. */
+export interface QQRequest {
+  /** Stable opaque identifier; it does not expose QQNT's action payload. */
+  id: string
+  kind: QQRequestKind
+  status: QQRequestStatus
+  requester: { id: string, name?: string }
+  group?: { id: string, name?: string }
+  message?: string
+  timestamp?: string | number
+}
+
+export interface QQRequestPage {
+  requests: QQRequest[]
+  nextCursor?: string
+}
+
+export interface QQRequestEvent {
+  type: 'request'
+  request: QQRequest
+}
+
 export interface QQCallSignalEvent {
   type: 'call-signal'
   version: 1
@@ -271,6 +296,7 @@ export interface QQCallSignalEvent {
 }
 
 export type QQEvent =
+  | QQRequestEvent
   | { type: 'message', conversation: QQConversation, message: QQMessage }
   | { type: 'message-delete', eventId: string, conversation: QQConversation, messageIds: string[], timestamp: number }
   | {

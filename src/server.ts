@@ -9,7 +9,7 @@ import {
   PROTOCOL_VERSION, type QQMediaLocator, type QQMultiForwardLocator, type QQSendMediaSpec, type QQStickerReference, type SendManifest,
 } from './protocol.js'
 import { QQKernelBridge, QQMediaLeaseAuthorizationError,
-  QQMediaLeaseUnavailableError,
+  QQMediaLeaseUnavailableError, QQRequestApiUnavailableError, QQRequestConflictError, QQRequestCursorError, QQRequestRefreshError, QQRequestResolutionError, QQRequestSessionChangedError,
   QQStickerAssetNotFoundError ,
 } from './qq-kernel.js'
 import { log, recordSlowHttpRequest, slowHttpLogPath } from './log.js'
@@ -283,6 +283,63 @@ export class QQBridgeServer {
           json(response, 503, { error: 'media lease unavailable' })
         else if (error instanceof QQMediaLeaseAuthorizationError)
           json(response, 403, { error: 'media lease unauthorized' })
+        else throw error
+      }
+      return
+    }
+    if (request.method === 'GET' && path === '/v1/requests') {
+      const kind = url.searchParams.get('kind')
+      if (kind !== null && kind !== 'friend' && kind !== 'group-join') {
+        json(response, 400, { error: 'invalid request kind' })
+        return
+      }
+      const cursor = url.searchParams.get('cursor')
+      const rawLimit = url.searchParams.get('limit')
+      const limit = rawLimit === null ? 100 : Number(rawLimit)
+      if ((cursor !== null && cursor.length > 2_048) ||
+        !Number.isSafeInteger(limit) || limit < 1 || limit > 500) {
+        json(response, 400, { error: 'invalid request pagination' })
+        return
+      }
+      try {
+        json(response, 200, await this.bridge.getRequests(
+          kind ?? undefined,
+          cursor ?? undefined,
+          limit,
+        ))
+      } catch (error) {
+        if (error instanceof QQRequestApiUnavailableError) json(response, 503, { error: error.message })
+        else if (error instanceof QQRequestCursorError) json(response, 400, { error: error.message })
+        else if (error instanceof QQRequestRefreshError) json(response, 502, { error: error.message })
+        else if (error instanceof Error && error.message === 'invalid request kind') json(response, 400, { error: error.message })
+        else throw error
+      }
+      return
+    }
+    const requestResolutionMatch = /^\/v1\/requests\/([^/]+)\/resolve$/.exec(path)
+    if (request.method === 'POST' && requestResolutionMatch) {
+      let id: string
+      let body: { action?: unknown }
+      try {
+        id = decodeURIComponent(requestResolutionMatch[1])
+        body = await readJson<{ action?: unknown }>(request)
+      } catch {
+        json(response, 400, { error: 'invalid request resolution' })
+        return
+      }
+      if (!id || (body?.action !== 'accept' && body?.action !== 'reject')) {
+        json(response, 400, { error: 'action must be accept or reject' })
+        return
+      }
+      try {
+        json(response, 200, await this.bridge.resolveRequest(id, body.action))
+      } catch (error) {
+        if (error instanceof QQRequestApiUnavailableError) json(response, 503, { error: error.message })
+        else if (error instanceof QQRequestResolutionError) json(response, 502, { error: 'QQNT request resolution failed' })
+        else if (error instanceof QQRequestSessionChangedError) json(response, 503, { error: 'QQNT request session changed' })
+        else if (error instanceof QQRequestConflictError) json(response, 409, { error: error.message })
+        else if (error instanceof Error && error.message === 'request not found') json(response, 404, { error: error.message })
+        else if (error instanceof Error && error.message === 'invalid request resolution') json(response, 400, { error: error.message })
         else throw error
       }
       return

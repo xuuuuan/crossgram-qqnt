@@ -664,10 +664,34 @@ export interface KernelSearchService {
   cancelSearchChatMsgs(searchId: number, code: number, reason: string): void
 }
 
+export interface BuddyRequest {
+  friendUid?: string
+  reqTime?: string | number
+  isInitiator?: boolean
+  isDecide?: boolean
+  reqType?: number
+  extWords?: string
+  isUnread?: boolean
+  isDoubt?: boolean
+  friendNick?: string
+  sourceId?: string
+  groupCode?: string
+  isBuddy?: boolean
+  isAgreed?: boolean
+  relation?: number
+}
+
 export interface KernelBuddyService {
   addKernelBuddyListener(listener: unknown): string
   removeKernelBuddyListener(listenerId: string): void
   getBuddyList(force: boolean): Promise<{ result: number, errMsg: string }>
+  /** QQNT request data may arrive through onBuddyReqChange rather than this call's return value. */
+  getBuddyReq?(): Promise<unknown>
+  approvalFriendRequest?(request: {
+    friendUid: string
+    reqTime: string | number
+    accept: boolean
+  }): Promise<unknown>
   getBuddyNick?(uids: string[]): Map<string, string>
   getBuddyRemark?(uids: string[]): Map<string, string>
 }
@@ -679,10 +703,29 @@ export interface KernelProfileService {
   getCoreAndBaseInfo?(callFrom: string, uids: string[]): Promise<Map<string, ProfileCoreAndBaseInfo>>
 }
 
+export interface GroupNotify {
+  seq?: string | number
+  type?: number
+  status?: number
+  group?: { groupCode?: string, groupName?: string }
+  user1?: { uid?: string, nickName?: string }
+  user2?: { uid?: string, nickName?: string }
+  actionUser?: { uid?: string, nickName?: string }
+  actionTime?: string | number
+  postscript?: string
+  invitationExt?: string
+}
+
 export interface KernelGroupService {
   addKernelGroupListener(listener: unknown): string
   removeKernelGroupListener(listenerId: string): void
   getGroupList(force: boolean): Promise<{ result: number, errMsg: string }>
+  /** QQNT request data may arrive through the group listener rather than this call's return value. */
+  getSingleScreenNotifies?(doubt: boolean, startSeq: string, count: number): Promise<unknown>
+  operateSysNotify?(doubt: boolean, request: {
+    operateType: 1 | 2
+    targetMsg: { seq: string | number, type: number, groupCode: string, postscript: string }
+  }): Promise<unknown>
   getGroupDetailInfo?(groupCode: string, source: number): Promise<{ result: number, errMsg: string }>
   createMemberListScene(groupCode: string, scene: string): string
   destroyMemberListScene(sceneId: string): void
