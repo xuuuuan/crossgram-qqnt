@@ -1,4 +1,4 @@
-import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto'
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { closeSync, createReadStream, createWriteStream, existsSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { copyFile, open as openFile, readFile, rename, rm, stat } from 'node:fs/promises'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
@@ -13,13 +13,15 @@ import type { PCMMediaLease } from './media-gateway.js'
 import { QQPacketClient, type DirectHighwayUpload, type QQPacketClientOptions } from './packet-client.js'
 import { HIGHWAY_BLOCK_SIZE, type DirectMessagePart } from './upload-protocol.js'
 import { decodePttTo, encodePtt, MAX_VOICE_INPUT_BYTES, transcodePttFallbackTo } from './silk-audio.js'
-import type {
-  CustomEmotionData, EmojiLikesUserInfo, FileTransNotifyInfo, GroupProfileInfo, InitSessionConfig, KernelAVSDKService, KernelModule, KernelSession,
-  MarketStickerPackInfo, MemberInfo, MsgElement, MsgRecord, ProfileSimpleInfo, RecentContactInfo, SearchMsgKeywordsResult,
+import {
+  GroupMsgMask,
+  type BuddyRequest, type CustomEmotionData, type EmojiLikesUserInfo, type FileTransNotifyInfo, type GroupMsgMaskInfo, type GroupNotify, type GroupProfileInfo,
+  type InitSessionConfig, type KernelAVSDKService, type KernelModule, type KernelSession, type MarketStickerPackInfo, type MemberInfo, type MsgElement,
+  type MsgRecord, type ProfileSimpleInfo, type RecentContactInfo, type SearchMsgKeywordsResult,
 } from './kernel-types.js'
 import {
   conversationId, parseConversationId, type HistoryQuery, type MemberPage, type QQCallSignalEvent, type QQCard, type QQConversation, type QQEvent, type QQMedia, type QQMediaLocator, type QQMediaUploadPlan, type QQMessage, type QQMultiForwardLocator, type QQReactionActorPage, type QQReactionContext, type QQReactionDefinition, type QQReactionState,
-  type QQSendMediaSpec, type QQSticker, type QQStickerPack, type QQStickerPackSummary, type QQStickerReference, type QQTextPart, type SearchPage, type SearchQuery, type SendManifest,
+  type QQRequest, type QQRequestKind, type QQRequestPage, type QQRequestStatus, type QQSendMediaSpec, type QQSticker, type QQStickerPack, type QQStickerPackSummary, type QQStickerReference, type QQTextPart, type SearchPage, type SearchQuery, type SendManifest,
 } from './protocol.js'
 
 const CHAT_C2C = 1
@@ -65,6 +67,7 @@ const AVSDK_LOG_OUT_BYTES = Buffer.from(AVSDK_LOG_OUT, 'ascii')
 const FAVORITE_STICKER_PACK_ID = 'qq-favorites'
 type StickerImageMimeType = 'image/gif' | 'image/apng' | 'image/png' | 'image/jpeg' | 'image/webp' | 'image/bmp'
 const FAVORITE_STICKER_PACK_TITLE = 'QQ 收藏表情'
+const REQUEST_PAGE_LIMIT = 100
 // Keep this in sync with Telegram's account-level reaction catalog. QQ emoji
 // outside this set are exposed as custom reactions backed by QQ's own icon.
 const TELEGRAM_STANDARD_REACTIONS = new Set([
@@ -114,6 +117,59 @@ export class QQStickerAssetNotFoundError extends Error {
     this.name = 'QQStickerAssetNotFoundError'
   }
 }
+
+export class QQRequestApiUnavailableError extends Error {
+  constructor() {
+    super('QQNT request API is unavailable')
+    this.name = 'QQRequestApiUnavailableError'
+  }
+}
+
+export class QQRequestConflictError extends Error {
+  constructor() {
+    super('request has already been resolved with a different action')
+    this.name = 'QQRequestConflictError'
+  }
+}
+
+export class QQRequestRefreshError extends Error {
+  constructor(cause: unknown) {
+    super(`QQNT request refresh failed: ${errorText(cause)}`)
+    this.name = 'QQRequestRefreshError'
+  }
+}
+
+export class QQRequestCursorError extends Error {
+  constructor() {
+    super('invalid request cursor')
+    this.name = 'QQRequestCursorError'
+  }
+}
+
+export class QQRequestResolutionError extends Error {
+  constructor(method: string, code: number, message: string) {
+    super(`${method}: ${message} (${code})`)
+    this.name = 'QQRequestResolutionError'
+  }
+}
+
+export class QQRequestSessionChangedError extends Error {
+  constructor() {
+    super('QQNT request session changed during resolution')
+    this.name = 'QQRequestSessionChangedError'
+  }
+}
+
+type RequestUpdate = { nextStartSeq?: string }
+
+type CachedRequest =
+  | { kind: 'friend', request: QQRequest, raw: Required<Pick<BuddyRequest, 'friendUid' | 'reqTime'>> }
+  | {
+      kind: 'group-join'
+      request: QQRequest
+      doubt: boolean
+      raw: { seq: string | number, type: number, groupCode: string, postscript: string }
+    }
 
 interface SearchContext {
   searchId: number
@@ -212,6 +268,20 @@ export class QQKernelBridge {
   private readonly users = new Map<string, {
     id: string, numericId?: string, name: string, avatarUrl?: string, signature?: string
   }>()
+  /** Native action data is kept process-local; the wire request only exposes structured fields. */
+  private readonly requests = new Map<string, CachedRequest>()
+  private readonly requestResolutionFlights = new Map<string, Promise<QQRequest>>()
+  private readonly pendingRequestUpdates = new Map<string, Set<(update: RequestUpdate) => void>>()
+  private readonly activeGroupRequestPages = new Map<boolean, { startSeq: string, token: number }>()
+  private readonly consumedGroupRequestPages = new Set<string>()
+  private groupRequestPageToken = 0
+  private friendRequestSnapshotLoaded = false
+  private groupRequestSnapshotLoaded = false
+  private friendRequestRefresh?: Promise<void>
+  private groupRequestRefresh?: Promise<void>
+  private requestRefreshGeneration = 0
+  private requestAttachmentGeneration = 0
+  private requestCursorSecret?: Buffer
   private readonly seenUsers = new Map<string, {
     id: string, numericId?: string, name: string, avatarUrl?: string, signature?: string
   }>()
@@ -221,6 +291,11 @@ export class QQKernelBridge {
     participantCount?: number
     selfRole?: MemberPage['members'][number]['role']
   }>()
+  private readonly groupMsgMasks = new Map<string, number>()
+  private readonly assistantMaterializedGroups = new Set<string>()
+  private groupMsgMaskRequest?: Promise<boolean>
+  private groupMsgMasksLoaded = false
+  private readonly pendingGroupMsgMaskUpdates = new Set<() => void>()
   private readonly avatarCache = new Map<string, QQMedia>()
   private buddySnapshotLoaded = false
   private readonly messages = new Map<string, QQMessage[]>()
@@ -310,6 +385,7 @@ export class QQKernelBridge {
       : options.marketStickerMimeCacheDir ?? join(dirname(logPath), 'sticker-mime')
     this.mediaGateway = options.mediaGateway
     try {
+      this.requestCursorSecret = randomBytes(32)
       this.callSignalSecret = randomBytes(CALL_SIGNAL_SECRET_BYTES)
       this.callSignalProcessEpoch = randomBytes(CALL_SIGNAL_PROCESS_EPOCH_BYTES)
     } catch {
@@ -358,8 +434,25 @@ export class QQKernelBridge {
     this.recentTopMessages.clear()
     this.recentContactOrder = []
     this.users.clear()
+    this.requests.clear()
+    this.requestResolutionFlights.clear()
+    this.activeGroupRequestPages.clear()
+    this.consumedGroupRequestPages.clear()
+    this.groupRequestPageToken = 0
+    this.resolveRequestUpdates()
+    this.requestRefreshGeneration++
+    this.requestAttachmentGeneration++
+    this.friendRequestRefresh = undefined
+    this.groupRequestRefresh = undefined
+    this.friendRequestSnapshotLoaded = false
+    this.groupRequestSnapshotLoaded = false
     this.seenUsers.clear()
     this.groups.clear()
+    this.groupMsgMasks.clear()
+    this.assistantMaterializedGroups.clear()
+    this.groupMsgMaskRequest = undefined
+    this.groupMsgMasksLoaded = false
+    this.resolveGroupMsgMaskUpdates()
     this.avatarCache.clear()
     this.resolvedReplyTargets.clear()
     this.groupProfileAttempts.clear()
@@ -422,6 +515,16 @@ export class QQKernelBridge {
     this.listenerRetry = undefined
     this.avsdkListenerRetry = undefined
     this.resolveRecentListUpdates()
+    this.resolveRequestUpdates()
+    this.requests.clear()
+    this.requestResolutionFlights.clear()
+    this.requestRefreshGeneration++
+    this.requestAttachmentGeneration++
+    this.friendRequestRefresh = undefined
+    this.groupRequestRefresh = undefined
+    this.friendRequestSnapshotLoaded = false
+    this.groupRequestSnapshotLoaded = false
+    this.resolveGroupMsgMaskUpdates()
     const msgService = this.msgService
     const buddyService = this.buddyService
     const profileService = this.profileService
@@ -579,6 +682,7 @@ export class QQKernelBridge {
     await Promise.allSettled([
       this.requestBuddyList(),
       this.requestGroupList(),
+      ...(!this.groupMsgMasksLoaded ? [this.requestGroupMsgMask()] : []),
     ])
     log('info', `contact refresh complete dialogs=${this.contacts.size} users=${this.users.size} groups=${this.groups.size}`)
     if (recentError) throw recentError
@@ -591,6 +695,13 @@ export class QQKernelBridge {
     nextCursor?: string
     total: number
   }> {
+    // Group masks are acknowledged by the getter but delivered asynchronously
+    // through the group listener. Bound the first page on that callback so an
+    // assistant-only group can appear without a second dialog request.
+    if (!this.groupMsgMasksLoaded) {
+      await withTimeout(this.requestGroupMsgMask(), 2_500, 'QQ group message mask refresh timed out')
+        .catch((error) => log('error', 'group message mask refresh failed; using cache', error))
+    }
     // A refresh failure must not erase/block the already subscribed recent
     // contact snapshot (QQ can transiently reject this call during startup).
     if (!this.contacts.size) {
@@ -659,6 +770,124 @@ export class QQKernelBridge {
     return { users, nextCursor: offset + users.length < all.length ? String(offset + users.length) : undefined }
   }
 
+  async getRequests(
+    kind?: QQRequestKind, cursor?: string, limit = REQUEST_PAGE_LIMIT,
+  ): Promise<QQRequestPage> {
+    if (kind !== undefined && kind !== 'friend' && kind !== 'group-join') {
+      throw new Error('invalid request kind')
+    }
+    const buddyAvailable = Boolean(this.buddyService?.getBuddyReq)
+    const groupAvailable = Boolean(this.groupService?.getSingleScreenNotifies)
+    if ((kind === 'friend' && !buddyAvailable) || (kind === 'group-join' && !groupAvailable) ||
+      (!kind && !buddyAvailable && !groupAvailable)) throw new QQRequestApiUnavailableError()
+    const needsRefresh = kind === 'friend'
+      ? !this.friendRequestSnapshotLoaded
+      : kind === 'group-join'
+        ? !this.groupRequestSnapshotLoaded
+        : (buddyAvailable && !this.friendRequestSnapshotLoaded) ||
+          (groupAvailable && !this.groupRequestSnapshotLoaded)
+    if (needsRefresh) {
+      try {
+        await this.refreshRequests(kind)
+      } catch (error) {
+        if (error instanceof QQRequestApiUnavailableError || error instanceof QQRequestRefreshError) throw error
+        if (!this.hasRequestSnapshot(kind, buddyAvailable, groupAvailable)) {
+          throw new QQRequestRefreshError(error)
+        }
+        log('error', 'QQNT request refresh failed; using cached snapshot', error)
+      }
+    }
+    const scope = kind ?? 'all'
+    const afterId = decodeRequestCursor(cursor, scope, this.requestCursorSecret)
+    const requests = [...this.requests.values()]
+      .map((item) => item.request)
+      .filter((request) => !kind || request.kind === kind)
+      .filter((request) => !afterId || request.id > afterId)
+      .sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0)
+    const selected = requests.slice(0, clamp(limit, 1, 500))
+    const last = selected.at(-1)
+    return {
+      requests: selected,
+      nextCursor: last && requests.length > selected.length
+        ? encodeRequestCursor(scope, last.id, this.requestCursorSecret)
+        : undefined,
+    }
+  }
+
+  private hasRequestSnapshot(
+    kind: QQRequestKind | undefined, buddyAvailable: boolean, groupAvailable: boolean,
+  ): boolean {
+    if (kind === 'friend') return this.friendRequestSnapshotLoaded
+    if (kind === 'group-join') return this.groupRequestSnapshotLoaded
+    return (!buddyAvailable || this.friendRequestSnapshotLoaded) &&
+      (!groupAvailable || this.groupRequestSnapshotLoaded)
+  }
+
+  async resolveRequest(id: string, action: 'accept' | 'reject'): Promise<QQRequest> {
+    const inFlight = this.requestResolutionFlights.get(id)
+    if (inFlight) {
+      await inFlight
+      return this.resolveRequest(id, action)
+    }
+    const resolution = this.resolveRequestOnce(id, action)
+    this.requestResolutionFlights.set(id, resolution)
+    try {
+      return await resolution
+    } finally {
+      if (this.requestResolutionFlights.get(id) === resolution) {
+        this.requestResolutionFlights.delete(id)
+      }
+    }
+  }
+
+  private async resolveRequestOnce(id: string, action: 'accept' | 'reject'): Promise<QQRequest> {
+    if (!id || (action !== 'accept' && action !== 'reject')) throw new Error('invalid request resolution')
+    const cached = this.requests.get(id)
+    if (!cached) throw new Error('request not found')
+    const attachmentGeneration = this.requestAttachmentGeneration
+    const targetStatus: QQRequestStatus = action === 'accept' ? 'accepted' : 'rejected'
+    if (cached.request.status !== 'pending') {
+      if (cached.request.status === targetStatus) return cached.request
+      throw new QQRequestConflictError()
+    }
+    if (cached.kind === 'friend') {
+      const method = this.buddyService?.approvalFriendRequest
+      if (!method) throw new QQRequestApiUnavailableError()
+      let result: unknown
+      try {
+        result = await method.call(this.buddyService, {
+          friendUid: cached.raw.friendUid,
+          reqTime: cached.raw.reqTime,
+          accept: action === 'accept',
+        })
+      } catch (error) {
+        if (error instanceof QQRequestApiUnavailableError || error instanceof QQRequestSessionChangedError || error instanceof QQRequestResolutionError) throw error
+        throw new QQRequestResolutionError('approvalFriendRequest', -1, 'native request rejected')
+      }
+      assertNativeRequestResolutionSuccess('approvalFriendRequest', result)
+    } else {
+      const method = this.groupService?.operateSysNotify
+      if (!method) throw new QQRequestApiUnavailableError()
+      let result: unknown
+      try {
+        result = await method.call(this.groupService, cached.doubt, {
+          operateType: action === 'accept' ? 1 : 2,
+          targetMsg: cached.raw,
+        })
+      } catch (error) {
+        if (error instanceof QQRequestApiUnavailableError || error instanceof QQRequestSessionChangedError || error instanceof QQRequestResolutionError) throw error
+        throw new QQRequestResolutionError('operateSysNotify', -1, 'native request rejected')
+      }
+      assertNativeRequestResolutionSuccess('operateSysNotify', result)
+    }
+    if (attachmentGeneration !== this.requestAttachmentGeneration || this.requests.get(id) !== cached) {
+      throw new QQRequestSessionChangedError()
+    }
+    cached.request = { ...cached.request, status: targetStatus }
+    this.dispatch({ type: 'request', request: cached.request })
+    return cached.request
+  }
+
   getConversation(id: string): QQConversation {
     const known = this.contacts.get(id)
     if (known) return known
@@ -674,12 +903,14 @@ export class QQKernelBridge {
   }
 
   async resolveConversation(chatType: 1 | 2, numericId: string): Promise<QQConversation> {
+    if (chatType === CHAT_GROUP) this.assistantMaterializedGroups.delete(numericId)
     const known = [...this.contacts.values()].find((item) => item.chatType === chatType && item.peerUin === numericId)
     if (known) return this.withConversationAvatar(known)
     if (chatType === CHAT_GROUP) {
       const created: QQConversation = {
         id: conversationId(CHAT_GROUP, numericId), kind: 'group', title: numericId,
         peerUid: numericId, peerUin: numericId, chatType: CHAT_GROUP,
+        groupMsgMask: this.groupMsgMasks.get(numericId),
       }
       this.mergeConversation(created)
       await this.ensureGroupProfile(numericId).catch((error) =>
@@ -871,6 +1102,21 @@ export class QQKernelBridge {
     this.unreadBatchState = ''
     this.unreadBatchPromise = undefined
     log('info', `native API complete name=setSpecificMsgReadAndReport conversation=${conversation.id} message=${messageId}`)
+  }
+
+  async setGroupMsgMask(groupCode: string, mask: GroupMsgMask): Promise<void> {
+    const groupService = this.requireGroupService()
+    const method = groupService.setGroupMsgMask
+    if (!method) throw new Error('QQNT does not expose setGroupMsgMask')
+    log('info', `native API start name=setGroupMsgMask group=${groupCode} mask=${mask}`)
+    const result = await method.call(groupService, groupCode, mask)
+    log('info', `native API complete name=setGroupMsgMask group=${groupCode} mask=${mask} result=${result.result} err=${JSON.stringify(result.errMsg)}`)
+    if (result.result !== 0) {
+      throw new Error(`setGroupMsgMask: ${result.errMsg} (${result.result})`)
+    }
+    // Reflect the change locally so the UI updates immediately; the registered
+    // onGroupsMsgMaskResult listener will deduplicate/overwrite when it arrives.
+    this.updateGroupMsgMask(groupCode, mask)
   }
 
   private async hydrateRecentTopMessage(conversation: QQConversation): Promise<QQConversation> {
@@ -2733,6 +2979,7 @@ export class QQKernelBridge {
     this.buddyService = buddyService
     this.groupService = groupService
     this.recentService = recentService
+    const requestListenerGeneration = this.requestAttachmentGeneration
     try {
       this.profileService = session.getProfileService?.()
     } catch {
@@ -2811,6 +3058,10 @@ export class QQKernelBridge {
           if (this.users.has(buddy.uid)) this.upsertBuddy(buddy)
         }
       },
+      onBuddyReqChange: (value: { unreadNums?: unknown, buddyReqs?: unknown } | unknown[]) => {
+        if (requestListenerGeneration !== this.requestAttachmentGeneration || this.buddyService !== buddyService) return
+        if (this.consumeBuddyRequests(value)) this.resolveRequestUpdates('buddy')
+      },
     }))
     this.buddyListenerId = buddyService.addKernelBuddyListener(buddyListener)
     log('info', `native listener registered service=buddy id=${this.buddyListenerId || '<empty>'}`)
@@ -2834,6 +3085,18 @@ export class QQKernelBridge {
     const groupListener = markBridgeListener(
       makeListener(
         'NodeIKernelGroupListener', kernel.NodeIKernelGroupListener, {
+      onGroupsMsgMaskResult: (items: GroupMsgMaskInfo[]) => {
+        if (!Array.isArray(items)) return
+        let accepted = 0
+        for (const item of items) {
+          if (!item?.groupCode || typeof item.msgMask !== 'number') continue
+          accepted++
+          this.updateGroupMsgMask(item.groupCode, item.msgMask)
+        }
+        this.groupMsgMasksLoaded = true
+        this.resolveGroupMsgMaskUpdates()
+        log('info', `group message mask update received entries=${items.length} accepted=${accepted} cached=${this.groupMsgMasks.size}`)
+      },
       onGroupListUpdate: (
         value: number | {
           groupList: Array<{
@@ -2886,11 +3149,27 @@ export class QQKernelBridge {
           finish: !info.hasNext,
         })
       },
+      onGroupSingleScreenNotifies: (
+        doubt: boolean,
+        nextStartSeq: unknown,
+        notifies?: unknown,
+      ) => {
+        if (requestListenerGeneration !== this.requestAttachmentGeneration || this.groupService !== groupService) return
+        this.receiveGroupRequestPage(
+          doubt,
+          notifies === undefined ? nextStartSeq : { nextStartSeq, notifies },
+        )
+      },
+      onGroupNotifiesUpdated: (doubt: boolean, value: unknown[] | { notifies?: unknown }) => {
+        if (requestListenerGeneration !== this.requestAttachmentGeneration || this.groupService !== groupService) return
+        this.consumeGroupRequests(doubt, value)
+      },
         },
       ),
     )
     this.groupListenerId = groupService.addKernelGroupListener(groupListener)
     log('info', `native listener registered service=group id=${this.groupListenerId || '<empty>'}`)
+    void this.requestGroupMsgMask()
     if (recentService.addKernelRecentContactListener) {
       const recentListener = markBridgeListener(
         makeListener(
@@ -3248,6 +3527,256 @@ export class QQKernelBridge {
     for (const resolve of [...this.pendingRecentListUpdates]) resolve()
   }
 
+  private waitForRequestUpdate(source: string, timeoutMs: number): { promise: Promise<RequestUpdate | undefined>, cancel: () => void } {
+    let finish!: (update: RequestUpdate | undefined) => void
+    const promise = new Promise<RequestUpdate | undefined>((resolve) => { finish = resolve })
+    const waiters = this.pendingRequestUpdates.get(source) ?? new Set<(update: RequestUpdate) => void>()
+    this.pendingRequestUpdates.set(source, waiters)
+    const timer = setTimeout(() => finish(undefined), timeoutMs)
+    const waiter = (update: RequestUpdate) => {
+      clearTimeout(timer)
+      waiters.delete(waiter)
+      if (!waiters.size) this.pendingRequestUpdates.delete(source)
+      finish(update)
+    }
+    waiters.add(waiter)
+    return { promise, cancel: () => waiter({}) }
+  }
+
+  private resolveRequestUpdates(source?: string, update: RequestUpdate = {}): void {
+    if (source !== undefined) {
+      for (const resolve of [...(this.pendingRequestUpdates.get(source) ?? [])]) resolve(update)
+      return
+    }
+    for (const waiters of this.pendingRequestUpdates.values()) {
+      for (const resolve of [...waiters]) resolve(update)
+    }
+  }
+
+  private async refreshRequests(kind?: QQRequestKind): Promise<void> {
+    const loads: Promise<void>[] = []
+    if ((kind === undefined || kind === 'friend') && this.buddyService?.getBuddyReq) {
+      loads.push(this.refreshFriendRequests())
+    }
+    if ((kind === undefined || kind === 'group-join') && this.groupService?.getSingleScreenNotifies) {
+      loads.push(this.refreshGroupRequests())
+    }
+    if (!loads.length) throw new QQRequestApiUnavailableError()
+    await Promise.all(loads)
+  }
+
+  private refreshFriendRequests(): Promise<void> {
+    if (this.friendRequestSnapshotLoaded) return Promise.resolve()
+    if (this.friendRequestRefresh) return this.friendRequestRefresh
+    const generation = this.requestRefreshGeneration
+    const task = this.requestBuddyRequests(generation).then(() => {
+      if (generation === this.requestRefreshGeneration) this.friendRequestSnapshotLoaded = true
+    })
+    this.friendRequestRefresh = task
+    void task.then(
+      () => { if (this.friendRequestRefresh === task) this.friendRequestRefresh = undefined },
+      () => { if (this.friendRequestRefresh === task) this.friendRequestRefresh = undefined },
+    )
+    return task
+  }
+
+  private refreshGroupRequests(): Promise<void> {
+    if (this.groupRequestSnapshotLoaded) return Promise.resolve()
+    if (this.groupRequestRefresh) return this.groupRequestRefresh
+    const generation = this.requestRefreshGeneration
+    const task = this.requestGroupRequests(generation).then(() => {
+      if (generation === this.requestRefreshGeneration) this.groupRequestSnapshotLoaded = true
+    })
+    this.groupRequestRefresh = task
+    void task.then(
+      () => { if (this.groupRequestRefresh === task) this.groupRequestRefresh = undefined },
+      () => { if (this.groupRequestRefresh === task) this.groupRequestRefresh = undefined },
+    )
+    return task
+  }
+
+  private async requestBuddyRequests(generation: number): Promise<void> {
+    const service = this.buddyService
+    const method = service?.getBuddyReq
+    if (!service || !method) throw new QQRequestApiUnavailableError()
+    const update = this.waitForRequestUpdate('buddy', 1_500)
+    try {
+      log('info', 'native API start name=getBuddyReq')
+      const result = await withTimeout(method.call(service), 1_500, 'getBuddyReq timed out')
+      assertNativeRequestSuccess('getBuddyReq', result)
+      log('info', `native API complete name=getBuddyReq payload=${summarizeNativeResult(result)}`)
+      if (generation !== this.requestRefreshGeneration) return
+      const refreshed = this.consumeBuddyRequests(result) || await update.promise
+      if (!refreshed) throw new Error('getBuddyReq listener timed out')
+    } finally {
+      update.cancel()
+    }
+  }
+
+  private async requestGroupRequests(generation: number): Promise<void> {
+    const service = this.groupService
+    const method = service?.getSingleScreenNotifies
+    if (!service || !method) throw new QQRequestApiUnavailableError()
+    for (const doubt of [false, true]) {
+      let startSeq = ''
+      const seen = new Set<string>()
+      while (true) {
+        if (seen.has(startSeq) || seen.size >= 100) {
+          throw new QQRequestRefreshError(
+            new Error(`group request pagination loop or limit reached doubt=${doubt} startSeq=${JSON.stringify(startSeq)}`),
+          )
+        }
+        seen.add(startSeq)
+        const active = { startSeq, token: ++this.groupRequestPageToken }
+        this.activeGroupRequestPages.set(doubt, active)
+        const update = this.waitForRequestUpdate(`group:${doubt}:${active.token}`, 1_500)
+        let page: RequestUpdate | undefined
+        try {
+          log('info', `native API start name=getSingleScreenNotifies doubt=${doubt} startSeq=${JSON.stringify(startSeq)} count=${REQUEST_PAGE_LIMIT}`)
+          const result = await withTimeout(
+            method.call(service, doubt, startSeq, REQUEST_PAGE_LIMIT),
+            1_500,
+            'getSingleScreenNotifies timed out',
+          )
+          assertNativeRequestSuccess('getSingleScreenNotifies', result)
+          log('info', `native API complete name=getSingleScreenNotifies payload=${summarizeNativeResult(result)}`)
+          if (generation !== this.requestRefreshGeneration) return
+          page = this.consumeGroupRequests(doubt, result)
+          if (page) this.markGroupRequestPageConsumed(doubt, result)
+          else page = await update.promise
+          if (!page) throw new Error('getSingleScreenNotifies listener timed out')
+        } finally {
+          update.cancel()
+          if (this.activeGroupRequestPages.get(doubt)?.token === active.token) {
+            this.activeGroupRequestPages.delete(doubt)
+          }
+        }
+        if (generation !== this.requestRefreshGeneration) return
+        const nextStartSeq = page?.nextStartSeq
+        if (!nextStartSeq) break
+        if (seen.has(nextStartSeq) || seen.size >= 100) {
+          throw new QQRequestRefreshError(
+            new Error(`group request pagination continuation is invalid doubt=${doubt} nextStartSeq=${JSON.stringify(nextStartSeq)}`),
+          )
+        }
+        startSeq = nextStartSeq
+      }
+    }
+  }
+
+  private consumeBuddyRequests(value: unknown): boolean {
+    const requests = Array.isArray(value)
+      ? value
+      : value && typeof value === 'object' && Array.isArray((value as { buddyReqs?: unknown }).buddyReqs)
+        ? (value as { buddyReqs: unknown[] }).buddyReqs
+        : undefined
+    if (!requests) return false
+    const pending = new Set<string>()
+    for (const value of requests) {
+      if (!value || typeof value !== 'object') continue
+      const raw = value as BuddyRequest
+      if (!isNativeRequestId(raw.friendUid) || !isNativeRequestId(raw.reqTime)) continue
+      const id = opaqueRequestId('friend', raw.friendUid, raw.reqTime)
+      // Only native, incoming, undecided requests can be approved by this account.
+      if (raw.isInitiator === false && raw.isDecide === false) {
+        pending.add(id)
+        const request: QQRequest = {
+          id, kind: 'friend', status: 'pending',
+          requester: { id: raw.friendUid, ...(nonEmptyString(raw.friendNick) ? { name: raw.friendNick } : {}) },
+          ...(nonEmptyString(raw.extWords) ? { message: raw.extWords } : {}),
+          timestamp: raw.reqTime,
+        }
+        this.cachePendingRequest({ kind: 'friend', request, raw: { friendUid: raw.friendUid, reqTime: raw.reqTime } })
+      } else if (raw.isInitiator === false && raw.isDecide === true && typeof raw.isAgreed === 'boolean') {
+        this.updateNativeRequestStatus(id, raw.isAgreed ? 'accepted' : 'rejected')
+      } else {
+        this.removePendingRequest(id)
+      }
+    }
+    // getBuddyReq and onBuddyReqChange both provide the complete native list.
+    for (const [id, cached] of this.requests) {
+      if (cached.kind === 'friend' && cached.request.status === 'pending' && !pending.has(id)) {
+        this.requests.delete(id)
+      }
+    }
+    return true
+  }
+
+  private receiveGroupRequestPage(doubt: boolean, value: unknown): void {
+    const active = this.activeGroupRequestPages.get(doubt)
+    const fingerprint = groupRequestPageFingerprint(doubt, value)
+    if (active && fingerprint && this.consumedGroupRequestPages.has(fingerprint)) return
+    const update = this.consumeGroupRequests(doubt, value)
+    if (!update || !active || !fingerprint) return
+    this.consumedGroupRequestPages.add(fingerprint)
+    this.resolveRequestUpdates(`group:${doubt}:${active.token}`, update)
+  }
+
+  private markGroupRequestPageConsumed(doubt: boolean, value: unknown): void {
+    const fingerprint = groupRequestPageFingerprint(doubt, value)
+    if (fingerprint) this.consumedGroupRequestPages.add(fingerprint)
+  }
+
+  private consumeGroupRequests(doubt: boolean, value: unknown): RequestUpdate | undefined {
+    const payload = Array.isArray(value) ? { notifies: value } : value
+    if (!payload || typeof payload !== 'object') return undefined
+    const { notifies, nextStartSeq } = payload as { notifies?: unknown, nextStartSeq?: unknown }
+    if (!Array.isArray(notifies)) return undefined
+    const update = isNativeRequestId(nextStartSeq) ? { nextStartSeq: String(nextStartSeq) } : {}
+    for (const value of notifies) {
+      if (!value || typeof value !== 'object') continue
+      const raw = value as GroupNotify
+      if (!isNativeRequestId(raw.seq) || raw.type !== 7) continue
+      const id = opaqueRequestId('group-join', doubt, raw.seq)
+      const groupCode = raw.group?.groupCode
+      const requester = raw.user1?.uid
+      // QQNT uses type 7/status 1 for administrator-pending group admission only.
+      if (raw.status !== 1 || !nonEmptyString(groupCode) || !nonEmptyString(requester)) {
+        this.removePendingRequest(id)
+        continue
+      }
+      const request: QQRequest = {
+        id, kind: 'group-join', status: 'pending',
+        requester: { id: requester, ...(nonEmptyString(raw.user1?.nickName) ? { name: raw.user1.nickName } : {}) },
+        group: { id: groupCode, ...(nonEmptyString(raw.group?.groupName) ? { name: raw.group.groupName } : {}) },
+        ...(nonEmptyString(raw.postscript) ? { message: raw.postscript } : {}),
+        ...(raw.actionTime === undefined ? {} : { timestamp: raw.actionTime }),
+      }
+      this.cachePendingRequest({
+        kind: 'group-join', request, doubt,
+        raw: {
+          seq: raw.seq,
+          type: raw.type,
+          groupCode,
+          postscript: nonEmptyString(raw.postscript) ? raw.postscript : ' ',
+        },
+      })
+    }
+    return update
+  }
+
+  private updateNativeRequestStatus(id: string, status: Extract<QQRequestStatus, 'accepted' | 'rejected'>): void {
+    const cached = this.requests.get(id)
+    if (!cached || cached.request.status !== 'pending') return
+    cached.request = { ...cached.request, status }
+    this.dispatch({ type: 'request', request: cached.request })
+  }
+
+  private removePendingRequest(id: string): void {
+    const cached = this.requests.get(id)
+    if (cached?.request.status === 'pending') this.requests.delete(id)
+  }
+
+  private cachePendingRequest(next: CachedRequest): void {
+    const previous = this.requests.get(next.request.id)
+    // A stale listener refresh must not undo a resolution completed locally.
+    if (previous?.request.status !== undefined && previous.request.status !== 'pending') return
+    this.requests.set(next.request.id, next)
+    if (!previous || JSON.stringify(previous.request) !== JSON.stringify(next.request)) {
+      this.dispatch({ type: 'request', request: next.request })
+    }
+  }
+
   private consumeRecentContactList(sortedContactList: string[] | undefined, changedList: RecentContactInfo[]): void {
     for (const item of changedList) {
       this.upsertRecent(item)
@@ -3291,6 +3820,9 @@ export class QQKernelBridge {
         log('error', 'initial self profile refresh failed', error))
     }
     await this.refreshContacts().catch((error) => log('error', 'initial contact refresh failed', error))
+    await this.refreshRequests().catch((error) => {
+      if (!(error instanceof QQRequestApiUnavailableError)) log('error', 'initial request refresh failed', error)
+    })
   }
 
   private async ensureUserProfiles(uids: string[]): Promise<void> {
@@ -3369,6 +3901,62 @@ export class QQKernelBridge {
     } finally {
       if (this.reactionCatalogPromise === pending) this.reactionCatalogPromise = undefined
     }
+  }
+
+  private async requestGroupMsgMask(): Promise<boolean> {
+    if (this.groupMsgMasksLoaded) return true
+    if (this.groupMsgMaskRequest) return this.groupMsgMaskRequest
+    const request = this.requestGroupMsgMaskOnce()
+    this.groupMsgMaskRequest = request
+    try {
+      return await request
+    } finally {
+      if (this.groupMsgMaskRequest === request) this.groupMsgMaskRequest = undefined
+    }
+  }
+
+  private async requestGroupMsgMaskOnce(): Promise<boolean> {
+    const groupService = this.requireGroupService()
+    const method = groupService.getGroupMsgMask
+    if (!method) return false
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const update = this.waitForGroupMsgMaskUpdate(1_000)
+      try {
+        log('info', `native API start name=getGroupMsgMask attempt=${attempt}`)
+        const result = await method.call(groupService)
+        log('info', `native API complete name=getGroupMsgMask attempt=${attempt} result=${result.result} hasError=${result.result !== 0}`)
+        if (result.result === 0) {
+          await update.promise
+          if (this.groupMsgMasksLoaded) return true
+        } else {
+          log('warn', `getGroupMsgMask did not refresh masks: attempt=${attempt} result=${result.result}`)
+        }
+      } catch (error) {
+        log('error', `group message mask refresh failed attempt=${attempt}`, error)
+      } finally {
+        update.cancel()
+      }
+      if (attempt < 2) log('info', 'retrying group message mask refresh')
+    }
+    return false
+  }
+
+  private waitForGroupMsgMaskUpdate(timeoutMs: number): { promise: Promise<void>, cancel: () => void } {
+    if (this.groupMsgMasksLoaded) return { promise: Promise.resolve(), cancel() {} }
+    let finish!: () => void
+    const promise = new Promise<void>((resolve) => { finish = resolve })
+    const timer = setTimeout(finish, timeoutMs)
+    const waiter = () => {
+      clearTimeout(timer)
+      this.pendingGroupMsgMaskUpdates.delete(waiter)
+      finish()
+    }
+    this.pendingGroupMsgMaskUpdates.add(waiter)
+    return { promise, cancel: waiter }
+  }
+
+  private resolveGroupMsgMaskUpdates(): void {
+    for (const resolve of [...this.pendingGroupMsgMaskUpdates]) resolve()
   }
 
   private async requestGroupList(): Promise<void> {
@@ -3754,6 +4342,7 @@ export class QQKernelBridge {
     }
     const user = item.chatType === CHAT_C2C ? this.users.get(item.peerUid) : undefined
     const group = item.chatType === CHAT_GROUP ? this.groups.get(item.peerUin || item.peerUid) : undefined
+    if (item.chatType === CHAT_GROUP) this.assistantMaterializedGroups.delete(item.peerUin || item.peerUid)
     const current = this.contacts.get(conversationId(item.chatType, item.peerUid))
     const id = conversationId(item.chatType, item.peerUid)
     if (item.msgId) {
@@ -3775,6 +4364,7 @@ export class QQKernelBridge {
       peerUin: item.peerUin || (item.chatType === CHAT_GROUP ? item.peerUid : ''),
       chatType: item.chatType,
       avatarUrl: user?.avatarUrl || group?.avatarUrl || item.avatarUrl,
+      groupMsgMask: item.chatType === CHAT_GROUP ? this.groupMsgMasks.get(item.peerUin || item.peerUid) : undefined,
       unreadCount: Number(item.unreadCnt) || 0,
       // abstractContent is only QQ's lossy UI summary (for example `[图片]`).
       // Never expose it as a QQMessage: getDialogs hydrates msgId through the
@@ -3845,12 +4435,17 @@ export class QQKernelBridge {
   private upsertGroupProfile(group: GroupProfileInfo & { avatarUrl?: string }): void {
     const name = group.remarkName || group.groupName || group.groupCode
     const previous = this.groups.get(group.groupCode)
+    if (typeof group.cmdUinMsgMask === 'number') this.updateGroupMsgMask(group.groupCode, group.cmdUinMsgMask)
+    const groupMsgMask = typeof group.cmdUinMsgMask === 'number'
+      ? group.cmdUinMsgMask
+      : this.groupMsgMasks.get(group.groupCode)
     this.groups.set(group.groupCode, {
       name: !isFallbackTitle(name, group.groupCode) ? name : previous?.name || name,
       avatarUrl: group.avatarUrl || previous?.avatarUrl,
       participantCount: group.memberCount ?? group.memberNum ?? previous?.participantCount,
       selfRole: mapMemberRole(group.memberRole ?? group.cmdUinPrivilege) ?? previous?.selfRole,
     })
+    this.materializeGroupAssistant(group.groupCode)
     const id = conversationId(CHAT_GROUP, group.groupCode)
     if (!this.contacts.has(id)) return
     this.mergeConversation({
@@ -3863,6 +4458,46 @@ export class QQKernelBridge {
       avatarUrl: group.avatarUrl,
       participantCount: group.memberCount ?? group.memberNum,
       selfRole: mapMemberRole(group.memberRole ?? group.cmdUinPrivilege),
+      groupMsgMask,
+    })
+  }
+
+  private updateGroupMsgMask(groupCode: string, groupMsgMask: number): void {
+    this.groupMsgMasks.set(groupCode, groupMsgMask)
+    const id = conversationId(CHAT_GROUP, groupCode)
+    if (groupMsgMask !== GroupMsgMask.ASSISTANT && this.assistantMaterializedGroups.delete(groupCode)) {
+      this.contacts.delete(id)
+      return
+    }
+    const current = this.contacts.get(id)
+    if (current?.chatType === CHAT_GROUP) {
+      this.mergeConversation({ ...current, groupMsgMask })
+    }
+    this.materializeGroupAssistant(groupCode)
+  }
+
+  private materializeGroupAssistant(groupCode: string): void {
+    if (this.groupMsgMasks.get(groupCode) !== GroupMsgMask.ASSISTANT) return
+    const group = this.groups.get(groupCode)
+    if (!group) return
+    const id = conversationId(CHAT_GROUP, groupCode)
+    const existing = this.contacts.get(id)
+    if (existing?.chatType === CHAT_GROUP) {
+      this.mergeConversation({ ...existing, groupMsgMask: GroupMsgMask.ASSISTANT })
+      return
+    }
+    this.assistantMaterializedGroups.add(groupCode)
+    this.mergeConversation({
+      id,
+      kind: 'group',
+      title: group.name,
+      peerUid: groupCode,
+      peerUin: groupCode,
+      chatType: CHAT_GROUP,
+      avatarUrl: group.avatarUrl,
+      participantCount: group.participantCount,
+      selfRole: group.selfRole,
+      groupMsgMask: GroupMsgMask.ASSISTANT,
     })
   }
 
@@ -3891,6 +4526,9 @@ export class QQKernelBridge {
       selfRole: next.selfRole
         ?? current?.selfRole
         ?? (next.chatType === CHAT_GROUP ? this.groups.get(peerKey)?.selfRole : undefined),
+      groupMsgMask: next.groupMsgMask
+        ?? current?.groupMsgMask
+        ?? (next.chatType === CHAT_GROUP ? this.groupMsgMasks.get(peerKey) : undefined),
       unreadCount: next.unreadCount ?? current?.unreadCount,
       lastMessage: next.lastMessage ?? current?.lastMessage,
     }
@@ -6075,6 +6713,105 @@ function isASCIITokenByte(value: number | undefined): boolean {
   )
 }
 
+function nonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0
+}
+
+function isNativeRequestId(value: unknown): value is string | number {
+  return nonEmptyString(value) || (typeof value === 'number' && Number.isFinite(value))
+}
+
+function opaqueRequestId(kind: QQRequestKind, ...parts: unknown[]): string {
+  const canonical = JSON.stringify([kind, parts])
+  return `request:${createHash('sha256').update('qqnt-request-id-v1\0').update(canonical).digest('base64url')}`
+}
+
+function groupRequestPageFingerprint(doubt: boolean, value: unknown): string | undefined {
+  const payload = Array.isArray(value) ? { notifies: value } : value
+  if (!payload || typeof payload !== 'object') return undefined
+  const { nextStartSeq, notifies } = payload as { nextStartSeq?: unknown, notifies?: unknown }
+  if (!Array.isArray(notifies)) return undefined
+  const notifiesFingerprint = notifies.map((notify) => {
+    if (!notify || typeof notify !== 'object') return null
+    const item = notify as GroupNotify
+    return {
+      seq: item.seq,
+      type: item.type,
+      status: item.status,
+      groupCode: item.group?.groupCode,
+      userUid: item.user1?.uid,
+    }
+  })
+  return createHash('sha256')
+    .update(JSON.stringify({ doubt, nextStartSeq: isNativeRequestId(nextStartSeq) ? String(nextStartSeq) : '', notifies: notifiesFingerprint }))
+    .digest('base64url')
+}
+
+function encodeRequestCursor(scope: QQRequestKind | 'all', afterId: string, secret: Buffer | undefined): string {
+  if (!secret) throw new QQRequestCursorError()
+  const payload = Buffer.from(JSON.stringify({ v: 1, scope, afterId })).toString('base64url')
+  const signature = createHmac('sha256', secret).update(payload).digest('base64url')
+  return `${payload}.${signature}`
+}
+
+function decodeRequestCursor(
+  cursor: string | undefined,
+  scope: QQRequestKind | 'all',
+  secret: Buffer | undefined,
+): string | undefined {
+  if (cursor === undefined) return undefined
+  if (!secret || !/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(cursor)) throw new QQRequestCursorError()
+  const [payload, signature] = cursor.split('.')
+  const expected = createHmac('sha256', secret).update(payload).digest()
+  let supplied: Buffer
+  let decoded: unknown
+  try {
+    supplied = Buffer.from(signature, 'base64url')
+    const payloadBytes = Buffer.from(payload, 'base64url')
+    if (supplied.toString('base64url') !== signature || payloadBytes.toString('base64url') !== payload) {
+      throw new QQRequestCursorError()
+    }
+    decoded = JSON.parse(payloadBytes.toString('utf8'))
+  } catch {
+    throw new QQRequestCursorError()
+  }
+  if (!supplied.length || supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) {
+    throw new QQRequestCursorError()
+  }
+  if (!decoded || typeof decoded !== 'object') throw new QQRequestCursorError()
+  const value = decoded as { v?: unknown, scope?: unknown, afterId?: unknown }
+  if (value.v !== 1 || value.scope !== scope || typeof value.afterId !== 'string' || !value.afterId) {
+    throw new QQRequestCursorError()
+  }
+  return value.afterId
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+function assertNativeRequestSuccess(method: string, result: unknown): void {
+  if (!result || typeof result !== 'object') return
+  const value = result as { result?: unknown, errCode?: unknown, errMsg?: unknown }
+  const code = typeof value.result === 'number' ? value.result : value.errCode
+  if (typeof code === 'number' && code !== 0) {
+    throw new Error(`${method}: ${typeof value.errMsg === 'string' ? value.errMsg : 'native request failed'} (${code})`)
+  }
+}
+
+function assertNativeRequestResolutionSuccess(method: string, result: unknown): void {
+  if (!result || typeof result !== 'object') return
+  const value = result as { result?: unknown, errCode?: unknown, errMsg?: unknown }
+  const code = typeof value.result === 'number' ? value.result : value.errCode
+  if (typeof code === 'number' && code !== 0) {
+    throw new QQRequestResolutionError(
+      method,
+      code,
+      typeof value.errMsg === 'string' ? value.errMsg : 'native request failed',
+    )
+  }
+}
+
 function makeListener(
   name: string,
   Constructor: (new (handlers: Record<string, (...args: never[]) => unknown>) => unknown) | undefined,
@@ -6608,6 +7345,9 @@ function eventSummary(event: QQEvent): string {
   }
   if (event.type === 'message-delete') {
     return `type=message-delete conversation=${event.conversation.id} title=${JSON.stringify(event.conversation.title)} avatar=${event.conversation.avatar?.id ?? '<none>'} messages=${event.messageIds.join(',')}`
+  }
+  if (event.type === 'request') {
+    return `type=request request=${event.request.id} kind=${event.request.kind} status=${event.request.status}`
   }
   if (event.type === 'call-signal') {
     return `type=call-signal version=${event.version} signal=${event.signal} media=${event.media}`

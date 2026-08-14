@@ -68,6 +68,35 @@ export interface MemberInfo {
   avatarPath: string
 }
 
+/**
+ * Group notification behavior verified live on QQ Linux 3.2.32.
+ *
+ * `getGroupMsgMask()` takes no arguments and succeeds with the Promise-like
+ * `{ result: 0, errMsg: 'success' }`; values arrive through the single
+ * `onGroupsMsgMaskResult(GroupMsgMaskInfo[])` argument, whose entries are
+ * `{ groupCode: string, msgMask: number }`. Native chatType 7 is
+ * KCHATTYPEGROUPHELPER, the group-assistant container. Do not confuse it with
+ * ServiceAssistant (118) or its child entries (201).
+ */
+export enum GroupMsgMask {
+  /** 0 UNSPECIFIED: 未指定. */
+  UNSPECIFIED = 0,
+  /** 1 NOTIFY: 接收并提醒. */
+  NOTIFY = 1,
+  /** 2 ASSISTANT: 收进群助手且不提醒. */
+  ASSISTANT = 2,
+  /** 3 SHIELD: 屏蔽群消息. */
+  SHIELD = 3,
+  /** 4 RECEIVE: 接收但不提醒. */
+  RECEIVE = 4,
+}
+
+export interface GroupMsgMaskInfo {
+  groupCode: string
+  /** Raw native value; it may be a newer value outside GroupMsgMask. */
+  msgMask: number
+}
+
 export interface GroupProfileInfo {
   groupCode: string
   groupName: string
@@ -76,6 +105,8 @@ export interface GroupProfileInfo {
   memberNum?: number
   memberRole?: number
   cmdUinPrivilege?: number
+  /** Raw native value; it may be a newer value outside GroupMsgMask. */
+  cmdUinMsgMask?: number
 }
 
 export interface MsgElement {
@@ -664,10 +695,34 @@ export interface KernelSearchService {
   cancelSearchChatMsgs(searchId: number, code: number, reason: string): void
 }
 
+export interface BuddyRequest {
+  friendUid?: string
+  reqTime?: string | number
+  isInitiator?: boolean
+  isDecide?: boolean
+  reqType?: number
+  extWords?: string
+  isUnread?: boolean
+  isDoubt?: boolean
+  friendNick?: string
+  sourceId?: string
+  groupCode?: string
+  isBuddy?: boolean
+  isAgreed?: boolean
+  relation?: number
+}
+
 export interface KernelBuddyService {
   addKernelBuddyListener(listener: unknown): string
   removeKernelBuddyListener(listenerId: string): void
   getBuddyList(force: boolean): Promise<{ result: number, errMsg: string }>
+  /** QQNT request data may arrive through onBuddyReqChange rather than this call's return value. */
+  getBuddyReq?(): Promise<unknown>
+  approvalFriendRequest?(request: {
+    friendUid: string
+    reqTime: string | number
+    accept: boolean
+  }): Promise<unknown>
   getBuddyNick?(uids: string[]): Map<string, string>
   getBuddyRemark?(uids: string[]): Map<string, string>
 }
@@ -679,11 +734,38 @@ export interface KernelProfileService {
   getCoreAndBaseInfo?(callFrom: string, uids: string[]): Promise<Map<string, ProfileCoreAndBaseInfo>>
 }
 
+export interface GroupNotify {
+  seq?: string | number
+  type?: number
+  status?: number
+  group?: { groupCode?: string, groupName?: string }
+  user1?: { uid?: string, nickName?: string }
+  user2?: { uid?: string, nickName?: string }
+  actionUser?: { uid?: string, nickName?: string }
+  actionTime?: string | number
+  postscript?: string
+  invitationExt?: string
+}
+
 export interface KernelGroupService {
   addKernelGroupListener(listener: unknown): string
   removeKernelGroupListener(listenerId: string): void
   getGroupList(force: boolean): Promise<{ result: number, errMsg: string }>
+  /** QQNT request data may arrive through the group listener rather than this call's return value. */
+  getSingleScreenNotifies?(doubt: boolean, startSeq: string, count: number): Promise<unknown>
+  operateSysNotify?(doubt: boolean, request: {
+    operateType: 1 | 2
+    targetMsg: { seq: string | number, type: number, groupCode: string, postscript: string }
+  }): Promise<unknown>
   getGroupDetailInfo?(groupCode: string, source: number): Promise<{ result: number, errMsg: string }>
+  getGroupMsgMask?(): Promise<{ result: number, errMsg: string }>
+  /**
+   * Sets the group notification mask for a single group. Return shape mirrors
+   * getGroupMsgMask: NapCat/Yui stubs expose `(groupCode: string, mask: GroupMsgMask)`
+   * resolving to `{ result: 0, errMsg: 'success' }`; a non-zero result indicates
+   * a native failure. Verified against the public stub signature only.
+   */
+  setGroupMsgMask?(groupCode: string, mask: GroupMsgMask): Promise<{ result: number, errMsg: string }>
   createMemberListScene(groupCode: string, scene: string): string
   destroyMemberListScene(sceneId: string): void
   getNextMemberList(sceneId: string, lastId: { uid: string, index: number }, count: number): Promise<{

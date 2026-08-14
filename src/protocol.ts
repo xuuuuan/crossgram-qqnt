@@ -252,12 +252,39 @@ export interface QQConversation {
   participantCount?: number
   /** Current account's native group role (2 member, 3 admin, 4 owner). */
   selfRole?: 'owner' | 'administrator' | 'member'
+  /** Raw QQ GroupMsgMask value; no notification behavior is inferred from it. */
+  groupMsgMask?: number
   unreadCount?: number
   lastMessage?: QQMessage
   /** QQ's native cursor for the first unread message. */
   firstUnread?: { msgSeq: string, msgTime: string }
   /** Last message read before QQ's first unread message. */
   readInboxMaxMessage?: QQMessage
+}
+
+export type QQRequestKind = 'friend' | 'group-join'
+export type QQRequestStatus = 'pending' | 'accepted' | 'rejected'
+
+/** Native QQ friend and administrator-approved group admission request. */
+export interface QQRequest {
+  /** Stable opaque identifier; it does not expose QQNT's action payload. */
+  id: string
+  kind: QQRequestKind
+  status: QQRequestStatus
+  requester: { id: string, name?: string }
+  group?: { id: string, name?: string }
+  message?: string
+  timestamp?: string | number
+}
+
+export interface QQRequestPage {
+  requests: QQRequest[]
+  nextCursor?: string
+}
+
+export interface QQRequestEvent {
+  type: 'request'
+  request: QQRequest
 }
 
 export interface QQCallSignalEvent {
@@ -271,6 +298,7 @@ export interface QQCallSignalEvent {
 }
 
 export type QQEvent =
+  | QQRequestEvent
   | { type: 'message', conversation: QQConversation, message: QQMessage }
   | { type: 'message-delete', eventId: string, conversation: QQConversation, messageIds: string[], timestamp: number }
   | {

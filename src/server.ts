@@ -8,8 +8,9 @@ import WebSocket, { WebSocketServer } from 'ws'
 import {
   PROTOCOL_VERSION, type QQMediaLocator, type QQMultiForwardLocator, type QQSendMediaSpec, type QQStickerReference, type SendManifest,
 } from './protocol.js'
+import { GroupMsgMask } from './kernel-types.js'
 import { QQKernelBridge, QQMediaLeaseAuthorizationError,
-  QQMediaLeaseUnavailableError,
+  QQMediaLeaseUnavailableError, QQRequestApiUnavailableError, QQRequestConflictError, QQRequestCursorError, QQRequestRefreshError, QQRequestResolutionError, QQRequestSessionChangedError,
   QQStickerAssetNotFoundError ,
 } from './qq-kernel.js'
 import { log, recordSlowHttpRequest, slowHttpLogPath } from './log.js'
@@ -287,6 +288,63 @@ export class QQBridgeServer {
       }
       return
     }
+    if (request.method === 'GET' && path === '/v1/requests') {
+      const kind = url.searchParams.get('kind')
+      if (kind !== null && kind !== 'friend' && kind !== 'group-join') {
+        json(response, 400, { error: 'invalid request kind' })
+        return
+      }
+      const cursor = url.searchParams.get('cursor')
+      const rawLimit = url.searchParams.get('limit')
+      const limit = rawLimit === null ? 100 : Number(rawLimit)
+      if ((cursor !== null && cursor.length > 2_048) ||
+        !Number.isSafeInteger(limit) || limit < 1 || limit > 500) {
+        json(response, 400, { error: 'invalid request pagination' })
+        return
+      }
+      try {
+        json(response, 200, await this.bridge.getRequests(
+          kind ?? undefined,
+          cursor ?? undefined,
+          limit,
+        ))
+      } catch (error) {
+        if (error instanceof QQRequestApiUnavailableError) json(response, 503, { error: error.message })
+        else if (error instanceof QQRequestCursorError) json(response, 400, { error: error.message })
+        else if (error instanceof QQRequestRefreshError) json(response, 502, { error: error.message })
+        else if (error instanceof Error && error.message === 'invalid request kind') json(response, 400, { error: error.message })
+        else throw error
+      }
+      return
+    }
+    const requestResolutionMatch = /^\/v1\/requests\/([^/]+)\/resolve$/.exec(path)
+    if (request.method === 'POST' && requestResolutionMatch) {
+      let id: string
+      let body: { action?: unknown }
+      try {
+        id = decodeURIComponent(requestResolutionMatch[1])
+        body = await readJson<{ action?: unknown }>(request)
+      } catch {
+        json(response, 400, { error: 'invalid request resolution' })
+        return
+      }
+      if (!id || (body?.action !== 'accept' && body?.action !== 'reject')) {
+        json(response, 400, { error: 'action must be accept or reject' })
+        return
+      }
+      try {
+        json(response, 200, await this.bridge.resolveRequest(id, body.action))
+      } catch (error) {
+        if (error instanceof QQRequestApiUnavailableError) json(response, 503, { error: error.message })
+        else if (error instanceof QQRequestResolutionError) json(response, 502, { error: 'QQNT request resolution failed' })
+        else if (error instanceof QQRequestSessionChangedError) json(response, 503, { error: 'QQNT request session changed' })
+        else if (error instanceof QQRequestConflictError) json(response, 409, { error: error.message })
+        else if (error instanceof Error && error.message === 'request not found') json(response, 404, { error: error.message })
+        else if (error instanceof Error && error.message === 'invalid request resolution') json(response, 400, { error: error.message })
+        else throw error
+      }
+      return
+    }
     if (request.method === 'GET' && path === '/v1/dialogs') {
       const page = await this.bridge.getDialogs(
         url.searchParams.get('cursor') ?? undefined,
@@ -408,6 +466,43 @@ export class QQBridgeServer {
       const conversation = await this.bridge.resolveConversation(kind === 'group' ? 2 : 1, numericId)
       log('info', `HTTP API resolve conversation id=${requestId} kind=${conversation.kind} conversation=${conversation.id} title=${JSON.stringify(conversation.title)} avatar=${conversation.avatar?.id ?? '<none>'}`)
       json(response, 200, conversation)
+      return
+    }
+
+    const notificationMaskMatch = /^\/v1\/conversations\/(?<chatType>1|2)\/(?<peerUin>[^/]+)\/notification-mask$/.exec(path)
+    if (request.method === 'POST' && notificationMaskMatch?.groups) {
+      const chatType = Number(notificationMaskMatch.groups.chatType) as 1 | 2
+      const peerUin = decodeURIComponent(notificationMaskMatch.groups.peerUin)
+      const body = await readJson<{ msgMask?: unknown }>(request)
+      const msgMask = body?.msgMask
+      const validMasks = new Set<number>([
+        GroupMsgMask.UNSPECIFIED,
+        GroupMsgMask.NOTIFY,
+        GroupMsgMask.ASSISTANT,
+        GroupMsgMask.SHIELD,
+        GroupMsgMask.RECEIVE,
+      ])
+      if (typeof msgMask !== 'number' || !validMasks.has(msgMask)) {
+        json(response, 400, { error: 'msgMask must be one of 0, 1, 2, 3, 4' })
+        return
+      }
+      if (chatType !== 2) {
+        json(response, 400, { error: 'notification mask is only supported for group conversations' })
+        return
+      }
+      try {
+        await this.bridge.setGroupMsgMask(peerUin, msgMask as GroupMsgMask)
+      } catch (error) {
+        const message = errorMessage(error)
+        if (/not ready|unavailable|expose/i.test(message)) {
+          json(response, 503, { error: message })
+        } else {
+          json(response, 502, { error: message })
+        }
+        return
+      }
+      log('info', `HTTP API set notification mask id=${requestId} chatType=${chatType} peer=${peerUin} mask=${msgMask}`)
+      json(response, 200, { ok: true, chatType, peerUin, msgMask })
       return
     }
 

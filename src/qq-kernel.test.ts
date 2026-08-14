@@ -8,7 +8,7 @@ import { execFile } from 'node:child_process'
 import { promisify, types } from 'node:util'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import WebSocket from 'ws'
-import type { ContactMsgBoxInfo, KernelGroupService, KernelModule, KernelMsgService, KernelSession, MsgElement, MsgRecord } from './kernel-types.js'
+import { GroupMsgMask, type ContactMsgBoxInfo, type KernelBuddyService, type KernelGroupService, type KernelModule, type KernelMsgService, type KernelSession, type MsgElement, type MsgRecord } from './kernel-types.js'
 import type { PacketAddon } from './packet-addon.js'
 import { parseConversationId, type QQEvent } from './protocol.js'
 import { QQKernelBridge } from './qq-kernel.js'
@@ -117,8 +117,10 @@ function testProtocolElements(part: DirectMessagePart): MsgElement[] {
 function fixture() {
   let msgHandlers: Record<string, (...args: unknown[]) => unknown> = {}
   let buddyHandlers: Record<string, (...args: unknown[]) => unknown> = {}
+  const buddyHandlerHistory: Array<Record<string, (...args: unknown[]) => unknown>> = []
   let profileHandlers: Record<string, (...args: unknown[]) => unknown> = {}
   let groupHandlers: Record<string, (...args: unknown[]) => unknown> = {}
+  const groupHandlerHistory: Array<Record<string, (...args: unknown[]) => unknown>> = []
   let searchHandlers: Record<string, (...args: unknown[]) => unknown> = {}
   let avsdkHandlers: Record<string, (...args: unknown[]) => unknown> = {}
   let avsdkAvailable = true
@@ -217,9 +219,12 @@ function fixture() {
   const buddy = {
     addKernelBuddyListener: vi.fn((listener: { handlers?: typeof buddyHandlers }) => {
       buddyHandlers = listener.handlers ?? listener as unknown as typeof buddyHandlers
+      buddyHandlerHistory.push(buddyHandlers)
       return 'buddy-listener'
     }), removeKernelBuddyListener: vi.fn(),
     getBuddyList: vi.fn(async () => ({ result: 0, errMsg: '' })),
+    getBuddyReq: vi.fn<NonNullable<KernelBuddyService['getBuddyReq']>>(async () => ({ buddyReqs: [] })),
+    approvalFriendRequest: vi.fn<NonNullable<KernelBuddyService['approvalFriendRequest']>>(async () => ({ result: 0, errMsg: '' })),
     getBuddyNick: vi.fn((uids: string[]) => new Map(uids.map((uid) => [uid, `nick-${uid}`]))),
     getBuddyRemark: vi.fn(() => new Map<string, string>()),
   }
@@ -250,10 +255,18 @@ function fixture() {
   const group = {
     addKernelGroupListener: vi.fn((listener: { handlers?: typeof groupHandlers }) => {
       groupHandlers = listener.handlers ?? listener as unknown as typeof groupHandlers
+      groupHandlerHistory.push(groupHandlers)
       return 'group-listener'
     }), removeKernelGroupListener: vi.fn(),
     getGroupList: vi.fn(async () => ({ result: 0, errMsg: '' })),
+    getSingleScreenNotifies: vi.fn<NonNullable<KernelGroupService['getSingleScreenNotifies']>>(async () => ({ notifies: [] })),
+    operateSysNotify: vi.fn<NonNullable<KernelGroupService['operateSysNotify']>>(async () => ({ result: 0, errMsg: '' })),
     getGroupDetailInfo: vi.fn<NonNullable<KernelGroupService['getGroupDetailInfo']>>(async () => ({ result: 0, errMsg: '' })),
+    getGroupMsgMask: vi.fn<NonNullable<KernelGroupService['getGroupMsgMask']>>(async () => {
+      queueMicrotask(() => groupHandlers.onGroupsMsgMaskResult?.([]))
+      return { result: 0, errMsg: 'success' }
+    }),
+    setGroupMsgMask: vi.fn<NonNullable<KernelGroupService['setGroupMsgMask']>>(async () => ({ result: 0, errMsg: 'success' })),
     createMemberListScene: vi.fn(() => 'scene'), destroyMemberListScene: vi.fn(),
     getNextMemberList: vi.fn(async () => ({
       errCode: 0, errMsg: '', result: {
@@ -371,6 +384,12 @@ function fixture() {
     emitBuddyInfo(infos: Map<string, unknown>) {
       buddyHandlers.onBuddyInfoChange?.(infos)
     },
+    emitBuddyRequests(buddyReqs: unknown[]) {
+      return buddyHandlers.onBuddyReqChange?.({ unreadNums: buddyReqs.length, buddyReqs })
+    },
+    emitHistoricalBuddyRequests(index: number, buddyReqs: unknown[]) {
+      return buddyHandlerHistory[index]?.onBuddyReqChange?.({ unreadNums: buddyReqs.length, buddyReqs })
+    },
     setProfile(info: {
       uid: string, uin: string, nick: string, remark: string, avatarUrl: string
       longNick?: string
@@ -385,8 +404,24 @@ function fixture() {
       remarkName?: string
       memberCount?: number
       memberRole?: number
+      cmdUinMsgMask?: number
     }>) {
       groupHandlers.onGroupListUpdate?.(1, groups)
+    },
+    emitGroupRequests(doubt: boolean, notifies: unknown[], nextStartSeq = '') {
+      return groupHandlers.onGroupSingleScreenNotifies?.(doubt, nextStartSeq, notifies)
+    },
+    emitHistoricalGroupRequests(index: number, doubt: boolean, notifies: unknown[], nextStartSeq = '') {
+      return groupHandlerHistory[index]?.onGroupSingleScreenNotifies?.(doubt, nextStartSeq, notifies)
+    },
+    emitGroupRequestPayload(doubt: boolean, payload: unknown) {
+      return groupHandlers.onGroupSingleScreenNotifies?.(doubt, payload)
+    },
+    emitGroupRequestUpdate(doubt: boolean, notifies: unknown[]) {
+      return groupHandlers.onGroupNotifiesUpdated?.(doubt, notifies)
+    },
+    emitGroupMsgMasks(masks: Array<{ groupCode?: string, msgMask?: number }>) {
+      groupHandlers.onGroupsMsgMaskResult?.(masks)
     },
     emitGroupDetail(group: {
       groupCode: string
@@ -3161,6 +3196,274 @@ describe('QQKernelBridge', () => {
     expect(user.name.trim().toLowerCase()).not.toMatch(/^(undefined|null)$/)
   })
 
+  it('exposes the verified QQ group message mask values', () => {
+    expect(GroupMsgMask).toMatchObject({
+      UNSPECIFIED: 0,
+      NOTIFY: 1,
+      ASSISTANT: 2,
+      SHIELD: 3,
+      RECEIVE: 4,
+    })
+  })
+
+  it('caches the group message mask callback for group conversations', () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    expect(f.group.getGroupMsgMask).toHaveBeenCalledTimes(1)
+    f.emitGroupMsgMasks([{ groupCode: '1058754719', msgMask: GroupMsgMask.RECEIVE }])
+
+    expect(bridge.getConversation('1058754719')).toMatchObject({
+      kind: 'group', groupMsgMask: GroupMsgMask.RECEIVE,
+    })
+  })
+
+  it.each(['mask-before-profile', 'profile-before-mask'] as const)(
+    'materializes an assistant group when masks arrive %s',
+    async (order) => {
+      const f = fixture()
+      const bridge = new QQKernelBridge()
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      const group = { groupCode: '1058754719', groupName: 'Bridge Test Group' }
+      const mask = [{ groupCode: group.groupCode, msgMask: GroupMsgMask.ASSISTANT }]
+
+      if (order === 'mask-before-profile') {
+        f.emitGroupMsgMasks(mask)
+        f.emitGroupList([group])
+      } else {
+        f.emitGroupList([group])
+        f.emitGroupMsgMasks(mask)
+      }
+
+      await expect(bridge.getDialogs()).resolves.toMatchObject({
+        conversations: [expect.objectContaining({
+          id: group.groupCode,
+          kind: 'group',
+          title: group.groupName,
+          groupMsgMask: GroupMsgMask.ASSISTANT,
+        })],
+      })
+    },
+  )
+
+  it('waits for a delayed group mask callback before returning the first dialog page', async () => {
+    const f = fixture()
+    f.group.getGroupMsgMask.mockImplementation(async () => {
+      setTimeout(() => f.emitGroupMsgMasks([
+        { groupCode: '1058754719', msgMask: GroupMsgMask.ASSISTANT },
+      ]), 25)
+      return { result: 0, errMsg: 'success' }
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.emitGroupList([{ groupCode: '1058754719', groupName: 'Delayed Assistant Group' }])
+
+    await expect(bridge.getDialogs()).resolves.toMatchObject({
+      conversations: expect.arrayContaining([expect.objectContaining({
+        id: '1058754719', groupMsgMask: GroupMsgMask.ASSISTANT,
+      })]),
+    })
+  })
+
+  it('retries a failed initial group mask request within the same initialization', async () => {
+    const f = fixture()
+    let calls = 0
+    f.group.getGroupMsgMask.mockImplementation(async () => {
+      calls++
+      if (calls === 1) return { result: -1, errMsg: 'retry' }
+      queueMicrotask(() => f.emitGroupMsgMasks([
+        { groupCode: '1058754719', msgMask: GroupMsgMask.ASSISTANT },
+      ]))
+      return { result: 0, errMsg: 'success' }
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.emitGroupList([{ groupCode: '1058754719', groupName: 'Retried Assistant Group' }])
+
+    await expect(bridge.getDialogs()).resolves.toMatchObject({
+      conversations: [expect.objectContaining({ id: '1058754719' })],
+    })
+    expect(calls).toBe(2)
+  })
+
+  it('retries group masks on a later contact refresh after initial failures', async () => {
+    const f = fixture()
+    let calls = 0
+    f.group.getGroupMsgMask.mockImplementation(async () => {
+      calls++
+      if (calls <= 2) return { result: -1, errMsg: 'retry' }
+      queueMicrotask(() => f.emitGroupMsgMasks([
+        { groupCode: '1058754719', msgMask: GroupMsgMask.ASSISTANT },
+      ]))
+      return { result: 0, errMsg: 'success' }
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.emitGroupList([{ groupCode: '1058754719', groupName: 'Later Assistant Group' }])
+    await new Promise<void>((resolve) => setImmediate(resolve))
+
+    await bridge.refreshContacts()
+
+    expect(calls).toBe(3)
+    await expect(bridge.getDialogs()).resolves.toMatchObject({
+      conversations: expect.arrayContaining([expect.objectContaining({ id: '1058754719' })]),
+    })
+  })
+
+  it('removes only assistant-materialized groups when their mask changes', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.emitGroupMsgMasks([{ groupCode: '1058754719', msgMask: GroupMsgMask.ASSISTANT }])
+    f.emitGroupList([{ groupCode: '1058754719', groupName: 'Assistant Group' }])
+    f.emitGroupMsgMasks([{ groupCode: '1058754719', msgMask: GroupMsgMask.NOTIFY }])
+
+    await expect(bridge.getDialogs()).resolves.not.toMatchObject({
+      conversations: [expect.objectContaining({ id: '1058754719' })],
+    })
+  })
+
+  it('removes assistant-materialized groups when a profile mask leaves assistant', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.emitGroupMsgMasks([{ groupCode: '1058754719', msgMask: GroupMsgMask.ASSISTANT }])
+    f.emitGroupList([{ groupCode: '1058754719', groupName: 'Assistant Group' }])
+    f.emitGroupList([{
+      groupCode: '1058754719', groupName: 'Assistant Group', cmdUinMsgMask: GroupMsgMask.NOTIFY,
+    }])
+
+    await expect(bridge.getDialogs()).resolves.not.toMatchObject({
+      conversations: [expect.objectContaining({ id: '1058754719' })],
+    })
+  })
+
+  it('keeps recent groups when their assistant mask changes', async () => {
+    const f = fixture()
+    f.recent.getRecentContactInfos.mockResolvedValue({
+      result: 0, errMsg: '', relation: [{
+        chatType: 2, peerUid: '1058754719', peerUin: '1058754719', peerName: 'Recent Group',
+        remark: '', avatarUrl: '', unreadCnt: '0', msgId: 'm1', msgTime: '1800000000',
+        senderUid: 'member', senderUin: '42', abstractContent: [],
+      }],
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.emitGroupMsgMasks([{ groupCode: '1058754719', msgMask: GroupMsgMask.ASSISTANT }])
+    f.emitGroupList([{ groupCode: '1058754719', groupName: 'Recent Group' }])
+    await bridge.refreshContacts()
+    f.emitGroupMsgMasks([{ groupCode: '1058754719', msgMask: GroupMsgMask.NOTIFY }])
+
+    await expect(bridge.getDialogs()).resolves.toMatchObject({
+      conversations: expect.arrayContaining([expect.objectContaining({
+        id: '1058754719', groupMsgMask: GroupMsgMask.NOTIFY,
+      })]),
+    })
+  })
+
+  it('keeps explicitly resolved groups when their assistant mask changes', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.emitGroupMsgMasks([{ groupCode: '1058754719', msgMask: GroupMsgMask.ASSISTANT }])
+    f.emitGroupList([{ groupCode: '1058754719', groupName: 'Resolved Group' }])
+    await bridge.resolveConversation(2, '1058754719')
+    f.emitGroupMsgMasks([{ groupCode: '1058754719', msgMask: GroupMsgMask.NOTIFY }])
+
+    await expect(bridge.getDialogs()).resolves.toMatchObject({
+      conversations: [expect.objectContaining({
+        id: '1058754719', groupMsgMask: GroupMsgMask.NOTIFY,
+      })],
+    })
+  })
+
+  it('preserves unknown raw masks and ignores incomplete callback items', () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.emitGroupMsgMasks([
+      { groupCode: '1058754719', msgMask: 99 },
+      { groupCode: 'incomplete' },
+      { msgMask: GroupMsgMask.ASSISTANT },
+    ])
+    f.emitGroupList([{
+      groupCode: '2000000000', groupName: 'Unknown Profile Mask', cmdUinMsgMask: 98,
+    }])
+
+    expect(bridge.getConversation('1058754719')).toMatchObject({ groupMsgMask: 99 })
+    expect(bridge.getConversation('2000000000')).toMatchObject({ groupMsgMask: 98 })
+  })
+
+  it('setGroupMsgMask updates the cache and conversation immediately on success', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.emitGroupList([{ groupCode: '1058754719', groupName: 'Bridge Test Group' }])
+    f.emitGroupMsgMasks([{ groupCode: '1058754719', msgMask: GroupMsgMask.NOTIFY }])
+
+    await bridge.setGroupMsgMask('1058754719', GroupMsgMask.SHIELD)
+
+    expect(f.group.setGroupMsgMask).toHaveBeenCalledWith('1058754719', GroupMsgMask.SHIELD)
+    expect(bridge.getConversation('1058754719')).toMatchObject({
+      id: '1058754719',
+      kind: 'group',
+      groupMsgMask: GroupMsgMask.SHIELD,
+    })
+  })
+
+  it('setGroupMsgMask leaves the assistant materialization path when leaving ASSISTANT', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.emitGroupMsgMasks([{ groupCode: '1058754719', msgMask: GroupMsgMask.ASSISTANT }])
+    f.emitGroupList([{ groupCode: '1058754719', groupName: 'Assistant Group' }])
+
+    await bridge.setGroupMsgMask('1058754719', GroupMsgMask.NOTIFY)
+
+    expect(bridge.getConversation('1058754719')).toMatchObject({
+      id: '1058754719',
+      groupMsgMask: GroupMsgMask.NOTIFY,
+    })
+  })
+
+  it('setGroupMsgMask throws when the native setter fails and keeps the prior mask', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.emitGroupList([{ groupCode: '1058754719', groupName: 'Bridge Test Group' }])
+    f.emitGroupMsgMasks([{ groupCode: '1058754719', msgMask: GroupMsgMask.NOTIFY }])
+    f.group.setGroupMsgMask.mockResolvedValue({ result: -1, errMsg: 'denied' })
+
+    await expect(bridge.setGroupMsgMask('1058754719', GroupMsgMask.SHIELD))
+      .rejects.toThrow(/setGroupMsgMask: denied \(-1\)/)
+    expect(bridge.getConversation('1058754719')).toMatchObject({ groupMsgMask: GroupMsgMask.NOTIFY })
+  })
+
+  it('setGroupMsgMask throws a clear error when the native setter is unavailable', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.group.setGroupMsgMask = undefined as unknown as typeof f.group.setGroupMsgMask
+
+    await expect(bridge.setGroupMsgMask('1058754719', GroupMsgMask.SHIELD))
+      .rejects.toThrow(/setGroupMsgMask/)
+  })
+
+  it('setGroupMsgMask defers to a later listener callback without double-applying the local value', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.emitGroupList([{ groupCode: '1058754719', groupName: 'Bridge Test Group' }])
+    f.emitGroupMsgMasks([{ groupCode: '1058754719', msgMask: GroupMsgMask.NOTIFY }])
+
+    await bridge.setGroupMsgMask('1058754719', GroupMsgMask.SHIELD)
+    // Native callback arrives later with the authoritative value; it overwrites.
+    f.emitGroupMsgMasks([{ groupCode: '1058754719', msgMask: GroupMsgMask.RECEIVE }])
+
+    expect(bridge.getConversation('1058754719')).toMatchObject({ groupMsgMask: GroupMsgMask.RECEIVE })
+  })
+
   it('refreshes a placeholder group dialog title through getDialogs', async () => {
     const f = fixture()
     f.recent.getRecentContactInfos.mockResolvedValue({
@@ -3821,6 +4124,435 @@ describe('QQKernelBridge', () => {
   })
 
 
+  it('maps only native pending requests, publishes listener updates, and resolves them idempotently', async () => {
+    const f = fixture()
+    f.buddy.getBuddyReq.mockResolvedValue({ buddyReqs: [
+      { friendUid: 'friend-uid', reqTime: '11', isInitiator: false, isDecide: false, friendNick: 'Friend', extWords: 'hello' },
+      { friendUid: 'outgoing-uid', reqTime: '12', isInitiator: true, isDecide: false },
+    ] })
+    f.group.getSingleScreenNotifies.mockImplementation(async (doubt, startSeq) => (
+      !doubt && !startSeq
+        ? { notifies: [
+          { seq: '21', type: 7, status: 1, group: { groupCode: '123', groupName: 'Group' }, user1: { uid: 'join-uid', nickName: 'Joiner' }, postscript: 'please join', actionTime: '22' },
+          { seq: '22', type: 7, status: 2, group: { groupCode: '123' }, user1: { uid: 'resolved-uid' } },
+          { seq: '23', type: 8, status: 1, group: { groupCode: '123' }, user1: { uid: 'other-uid' } },
+        ] }
+        : { notifies: [] }
+    ))
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    const page = await bridge.getRequests()
+    expect(page.requests).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'friend', status: 'pending', requester: { id: 'friend-uid', name: 'Friend' }, message: 'hello' }),
+      expect.objectContaining({ kind: 'group-join', status: 'pending', requester: { id: 'join-uid', name: 'Joiner' }, group: { id: '123', name: 'Group' } }),
+    ]))
+    expect(page.requests).toHaveLength(2)
+
+    const events = bridge.subscribe()[Symbol.asyncIterator]()
+    f.emitBuddyRequests([
+      { friendUid: 'friend-uid', reqTime: '11', isInitiator: false, isDecide: false, friendNick: 'Friend', extWords: 'hello' },
+      { friendUid: 'live-uid', reqTime: '13', isInitiator: false, isDecide: false },
+    ])
+    await expect(events.next()).resolves.toMatchObject({
+      value: { type: 'request', request: { kind: 'friend', requester: { id: 'live-uid' }, status: 'pending' } },
+    })
+
+    const friend = page.requests.find((request) => request.kind === 'friend')!
+    await expect(bridge.resolveRequest(friend.id, 'accept')).resolves.toMatchObject({ status: 'accepted' })
+    expect(f.buddy.approvalFriendRequest).toHaveBeenCalledWith({ friendUid: 'friend-uid', reqTime: '11', accept: true })
+    await expect(bridge.resolveRequest(friend.id, 'accept')).resolves.toMatchObject({ status: 'accepted' })
+    await expect(bridge.resolveRequest(friend.id, 'reject')).rejects.toThrow('different action')
+
+    const group = page.requests.find((request) => request.kind === 'group-join')!
+    await expect(bridge.resolveRequest(group.id, 'reject')).resolves.toMatchObject({ status: 'rejected' })
+    expect(f.group.operateSysNotify).toHaveBeenCalledWith(false, {
+      operateType: 2,
+      targetMsg: { seq: '21', type: 7, groupCode: '123', postscript: 'please join' },
+    })
+  })
+
+  it('ignores request callbacks queued by a detached attachment', async () => {
+    const f = fixture()
+    f.buddy.getBuddyReq.mockResolvedValue({ buddyReqs: [] })
+    f.group.getSingleScreenNotifies.mockResolvedValue({ notifies: [] })
+    const bridge = new QQKernelBridge()
+    vi.spyOn(bridge as unknown as { initializePlatformData(): Promise<void> }, 'initializePlatformData').mockResolvedValue()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'account-a', userPath: '/tmp' })
+    bridge.detach()
+    bridge.attach(f.kernel, f.session, { selfUin: '20000', selfUid: 'account-b', userPath: '/tmp' })
+    await bridge.getRequests()
+    const events = bridge.subscribe()[Symbol.asyncIterator]()
+
+    f.emitHistoricalBuddyRequests(0, [{ friendUid: 'account-a-friend', reqTime: '1', isInitiator: false, isDecide: false }])
+    f.emitHistoricalGroupRequests(0, false, [
+      { seq: '1', type: 7, status: 1, group: { groupCode: '123' }, user1: { uid: 'account-a-joiner' } },
+    ])
+    await new Promise(setImmediate)
+    expect((await bridge.getRequests()).requests).toEqual([])
+    const received = await Promise.race([
+      events.next(),
+      new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 10)),
+    ])
+    expect(received).toBe('timeout')
+  })
+
+  it('uses stable non-reversible request IDs', async () => {
+    const records = [
+      { friendUid: 'uid-secret-one', reqTime: '111', isInitiator: false, isDecide: false },
+      { friendUid: 'uid-secret-two', reqTime: '222', isInitiator: false, isDecide: false },
+    ]
+    const leftFixture = fixture()
+    leftFixture.buddy.getBuddyReq.mockResolvedValue({ buddyReqs: records })
+    const left = new QQKernelBridge()
+    vi.spyOn(left as unknown as { initializePlatformData(): Promise<void> }, 'initializePlatformData').mockResolvedValue()
+    left.attach(leftFixture.kernel, leftFixture.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const leftIds = (await left.getRequests('friend')).requests.map((request) => request.id)
+
+    const rightFixture = fixture()
+    rightFixture.buddy.getBuddyReq.mockResolvedValue({ buddyReqs: records })
+    const right = new QQKernelBridge()
+    vi.spyOn(right as unknown as { initializePlatformData(): Promise<void> }, 'initializePlatformData').mockResolvedValue()
+    right.attach(rightFixture.kernel, rightFixture.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const rightIds = (await right.getRequests('friend')).requests.map((request) => request.id)
+
+    expect(leftIds).toEqual(rightIds)
+    expect(new Set(leftIds).size).toBe(2)
+    for (const id of leftIds) {
+      expect(Buffer.from(id.slice('request:'.length), 'base64url').toString('utf8')).not.toContain('uid-secret')
+      expect(id).not.toContain('111')
+      expect(id).not.toContain('222')
+    }
+  })
+
+  it('times out hung native request getters and permits retry', async () => {
+    for (const kind of ['friend', 'group-join'] as const) {
+      vi.useFakeTimers()
+      try {
+        const f = fixture()
+        if (kind === 'friend') {
+          f.buddy.getBuddyReq.mockImplementationOnce(() => new Promise(() => {}))
+            .mockResolvedValue({ buddyReqs: [] })
+        } else {
+          f.group.getSingleScreenNotifies.mockImplementationOnce(() => new Promise(() => {}))
+            .mockResolvedValue({ notifies: [] })
+        }
+        const bridge = new QQKernelBridge()
+        vi.spyOn(bridge as unknown as { initializePlatformData(): Promise<void> }, 'initializePlatformData').mockResolvedValue()
+        bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+        const hung = bridge.getRequests(kind)
+        const rejected = expect(hung).rejects.toThrow('QQNT request refresh failed')
+        await vi.advanceTimersByTimeAsync(1_500)
+        await rejected
+        await expect(bridge.getRequests(kind)).resolves.toMatchObject({ requests: [] })
+      } finally {
+        vi.useRealTimers()
+      }
+    }
+  })
+
+  it('rejects a resolution completed after detach and reattach', async () => {
+    const f = fixture()
+    f.buddy.getBuddyReq.mockResolvedValue({ buddyReqs: [
+      { friendUid: 'friend', reqTime: '1', isInitiator: false, isDecide: false },
+    ] })
+    let resolveApproval!: (value: unknown) => void
+    f.buddy.approvalFriendRequest.mockImplementationOnce(() => new Promise((resolve) => { resolveApproval = resolve }))
+    const bridge = new QQKernelBridge()
+    vi.spyOn(bridge as unknown as { initializePlatformData(): Promise<void> }, 'initializePlatformData').mockResolvedValue()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const request = (await bridge.getRequests('friend')).requests[0]
+    const resolution = bridge.resolveRequest(request.id, 'accept')
+    bridge.detach()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    resolveApproval({ result: 0, errMsg: '' })
+    await expect(resolution).rejects.toThrow('session changed')
+  })
+
+  it('waits for each native request source independently', async () => {
+    const f = fixture()
+    f.buddy.getBuddyReq.mockResolvedValue({ result: 0, errMsg: '' })
+    f.group.getSingleScreenNotifies.mockResolvedValue({ result: 0, errMsg: '' })
+    const bridge = new QQKernelBridge()
+    vi.spyOn(bridge as unknown as { initializePlatformData(): Promise<void> }, 'initializePlatformData').mockResolvedValue()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    let settled = false
+    const listed = bridge.getRequests().then((page) => { settled = true; return page })
+    await Promise.resolve()
+    expect(f.buddy.getBuddyReq).toHaveBeenCalledOnce()
+    expect(f.group.getSingleScreenNotifies).toHaveBeenCalledOnce()
+
+    f.emitGroupRequests(true, [], 'wrong-queue-cursor')
+    f.emitBuddyRequests([{ friendUid: 'friend', reqTime: '1', isInitiator: false, isDecide: false }])
+    await Promise.resolve()
+    expect(settled).toBe(false)
+    f.emitGroupRequests(false, [])
+    await new Promise(setImmediate)
+    expect(f.group.getSingleScreenNotifies).toHaveBeenCalledTimes(2)
+    expect(f.group.getSingleScreenNotifies).toHaveBeenLastCalledWith(true, '', 100)
+    expect(settled).toBe(false)
+    f.emitGroupRequests(true, [])
+    await expect(listed).resolves.toMatchObject({ requests: [{ kind: 'friend' }] })
+  })
+
+  it('ignores delayed group pages and live deltas while waiting for the active page', async () => {
+    const f = fixture()
+    const calls: Array<{ doubt: boolean, startSeq: string }> = []
+    f.group.getSingleScreenNotifies.mockImplementation(async (doubt, startSeq) => {
+      calls.push({ doubt, startSeq })
+      if (doubt) return { notifies: [] }
+      return { result: 0, errMsg: '' }
+    })
+    const bridge = new QQKernelBridge()
+    vi.spyOn(bridge as unknown as { initializePlatformData(): Promise<void> }, 'initializePlatformData').mockResolvedValue()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    let settled = false
+    const listed = bridge.getRequests('group-join').then((page) => { settled = true; return page })
+    await Promise.resolve()
+    expect(calls).toEqual([{ doubt: false, startSeq: '' }])
+
+    const page1 = [{ seq: '1', type: 7, status: 1, group: { groupCode: '123' }, user1: { uid: 'page-one' } }]
+    f.emitGroupRequests(false, page1, 'page-2')
+    await new Promise(setImmediate)
+    expect(calls).toEqual([{ doubt: false, startSeq: '' }, { doubt: false, startSeq: 'page-2' }])
+
+    f.emitGroupRequests(false, page1, 'page-2')
+    f.emitGroupRequestUpdate(false, [{ seq: 'live', type: 7, status: 1, group: { groupCode: '123' }, user1: { uid: 'live' } }])
+    await new Promise(setImmediate)
+    expect(calls).toHaveLength(2)
+    expect(settled).toBe(false)
+
+    f.emitGroupRequests(false, [{ seq: '2', type: 7, status: 1, group: { groupCode: '123' }, user1: { uid: 'page-two' } }])
+    await expect(listed).resolves.toMatchObject({
+      requests: expect.arrayContaining([
+        expect.objectContaining({ requester: { id: 'page-one' } }),
+        expect.objectContaining({ requester: { id: 'page-two' } }),
+      ]),
+    })
+  })
+
+  it('drains both paginated native group request queues and preserves blank postscript for approval', async () => {
+    const f = fixture()
+    const calls: Array<{ doubt: boolean, startSeq: string }> = []
+    f.group.getSingleScreenNotifies.mockImplementation(async (doubt, startSeq) => {
+      calls.push({ doubt, startSeq })
+      if (!doubt && startSeq === '') return {
+        nextStartSeq: 'false-next',
+        notifies: [{ seq: '1', type: 7, status: 1, group: { groupCode: '100' }, user1: { uid: 'false-first' } }],
+      }
+      if (!doubt && startSeq === 'false-next') return {
+        notifies: [{ seq: '2', type: 7, status: 1, group: { groupCode: '100' }, user1: { uid: 'false-second' } }],
+      }
+      if (doubt && startSeq === '') return {
+        nextStartSeq: 'true-next',
+        notifies: [{ seq: '3', type: 7, status: 1, group: { groupCode: '200' }, user1: { uid: 'true-first' } }],
+      }
+      return {
+        notifies: [{ seq: '4', type: 7, status: 1, group: { groupCode: '200' }, user1: { uid: 'true-second' } }],
+      }
+    })
+    const bridge = new QQKernelBridge()
+    vi.spyOn(bridge as unknown as { initializePlatformData(): Promise<void> }, 'initializePlatformData').mockResolvedValue()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    const page = await bridge.getRequests('group-join')
+    expect(calls).toEqual([
+      { doubt: false, startSeq: '' }, { doubt: false, startSeq: 'false-next' },
+      { doubt: true, startSeq: '' }, { doubt: true, startSeq: 'true-next' },
+    ])
+    expect(page).not.toHaveProperty('nativeNextStartSeq')
+    expect(page.requests.map((request) => request.requester.id).sort()).toEqual([
+      'false-first', 'false-second', 'true-first', 'true-second',
+    ])
+    const events = bridge.subscribe()[Symbol.asyncIterator]()
+    f.emitGroupRequests(false, [
+      { seq: '5', type: 7, status: 1, group: { groupCode: '100' }, user1: { uid: 'listener-user' } },
+    ])
+    await expect(events.next()).resolves.toMatchObject({
+      value: { type: 'request', request: { kind: 'group-join', requester: { id: 'listener-user' } } },
+    })
+    const blankPostscript = page.requests.find((request) => request.requester.id === 'false-first')!
+    await bridge.resolveRequest(blankPostscript.id, 'accept')
+    expect(f.group.operateSysNotify).toHaveBeenCalledWith(false, {
+      operateType: 1,
+      targetMsg: { seq: '1', type: 7, groupCode: '100', postscript: ' ' },
+    })
+  })
+
+  it('rejects repeated group pagination cursors for either doubt queue', async () => {
+    for (const failingDoubt of [false, true]) {
+      const f = fixture()
+      f.group.getSingleScreenNotifies.mockImplementation(async (doubt, startSeq) => {
+        if (doubt !== failingDoubt) return { notifies: [] }
+        return { nextStartSeq: startSeq || 'repeat', notifies: [] }
+      })
+      const bridge = new QQKernelBridge()
+      vi.spyOn(bridge as unknown as { initializePlatformData(): Promise<void> }, 'initializePlatformData').mockResolvedValue()
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      await expect(bridge.getRequests('group-join')).rejects.toThrow('QQNT request refresh failed')
+    }
+  })
+
+  it('rejects a group pagination continuation after the page limit', async () => {
+    const f = fixture()
+    let falsePages = 0
+    f.group.getSingleScreenNotifies.mockImplementation(async (doubt) => {
+      if (doubt) return { notifies: [] }
+      falsePages++
+      return { nextStartSeq: String(falsePages), notifies: [] }
+    })
+    const bridge = new QQKernelBridge()
+    vi.spyOn(bridge as unknown as { initializePlatformData(): Promise<void> }, 'initializePlatformData').mockResolvedValue()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    await expect(bridge.getRequests('group-join')).rejects.toThrow('QQNT request refresh failed')
+    expect(falsePages).toBe(100)
+  })
+
+  it('shares the initial friend refresh with an immediate request list call', async () => {
+    const f = fixture()
+    let resolveBuddy!: (value: unknown) => void
+    f.buddy.getBuddyReq.mockImplementationOnce(() => new Promise((resolve) => { resolveBuddy = resolve }))
+    const bridge = new QQKernelBridge()
+    vi.spyOn(bridge as unknown as { refreshContacts(): Promise<void> }, 'refreshContacts').mockResolvedValue()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const page = bridge.getRequests('friend')
+    await Promise.resolve()
+    expect(f.buddy.getBuddyReq).toHaveBeenCalledOnce()
+    resolveBuddy({ buddyReqs: [] })
+    await page
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(f.buddy.getBuddyReq).toHaveBeenCalledOnce()
+  })
+
+  it('serializes concurrent friend and group request resolutions', async () => {
+    const f = fixture()
+    f.buddy.getBuddyReq.mockResolvedValue({ buddyReqs: [
+      { friendUid: 'friend', reqTime: '1', isInitiator: false, isDecide: false },
+    ] })
+    f.group.getSingleScreenNotifies.mockResolvedValue({ notifies: [
+      { seq: '2', type: 7, status: 1, group: { groupCode: '123' }, user1: { uid: 'joiner' } },
+      { seq: '3', type: 7, status: 1, group: { groupCode: '123' }, user1: { uid: 'retry-joiner' } },
+    ] })
+    const bridge = new QQKernelBridge()
+    vi.spyOn(bridge as unknown as { initializePlatformData(): Promise<void> }, 'initializePlatformData').mockResolvedValue()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const requests = (await bridge.getRequests()).requests
+    const friend = requests.find((request) => request.kind === 'friend')!
+    const group = requests.find((request) => request.kind === 'group-join' && request.requester.id === 'joiner')!
+    const retryGroup = requests.find((request) => request.kind === 'group-join' && request.requester.id === 'retry-joiner')!
+
+    let resolveFriend!: (value: unknown) => void
+    f.buddy.approvalFriendRequest.mockImplementationOnce(() => new Promise((resolve) => { resolveFriend = resolve }))
+    const friendAccept = bridge.resolveRequest(friend.id, 'accept')
+    const friendSameAction = bridge.resolveRequest(friend.id, 'accept')
+    const friendOppositeAction = bridge.resolveRequest(friend.id, 'reject')
+    expect(f.buddy.approvalFriendRequest).toHaveBeenCalledOnce()
+    resolveFriend({ result: 0, errMsg: '' })
+    await expect(friendAccept).resolves.toMatchObject({ status: 'accepted' })
+    await expect(friendSameAction).resolves.toMatchObject({ status: 'accepted' })
+    await expect(friendOppositeAction).rejects.toThrow('different action')
+    expect(f.buddy.approvalFriendRequest).toHaveBeenCalledOnce()
+
+    let resolveGroup!: (value: unknown) => void
+    f.group.operateSysNotify.mockImplementationOnce(() => new Promise((resolve) => { resolveGroup = resolve }))
+    const groupAccept = bridge.resolveRequest(group.id, 'accept')
+    const groupOppositeAction = bridge.resolveRequest(group.id, 'reject')
+    expect(f.group.operateSysNotify).toHaveBeenCalledOnce()
+    resolveGroup({ result: 0, errMsg: '' })
+    await expect(groupAccept).resolves.toMatchObject({ status: 'accepted' })
+    await expect(groupOppositeAction).rejects.toThrow('different action')
+    expect(f.group.operateSysNotify).toHaveBeenCalledOnce()
+
+    f.group.operateSysNotify.mockRejectedValueOnce(new Error('temporary native failure'))
+      .mockResolvedValueOnce({ result: 0, errMsg: '' })
+    await expect(bridge.resolveRequest(retryGroup.id, 'accept')).rejects.toThrow('native request rejected')
+    await expect(bridge.resolveRequest(retryGroup.id, 'accept')).resolves.toMatchObject({ status: 'accepted' })
+    expect(f.group.operateSysNotify).toHaveBeenCalledTimes(3)
+  })
+
+  it('reconciles friend snapshots and removes resolved group requests', async () => {
+    const f = fixture()
+    f.buddy.getBuddyReq.mockResolvedValue({ buddyReqs: [
+      { friendUid: 'first', reqTime: '1', isInitiator: false, isDecide: false },
+      { friendUid: 'stale', reqTime: '2', isInitiator: false, isDecide: false },
+    ] })
+    f.group.getSingleScreenNotifies.mockImplementation(async (doubt) => (
+      doubt ? { notifies: [] } : { notifies: [
+        { seq: '3', type: 7, status: 1, group: { groupCode: '123' }, user1: { uid: 'joiner' } },
+      ] }
+    ))
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    await bridge.getRequests()
+    const events = bridge.subscribe()[Symbol.asyncIterator]()
+
+    f.emitBuddyRequests([{ friendUid: 'first', reqTime: '1', isInitiator: false, isDecide: true, isAgreed: true }])
+    await expect(events.next()).resolves.toMatchObject({
+      value: { type: 'request', request: { requester: { id: 'first' }, status: 'accepted' } },
+    })
+    expect((await bridge.getRequests('friend')).requests).toMatchObject([
+      { requester: { id: 'first' }, status: 'accepted' },
+    ])
+
+    f.emitGroupRequestUpdate(false, [{ seq: '3', type: 7, status: 2 }])
+    expect((await bridge.getRequests('group-join')).requests).toEqual([])
+  })
+
+  it('loads the group snapshot after a friend-only request list', async () => {
+    const f = fixture()
+    f.buddy.getBuddyReq.mockResolvedValue({ buddyReqs: [
+      { friendUid: 'friend', reqTime: '1', isInitiator: false, isDecide: false },
+    ] })
+    f.group.getSingleScreenNotifies.mockImplementation(async (doubt) => (
+      doubt ? { notifies: [] } : { notifies: [
+        { seq: '2', type: 7, status: 1, group: { groupCode: '123' }, user1: { uid: 'joiner' } },
+      ] }
+    ))
+    const bridge = new QQKernelBridge()
+    vi.spyOn(bridge as unknown as { initializePlatformData(): Promise<void> }, 'initializePlatformData').mockResolvedValue()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await bridge.getRequests('friend')
+    expect(f.buddy.getBuddyReq).toHaveBeenCalledOnce()
+    expect(f.group.getSingleScreenNotifies).not.toHaveBeenCalled()
+    await expect(bridge.getRequests('group-join')).resolves.toMatchObject({
+      requests: [{ kind: 'group-join', group: { id: '123' } }],
+    })
+    expect(f.group.getSingleScreenNotifies).toHaveBeenCalledTimes(2)
+  })
+
+  it('loads the friend snapshot after a group-only request list', async () => {
+    const f = fixture()
+    f.buddy.getBuddyReq.mockResolvedValue({ buddyReqs: [
+      { friendUid: 'friend', reqTime: '1', isInitiator: false, isDecide: false },
+    ] })
+    f.group.getSingleScreenNotifies.mockImplementation(async (doubt) => (
+      doubt ? { notifies: [] } : { notifies: [
+        { seq: '2', type: 7, status: 1, group: { groupCode: '123' }, user1: { uid: 'joiner' } },
+      ] }
+    ))
+    const bridge = new QQKernelBridge()
+    vi.spyOn(bridge as unknown as { initializePlatformData(): Promise<void> }, 'initializePlatformData').mockResolvedValue()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await bridge.getRequests('group-join')
+    expect(f.group.getSingleScreenNotifies).toHaveBeenCalledTimes(2)
+    expect(f.buddy.getBuddyReq).not.toHaveBeenCalled()
+    await expect(bridge.getRequests('friend')).resolves.toMatchObject({
+      requests: [{ kind: 'friend', requester: { id: 'friend' } }],
+    })
+    expect(f.buddy.getBuddyReq).toHaveBeenCalledOnce()
+  })
+
+  it('reports unavailable request APIs without using message paths', async () => {
+    const f = fixture()
+    delete (f.buddy as { getBuddyReq?: unknown }).getBuddyReq
+    delete (f.group as { getSingleScreenNotifies?: unknown }).getSingleScreenNotifies
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    await expect(bridge.getRequests()).rejects.toThrow('request API is unavailable')
+  })
+
   it('revokes active call media on detach and account switch without logging the call ID', async () => {
     const f = fixture()
     const revokeCallLeases = vi.fn()
@@ -3859,6 +4591,76 @@ describe('QQBridgeServer', () => {
   afterEach(async () => {
     await server?.stop()
     await Promise.all(tempPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })))
+  })
+
+  it('returns a non-success response when the initial native request getter fails', async () => {
+    const f = fixture()
+    f.buddy.getBuddyReq.mockResolvedValue({ result: 1, errMsg: 'native unavailable' })
+    const bridge = new QQKernelBridge()
+    vi.spyOn(bridge as unknown as { initializePlatformData(): Promise<void> }, 'initializePlatformData').mockResolvedValue()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/v1/requests?kind=friend`)
+    expect(response.status).toBe(502)
+    expect((await response.json() as { error: string }).error).toContain('QQNT request refresh failed:')
+  })
+
+  it('maps rejected friend and group native resolutions to safe 502 responses', async () => {
+    const f = fixture()
+    f.buddy.getBuddyReq.mockResolvedValue({ buddyReqs: [
+      { friendUid: 'friend', reqTime: '1', isInitiator: false, isDecide: false },
+    ] })
+    f.group.getSingleScreenNotifies.mockImplementation(async (doubt) => (
+      doubt ? { notifies: [] } : { notifies: [
+        { seq: '2', type: 7, status: 1, group: { groupCode: '123' }, user1: { uid: 'joiner' } },
+      ] }
+    ))
+    f.buddy.approvalFriendRequest.mockRejectedValue(new Error('friend native secret'))
+    f.group.operateSysNotify.mockRejectedValue(new Error('group native secret'))
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const base = `http://127.0.0.1:${server.address().port}/v1/requests`
+    const friend = await (await fetch(`${base}?kind=friend`)).json() as { requests: Array<{ id: string }> }
+    const group = await (await fetch(`${base}?kind=group-join`)).json() as { requests: Array<{ id: string }> }
+    for (const id of [friend.requests[0].id, group.requests[0].id]) {
+      const response = await fetch(`${base}/${encodeURIComponent(id)}/resolve`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'accept' }),
+      })
+      expect(response.status).toBe(502)
+      await expect(response.json()).resolves.toEqual({ error: 'QQNT request resolution failed' })
+    }
+  })
+
+  it('maps native friend and group resolution errors to safe 502 responses', async () => {
+    const f = fixture()
+    f.buddy.getBuddyReq.mockResolvedValue({ buddyReqs: [
+      { friendUid: 'friend', reqTime: '1', isInitiator: false, isDecide: false },
+    ] })
+    f.group.getSingleScreenNotifies.mockImplementation(async (doubt) => (
+      doubt ? { notifies: [] } : { notifies: [
+        { seq: '2', type: 7, status: 1, group: { groupCode: '123' }, user1: { uid: 'joiner' } },
+      ] }
+    ))
+    f.buddy.approvalFriendRequest.mockResolvedValue({ result: 1, errMsg: 'sensitive native detail' })
+    f.group.operateSysNotify.mockResolvedValue({ result: 2, errMsg: 'sensitive native detail' })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const base = `http://127.0.0.1:${server.address().port}/v1/requests`
+    const friend = await (await fetch(`${base}?kind=friend`)).json() as { requests: Array<{ id: string }> }
+    const group = await (await fetch(`${base}?kind=group-join`)).json() as { requests: Array<{ id: string }> }
+    for (const id of [friend.requests[0].id, group.requests[0].id]) {
+      const response = await fetch(`${base}/${encodeURIComponent(id)}/resolve`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'accept' }),
+      })
+      expect(response.status).toBe(502)
+      await expect(response.json()).resolves.toEqual({ error: 'QQNT request resolution failed' })
+    }
   })
 
   it('rejects an empty user ID before resolving a user', async () => {
@@ -4668,6 +5470,94 @@ describe('QQBridgeServer', () => {
     }
   })
 
+  it('exposes native requests through the dedicated HTTP contract', async () => {
+    const f = fixture()
+    f.buddy.getBuddyReq.mockResolvedValue({ buddyReqs: [
+      { friendUid: 'friend-uid', reqTime: '11', isInitiator: false, isDecide: false },
+    ] })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const base = `http://127.0.0.1:${server.address().port}/v1/requests`
+
+    const listed = await fetch(`${base}?kind=friend`)
+    expect(listed.status).toBe(200)
+    const page = await listed.json() as { requests: Array<{ id: string, kind: string }> }
+    expect(page.requests).toHaveLength(1)
+    expect(page.requests[0].kind).toBe('friend')
+
+    const resolved = await fetch(`${base}/${encodeURIComponent(page.requests[0].id)}/resolve`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'accept' }),
+    })
+    expect(resolved.status).toBe(200)
+    await expect(resolved.json()).resolves.toMatchObject({ status: 'accepted' })
+    expect(f.buddy.approvalFriendRequest).toHaveBeenCalledWith({ friendUid: 'friend-uid', reqTime: '11', accept: true })
+
+    const repeated = await fetch(`${base}/${encodeURIComponent(page.requests[0].id)}/resolve`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'accept' }),
+    })
+    expect(repeated.status).toBe(200)
+    const conflict = await fetch(`${base}/${encodeURIComponent(page.requests[0].id)}/resolve`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'reject' }),
+    })
+    expect(conflict.status).toBe(409)
+    expect((await fetch(`${base}?kind=other`)).status).toBe(400)
+    expect((await fetch(`${base}?limit=0`)).status).toBe(400)
+    expect((await fetch(`${base}/missing/resolve`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'accept' }),
+    })).status).toBe(404)
+  })
+
+  it('uses authenticated request boundary cursors across list mutations', async () => {
+    const f = fixture()
+    const buddies = [
+      { friendUid: 'z1', reqTime: '1', isInitiator: false, isDecide: false },
+      { friendUid: 'z2', reqTime: '2', isInitiator: false, isDecide: false },
+    ]
+    f.buddy.getBuddyReq.mockResolvedValue({ buddyReqs: buddies })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const base = `http://127.0.0.1:${server.address().port}/v1/requests`
+
+    const firstResponse = await fetch(`${base}?kind=friend&limit=1`)
+    const first = await firstResponse.json() as { requests: Array<{ id: string }>, nextCursor: string }
+    expect(first.nextCursor).toBeTruthy()
+    const allFirst = await fetch(`${base}?limit=1`)
+    const allPage = await allFirst.json() as { nextCursor: string }
+    expect((await fetch(`${base}?cursor=${encodeURIComponent(allPage.nextCursor)}`)).status).toBe(200)
+
+    const inserted = Array.from({ length: 32 }, (_, index) => ({
+      friendUid: `inserted-${index}`, reqTime: '0', isInitiator: false, isDecide: false,
+    }))
+    f.emitBuddyRequests([...inserted, ...buddies])
+    const current = await (await fetch(`${base}?kind=friend&limit=500`)).json() as { requests: Array<{ id: string }> }
+    const expected = current.requests.filter((request) => request.id > first.requests[0].id).map((request) => request.id)
+    expect(current.requests.some((request) => request.id < first.requests[0].id)).toBe(true)
+    const secondResponse = await fetch(`${base}?kind=friend&cursor=${encodeURIComponent(first.nextCursor)}&limit=500`)
+    const second = await secondResponse.json() as { requests: Array<{ id: string }> }
+    expect(second.requests.map((request) => request.id)).toEqual(expected)
+
+    expect((await fetch(`${base}?kind=group-join&cursor=${encodeURIComponent(first.nextCursor)}`)).status).toBe(400)
+    expect((await fetch(`${base}?kind=friend&cursor=malformed`)).status).toBe(400)
+    const forged = `${first.nextCursor.slice(0, -1)}${first.nextCursor.endsWith('A') ? 'B' : 'A'}`
+    expect((await fetch(`${base}?kind=friend&cursor=${encodeURIComponent(forged)}`)).status).toBe(400)
+  })
+
+  it('returns unavailable when no native request API exists', async () => {
+    const f = fixture()
+    delete (f.buddy as { getBuddyReq?: unknown }).getBuddyReq
+    delete (f.group as { getSingleScreenNotifies?: unknown }).getSingleScreenNotifies
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/v1/requests`)
+    expect(response.status).toBe(503)
+  })
+
   it('warns once per normalized slow HTTP route', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
@@ -4692,6 +5582,107 @@ describe('QQBridgeServer', () => {
       method: 'GET',
       status: 200,
       completed: true,
+    })
+  })
+
+  describe('notification-mask endpoint', () => {
+    it('updates the group mask and returns 200 on success', async () => {
+      const f = fixture()
+      const bridge = new QQKernelBridge()
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      f.emitGroupList([{ groupCode: '1058754719', groupName: 'Bridge Test Group' }])
+      f.emitGroupMsgMasks([{ groupCode: '1058754719', msgMask: GroupMsgMask.NOTIFY }])
+      server = new QQBridgeServer(bridge, { port: 0 })
+      await server.start()
+      const endpoint = `http://127.0.0.1:${server.address().port}/v1/conversations/2/1058754719/notification-mask`
+
+      const response = await fetch(endpoint, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ msgMask: GroupMsgMask.SHIELD }),
+      })
+
+      expect(response.status).toBe(200)
+      await expect(response.json()).resolves.toEqual({
+        ok: true, chatType: 2, peerUin: '1058754719', msgMask: GroupMsgMask.SHIELD,
+      })
+      expect(f.group.setGroupMsgMask).toHaveBeenCalledWith('1058754719', GroupMsgMask.SHIELD)
+      expect(bridge.getConversation('1058754719')).toMatchObject({ groupMsgMask: GroupMsgMask.SHIELD })
+    })
+
+    it('rejects an out-of-range msgMask with 400', async () => {
+      const f = fixture()
+      const bridge = new QQKernelBridge()
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      server = new QQBridgeServer(bridge, { port: 0 })
+      await server.start()
+      const endpoint = `http://127.0.0.1:${server.address().port}/v1/conversations/2/1058754719/notification-mask`
+
+      const response = await fetch(endpoint, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ msgMask: 7 }),
+      })
+
+      expect(response.status).toBe(400)
+      await expect(response.json()).resolves.toEqual({ error: 'msgMask must be one of 0, 1, 2, 3, 4' })
+      expect(f.group.setGroupMsgMask).not.toHaveBeenCalled()
+    })
+
+    it('rejects a non-group chatType with 400', async () => {
+      const f = fixture()
+      const bridge = new QQKernelBridge()
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      server = new QQBridgeServer(bridge, { port: 0 })
+      await server.start()
+      const endpoint = `http://127.0.0.1:${server.address().port}/v1/conversations/1/1058754719/notification-mask`
+
+      const response = await fetch(endpoint, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ msgMask: GroupMsgMask.SHIELD }),
+      })
+
+      expect(response.status).toBe(400)
+      await expect(response.json()).resolves.toEqual({ error: 'notification mask is only supported for group conversations' })
+      expect(f.group.setGroupMsgMask).not.toHaveBeenCalled()
+    })
+
+    it('maps a native setter failure to 502', async () => {
+      const f = fixture()
+      const bridge = new QQKernelBridge()
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      f.emitGroupList([{ groupCode: '1058754719', groupName: 'Bridge Test Group' }])
+      f.emitGroupMsgMasks([{ groupCode: '1058754719', msgMask: GroupMsgMask.NOTIFY }])
+      f.group.setGroupMsgMask.mockResolvedValue({ result: -1, errMsg: 'denied' })
+      server = new QQBridgeServer(bridge, { port: 0 })
+      await server.start()
+      const endpoint = `http://127.0.0.1:${server.address().port}/v1/conversations/2/1058754719/notification-mask`
+
+      const response = await fetch(endpoint, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ msgMask: GroupMsgMask.SHIELD }),
+      })
+
+      expect(response.status).toBe(502)
+      const body = await response.json() as { error: string }
+      expect(body.error).toMatch(/setGroupMsgMask: denied/)
+    })
+
+    it('maps an unavailable native setter to 503', async () => {
+      const f = fixture()
+      const bridge = new QQKernelBridge()
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      f.group.setGroupMsgMask = undefined as unknown as typeof f.group.setGroupMsgMask
+      server = new QQBridgeServer(bridge, { port: 0 })
+      await server.start()
+      const endpoint = `http://127.0.0.1:${server.address().port}/v1/conversations/2/1058754719/notification-mask`
+
+      const response = await fetch(endpoint, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ msgMask: GroupMsgMask.SHIELD }),
+      })
+
+      expect(response.status).toBe(503)
+      const body = await response.json() as { error: string }
+      expect(body.error).toMatch(/setGroupMsgMask/)
     })
   })
 })
