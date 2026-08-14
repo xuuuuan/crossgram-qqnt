@@ -8,7 +8,7 @@ import { execFile } from 'node:child_process'
 import { promisify, types } from 'node:util'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import WebSocket from 'ws'
-import type { ContactMsgBoxInfo, KernelBuddyService, KernelGroupService, KernelModule, KernelMsgService, KernelSession, MsgElement, MsgRecord } from './kernel-types.js'
+import { GroupMsgMask, type ContactMsgBoxInfo, type KernelBuddyService, type KernelGroupService, type KernelModule, type KernelMsgService, type KernelSession, type MsgElement, type MsgRecord } from './kernel-types.js'
 import type { PacketAddon } from './packet-addon.js'
 import { parseConversationId, type QQEvent } from './protocol.js'
 import { QQKernelBridge } from './qq-kernel.js'
@@ -262,6 +262,11 @@ function fixture() {
     getSingleScreenNotifies: vi.fn<NonNullable<KernelGroupService['getSingleScreenNotifies']>>(async () => ({ notifies: [] })),
     operateSysNotify: vi.fn<NonNullable<KernelGroupService['operateSysNotify']>>(async () => ({ result: 0, errMsg: '' })),
     getGroupDetailInfo: vi.fn<NonNullable<KernelGroupService['getGroupDetailInfo']>>(async () => ({ result: 0, errMsg: '' })),
+    getGroupMsgMask: vi.fn<NonNullable<KernelGroupService['getGroupMsgMask']>>(async () => {
+      queueMicrotask(() => groupHandlers.onGroupsMsgMaskResult?.([]))
+      return { result: 0, errMsg: 'success' }
+    }),
+    setGroupMsgMask: vi.fn<NonNullable<KernelGroupService['setGroupMsgMask']>>(async () => ({ result: 0, errMsg: 'success' })),
     createMemberListScene: vi.fn(() => 'scene'), destroyMemberListScene: vi.fn(),
     getNextMemberList: vi.fn(async () => ({
       errCode: 0, errMsg: '', result: {
@@ -399,6 +404,7 @@ function fixture() {
       remarkName?: string
       memberCount?: number
       memberRole?: number
+      cmdUinMsgMask?: number
     }>) {
       groupHandlers.onGroupListUpdate?.(1, groups)
     },
@@ -413,6 +419,9 @@ function fixture() {
     },
     emitGroupRequestUpdate(doubt: boolean, notifies: unknown[]) {
       return groupHandlers.onGroupNotifiesUpdated?.(doubt, notifies)
+    },
+    emitGroupMsgMasks(masks: Array<{ groupCode?: string, msgMask?: number }>) {
+      groupHandlers.onGroupsMsgMaskResult?.(masks)
     },
     emitGroupDetail(group: {
       groupCode: string
@@ -3187,6 +3196,274 @@ describe('QQKernelBridge', () => {
     expect(user.name.trim().toLowerCase()).not.toMatch(/^(undefined|null)$/)
   })
 
+  it('exposes the verified QQ group message mask values', () => {
+    expect(GroupMsgMask).toMatchObject({
+      UNSPECIFIED: 0,
+      NOTIFY: 1,
+      ASSISTANT: 2,
+      SHIELD: 3,
+      RECEIVE: 4,
+    })
+  })
+
+  it('caches the group message mask callback for group conversations', () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    expect(f.group.getGroupMsgMask).toHaveBeenCalledTimes(1)
+    f.emitGroupMsgMasks([{ groupCode: '1058754719', msgMask: GroupMsgMask.RECEIVE }])
+
+    expect(bridge.getConversation('1058754719')).toMatchObject({
+      kind: 'group', groupMsgMask: GroupMsgMask.RECEIVE,
+    })
+  })
+
+  it.each(['mask-before-profile', 'profile-before-mask'] as const)(
+    'materializes an assistant group when masks arrive %s',
+    async (order) => {
+      const f = fixture()
+      const bridge = new QQKernelBridge()
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      const group = { groupCode: '1058754719', groupName: 'Bridge Test Group' }
+      const mask = [{ groupCode: group.groupCode, msgMask: GroupMsgMask.ASSISTANT }]
+
+      if (order === 'mask-before-profile') {
+        f.emitGroupMsgMasks(mask)
+        f.emitGroupList([group])
+      } else {
+        f.emitGroupList([group])
+        f.emitGroupMsgMasks(mask)
+      }
+
+      await expect(bridge.getDialogs()).resolves.toMatchObject({
+        conversations: [expect.objectContaining({
+          id: group.groupCode,
+          kind: 'group',
+          title: group.groupName,
+          groupMsgMask: GroupMsgMask.ASSISTANT,
+        })],
+      })
+    },
+  )
+
+  it('waits for a delayed group mask callback before returning the first dialog page', async () => {
+    const f = fixture()
+    f.group.getGroupMsgMask.mockImplementation(async () => {
+      setTimeout(() => f.emitGroupMsgMasks([
+        { groupCode: '1058754719', msgMask: GroupMsgMask.ASSISTANT },
+      ]), 25)
+      return { result: 0, errMsg: 'success' }
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.emitGroupList([{ groupCode: '1058754719', groupName: 'Delayed Assistant Group' }])
+
+    await expect(bridge.getDialogs()).resolves.toMatchObject({
+      conversations: expect.arrayContaining([expect.objectContaining({
+        id: '1058754719', groupMsgMask: GroupMsgMask.ASSISTANT,
+      })]),
+    })
+  })
+
+  it('retries a failed initial group mask request within the same initialization', async () => {
+    const f = fixture()
+    let calls = 0
+    f.group.getGroupMsgMask.mockImplementation(async () => {
+      calls++
+      if (calls === 1) return { result: -1, errMsg: 'retry' }
+      queueMicrotask(() => f.emitGroupMsgMasks([
+        { groupCode: '1058754719', msgMask: GroupMsgMask.ASSISTANT },
+      ]))
+      return { result: 0, errMsg: 'success' }
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.emitGroupList([{ groupCode: '1058754719', groupName: 'Retried Assistant Group' }])
+
+    await expect(bridge.getDialogs()).resolves.toMatchObject({
+      conversations: [expect.objectContaining({ id: '1058754719' })],
+    })
+    expect(calls).toBe(2)
+  })
+
+  it('retries group masks on a later contact refresh after initial failures', async () => {
+    const f = fixture()
+    let calls = 0
+    f.group.getGroupMsgMask.mockImplementation(async () => {
+      calls++
+      if (calls <= 2) return { result: -1, errMsg: 'retry' }
+      queueMicrotask(() => f.emitGroupMsgMasks([
+        { groupCode: '1058754719', msgMask: GroupMsgMask.ASSISTANT },
+      ]))
+      return { result: 0, errMsg: 'success' }
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.emitGroupList([{ groupCode: '1058754719', groupName: 'Later Assistant Group' }])
+    await new Promise<void>((resolve) => setImmediate(resolve))
+
+    await bridge.refreshContacts()
+
+    expect(calls).toBe(3)
+    await expect(bridge.getDialogs()).resolves.toMatchObject({
+      conversations: expect.arrayContaining([expect.objectContaining({ id: '1058754719' })]),
+    })
+  })
+
+  it('removes only assistant-materialized groups when their mask changes', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.emitGroupMsgMasks([{ groupCode: '1058754719', msgMask: GroupMsgMask.ASSISTANT }])
+    f.emitGroupList([{ groupCode: '1058754719', groupName: 'Assistant Group' }])
+    f.emitGroupMsgMasks([{ groupCode: '1058754719', msgMask: GroupMsgMask.NOTIFY }])
+
+    await expect(bridge.getDialogs()).resolves.not.toMatchObject({
+      conversations: [expect.objectContaining({ id: '1058754719' })],
+    })
+  })
+
+  it('removes assistant-materialized groups when a profile mask leaves assistant', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.emitGroupMsgMasks([{ groupCode: '1058754719', msgMask: GroupMsgMask.ASSISTANT }])
+    f.emitGroupList([{ groupCode: '1058754719', groupName: 'Assistant Group' }])
+    f.emitGroupList([{
+      groupCode: '1058754719', groupName: 'Assistant Group', cmdUinMsgMask: GroupMsgMask.NOTIFY,
+    }])
+
+    await expect(bridge.getDialogs()).resolves.not.toMatchObject({
+      conversations: [expect.objectContaining({ id: '1058754719' })],
+    })
+  })
+
+  it('keeps recent groups when their assistant mask changes', async () => {
+    const f = fixture()
+    f.recent.getRecentContactInfos.mockResolvedValue({
+      result: 0, errMsg: '', relation: [{
+        chatType: 2, peerUid: '1058754719', peerUin: '1058754719', peerName: 'Recent Group',
+        remark: '', avatarUrl: '', unreadCnt: '0', msgId: 'm1', msgTime: '1800000000',
+        senderUid: 'member', senderUin: '42', abstractContent: [],
+      }],
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.emitGroupMsgMasks([{ groupCode: '1058754719', msgMask: GroupMsgMask.ASSISTANT }])
+    f.emitGroupList([{ groupCode: '1058754719', groupName: 'Recent Group' }])
+    await bridge.refreshContacts()
+    f.emitGroupMsgMasks([{ groupCode: '1058754719', msgMask: GroupMsgMask.NOTIFY }])
+
+    await expect(bridge.getDialogs()).resolves.toMatchObject({
+      conversations: expect.arrayContaining([expect.objectContaining({
+        id: '1058754719', groupMsgMask: GroupMsgMask.NOTIFY,
+      })]),
+    })
+  })
+
+  it('keeps explicitly resolved groups when their assistant mask changes', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.emitGroupMsgMasks([{ groupCode: '1058754719', msgMask: GroupMsgMask.ASSISTANT }])
+    f.emitGroupList([{ groupCode: '1058754719', groupName: 'Resolved Group' }])
+    await bridge.resolveConversation(2, '1058754719')
+    f.emitGroupMsgMasks([{ groupCode: '1058754719', msgMask: GroupMsgMask.NOTIFY }])
+
+    await expect(bridge.getDialogs()).resolves.toMatchObject({
+      conversations: [expect.objectContaining({
+        id: '1058754719', groupMsgMask: GroupMsgMask.NOTIFY,
+      })],
+    })
+  })
+
+  it('preserves unknown raw masks and ignores incomplete callback items', () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.emitGroupMsgMasks([
+      { groupCode: '1058754719', msgMask: 99 },
+      { groupCode: 'incomplete' },
+      { msgMask: GroupMsgMask.ASSISTANT },
+    ])
+    f.emitGroupList([{
+      groupCode: '2000000000', groupName: 'Unknown Profile Mask', cmdUinMsgMask: 98,
+    }])
+
+    expect(bridge.getConversation('1058754719')).toMatchObject({ groupMsgMask: 99 })
+    expect(bridge.getConversation('2000000000')).toMatchObject({ groupMsgMask: 98 })
+  })
+
+  it('setGroupMsgMask updates the cache and conversation immediately on success', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.emitGroupList([{ groupCode: '1058754719', groupName: 'Bridge Test Group' }])
+    f.emitGroupMsgMasks([{ groupCode: '1058754719', msgMask: GroupMsgMask.NOTIFY }])
+
+    await bridge.setGroupMsgMask('1058754719', GroupMsgMask.SHIELD)
+
+    expect(f.group.setGroupMsgMask).toHaveBeenCalledWith('1058754719', GroupMsgMask.SHIELD)
+    expect(bridge.getConversation('1058754719')).toMatchObject({
+      id: '1058754719',
+      kind: 'group',
+      groupMsgMask: GroupMsgMask.SHIELD,
+    })
+  })
+
+  it('setGroupMsgMask leaves the assistant materialization path when leaving ASSISTANT', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.emitGroupMsgMasks([{ groupCode: '1058754719', msgMask: GroupMsgMask.ASSISTANT }])
+    f.emitGroupList([{ groupCode: '1058754719', groupName: 'Assistant Group' }])
+
+    await bridge.setGroupMsgMask('1058754719', GroupMsgMask.NOTIFY)
+
+    expect(bridge.getConversation('1058754719')).toMatchObject({
+      id: '1058754719',
+      groupMsgMask: GroupMsgMask.NOTIFY,
+    })
+  })
+
+  it('setGroupMsgMask throws when the native setter fails and keeps the prior mask', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.emitGroupList([{ groupCode: '1058754719', groupName: 'Bridge Test Group' }])
+    f.emitGroupMsgMasks([{ groupCode: '1058754719', msgMask: GroupMsgMask.NOTIFY }])
+    f.group.setGroupMsgMask.mockResolvedValue({ result: -1, errMsg: 'denied' })
+
+    await expect(bridge.setGroupMsgMask('1058754719', GroupMsgMask.SHIELD))
+      .rejects.toThrow(/setGroupMsgMask: denied \(-1\)/)
+    expect(bridge.getConversation('1058754719')).toMatchObject({ groupMsgMask: GroupMsgMask.NOTIFY })
+  })
+
+  it('setGroupMsgMask throws a clear error when the native setter is unavailable', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.group.setGroupMsgMask = undefined as unknown as typeof f.group.setGroupMsgMask
+
+    await expect(bridge.setGroupMsgMask('1058754719', GroupMsgMask.SHIELD))
+      .rejects.toThrow(/setGroupMsgMask/)
+  })
+
+  it('setGroupMsgMask defers to a later listener callback without double-applying the local value', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.emitGroupList([{ groupCode: '1058754719', groupName: 'Bridge Test Group' }])
+    f.emitGroupMsgMasks([{ groupCode: '1058754719', msgMask: GroupMsgMask.NOTIFY }])
+
+    await bridge.setGroupMsgMask('1058754719', GroupMsgMask.SHIELD)
+    // Native callback arrives later with the authoritative value; it overwrites.
+    f.emitGroupMsgMasks([{ groupCode: '1058754719', msgMask: GroupMsgMask.RECEIVE }])
+
+    expect(bridge.getConversation('1058754719')).toMatchObject({ groupMsgMask: GroupMsgMask.RECEIVE })
+  })
+
   it('refreshes a placeholder group dialog title through getDialogs', async () => {
     const f = fixture()
     f.recent.getRecentContactInfos.mockResolvedValue({
@@ -5305,6 +5582,107 @@ describe('QQBridgeServer', () => {
       method: 'GET',
       status: 200,
       completed: true,
+    })
+  })
+
+  describe('notification-mask endpoint', () => {
+    it('updates the group mask and returns 200 on success', async () => {
+      const f = fixture()
+      const bridge = new QQKernelBridge()
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      f.emitGroupList([{ groupCode: '1058754719', groupName: 'Bridge Test Group' }])
+      f.emitGroupMsgMasks([{ groupCode: '1058754719', msgMask: GroupMsgMask.NOTIFY }])
+      server = new QQBridgeServer(bridge, { port: 0 })
+      await server.start()
+      const endpoint = `http://127.0.0.1:${server.address().port}/v1/conversations/2/1058754719/notification-mask`
+
+      const response = await fetch(endpoint, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ msgMask: GroupMsgMask.SHIELD }),
+      })
+
+      expect(response.status).toBe(200)
+      await expect(response.json()).resolves.toEqual({
+        ok: true, chatType: 2, peerUin: '1058754719', msgMask: GroupMsgMask.SHIELD,
+      })
+      expect(f.group.setGroupMsgMask).toHaveBeenCalledWith('1058754719', GroupMsgMask.SHIELD)
+      expect(bridge.getConversation('1058754719')).toMatchObject({ groupMsgMask: GroupMsgMask.SHIELD })
+    })
+
+    it('rejects an out-of-range msgMask with 400', async () => {
+      const f = fixture()
+      const bridge = new QQKernelBridge()
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      server = new QQBridgeServer(bridge, { port: 0 })
+      await server.start()
+      const endpoint = `http://127.0.0.1:${server.address().port}/v1/conversations/2/1058754719/notification-mask`
+
+      const response = await fetch(endpoint, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ msgMask: 7 }),
+      })
+
+      expect(response.status).toBe(400)
+      await expect(response.json()).resolves.toEqual({ error: 'msgMask must be one of 0, 1, 2, 3, 4' })
+      expect(f.group.setGroupMsgMask).not.toHaveBeenCalled()
+    })
+
+    it('rejects a non-group chatType with 400', async () => {
+      const f = fixture()
+      const bridge = new QQKernelBridge()
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      server = new QQBridgeServer(bridge, { port: 0 })
+      await server.start()
+      const endpoint = `http://127.0.0.1:${server.address().port}/v1/conversations/1/1058754719/notification-mask`
+
+      const response = await fetch(endpoint, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ msgMask: GroupMsgMask.SHIELD }),
+      })
+
+      expect(response.status).toBe(400)
+      await expect(response.json()).resolves.toEqual({ error: 'notification mask is only supported for group conversations' })
+      expect(f.group.setGroupMsgMask).not.toHaveBeenCalled()
+    })
+
+    it('maps a native setter failure to 502', async () => {
+      const f = fixture()
+      const bridge = new QQKernelBridge()
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      f.emitGroupList([{ groupCode: '1058754719', groupName: 'Bridge Test Group' }])
+      f.emitGroupMsgMasks([{ groupCode: '1058754719', msgMask: GroupMsgMask.NOTIFY }])
+      f.group.setGroupMsgMask.mockResolvedValue({ result: -1, errMsg: 'denied' })
+      server = new QQBridgeServer(bridge, { port: 0 })
+      await server.start()
+      const endpoint = `http://127.0.0.1:${server.address().port}/v1/conversations/2/1058754719/notification-mask`
+
+      const response = await fetch(endpoint, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ msgMask: GroupMsgMask.SHIELD }),
+      })
+
+      expect(response.status).toBe(502)
+      const body = await response.json() as { error: string }
+      expect(body.error).toMatch(/setGroupMsgMask: denied/)
+    })
+
+    it('maps an unavailable native setter to 503', async () => {
+      const f = fixture()
+      const bridge = new QQKernelBridge()
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      f.group.setGroupMsgMask = undefined as unknown as typeof f.group.setGroupMsgMask
+      server = new QQBridgeServer(bridge, { port: 0 })
+      await server.start()
+      const endpoint = `http://127.0.0.1:${server.address().port}/v1/conversations/2/1058754719/notification-mask`
+
+      const response = await fetch(endpoint, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ msgMask: GroupMsgMask.SHIELD }),
+      })
+
+      expect(response.status).toBe(503)
+      const body = await response.json() as { error: string }
+      expect(body.error).toMatch(/setGroupMsgMask/)
     })
   })
 })

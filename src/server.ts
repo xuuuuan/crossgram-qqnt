@@ -8,6 +8,7 @@ import WebSocket, { WebSocketServer } from 'ws'
 import {
   PROTOCOL_VERSION, type QQMediaLocator, type QQMultiForwardLocator, type QQSendMediaSpec, type QQStickerReference, type SendManifest,
 } from './protocol.js'
+import { GroupMsgMask } from './kernel-types.js'
 import { QQKernelBridge, QQMediaLeaseAuthorizationError,
   QQMediaLeaseUnavailableError, QQRequestApiUnavailableError, QQRequestConflictError, QQRequestCursorError, QQRequestRefreshError, QQRequestResolutionError, QQRequestSessionChangedError,
   QQStickerAssetNotFoundError ,
@@ -465,6 +466,43 @@ export class QQBridgeServer {
       const conversation = await this.bridge.resolveConversation(kind === 'group' ? 2 : 1, numericId)
       log('info', `HTTP API resolve conversation id=${requestId} kind=${conversation.kind} conversation=${conversation.id} title=${JSON.stringify(conversation.title)} avatar=${conversation.avatar?.id ?? '<none>'}`)
       json(response, 200, conversation)
+      return
+    }
+
+    const notificationMaskMatch = /^\/v1\/conversations\/(?<chatType>1|2)\/(?<peerUin>[^/]+)\/notification-mask$/.exec(path)
+    if (request.method === 'POST' && notificationMaskMatch?.groups) {
+      const chatType = Number(notificationMaskMatch.groups.chatType) as 1 | 2
+      const peerUin = decodeURIComponent(notificationMaskMatch.groups.peerUin)
+      const body = await readJson<{ msgMask?: unknown }>(request)
+      const msgMask = body?.msgMask
+      const validMasks = new Set<number>([
+        GroupMsgMask.UNSPECIFIED,
+        GroupMsgMask.NOTIFY,
+        GroupMsgMask.ASSISTANT,
+        GroupMsgMask.SHIELD,
+        GroupMsgMask.RECEIVE,
+      ])
+      if (typeof msgMask !== 'number' || !validMasks.has(msgMask)) {
+        json(response, 400, { error: 'msgMask must be one of 0, 1, 2, 3, 4' })
+        return
+      }
+      if (chatType !== 2) {
+        json(response, 400, { error: 'notification mask is only supported for group conversations' })
+        return
+      }
+      try {
+        await this.bridge.setGroupMsgMask(peerUin, msgMask as GroupMsgMask)
+      } catch (error) {
+        const message = errorMessage(error)
+        if (/not ready|unavailable|expose/i.test(message)) {
+          json(response, 503, { error: message })
+        } else {
+          json(response, 502, { error: message })
+        }
+        return
+      }
+      log('info', `HTTP API set notification mask id=${requestId} chatType=${chatType} peer=${peerUin} mask=${msgMask}`)
+      json(response, 200, { ok: true, chatType, peerUin, msgMask })
       return
     }
 

@@ -68,6 +68,35 @@ export interface MemberInfo {
   avatarPath: string
 }
 
+/**
+ * Group notification behavior verified live on QQ Linux 3.2.32.
+ *
+ * `getGroupMsgMask()` takes no arguments and succeeds with the Promise-like
+ * `{ result: 0, errMsg: 'success' }`; values arrive through the single
+ * `onGroupsMsgMaskResult(GroupMsgMaskInfo[])` argument, whose entries are
+ * `{ groupCode: string, msgMask: number }`. Native chatType 7 is
+ * KCHATTYPEGROUPHELPER, the group-assistant container. Do not confuse it with
+ * ServiceAssistant (118) or its child entries (201).
+ */
+export enum GroupMsgMask {
+  /** 0 UNSPECIFIED: 未指定. */
+  UNSPECIFIED = 0,
+  /** 1 NOTIFY: 接收并提醒. */
+  NOTIFY = 1,
+  /** 2 ASSISTANT: 收进群助手且不提醒. */
+  ASSISTANT = 2,
+  /** 3 SHIELD: 屏蔽群消息. */
+  SHIELD = 3,
+  /** 4 RECEIVE: 接收但不提醒. */
+  RECEIVE = 4,
+}
+
+export interface GroupMsgMaskInfo {
+  groupCode: string
+  /** Raw native value; it may be a newer value outside GroupMsgMask. */
+  msgMask: number
+}
+
 export interface GroupProfileInfo {
   groupCode: string
   groupName: string
@@ -76,6 +105,8 @@ export interface GroupProfileInfo {
   memberNum?: number
   memberRole?: number
   cmdUinPrivilege?: number
+  /** Raw native value; it may be a newer value outside GroupMsgMask. */
+  cmdUinMsgMask?: number
 }
 
 export interface MsgElement {
@@ -727,6 +758,14 @@ export interface KernelGroupService {
     targetMsg: { seq: string | number, type: number, groupCode: string, postscript: string }
   }): Promise<unknown>
   getGroupDetailInfo?(groupCode: string, source: number): Promise<{ result: number, errMsg: string }>
+  getGroupMsgMask?(): Promise<{ result: number, errMsg: string }>
+  /**
+   * Sets the group notification mask for a single group. Return shape mirrors
+   * getGroupMsgMask: NapCat/Yui stubs expose `(groupCode: string, mask: GroupMsgMask)`
+   * resolving to `{ result: 0, errMsg: 'success' }`; a non-zero result indicates
+   * a native failure. Verified against the public stub signature only.
+   */
+  setGroupMsgMask?(groupCode: string, mask: GroupMsgMask): Promise<{ result: number, errMsg: string }>
   createMemberListScene(groupCode: string, scene: string): string
   destroyMemberListScene(sceneId: string): void
   getNextMemberList(sceneId: string, lastId: { uid: string, index: number }, count: number): Promise<{

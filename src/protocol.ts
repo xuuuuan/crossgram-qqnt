@@ -252,6 +252,8 @@ export interface QQConversation {
   participantCount?: number
   /** Current account's native group role (2 member, 3 admin, 4 owner). */
   selfRole?: 'owner' | 'administrator' | 'member'
+  /** Raw QQ GroupMsgMask value; no notification behavior is inferred from it. */
+  groupMsgMask?: number
   unreadCount?: number
   lastMessage?: QQMessage
   /** QQ's native cursor for the first unread message. */
