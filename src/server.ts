@@ -200,13 +200,22 @@ export class QQBridgeServer {
     response: ServerResponse,
     requestId: number,
   ): Promise<void> {
+    const url = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`)
+    const path = url.pathname
+    if (request.method === 'GET' && path === '/v1/group-join/probe') {
+      if (!this.tokenDigest) {
+        json(response, 503, { error: 'group-join probe requires bridge token' })
+      } else if (!this.authorize(request)) {
+        json(response, 401, { error: 'unauthorized' })
+      } else {
+        json(response, 200, await this.bridge.getGroupJoinContractProbe())
+      }
+      return
+    }
     if (!this.authorize(request)) {
       json(response, 401, { error: 'unauthorized' })
       return
     }
-    const url = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`)
-
-    const path = url.pathname
 
     if (request.method === 'GET' && path === '/v1/status') {
       const status = { protocolVersion: PROTOCOL_VERSION, ...this.bridge.status, login: this.login?.status }
@@ -811,21 +820,37 @@ export class QQBridgeServer {
   }
 }
 
-function httpLogTarget(method: string, target: string): string {
-  if (method !== 'POST') return target
+function httpLogTarget(_method: string, target: string): string {
   try {
-    if (
-      new URL(target, 'http://localhost').pathname === '/v1/calls/media-lease'
-    )
-      return '/v1/calls/media-lease'
+    const path = new URL(target, 'http://localhost').pathname
+    if (path === '/v1/calls/media-lease') return '/v1/calls/media-lease'
+    // Redact group-join targets for every HTTP method, including percent-encoded
+    // route separators, so future writes never log identifiers or query values.
+    if (isGroupJoinRoute(path)) return '/v1/groups/join'
   } catch {
-    if (
-      target === '/v1/calls/media-lease' ||
-      target.startsWith('/v1/calls/media-lease?')
-    )
+    if (target === '/v1/calls/media-lease' || target.startsWith('/v1/calls/media-lease?')) {
       return '/v1/calls/media-lease'
+    }
+    if (isGroupJoinRoute(target.split(/[?#]/, 1)[0])) return '/v1/groups/join'
   }
   return target
+}
+
+function isGroupJoinRoute(path: string): boolean {
+  let normalized = path
+  for (let depth = 0; depth < 64; depth++) {
+    if (/^\/v1\/(?:groups\/join|group-join)(?:[/?#;]|%|$)/i.test(normalized)) return true
+    try {
+      const decoded = decodeURIComponent(normalized)
+      if (decoded === normalized) return false
+      normalized = decoded
+    } catch {
+      // Any malformed percent-encoded target is unsafe to log verbatim.
+      return path.includes('%')
+    }
+  }
+  // Excessive nesting is unsafe to log verbatim.
+  return true
 }
 
 function isWebSocketEventsRequest(target: string): boolean {

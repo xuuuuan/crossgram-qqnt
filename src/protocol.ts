@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 21
+export const PROTOCOL_VERSION = 22
 
 /** Local Unix-socket PCM media protocol. Audio frames use a 1-byte type plus a 4-byte big-endian length. */
 export const PCM_MEDIA_PROTOCOL_VERSION = 1
@@ -465,6 +465,32 @@ export interface MemberPage {
   }>
   total?: number
   nextCursor?: string
+}
+
+export interface QQGroupJoinContractProbeMethod {
+  name: 'getGroupInfoForJoinGroup' | 'queryJoinGroupCanNoVerify' | 'reqToJoinGroup' | 'joinGroup'
+  present: boolean
+  argumentCount?: number
+}
+
+/** Fixed, allowlisted metadata from an opt-in, non-invoking QQNT contract probe. */
+export interface QQGroupJoinContractProbe {
+  enabled: boolean
+  /** Whether every allowlisted descriptor and arity was observed safely; not a contract validation. */
+  surfaceComplete: boolean
+  /** This presence-only observation never validates a native call contract. */
+  contractVerified: false
+  /** This probe never enables group-join writes. */
+  writeEnabled: false
+  methods: QQGroupJoinContractProbeMethod[]
+  /** Digest and byte size of the inert wrapper file; its path is never exposed. */
+  wrapperIdentity?: { sha256: string, size: number }
+  /** Versions of the host runtime only; they do not identify or verify a QQ build. */
+  hostRuntime?: {
+    node?: string
+    electron?: string
+    chrome?: string
+  }
 }
 
 export interface BridgeStatus {
