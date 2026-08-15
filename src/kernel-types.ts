@@ -712,12 +712,29 @@ export interface BuddyRequest {
   relation?: number
 }
 
+export interface DoubtBuddyRequest {
+  uid?: string
+  nick?: string
+  source?: string
+  reason?: string
+  msg?: string
+  groupCode?: string
+  reqTime?: string | number
+}
+
+export interface DoubtBuddyReqChange {
+  reqId?: string
+  cookie?: string
+  doubtList?: DoubtBuddyRequest[]
+}
+
 export interface KernelBuddyService {
   addKernelBuddyListener(listener: unknown): string
   removeKernelBuddyListener(listenerId: string): void
   getBuddyList(force: boolean): Promise<{ result: number, errMsg: string }>
   /** QQNT request data may arrive through onBuddyReqChange rather than this call's return value. */
   getBuddyReq?(): Promise<unknown>
+  getDoubtBuddyReq?(reqId: string, count: number, cookie: string): Promise<unknown>
   approvalFriendRequest?(request: {
     friendUid: string
     reqTime: string | number

@@ -10,7 +10,7 @@ import {
 } from './protocol.js'
 import { GroupMsgMask } from './kernel-types.js'
 import { QQKernelBridge, QQMediaLeaseAuthorizationError,
-  QQMediaLeaseUnavailableError, QQRequestApiUnavailableError, QQRequestConflictError, QQRequestCursorError, QQRequestRefreshError, QQRequestResolutionError, QQRequestSessionChangedError,
+  QQMediaLeaseUnavailableError, QQRequestApiUnavailableError, QQRequestConflictError, QQRequestCursorError, QQRequestRefreshError, QQRequestResolutionError, QQRequestSessionChangedError, QQRequestUnsupportedError,
   QQStickerAssetNotFoundError ,
 } from './qq-kernel.js'
 import { log, recordSlowHttpRequest, slowHttpLogPath } from './log.js'
@@ -336,6 +336,7 @@ export class QQBridgeServer {
         json(response, 200, await this.bridge.resolveRequest(id, body.action))
       } catch (error) {
         if (error instanceof QQRequestApiUnavailableError) json(response, 503, { error: error.message })
+        else if (error instanceof QQRequestUnsupportedError) json(response, 400, { error: error.message })
         else if (error instanceof QQRequestResolutionError) json(response, 502, { error: 'QQNT request resolution failed' })
         else if (error instanceof QQRequestSessionChangedError) json(response, 503, { error: 'QQNT request session changed' })
         else if (error instanceof QQRequestConflictError) json(response, 409, { error: error.message })

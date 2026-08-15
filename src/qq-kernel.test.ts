@@ -224,6 +224,7 @@ function fixture() {
     }), removeKernelBuddyListener: vi.fn(),
     getBuddyList: vi.fn(async () => ({ result: 0, errMsg: '' })),
     getBuddyReq: vi.fn<NonNullable<KernelBuddyService['getBuddyReq']>>(async () => ({ buddyReqs: [] })),
+    getDoubtBuddyReq: undefined as KernelBuddyService['getDoubtBuddyReq'],
     approvalFriendRequest: vi.fn<NonNullable<KernelBuddyService['approvalFriendRequest']>>(async () => ({ result: 0, errMsg: '' })),
     getBuddyNick: vi.fn((uids: string[]) => new Map(uids.map((uid) => [uid, `nick-${uid}`]))),
     getBuddyRemark: vi.fn(() => new Map<string, string>()),
@@ -386,6 +387,9 @@ function fixture() {
     },
     emitBuddyRequests(buddyReqs: unknown[]) {
       return buddyHandlers.onBuddyReqChange?.({ unreadNums: buddyReqs.length, buddyReqs })
+    },
+    emitDoubtBuddyRequests(payload: { reqId: string, cookie?: string, doubtList: unknown[] }) {
+      return buddyHandlers.onDoubtBuddyReqChange?.(payload)
     },
     emitHistoricalBuddyRequests(index: number, buddyReqs: unknown[]) {
       return buddyHandlerHistory[index]?.onBuddyReqChange?.({ unreadNums: buddyReqs.length, buddyReqs })
@@ -4172,6 +4176,104 @@ describe('QQKernelBridge', () => {
     })
   })
 
+  it('reads filtered friend requests through their correlated doubt channel without approving them', async () => {
+    const f = fixture()
+    const regular = { friendUid: 'same-user', reqTime: '11', isInitiator: false, isDecide: false }
+    f.buddy.getBuddyReq.mockResolvedValue({ buddyReqs: [regular] })
+    const getDoubtBuddyReq = vi.fn<NonNullable<KernelBuddyService['getDoubtBuddyReq']>>(async () => ({ result: 0, errMsg: '' }))
+    f.buddy.getDoubtBuddyReq = getDoubtBuddyReq
+    const bridge = new QQKernelBridge()
+    vi.spyOn(bridge as unknown as { initializePlatformData(): Promise<void> }, 'initializePlatformData').mockResolvedValue()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    const listed = bridge.getRequests('friend')
+    await vi.waitFor(() => expect(f.buddy.getBuddyReq).toHaveBeenCalledWith())
+    await vi.waitFor(() => expect(getDoubtBuddyReq).toHaveBeenCalledOnce())
+    const [reqId, count, cookie] = getDoubtBuddyReq.mock.calls[0]
+    expect([count, cookie]).toEqual([100, ''])
+
+    f.emitDoubtBuddyRequests({
+      reqId: 'stale-request', doubtList: [{ uid: 'stale-user', reqTime: '10', nick: 'Stale' }],
+    })
+    f.emitDoubtBuddyRequests({
+      reqId, doubtList: [{ uid: 'same-user', reqTime: '11', nick: 'Filtered', msg: 'please add me', reason: 'QQ 风险提示' }],
+    })
+    const page = await listed
+    const doubt = page.requests.find((request) => request.source === 'doubt')!
+    const normal = page.requests.find((request) => request.source === undefined)!
+    expect(page.requests).toHaveLength(2)
+    expect(doubt).toMatchObject({
+      kind: 'friend', status: 'pending', requester: { id: 'same-user', name: 'Filtered' },
+      message: 'please add me', reason: 'QQ 风险提示', timestamp: '11', source: 'doubt',
+    })
+    expect(doubt.id).not.toBe(normal.id)
+    await expect(bridge.resolveRequest(doubt.id, 'accept')).rejects.toThrow(
+      'filtered QQ friend requests must be handled in the QQ client',
+    )
+    expect(f.buddy.approvalFriendRequest).not.toHaveBeenCalled()
+  })
+
+  it('coalesces concurrent friend refreshes across normal and doubt channels', async () => {
+    const f = fixture()
+    f.buddy.getBuddyReq.mockResolvedValue({ buddyReqs: [
+      { friendUid: 'regular', reqTime: '1', isInitiator: false, isDecide: false },
+    ] })
+    const getDoubtBuddyReq = vi.fn<NonNullable<KernelBuddyService['getDoubtBuddyReq']>>(async (reqId) => ({
+      reqId, doubtList: [{ uid: 'filtered', reqTime: '2', nick: 'Filtered' }],
+    }))
+    f.buddy.getDoubtBuddyReq = getDoubtBuddyReq
+    const bridge = new QQKernelBridge()
+    vi.spyOn(bridge as unknown as { initializePlatformData(): Promise<void> }, 'initializePlatformData').mockResolvedValue()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    const [first, second] = await Promise.all([bridge.getRequests('friend'), bridge.getRequests('friend')])
+    expect(f.buddy.getBuddyReq).toHaveBeenCalledOnce()
+    expect(getDoubtBuddyReq).toHaveBeenCalledOnce()
+    expect(first.requests).toEqual(second.requests)
+    expect(first.requests).toHaveLength(2)
+    expect(new Set(first.requests.map((request) => request.id)).size).toBe(2)
+  })
+
+  it('ignores timed-out doubt callbacks without contaminating the next friend refresh', async () => {
+    vi.useFakeTimers()
+    try {
+      const f = fixture()
+      f.buddy.getBuddyReq.mockResolvedValue({ buddyReqs: [] })
+      const getDoubtBuddyReq = vi.fn<NonNullable<KernelBuddyService['getDoubtBuddyReq']>>(async () => ({ result: 0, errMsg: '' }))
+      f.buddy.getDoubtBuddyReq = getDoubtBuddyReq
+      const bridge = new QQKernelBridge()
+      vi.spyOn(bridge as unknown as { initializePlatformData(): Promise<void> }, 'initializePlatformData').mockResolvedValue()
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+      const timedOut = bridge.getRequests('friend')
+      const rejected = expect(timedOut).rejects.toThrow('QQNT request refresh failed')
+      await Promise.resolve()
+      const firstReqId = getDoubtBuddyReq.mock.calls[0][0]
+      await vi.advanceTimersByTimeAsync(1_500)
+      await rejected
+
+      let settled = false
+      const retried = bridge.getRequests('friend').then((page) => { settled = true; return page })
+      await Promise.resolve()
+      expect(getDoubtBuddyReq).toHaveBeenCalledTimes(2)
+      const secondReqId = getDoubtBuddyReq.mock.calls[1][0]
+      f.emitDoubtBuddyRequests({
+        reqId: firstReqId, doubtList: [{ uid: 'late', reqTime: '1', nick: 'Late' }],
+      })
+      await Promise.resolve()
+      expect(settled).toBe(false)
+      f.emitDoubtBuddyRequests({
+        reqId: secondReqId, doubtList: [{ uid: 'fresh', reqTime: '2', nick: 'Fresh' }],
+      })
+      await expect(retried).resolves.toMatchObject({
+        requests: [{ requester: { id: 'fresh' }, source: 'doubt' }],
+      })
+      expect((await bridge.getRequests('friend')).requests.map((request) => request.requester.id)).toEqual(['fresh'])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('ignores request callbacks queued by a detached attachment', async () => {
     const f = fixture()
     f.buddy.getBuddyReq.mockResolvedValue({ buddyReqs: [] })
@@ -4605,6 +4707,30 @@ describe('QQBridgeServer', () => {
     const response = await fetch(`http://127.0.0.1:${server.address().port}/v1/requests?kind=friend`)
     expect(response.status).toBe(502)
     expect((await response.json() as { error: string }).error).toContain('QQNT request refresh failed:')
+  })
+
+  it('rejects filtered friend request resolution over HTTP without approvalFriendRequest', async () => {
+    const f = fixture()
+    f.buddy.getBuddyReq.mockResolvedValue({ buddyReqs: [] })
+    f.buddy.getDoubtBuddyReq = vi.fn<NonNullable<KernelBuddyService['getDoubtBuddyReq']>>(async (reqId) => ({
+      reqId, doubtList: [{ uid: 'filtered', reqTime: '1', nick: 'Filtered' }],
+    }))
+    const bridge = new QQKernelBridge()
+    vi.spyOn(bridge as unknown as { initializePlatformData(): Promise<void> }, 'initializePlatformData').mockResolvedValue()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const base = `http://127.0.0.1:${server.address().port}/v1/requests`
+    const page = await (await fetch(`${base}?kind=friend`)).json() as { requests: Array<{ id: string }> }
+
+    const response = await fetch(`${base}/${encodeURIComponent(page.requests[0].id)}/resolve`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'accept' }),
+    })
+    expect(response.status).toBe(400)
+    await expect(response.json()).resolves.toEqual({
+      error: 'filtered QQ friend requests must be handled in the QQ client',
+    })
+    expect(f.buddy.approvalFriendRequest).not.toHaveBeenCalled()
   })
 
   it('maps rejected friend and group native resolutions to safe 502 responses', async () => {

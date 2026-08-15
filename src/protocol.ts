@@ -275,6 +275,10 @@ export interface QQRequest {
   group?: { id: string, name?: string }
   message?: string
   timestamp?: string | number
+  /** `doubt` requests come from QQ's filtered-notification channel. */
+  source?: 'doubt'
+  /** QQ's original reason for filtering a doubt friend request. */
+  reason?: string
 }
 
 export interface QQRequestPage {

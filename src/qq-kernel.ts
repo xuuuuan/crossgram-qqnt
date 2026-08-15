@@ -15,7 +15,7 @@ import { HIGHWAY_BLOCK_SIZE, type DirectMessagePart } from './upload-protocol.js
 import { decodePttTo, encodePtt, MAX_VOICE_INPUT_BYTES, transcodePttFallbackTo } from './silk-audio.js'
 import {
   GroupMsgMask,
-  type BuddyRequest, type CustomEmotionData, type EmojiLikesUserInfo, type FileTransNotifyInfo, type GroupMsgMaskInfo, type GroupNotify, type GroupProfileInfo,
+  type BuddyRequest, type CustomEmotionData, type DoubtBuddyReqChange, type DoubtBuddyRequest, type EmojiLikesUserInfo, type FileTransNotifyInfo, type GroupMsgMaskInfo, type GroupNotify, type GroupProfileInfo,
   type InitSessionConfig, type KernelAVSDKService, type KernelModule, type KernelSession, type MarketStickerPackInfo, type MemberInfo, type MsgElement,
   type MsgRecord, type ProfileSimpleInfo, type RecentContactInfo, type SearchMsgKeywordsResult,
 } from './kernel-types.js'
@@ -153,6 +153,13 @@ export class QQRequestResolutionError extends Error {
   }
 }
 
+export class QQRequestUnsupportedError extends Error {
+  constructor() {
+    super('filtered QQ friend requests must be handled in the QQ client')
+    this.name = 'QQRequestUnsupportedError'
+  }
+}
+
 export class QQRequestSessionChangedError extends Error {
   constructor() {
     super('QQNT request session changed during resolution')
@@ -163,7 +170,8 @@ export class QQRequestSessionChangedError extends Error {
 type RequestUpdate = { nextStartSeq?: string }
 
 type CachedRequest =
-  | { kind: 'friend', request: QQRequest, raw: Required<Pick<BuddyRequest, 'friendUid' | 'reqTime'>> }
+  | { kind: 'friend', source: 'normal', request: QQRequest, raw: Required<Pick<BuddyRequest, 'friendUid' | 'reqTime'>> }
+  | { kind: 'friend', source: 'doubt', request: QQRequest, raw: Required<Pick<DoubtBuddyRequest, 'uid' | 'reqTime'>> }
   | {
       kind: 'group-join'
       request: QQRequest
@@ -272,6 +280,7 @@ export class QQKernelBridge {
   private readonly requests = new Map<string, CachedRequest>()
   private readonly requestResolutionFlights = new Map<string, Promise<QQRequest>>()
   private readonly pendingRequestUpdates = new Map<string, Set<(update: RequestUpdate) => void>>()
+  private readonly activeDoubtRequestIds = new Set<string>()
   private readonly activeGroupRequestPages = new Map<boolean, { startSeq: string, token: number }>()
   private readonly consumedGroupRequestPages = new Set<string>()
   private groupRequestPageToken = 0
@@ -436,6 +445,7 @@ export class QQKernelBridge {
     this.users.clear()
     this.requests.clear()
     this.requestResolutionFlights.clear()
+    this.activeDoubtRequestIds.clear()
     this.activeGroupRequestPages.clear()
     this.consumedGroupRequestPages.clear()
     this.groupRequestPageToken = 0
@@ -518,6 +528,7 @@ export class QQKernelBridge {
     this.resolveRequestUpdates()
     this.requests.clear()
     this.requestResolutionFlights.clear()
+    this.activeDoubtRequestIds.clear()
     this.requestRefreshGeneration++
     this.requestAttachmentGeneration++
     this.friendRequestRefresh = undefined
@@ -776,7 +787,7 @@ export class QQKernelBridge {
     if (kind !== undefined && kind !== 'friend' && kind !== 'group-join') {
       throw new Error('invalid request kind')
     }
-    const buddyAvailable = Boolean(this.buddyService?.getBuddyReq)
+    const buddyAvailable = Boolean(this.buddyService?.getBuddyReq || this.buddyService?.getDoubtBuddyReq)
     const groupAvailable = Boolean(this.groupService?.getSingleScreenNotifies)
     if ((kind === 'friend' && !buddyAvailable) || (kind === 'group-join' && !groupAvailable) ||
       (!kind && !buddyAvailable && !groupAvailable)) throw new QQRequestApiUnavailableError()
@@ -851,6 +862,7 @@ export class QQKernelBridge {
       throw new QQRequestConflictError()
     }
     if (cached.kind === 'friend') {
+      if (cached.source === 'doubt') throw new QQRequestUnsupportedError()
       const method = this.buddyService?.approvalFriendRequest
       if (!method) throw new QQRequestApiUnavailableError()
       let result: unknown
@@ -3062,6 +3074,13 @@ export class QQKernelBridge {
         if (requestListenerGeneration !== this.requestAttachmentGeneration || this.buddyService !== buddyService) return
         if (this.consumeBuddyRequests(value)) this.resolveRequestUpdates('buddy')
       },
+      onDoubtBuddyReqChange: (value: DoubtBuddyReqChange) => {
+        if (requestListenerGeneration !== this.requestAttachmentGeneration || this.buddyService !== buddyService) return
+        if (!value?.reqId || !this.activeDoubtRequestIds.has(value.reqId)) return
+        if (this.consumeDoubtBuddyRequests(value, value.reqId)) {
+          this.resolveRequestUpdates(`doubt:${value.reqId}`)
+        }
+      },
     }))
     this.buddyListenerId = buddyService.addKernelBuddyListener(buddyListener)
     log('info', `native listener registered service=buddy id=${this.buddyListenerId || '<empty>'}`)
@@ -3555,7 +3574,8 @@ export class QQKernelBridge {
 
   private async refreshRequests(kind?: QQRequestKind): Promise<void> {
     const loads: Promise<void>[] = []
-    if ((kind === undefined || kind === 'friend') && this.buddyService?.getBuddyReq) {
+    if ((kind === undefined || kind === 'friend') &&
+      (this.buddyService?.getBuddyReq || this.buddyService?.getDoubtBuddyReq)) {
       loads.push(this.refreshFriendRequests())
     }
     if ((kind === undefined || kind === 'group-join') && this.groupService?.getSingleScreenNotifies) {
@@ -3597,8 +3617,17 @@ export class QQKernelBridge {
 
   private async requestBuddyRequests(generation: number): Promise<void> {
     const service = this.buddyService
-    const method = service?.getBuddyReq
-    if (!service || !method) throw new QQRequestApiUnavailableError()
+    if (!service) throw new QQRequestApiUnavailableError()
+    const requests: Promise<void>[] = []
+    if (service.getBuddyReq) requests.push(this.requestNormalBuddyRequests(service, generation))
+    if (service.getDoubtBuddyReq) requests.push(this.requestDoubtBuddyRequests(service, generation))
+    if (!requests.length) throw new QQRequestApiUnavailableError()
+    await Promise.all(requests)
+  }
+
+  private async requestNormalBuddyRequests(service: NonNullable<QQKernelBridge['buddyService']>, generation: number): Promise<void> {
+    const method = service.getBuddyReq
+    if (!method) throw new QQRequestApiUnavailableError()
     const update = this.waitForRequestUpdate('buddy', 1_500)
     try {
       log('info', 'native API start name=getBuddyReq')
@@ -3609,6 +3638,30 @@ export class QQKernelBridge {
       const refreshed = this.consumeBuddyRequests(result) || await update.promise
       if (!refreshed) throw new Error('getBuddyReq listener timed out')
     } finally {
+      update.cancel()
+    }
+  }
+
+  private async requestDoubtBuddyRequests(service: NonNullable<QQKernelBridge['buddyService']>, generation: number): Promise<void> {
+    const method = service.getDoubtBuddyReq
+    if (!method) throw new QQRequestApiUnavailableError()
+    const reqId = randomUUID()
+    const update = this.waitForRequestUpdate(`doubt:${reqId}`, 1_500)
+    this.activeDoubtRequestIds.add(reqId)
+    try {
+      log('info', `native API start name=getDoubtBuddyReq reqId=${reqId} count=${REQUEST_PAGE_LIMIT}`)
+      const result = await withTimeout(
+        method.call(service, reqId, REQUEST_PAGE_LIMIT, ''),
+        1_500,
+        'getDoubtBuddyReq timed out',
+      )
+      assertNativeRequestSuccess('getDoubtBuddyReq', result)
+      log('info', `native API complete name=getDoubtBuddyReq payload=${summarizeNativeResult(result)}`)
+      if (generation !== this.requestRefreshGeneration) return
+      const refreshed = this.consumeDoubtBuddyRequests(result, reqId) || await update.promise
+      if (!refreshed) throw new Error('getDoubtBuddyReq listener timed out')
+    } finally {
+      this.activeDoubtRequestIds.delete(reqId)
       update.cancel()
     }
   }
@@ -3686,7 +3739,7 @@ export class QQKernelBridge {
           ...(nonEmptyString(raw.extWords) ? { message: raw.extWords } : {}),
           timestamp: raw.reqTime,
         }
-        this.cachePendingRequest({ kind: 'friend', request, raw: { friendUid: raw.friendUid, reqTime: raw.reqTime } })
+        this.cachePendingRequest({ kind: 'friend', source: 'normal', request, raw: { friendUid: raw.friendUid, reqTime: raw.reqTime } })
       } else if (raw.isInitiator === false && raw.isDecide === true && typeof raw.isAgreed === 'boolean') {
         this.updateNativeRequestStatus(id, raw.isAgreed ? 'accepted' : 'rejected')
       } else {
@@ -3695,7 +3748,38 @@ export class QQKernelBridge {
     }
     // getBuddyReq and onBuddyReqChange both provide the complete native list.
     for (const [id, cached] of this.requests) {
-      if (cached.kind === 'friend' && cached.request.status === 'pending' && !pending.has(id)) {
+      if (cached.kind === 'friend' && cached.source !== 'doubt' &&
+        cached.request.status === 'pending' && !pending.has(id)) {
+        this.requests.delete(id)
+      }
+    }
+    return true
+  }
+
+  private consumeDoubtBuddyRequests(value: unknown, reqId: string): boolean {
+    if (!value || typeof value !== 'object') return false
+    const payload = value as DoubtBuddyReqChange
+    if (payload.reqId !== undefined && payload.reqId !== reqId) return false
+    if (!Array.isArray(payload.doubtList)) return false
+    const pending = new Set<string>()
+    for (const value of payload.doubtList) {
+      if (!value || typeof value !== 'object') continue
+      const raw = value as DoubtBuddyRequest
+      if (!isNativeRequestId(raw.uid) || !isNativeRequestId(raw.reqTime)) continue
+      const id = opaqueRequestId('friend', 'doubt', raw.uid, raw.reqTime)
+      pending.add(id)
+      const request: QQRequest = {
+        id, kind: 'friend', status: 'pending', source: 'doubt',
+        requester: { id: raw.uid, ...(nonEmptyString(raw.nick) ? { name: raw.nick } : {}) },
+        ...(nonEmptyString(raw.msg) ? { message: raw.msg } : {}),
+        ...(nonEmptyString(raw.reason) ? { reason: raw.reason } : {}),
+        timestamp: raw.reqTime,
+      }
+      this.cachePendingRequest({ kind: 'friend', source: 'doubt', request, raw: { uid: raw.uid, reqTime: raw.reqTime } })
+    }
+    for (const [id, cached] of this.requests) {
+      if (cached.kind === 'friend' && cached.source === 'doubt' &&
+        cached.request.status === 'pending' && !pending.has(id)) {
         this.requests.delete(id)
       }
     }
