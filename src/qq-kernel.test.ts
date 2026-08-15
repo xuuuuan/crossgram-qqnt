@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { Readable } from 'node:stream'
 import { once } from 'node:events'
 import { existsSync } from 'node:fs'
@@ -19,6 +20,12 @@ import { encodePtt } from './silk-audio.js'
 
 const execFileAsync = promisify(execFile)
 const avatarFixturePath = process.platform === 'win32' ? process.execPath : '/dev/null'
+const GROUP_JOIN_WRAPPER_MARKERS = [
+  'getGroupInfoForJoinGroup needs 0 arguments',
+  'queryJoinGroupCanNoVerify needs 4 arguments',
+  'reqToJoinGroup needs 2 arguments',
+  'joinGroup needs 3 arguments',
+].join('\n')
 
 function completePng(width: number, height: number, padding = 0): Buffer {
   const bytes = Buffer.alloc(24 + padding + 12)
@@ -522,6 +529,172 @@ describe('QQKernelBridge', () => {
       1, 'uid-1715311957', '1715311957', [{ kind: 'text', text: 'hello' }], 'self',
     )
     expect(f.msg.sendMsg).not.toHaveBeenCalled()
+  })
+
+  it('leaves the static group-join wrapper probe off without reading native candidates', async () => {
+    const f = fixture()
+    const candidates = [
+      'getGroupInfoForJoinGroup', 'queryJoinGroupCanNoVerify', 'reqToJoinGroup', 'joinGroup',
+    ] as const
+    let candidateReads = 0
+    const trackedGroup = new Proxy(f.group, {
+      get(target, property, receiver) {
+        if (candidates.includes(property as typeof candidates[number])) candidateReads++
+        return Reflect.get(target, property, receiver)
+      },
+    })
+    ;(f.session as unknown as { getGroupService: () => KernelGroupService }).getGroupService =
+      () => trackedGroup as KernelGroupService
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.getGroupJoinContractProbe()).resolves.toEqual({
+      enabled: false,
+      surfaceComplete: false,
+      contractVerified: false,
+      writeEnabled: false,
+      methods: [],
+    })
+    expect(candidateReads).toBe(0)
+  })
+
+  it('probes only an explicit inert wrapper fixture without reading native candidates', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'qqnt-group-join-wrapper-'))
+    tempPaths.push(directory)
+    const path = join(directory, 'wrapper.node')
+    const wrapper = Buffer.from([
+      'getGroupInfoForJoinGroup needs 0 arguments',
+      'queryJoinGroupCanNoVerify needs 4 arguments',
+      'reqToJoinGroup needs 2 arguments',
+      'joinGroup needs 3 arguments',
+      'unexpectedNativeMethod needs 9 arguments',
+    ].join('\n'), 'ascii')
+    await writeFile(path, wrapper)
+    vi.stubEnv('QQNT_BRIDGE_GROUP_JOIN_CONTRACT_PROBE', '1')
+    vi.stubEnv('QQNT_BRIDGE_GROUP_JOIN_WRAPPER_PATH', path)
+    const f = fixture()
+    const candidates = [
+      'getGroupInfoForJoinGroup', 'queryJoinGroupCanNoVerify', 'reqToJoinGroup', 'joinGroup',
+    ] as const
+    let candidateReads = 0
+    const trackedGroup = new Proxy(f.group, {
+      get(target, property, receiver) {
+        if (candidates.includes(property as typeof candidates[number])) candidateReads++
+        return Reflect.get(target, property, receiver)
+      },
+    })
+    ;(f.session as unknown as { getGroupService: () => KernelGroupService }).getGroupService =
+      () => trackedGroup as KernelGroupService
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    const probe = await bridge.getGroupJoinContractProbe()
+    expect(probe).toMatchObject({
+      enabled: true,
+      surfaceComplete: true,
+      contractVerified: false,
+      writeEnabled: false,
+      methods: [
+        { name: 'getGroupInfoForJoinGroup', present: true, argumentCount: 0 },
+        { name: 'queryJoinGroupCanNoVerify', present: true, argumentCount: 4 },
+        { name: 'reqToJoinGroup', present: true, argumentCount: 2 },
+        { name: 'joinGroup', present: true, argumentCount: 3 },
+      ],
+      wrapperIdentity: {
+        sha256: createHash('sha256').update(wrapper).digest('hex'),
+        size: wrapper.length,
+      },
+      hostRuntime: { node: expect.any(String) },
+    })
+    expect(JSON.stringify(probe)).not.toContain(path)
+    expect(JSON.stringify(probe)).not.toContain('unexpectedNativeMethod')
+    expect(candidateReads).toBe(0)
+  })
+
+  it('returns detached static wrapper probe snapshots and fails closed for invalid fixtures', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'qqnt-group-join-wrapper-'))
+    tempPaths.push(directory)
+    const validPath = join(directory, 'wrapper.node')
+    const valid = Buffer.from(GROUP_JOIN_WRAPPER_MARKERS, 'ascii')
+    await writeFile(validPath, valid)
+    vi.stubEnv('QQNT_BRIDGE_GROUP_JOIN_CONTRACT_PROBE', '1')
+    vi.stubEnv('QQNT_BRIDGE_GROUP_JOIN_WRAPPER_PATH', validPath)
+    const bridge = new QQKernelBridge()
+    const first = await bridge.getGroupJoinContractProbe()
+    first.methods[0].present = false
+    first.wrapperIdentity!.sha256 = 'mutated'
+    first.hostRuntime!.node = 'mutated'
+    const second = await bridge.getGroupJoinContractProbe()
+    expect(second.methods[0].present).toBe(true)
+    expect(second.wrapperIdentity).toEqual({
+      sha256: createHash('sha256').update(valid).digest('hex'), size: valid.length,
+    })
+    expect(second.hostRuntime?.node).toBe(process.versions.node)
+
+    const missingMarkerPath = join(directory, 'missing-marker.node')
+    await writeFile(missingMarkerPath, 'getGroupInfoForJoinGroup')
+    vi.stubEnv('QQNT_BRIDGE_GROUP_JOIN_WRAPPER_PATH', missingMarkerPath)
+    const missingMarker = await new QQKernelBridge().getGroupJoinContractProbe()
+    expect(missingMarker).toMatchObject({ enabled: true, surfaceComplete: false })
+    expect(missingMarker.wrapperIdentity).toBeDefined()
+
+    vi.stubEnv('QQNT_BRIDGE_GROUP_JOIN_WRAPPER_PATH', directory)
+    await expect(new QQKernelBridge().getGroupJoinContractProbe()).resolves.toMatchObject({
+      enabled: true, surfaceComplete: false, methods: [],
+    })
+
+    const oversizedPath = join(directory, 'oversized.node')
+    await writeFile(oversizedPath, Buffer.alloc(32 * 1024 * 1024 + 1))
+    vi.stubEnv('QQNT_BRIDGE_GROUP_JOIN_WRAPPER_PATH', oversizedPath)
+    await expect(new QQKernelBridge().getGroupJoinContractProbe()).resolves.toMatchObject({
+      enabled: true, surfaceComplete: false, methods: [],
+    })
+  })
+
+  it.runIf(process.platform === 'linux')('uses a nonblocking no-follow wrapper handle and single-flight cache', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'qqnt-group-join-wrapper-linux-'))
+    tempPaths.push(directory)
+    vi.stubEnv('QQNT_BRIDGE_GROUP_JOIN_CONTRACT_PROBE', '1')
+    const within = <T>(promise: Promise<T>) => Promise.race([
+      promise,
+      new Promise<T>((_resolve, reject) => setTimeout(() => reject(new Error('wrapper probe timed out')), 1_000)),
+    ])
+
+    const fifo = join(directory, 'wrapper.fifo')
+    await execFileAsync('mkfifo', [fifo])
+    vi.stubEnv('QQNT_BRIDGE_GROUP_JOIN_WRAPPER_PATH', fifo)
+    await expect(within(new QQKernelBridge().getGroupJoinContractProbe())).resolves.toMatchObject({
+      enabled: true, surfaceComplete: false, methods: [],
+    })
+
+    const fifoLink = join(directory, 'wrapper-fifo-link.node')
+    await symlink(fifo, fifoLink)
+    vi.stubEnv('QQNT_BRIDGE_GROUP_JOIN_WRAPPER_PATH', fifoLink)
+    await expect(within(new QQKernelBridge().getGroupJoinContractProbe())).resolves.toMatchObject({
+      enabled: true, surfaceComplete: false, methods: [],
+    })
+
+    const regular = join(directory, 'wrapper.node')
+    await writeFile(regular, GROUP_JOIN_WRAPPER_MARKERS, 'ascii')
+    const regularLink = join(directory, 'wrapper-regular-link.node')
+    await symlink(regular, regularLink)
+    vi.stubEnv('QQNT_BRIDGE_GROUP_JOIN_WRAPPER_PATH', regularLink)
+    await expect(within(new QQKernelBridge().getGroupJoinContractProbe())).resolves.toMatchObject({
+      enabled: true, surfaceComplete: false, methods: [],
+    })
+
+    vi.stubEnv('QQNT_BRIDGE_GROUP_JOIN_WRAPPER_PATH', regular)
+    const probes = await Promise.all(Array.from({ length: 8 }, () => new QQKernelBridge().getGroupJoinContractProbe()))
+    expect(probes).toEqual(Array.from({ length: 8 }, () => expect.objectContaining({
+      enabled: true, surfaceComplete: true,
+    })))
+    await rm(regular)
+    // A completed once-per-process cache must serve concurrent callers without
+    // opening or reading the now-absent wrapper again.
+    await expect(Promise.all(Array.from({ length: 8 }, () => new QQKernelBridge().getGroupJoinContractProbe())))
+      .resolves.toEqual(Array.from({ length: 8 }, () => expect.objectContaining({
+        enabled: true, surfaceComplete: true,
+      })))
   })
 
   it('emits an incoming call signal for an uncached direct peer', async () => {
@@ -4590,7 +4763,80 @@ describe('QQBridgeServer', () => {
   const tempPaths: string[] = []
   afterEach(async () => {
     await server?.stop()
+    vi.unstubAllEnvs()
+    vi.restoreAllMocks()
     await Promise.all(tempPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })))
+  })
+
+  it('requires a configured bearer token for the inert wrapper probe and redacts encoded targets', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'qqnt-group-join-server-'))
+    tempPaths.push(directory)
+    const wrapperPath = join(directory, 'wrapper.node')
+    await writeFile(wrapperPath, GROUP_JOIN_WRAPPER_MARKERS, 'ascii')
+    vi.stubEnv('QQNT_BRIDGE_GROUP_JOIN_CONTRACT_PROBE', '1')
+    vi.stubEnv('QQNT_BRIDGE_GROUP_JOIN_WRAPPER_PATH', wrapperPath)
+    const f = fixture()
+    const candidates = [
+      'getGroupInfoForJoinGroup', 'queryJoinGroupCanNoVerify', 'reqToJoinGroup', 'joinGroup',
+    ] as const
+    const methods = candidates.map(() => vi.fn(function () { return 'native-group-service-secret' }))
+    for (const [index, name] of candidates.entries()) {
+      ;(f.group as Record<string, unknown>)[name] = methods[index]
+    }
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => {})
+    const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const unsecuredBase = `http://127.0.0.1:${server.address().port}/v1`
+    expect((await fetch(`${unsecuredBase}/group-join/probe`)).status).toBe(503)
+    expect(await (await fetch(`${unsecuredBase}/status`)).json()).not.toHaveProperty('groupJoinContractProbe')
+    await server.stop()
+    const slowPath = join(directory, 'slow.log')
+    server = new QQBridgeServer(bridge, {
+      port: 0, token: 'probe-token', slowRequestThresholdMs: -1, slowRequestPath: slowPath,
+    })
+    await server.start()
+    const base = `http://127.0.0.1:${server.address().port}/v1`
+
+    expect((await fetch(`${base}/group-join/probe`)).status).toBe(401)
+    expect((await fetch(`${base}/group-join/probe`, {
+      headers: { authorization: 'Bearer wrong-token' },
+    })).status).toBe(401)
+    const status = await fetch(`${base}/status`, { headers: { authorization: 'Bearer probe-token' } })
+    expect(status.status).toBe(200)
+    expect(await status.json()).not.toHaveProperty('groupJoinContractProbe')
+
+    const probe = await fetch(`${base}/group-join/probe`, { headers: { authorization: 'Bearer probe-token' } })
+    expect(probe.status).toBe(200)
+    const result = await probe.json() as { methods: Array<{ name: string }>, wrapperIdentity?: unknown }
+    expect(result.methods.map((method) => method.name)).toEqual(candidates)
+    expect(result.wrapperIdentity).toBeDefined()
+    expect(JSON.stringify(result)).not.toContain(wrapperPath)
+    expect(JSON.stringify(result)).not.toContain('native-group-service-secret')
+
+    for (const path of [
+      '/v1%2fgroups%2Fjoin%3Fmint',
+      '/v1%2Fgroups%2fjoin%3Bmint',
+      '/v1%252fgroups%252Fjoin%253Fmint',
+      '/v1%252Fgroups%252fjoin%253Bmint',
+      '/v1%25252525252Fgroups%25252525252Fjoin%253Fmint',
+      '/v1/groups/join%ZZmint',
+      '/%76%31/groups/join%ZZmint',
+    ]) {
+      expect((await fetch(`${base.slice(0, -3)}${path}?target=native-group-service-secret`, {
+        headers: { authorization: 'Bearer probe-token' },
+      })).status).toBe(404)
+    }
+    const logs = [consoleLog, consoleWarn]
+      .flatMap((spy) => spy.mock.calls.map(([message]) => String(message)))
+      .join('\n')
+    const slowLogs = await readFile(slowPath, 'utf8')
+    expect(logs).toContain('target="/v1/groups/join"')
+    expect(`${logs}\n${slowLogs}`).not.toContain('native-group-service-secret')
+    for (const method of methods) expect(method).not.toHaveBeenCalled()
   })
 
   it('returns a non-success response when the initial native request getter fails', async () => {
@@ -4824,7 +5070,7 @@ describe('QQBridgeServer', () => {
     const { port } = server.address()
     const base = `http://127.0.0.1:${port}/v1`
     await expect(fetch(`${base}/status`).then((response) => response.json())).resolves.toMatchObject({
-      protocolVersion: 21, ready: true, selfUin: '10000',
+      protocolVersion: 22, ready: true, selfUin: '10000',
     })
     const dialogs = await fetch(`${base}/dialogs`)
     expect(dialogs.status).toBe(200)
