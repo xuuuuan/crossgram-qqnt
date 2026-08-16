@@ -1,42 +1,20 @@
-# qqnt-bridge
+# crossgram-qqnt
 
-qqnt-bridge 是一个本地流式桥接服务：它注入 QQNT Electron 主进程，把 QQNT 内核能力以带鉴权的 HTTP/WebSocket API 暴露给 `mtproto-relay`（Crossgram 的 Telegram ↔ QQ 桥）。Linux x86_64 上提供一等公民的 headless systemd 部署；Windows/macOS 支持本地构建后注入开发调试。
-
-主页 / 仓库：<https://github.com/xuuuuan/crossgram-qqnt>
+crossgram-qqnt 是一个基于 QQNT PC 客户端的 crossgram-protocol 实现：它注入 QQNT Electron 主进程，把 QQNT 内核能力以带鉴权的 HTTP/WebSocket API 暴露给 Crossgram
 
 默认监听 `http://127.0.0.1:18767/v1`，API 根路径为 `/v1`。
 
 ## 主要能力
 
 - **消息**：发送文本、图片、文件、语音（PTT/Silk 转码），拉取历史记录，删除消息，标记已读，转发与合并转发，多选转发内容解析。
-- **会话与联系人**：会话列表/详情/成员分页，联系人分页，按 UID 查询用户，按 QQ 号解析会话。
+- **会话与联系人**：会话列表/详情/成员/联系人分页，按 UID 查询用户，按 QQ 号解析会话。
 - **媒体**：通过原生 OIDB 发包刷新 RKey，获取图片/文件直链；本地媒体资产流式下载，支持 HTTP Range；表情资产读取。
 - **表情与回应**：QQ 收藏表情、商城表情、系统表情；消息回应读取、设置与回应资产。
 - **登录**：无头二维码登录、登录状态、二维码 PNG/URL、刷新二维码、自动登录开关。
 - **好友/群请求**：好友请求与加群请求的分页查询及同意/拒绝。
 - **事件**：WebSocket 事件流 `/v1/events/ws`。
-- **通话媒体**：本地 PCM 媒体网关租约（`/v1/calls/media-lease`），供语音通话媒体面使用；原生 AVSDK 来电状态通过 listener tee 做有界投影。
+- **通话媒体**：本地 PCM 媒体网关，原生 AVSDK 来电。
 - **群通知屏蔽**：读取/设置群消息屏蔽（群助手/免打扰等）。
-
-## 工作原理
-
-```
-mtproto-relay / Crossgram
-        │ HTTP + WebSocket (Bearer token)
-        ▼
-qqnt-bridge HTTP server (src/server.ts)
-        │
-        ▼
-QQKernelBridge (src/qq-kernel.ts)
-        │
-        ├─ listener tee / login controller / packet client
-        ├─ native packet addon (Rust, napi-rs)
-        │    └─ hook QQNT sendSsoCmdReqByContend 收发二进制，
-        │       实现 OIDB 发包、RKey 刷新、图片/文件直链与 Highway 上传
-        └─ PCM media gateway (本地 Unix socket, 48kHz s16le 20ms 帧)
-```
-
-注入方式：Linux 发行包用 `deploy/loader.cjs` 生成小型 `app.asar` 放到 `resources/app.asar`，启动时把 `appPath` 指回腾讯原始 `resources/app`，再加载 bridge 入口与官方 `app_launcher/index.js`。bridge 入口通过 `Module._load` 与 `process.dlopen` 包装 QQNT 内核模块，不修改原生对象，只替换导出对象并通过 construct proxy 观察 session 初始化。
 
 ## 快速开始
 
@@ -46,7 +24,7 @@ QQKernelBridge (src/qq-kernel.ts)
 curl -fsSL https://raw.githubusercontent.com/xuuuuan/crossgram-qqnt/master/deploy/install.sh | sudo sh
 ```
 
-Debian/Ubuntu 会尝试自动下载腾讯官方 Linux QQ `.deb`；Fedora/RHEL、Arch、openSUSE 请先安装官方 Linux QQ，再运行安装脚本。脚本会安装依赖（Xvfb、D-Bus、ffmpeg、qrencode 等），创建 `qqnt-bridge` 系统用户，写入 `/etc/qqnt-bridge.env`（含随机 Bearer token，权限 `0600`），并启用 `qqnt-bridge.service`。
+Debian/Ubuntu 会尝试自动下载腾讯官方 Linux QQ `.deb`；Fedora/RHEL、Arch、openSUSE 请先安装官方 Linux QQ，再运行安装脚本。脚本会安装依赖（Xvfb、D-Bus、ffmpeg、qrencode 等），创建 `qqnt-bridge` 系统用户，写入 `/etc/qqnt-bridge.env`，并启用 `qqnt-bridge.service`。
 
 安装后：
 
@@ -68,23 +46,21 @@ curl -fsSL https://raw.githubusercontent.com/xuuuuan/crossgram-qqnt/master/deplo
 
 更多部署细节见 [`deploy/README.md`](deploy/README.md)。
 
-### Windows / macOS（本地构建注入）
+### Windows
 
 ```sh
 pnpm install --frozen-lockfile
 pnpm build
 ```
 
-- Windows：先确认原生 Rust 工具链可用，`pnpm build` 会构建 native packet addon 并生成 `dist/`。随后：
+- Windows：先安装 Rust 工具链，然后 `pnpm build` 构建 native packet addon 并生成 `dist/`。随后：
 
   ```powershell
   $env:QQNT_BRIDGE_PACKET_ADDON = Join-Path $PSScriptRoot 'dist\qqnt_packet.win32-x64-msvc.node'
   .\start.ps1
   ```
 
-- macOS：`start.sh` 会把 `dist/main.js` 复制到 `/Applications/QQ.app/Contents/Resources/app/main.js` 后启动 QQ。
-
-> Windows/macOS 路径目前以开发调试为主；生产环境建议使用 Linux headless 部署。
+> Windows/macOS 目前以开发调试为主；生产环境建议使用 Linux headless 部署。
 
 ## 构建与测试
 
@@ -190,34 +166,3 @@ Authorization: Bearer <QQNT_BRIDGE_TOKEN>
 | `POST` | `/v1/reactions/asset` | 回应图标资产。 |
 | `GET` | `/v1/group-join/probe` | 加群契约探测状态（要求 token）。 |
 
-## 目录结构
-
-```
-.
-├── deploy/                  # Linux headless 部署：systemd、安装器、qqntctl、loader
-├── docs/                    # 原生实现研究文档
-│   ├── NATIVE_PACKET_IMPL.md
-│   └── NATIVE_VOICE_CALL.md
-├── native/
-│   ├── packet-addon/        # Rust napi-rs 原生发包/RKey/直链 addon
-│   └── ppapi-host/          # PPAPI AVSDK loader 元数据观测宿主
-├── proto/qqnt/              # Protobuf 定义
-├── scripts/                 # 构建、打包、镜像同步脚本
-├── src/                     # TypeScript 源码（注入入口、HTTP server、内核桥接）
-├── package.json
-├── pnpm-lock.yaml
-└── pnpm-workspace.yaml
-```
-
-## 文档索引
-
-- [`deploy/README.md`](deploy/README.md)：Linux headless 部署、`qqntctl` 命令与账号切换/恢复策略。
-- [`docs/NATIVE_PACKET_IMPL.md`](docs/NATIVE_PACKET_IMPL.md)：QQNT 原生发包、RKey 刷新、图片直链与 Highway 上传的实现与维护记录。
-- [`docs/NATIVE_VOICE_CALL.md`](docs/NATIVE_VOICE_CALL.md)：原生语音通话控制面的跨平台逆向记录、证据分层与安全边界。
-
-## 安全说明
-
-- 服务默认只绑定 `127.0.0.1`。需要远程访问时请使用 SSH 隧道，不要直接把 `QQNT_BRIDGE_HOST` 暴露到公网。
-- 生产安装器会生成随机 Bearer token 并写入权限为 `0600` 的 `/etc/qqnt-bridge.env`；本地调试若未设置 `QQNT_BRIDGE_TOKEN` 则无鉴权。
-- 日志会脱敏群号/加群目标等敏感路由；日志文件同样只保存在本地。
-- bridge 不拦截、不观察、不序列化原生 AVSDK action 数据；通话媒体租约与来电状态投影遵循最小化采集边界。
