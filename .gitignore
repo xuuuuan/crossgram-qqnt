@@ -5,3 +5,7 @@
 /native/packet-addon/artifacts/*.node
 /native/packet-addon/artifacts/index.d.ts
 /AGENTS.md
+/data/
+/backups/
+/result
+/result-*
