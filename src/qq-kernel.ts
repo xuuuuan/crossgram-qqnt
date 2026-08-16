@@ -3862,6 +3862,11 @@ export class QQKernelBridge {
       const raw = value as GroupNotify
       if (!isNativeRequestId(raw.seq) || raw.type !== 7) continue
       const id = opaqueRequestId('group-join', doubt, raw.seq)
+      // QQNT group notify statuses: 1 unhandled, 2 agreed, 3 refused.
+      if (raw.status === 2 || raw.status === 3) {
+        this.updateNativeRequestStatus(id, raw.status === 2 ? 'accepted' : 'rejected')
+        continue
+      }
       const groupCode = raw.group?.groupCode
       const requester = raw.user1?.uid
       // QQNT uses type 7/status 1 for administrator-pending group admission only.

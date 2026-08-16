@@ -4745,7 +4745,7 @@ describe('QQKernelBridge', () => {
     expect(f.group.operateSysNotify).toHaveBeenCalledTimes(3)
   })
 
-  it('reconciles friend snapshots and removes resolved group requests', async () => {
+  it('reconciles friend snapshots and publishes resolved group requests', async () => {
     const f = fixture()
     f.buddy.getBuddyReq.mockResolvedValue({ buddyReqs: [
       { friendUid: 'first', reqTime: '1', isInitiator: false, isDecide: false },
@@ -4753,7 +4753,9 @@ describe('QQKernelBridge', () => {
     ] })
     f.group.getSingleScreenNotifies.mockImplementation(async (doubt) => (
       doubt ? { notifies: [] } : { notifies: [
-        { seq: '3', type: 7, status: 1, group: { groupCode: '123' }, user1: { uid: 'joiner' } },
+        { seq: '3', type: 7, status: 1, group: { groupCode: '123' }, user1: { uid: 'accepted-joiner' } },
+        { seq: '4', type: 7, status: 1, group: { groupCode: '123' }, user1: { uid: 'rejected-joiner' } },
+        { seq: '5', type: 7, status: 1, group: { groupCode: '123' }, user1: { uid: 'ignored-joiner' } },
       ] }
     ))
     const bridge = new QQKernelBridge()
@@ -4770,7 +4772,27 @@ describe('QQKernelBridge', () => {
     ])
 
     f.emitGroupRequestUpdate(false, [{ seq: '3', type: 7, status: 2 }])
-    expect((await bridge.getRequests('group-join')).requests).toEqual([])
+    await expect(events.next()).resolves.toMatchObject({
+      value: { type: 'request', request: { requester: { id: 'accepted-joiner' }, status: 'accepted' } },
+    })
+    f.emitGroupRequestUpdate(false, [{ seq: '4', type: 7, status: 3 }])
+    await expect(events.next()).resolves.toMatchObject({
+      value: { type: 'request', request: { requester: { id: 'rejected-joiner' }, status: 'rejected' } },
+    })
+    f.emitGroupRequestUpdate(false, [
+      { seq: '5', type: 7, status: 4 },
+      { seq: 'unknown-accepted', type: 7, status: 2 },
+      { seq: 'unknown-rejected', type: 7, status: 3 },
+    ])
+    expect((await bridge.getRequests('group-join')).requests).toEqual([
+      expect.objectContaining({ requester: { id: 'accepted-joiner' }, status: 'accepted' }),
+      expect.objectContaining({ requester: { id: 'rejected-joiner' }, status: 'rejected' }),
+    ])
+    const received = await Promise.race([
+      events.next(),
+      new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 10)),
+    ])
+    expect(received).toBe('timeout')
   })
 
   it('loads the group snapshot after a friend-only request list', async () => {
