@@ -562,7 +562,7 @@ describe('QQKernelBridge', () => {
     expect(candidateReads).toBe(0)
   })
 
-  it('probes only an explicit inert wrapper fixture without reading native candidates', async () => {
+  it.runIf(process.platform === 'linux')('probes only an explicit inert wrapper fixture without reading native candidates', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'qqnt-group-join-wrapper-'))
     tempPaths.push(directory)
     const path = join(directory, 'wrapper.node')
@@ -615,7 +615,7 @@ describe('QQKernelBridge', () => {
     expect(candidateReads).toBe(0)
   })
 
-  it('returns detached static wrapper probe snapshots and fails closed for invalid fixtures', async () => {
+  it.runIf(process.platform === 'linux')('returns detached static wrapper probe snapshots and fails closed for invalid fixtures', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'qqnt-group-join-wrapper-'))
     tempPaths.push(directory)
     const validPath = join(directory, 'wrapper.node')
@@ -652,6 +652,23 @@ describe('QQKernelBridge', () => {
     vi.stubEnv('QQNT_BRIDGE_GROUP_JOIN_WRAPPER_PATH', oversizedPath)
     await expect(new QQKernelBridge().getGroupJoinContractProbe()).resolves.toMatchObject({
       enabled: true, surfaceComplete: false, methods: [],
+    })
+  })
+
+  it.runIf(process.platform !== 'linux')('fails closed for explicit wrapper fixtures outside Linux', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'qqnt-group-join-wrapper-'))
+    tempPaths.push(directory)
+    const path = join(directory, 'wrapper.node')
+    await writeFile(path, GROUP_JOIN_WRAPPER_MARKERS, 'ascii')
+    vi.stubEnv('QQNT_BRIDGE_GROUP_JOIN_CONTRACT_PROBE', '1')
+    vi.stubEnv('QQNT_BRIDGE_GROUP_JOIN_WRAPPER_PATH', path)
+
+    await expect(new QQKernelBridge().getGroupJoinContractProbe()).resolves.toEqual({
+      enabled: true,
+      surfaceComplete: false,
+      contractVerified: false,
+      writeEnabled: false,
+      methods: [],
     })
   })
 
@@ -4892,7 +4909,7 @@ describe('QQBridgeServer', () => {
     await Promise.all(tempPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })))
   })
 
-  it('requires a configured bearer token for the inert wrapper probe and redacts encoded targets', async () => {
+  it.runIf(process.platform === 'linux')('requires a configured bearer token for the inert wrapper probe and redacts encoded targets', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'qqnt-group-join-server-'))
     tempPaths.push(directory)
     const wrapperPath = join(directory, 'wrapper.node')
