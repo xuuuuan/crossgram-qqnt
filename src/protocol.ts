@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 22
+export const PROTOCOL_VERSION = 24
 
 /** Local Unix-socket PCM media protocol. Audio frames use a 1-byte type plus a 4-byte big-endian length. */
 export const PCM_MEDIA_PROTOCOL_VERSION = 1
@@ -364,7 +364,7 @@ export interface QQReactionActorPage {
 }
 
 export interface QQSendMediaSpec {
-  kind: 'image' | 'file' | 'voice'
+  kind: 'image' | 'video' | 'file' | 'voice'
   name: string
   mimeType?: string
   size?: number
@@ -376,6 +376,14 @@ export interface QQSendMediaSpec {
   width?: number
   height?: number
   duration?: number
+  /** Relay-extracted JPEG frame used by QQ's native video element. */
+  thumbnail?: {
+    size: number
+    md5: string
+    sha1: string
+    width: number
+    height: number
+  }
 }
 
 export type QQPreparedMedia =
@@ -384,6 +392,11 @@ export type QQPreparedMedia =
       fileUuid: string
       msgInfo: string
       compatQMsg?: string
+    }
+  | {
+      kind: 'video'
+      fileUuid: string
+      msgInfo: string
     }
   | {
       kind: 'file'
@@ -409,6 +422,13 @@ export interface QQMediaUploadPlan {
   prepared: QQPreparedMedia
   /** Absent when QQ reports that the bytes already exist on its CDN. */
   highway?: QQHighwayUpload
+  /** Small bridge-owned companion assets, such as a video's thumbnail. */
+  auxiliaryHighways?: Array<{
+    role: 'thumbnail'
+    /** Present only when the bridge must provide its generic fallback thumbnail. */
+    bytes?: string
+    highway: QQHighwayUpload
+  }>
 }
 
 export interface SendManifest {

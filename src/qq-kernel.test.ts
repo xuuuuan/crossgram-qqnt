@@ -15,7 +15,9 @@ import { parseConversationId, type QQEvent } from './protocol.js'
 import { QQKernelBridge } from './qq-kernel.js'
 import { QQBridgeServer } from './server.js'
 import { QQPacketClient } from './packet-client.js'
-import { HIGHWAY_BLOCK_SIZE, type DirectMessagePart } from './upload-protocol.js'
+import {
+  HIGHWAY_BLOCK_SIZE, type DirectMessagePart,
+} from './upload-protocol.js'
 import { encodePtt } from './silk-audio.js'
 
 const execFileAsync = promisify(execFile)
@@ -110,6 +112,12 @@ function testProtocolElements(part: DirectMessagePart): MsgElement[] {
     elementType: 2, elementId: 'image-element', picElement: {
       fileName: part.upload.fileUuid, fileSize: '0', fileUuid: part.upload.fileUuid,
       fileSubId: '', md5HexStr: '', picWidth: 0, picHeight: 0,
+    },
+  }]
+  if (part.kind === 'video') return [{
+    elementType: 5, elementId: 'video-element', videoElement: {
+      fileName: part.upload.fileUuid, fileSize: '0', fileUuid: part.upload.fileUuid,
+      filePath: '', fileTime: 0, fileFormat: 2, thumbPath: new Map(),
     },
   }]
   return [{
@@ -371,9 +379,22 @@ function fixture() {
       }))
       return { sequence: 1n, clientSequence: 2n, sendTime: 3 }
     })
+  const groupFilePublish = vi.spyOn(QQPacketClient.prototype, 'publishGroupFile')
+    .mockImplementation(async (peerUin, fileUuid) => {
+      queueMicrotask(() => msgHandlers.onAddSendMsg?.({
+        ...message, chatType: 2, peerUid: peerUin, peerUin, sendStatus: 2,
+        elements: [{
+          elementType: 3, elementId: 'file-element', fileElement: {
+            fileName: fileUuid, fileSize: '4', filePath: '', fileUuid, fileSubId: '',
+            fileMd5: '', fileSha: '', fileSha3: '', file10MMd5: '',
+          },
+        }],
+      }))
+      return { published: true }
+    })
   return {
     kernel, session, msg, recent, buddy, profile, group, search, avsdk, richMedia, uix, message, sentBodies,
-    imageUpload, fileUpload, protocolSend,
+    imageUpload, fileUpload, protocolSend, groupFilePublish,
     emitMessages(records: MsgRecord[]) {
       return msgHandlers.onMsgInfoListUpdate?.(records)
     },
@@ -2438,70 +2459,46 @@ describe('QQKernelBridge', () => {
     expect(sent.parts.filter((part) => part.type === 'media')).toHaveLength(2)
   })
 
-  it('sends hashed image and file manifests through protocol upload without local media paths', async () => {
+  it('publishes a hashed group file through CDN upload and OidbSvcTrpcTcp.0x6d9_4', async () => {
     const f = fixture()
-    const image = Buffer.from([1, 2, 3])
     const file = Buffer.from([4, 5, 6, 7])
     const received: Buffer[] = []
-    const imageUpload = vi.spyOn(QQPacketClient.prototype, 'uploadImage')
-      .mockImplementation(async (_chat, _peer, _self, _spec, source) => {
-        for await (const chunk of source) received.push(Buffer.from(chunk))
-        return { fileUuid: 'image-uuid', ipv4s: [], msgInfo: Buffer.from('msg-info'), msgInfoBodies: [] }
-      })
     const fileUpload = vi.spyOn(QQPacketClient.prototype, 'uploadFile')
       .mockImplementation(async (_chat, _peer, _uin, _uid, _spec, source) => {
         for await (const chunk of source) received.push(Buffer.from(chunk))
-        return { fileUuid: 'file-uuid', exists: true, commandId: 95 }
-      })
-    const protocolSend = vi.spyOn(QQPacketClient.prototype, 'sendDirectMessage')
-      .mockImplementation(async (_chat, peerUid, _peerUin, parts) => {
-        const elements = parts.map((part) => part.kind === 'image' ? {
-          elementType: 2, elementId: 'image-element', picElement: {
-            fileName: 'direct.png', fileSize: String(image.length), sourcePath: '',
-            fileUuid: part.upload.fileUuid, fileSubId: '', md5HexStr: '5289df737df57326fcdd22597afb1fac',
-            picWidth: 1, picHeight: 1, picType: 1001, picSubType: 0,
-          },
-        } : {
-          elementType: 3, elementId: 'file-element', fileElement: {
-            fileName: 'direct.bin', fileSize: String(file.length), filePath: '',
-            fileUuid: part.kind === 'file' ? part.upload.fileUuid : '', fileSubId: '',
-            fileMd5: 'a6b8537b97d58b417d3dfdd1030b15d2', fileSha: '', fileSha3: '', file10MMd5: '',
-          },
-        })
-        queueMicrotask(() => f.emitMessages([{
-          ...f.message, msgId: 'protocol-message', peerUid, peerUin: peerUid,
-          chatType: 2, sendStatus: 2, elements,
-        }]))
-        return { sequence: 1n, clientSequence: 2n, sendTime: 3 }
+        return { fileUuid: 'direct.bin', exists: true, commandId: 71 }
       })
     const bridge = new QQKernelBridge()
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
-    const frame = (value: Buffer) => [
-      Buffer.from([0, 0, 0, value.length]), value, Buffer.alloc(4),
-    ]
 
     await bridge.send({
-      conversationId: '1058754719', mediaFraming: 'length-prefixed-v1',
+      conversationId: '1058754719',
       media: [{
-        kind: 'image', name: 'direct.png', size: image.length,
-        md5: '5289df737df57326fcdd22597afb1fac', sha1: '7037807198c22a7d2b0807371d763779a84fdfcf',
-        file10MMd5: '5289df737df57326fcdd22597afb1fac', width: 1, height: 1,
-      }, {
         kind: 'file', name: 'direct.bin', size: file.length,
         md5: 'a6b8537b97d58b417d3dfdd1030b15d2', sha1: '13a936c521299ecb9702d0b63e6458171f926bba',
         file10MMd5: 'a6b8537b97d58b417d3dfdd1030b15d2',
       }],
-    }, Readable.from([...frame(image), ...frame(file)]))
+    }, Readable.from([file]))
 
-    expect(Buffer.concat(received)).toEqual(Buffer.concat([image, file]))
-    expect(imageUpload).toHaveBeenCalledOnce()
+    expect(Buffer.concat(received)).toEqual(file)
     expect(fileUpload).toHaveBeenCalledOnce()
-    expect(protocolSend).toHaveBeenCalledWith(2, '1058754719', '1058754719', [
-      expect.objectContaining({ kind: 'image', upload: expect.objectContaining({ fileUuid: 'image-uuid' }) }),
-      expect.objectContaining({ kind: 'file', upload: expect.objectContaining({ fileUuid: 'file-uuid' }) }),
-    ], 'self')
+    expect(f.groupFilePublish).toHaveBeenCalledWith('1058754719', 'direct.bin')
+    expect(f.protocolSend).not.toHaveBeenCalled()
     expect(f.msg.sendMsg).not.toHaveBeenCalled()
     expect(f.sentBodies).toEqual([])
+  })
+
+  it('rejects group file captions before uploading to QQ CDN', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.send({
+      conversationId: '1058754719', text: 'caption',
+      media: [{ kind: 'file', name: 'direct.bin', size: 4 }],
+    }, Readable.from([Buffer.from('file')]))).rejects.toThrow('exactly one file without a caption')
+    expect(f.fileUpload).not.toHaveBeenCalled()
+    expect(f.groupFilePublish).not.toHaveBeenCalled()
   })
 
   it('returns a direct Highway plan and sends its uploaded image metadata with an empty body', async () => {
@@ -2557,6 +2554,87 @@ describe('QQKernelBridge', () => {
         }),
       })], 'self',
     )
+    expect(f.msg.sendMsg).not.toHaveBeenCalled()
+  })
+
+  it('returns dual Highway video plans and sends the prepared video through PbSendMsg', async () => {
+    const f = fixture()
+    const thumbnail = {
+      size: 321, md5: '00112233445566778899aabbccddeeff',
+      sha1: '00112233445566778899aabbccddeeff00112233', width: 320, height: 180,
+    }
+    const prepare = vi.spyOn(QQPacketClient.prototype, 'prepareVideoUpload').mockResolvedValue({
+      upload: {
+        fileUuid: 'prepared-video', thumbnailFileUuid: 'prepared-thumbnail',
+        msgInfo: Buffer.from('prepared-video-msg-info'), msgInfoBodies: [Buffer.from('video'), Buffer.from('thumb')],
+        videoUkey: 'video-ukey', videoIpv4s: [{ host: '127.0.0.1', port: 8080 }],
+        thumbnailUkey: 'thumb-ukey', thumbnailIpv4s: [{ host: '127.0.0.1', port: 8080 }],
+      },
+      thumbnail,
+      highway: {
+        session: { ticket: Buffer.from('ticket'), servers: [{ host: '127.0.0.1', port: 8080 }] },
+        extendInfo: Buffer.from('video-extend'), commandId: 1001, sequenceStart: 41,
+      },
+      thumbnailHighway: {
+        session: { ticket: Buffer.from('ticket'), servers: [{ host: '127.0.0.1', port: 8080 }] },
+        extendInfo: Buffer.from('thumb-extend'), commandId: 1002, sequenceStart: 42,
+      },
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const media = {
+      kind: 'video' as const, name: 'clip.mp4', mimeType: 'video/mp4', size: 3,
+      md5: '5289df737df57326fcdd22597afb1fac', sha1: '7037807198c22a7d2b0807371d763779a84fdfcf',
+      width: 320, height: 180, duration: 2, thumbnail,
+    }
+
+    const plan = await bridge.prepareMediaUpload('uid-1715311957', media)
+    expect(plan).toEqual({
+      prepared: {
+        kind: 'video', fileUuid: 'prepared-video',
+        msgInfo: Buffer.from('prepared-video-msg-info').toString('base64url'),
+      },
+      highway: {
+        servers: [{ host: '127.0.0.1', port: 8080 }],
+        ticket: Buffer.from('ticket').toString('base64url'),
+        extendInfo: Buffer.from('video-extend').toString('base64url'),
+        selfUin: '10000', commandId: 1001, sequenceStart: 41,
+        blockSize: HIGHWAY_BLOCK_SIZE, fileSize: 3,
+        fileMd5: '5289df737df57326fcdd22597afb1fac',
+      },
+      auxiliaryHighways: [{
+        role: 'thumbnail',
+        highway: {
+          servers: [{ host: '127.0.0.1', port: 8080 }],
+          ticket: Buffer.from('ticket').toString('base64url'),
+          extendInfo: Buffer.from('thumb-extend').toString('base64url'),
+          selfUin: '10000', commandId: 1002, sequenceStart: 42,
+          blockSize: HIGHWAY_BLOCK_SIZE, fileSize: thumbnail.size,
+          fileMd5: thumbnail.md5,
+        },
+      }],
+    })
+    const sent = await bridge.send({
+      conversationId: 'uid-1715311957', text: 'caption', media: [media], uploadedMedia: [plan.prepared],
+    }, Readable.from([]))
+
+    expect(sent).toMatchObject({ id: 'm1', parts: expect.any(Array) })
+    expect(prepare).toHaveBeenCalledWith(1, 'uid-1715311957', expect.objectContaining({
+      name: 'clip.mp4', mimeType: 'video/mp4', size: 3, width: 320, height: 180, duration: 2,
+      thumbnail,
+    }))
+    expect(f.protocolSend).toHaveBeenCalledWith(
+      1, 'uid-1715311957', '1715311957', [
+        { kind: 'text', text: 'caption' },
+        expect.objectContaining({
+          kind: 'video', upload: expect.objectContaining({
+            fileUuid: 'prepared-video', msgInfo: Buffer.from('prepared-video-msg-info'),
+          }),
+        }),
+      ], 'self',
+    )
+    expect(f.fileUpload).not.toHaveBeenCalled()
+    expect(f.groupFilePublish).not.toHaveBeenCalled()
     expect(f.msg.sendMsg).not.toHaveBeenCalled()
   })
 
@@ -5255,7 +5333,7 @@ describe('QQBridgeServer', () => {
     const { port } = server.address()
     const base = `http://127.0.0.1:${port}/v1`
     await expect(fetch(`${base}/status`).then((response) => response.json())).resolves.toMatchObject({
-      protocolVersion: 22, ready: true, selfUin: '10000',
+      protocolVersion: 24, ready: true, selfUin: '10000',
     })
     const dialogs = await fetch(`${base}/dialogs`)
     expect(dialogs.status).toBe(200)

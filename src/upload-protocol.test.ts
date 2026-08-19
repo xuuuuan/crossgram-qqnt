@@ -6,11 +6,13 @@ import type { KernelMsgService } from './kernel-types.js'
 import type { PacketAddon } from './packet-addon.js'
 import { QQPacketClient } from './packet-client.js'
 import {
-  decodeDirectMessageResponse, decodeHighwayResponse, decodeHighwaySessionResponse,
-  decodeImageUploadResponse, decodeFileUploadResponse, decodePrivateFileMetadataResponse,
-  encodeDirectMessageRequest, encodeFileUploadRequest, encodeHighwayFrame,
+  decodeDirectMessageResponse, decodeGroupFileFeedResponse, decodeHighwayResponse, decodeHighwaySessionResponse,
+  decodeImageUploadResponse, decodeFileUploadResponse, decodePrivateFileMetadataResponse, decodeVideoUploadResponse,
+  encodeDirectMessageRequest, encodeFileUploadRequest, encodeGroupFileFeedRequest, encodeHighwayFrame,
   encodeHighwaySessionRequest, encodeImageUploadRequest, encodePrivateFileMetadataRequest,
-  HIGHWAY_BLOCK_SIZE, QQMessageSendRejectedError,
+  encodeVideoHighwayExt, encodeVideoUploadRequest,
+  HIGHWAY_BLOCK_SIZE, QQMessageSendRejectedError, VIDEO_THUMBNAIL_BYTES,
+  VIDEO_THUMBNAIL_HEIGHT, VIDEO_THUMBNAIL_MD5, VIDEO_THUMBNAIL_SHA1, VIDEO_THUMBNAIL_WIDTH,
 } from './upload-protocol.js'
 
 describe('direct QQ upload protocol', () => {
@@ -60,6 +62,96 @@ describe('direct QQ upload protocol', () => {
     })
     expect(() => decodeImageUploadResponse(pb([u(3, 7), field(5, Buffer.from('denied'))])))
       .toThrow('denied (7)')
+  })
+
+  it('negotiates playable video with main and thumbnail rich-media uploads', () => {
+    const spec = {
+      name: 'clip.mp4', mimeType: 'video/mp4', size: 1234,
+      md5: '00112233445566778899aabbccddeeff',
+      sha1: '00112233445566778899aabbccddeeff00112233',
+      width: 640, height: 360, duration: 9.4,
+    }
+    const direct = encodeVideoUploadRequest(1, 'u_friend', spec)
+    const group = encodeVideoUploadRequest(2, '1002974327', spec)
+    expect(direct.command).toBe('OidbSvcTrpcTcp.0x11e9_100')
+    expect(group.command).toBe('OidbSvcTrpcTcp.0x11ea_100')
+    const requestEnvelope = fromBinary(generated.OidbEnvelopeSchema, group.payload)
+    const request = fromBinary(generated.VideoUploadRequestSchema, requestEnvelope.body)
+    expect(request.head).toMatchObject({
+      common: { requestId: 3, command: 100 },
+      scene: { requestType: 2, businessType: 2, sceneType: 2, group: { groupUin: 1002974327 } },
+      client: { agentType: 2 },
+    })
+    expect(request.upload).toMatchObject({
+      tryFastUploadCompleted: true, srvSendMsg: false, compatQmsgSceneType: 2,
+      noNeedCompatMsg: false,
+      uploadInfo: [{
+        subFileType: 0,
+        fileInfo: {
+          fileSize: 1234, fileName: 'clip.mp4', width: 640, height: 360, time: 9,
+          type: { type: 2, videoFormat: 2 },
+        },
+      }, {
+        subFileType: 100,
+        fileInfo: {
+          fileSize: VIDEO_THUMBNAIL_BYTES.length,
+          width: VIDEO_THUMBNAIL_WIDTH, height: VIDEO_THUMBNAIL_HEIGHT,
+          fileHash: VIDEO_THUMBNAIL_MD5.toUpperCase(),
+          fileSha1: VIDEO_THUMBNAIL_SHA1.toUpperCase(),
+          type: { type: 1 },
+        },
+      }],
+    })
+    const customThumbnail = {
+      size: 777,
+      md5: 'ffeeddccbbaa99887766554433221100',
+      sha1: 'ffeeddccbbaa9988776655443322110000112233',
+      width: 400,
+      height: 225,
+    }
+    const customEnvelope = fromBinary(
+      generated.OidbEnvelopeSchema,
+      encodeVideoUploadRequest(1, 'u_friend', { ...spec, thumbnail: customThumbnail }).payload,
+    )
+    const customRequest = fromBinary(generated.VideoUploadRequestSchema, customEnvelope.body)
+    expect(customRequest.upload?.uploadInfo[1]?.fileInfo).toMatchObject({
+      fileSize: customThumbnail.size,
+      fileHash: customThumbnail.md5.toUpperCase(),
+      fileSha1: customThumbnail.sha1.toUpperCase(),
+      width: customThumbnail.width,
+      height: customThumbnail.height,
+    })
+
+    const videoBody = pb([field(1, pb([field(2, Buffer.from('video-uuid'))]))])
+    const thumbnailBody = pb([field(1, pb([field(2, Buffer.from('thumbnail-uuid'))]))])
+    const msgInfo = pb([field(1, videoBody), field(1, thumbnailBody)])
+    const response = oidb(pb([field(2, pb([
+      field(1, Buffer.from('video-ukey')),
+      field(3, pb([u(1, 0x0100007f), u(2, 80)])),
+      field(6, msgInfo),
+      field(10, pb([
+        u(1, 100), field(2, Buffer.from('thumbnail-ukey')),
+        field(4, pb([u(1, 0x0200007f), u(2, 81)])),
+      ])),
+    ]))]))
+    const upload = decodeVideoUploadResponse(response)
+    expect(upload).toEqual({
+      fileUuid: 'video-uuid', thumbnailFileUuid: 'thumbnail-uuid', msgInfo,
+      msgInfoBodies: [videoBody, thumbnailBody],
+      videoUkey: 'video-ukey', videoIpv4s: [{ host: '127.0.0.1', port: 80 }],
+      thumbnailUkey: 'thumbnail-ukey', thumbnailIpv4s: [{ host: '127.0.0.2', port: 81 }],
+    })
+    const mainExt = fromBinary(
+      generated.ImageHighwayExtSchema,
+      encodeVideoHighwayExt(upload, 'video', spec.sha1),
+    )
+    const thumbnailExt = fromBinary(
+      generated.ImageHighwayExtSchema,
+      encodeVideoHighwayExt(upload, 'thumbnail', VIDEO_THUMBNAIL_SHA1),
+    )
+    expect(mainExt).toMatchObject({ fileUuid: 'video-uuid', ukey: 'video-ukey' })
+    expect(thumbnailExt).toMatchObject({ fileUuid: 'thumbnail-uuid', ukey: 'thumbnail-ukey' })
+    expect(mainExt.msgInfoBodies.map(Buffer.from)).toEqual([videoBody, thumbnailBody])
   })
 
   it('frames exact Highway metadata and validates server responses', () => {
@@ -123,7 +215,7 @@ describe('direct QQ upload protocol', () => {
       .toEqual({ fileUuid: 'existing-uuid', exists: true, commandId: 71 })
   })
 
-  it('builds complete PbSendMsg image/group-file elements and decodes send responses', () => {
+  it('keeps images on PbSendMsg and publishes group files through the 0x6d9 feed protocol', () => {
     const image = {
       fileUuid: 'image-uuid', ipv4s: [], ukey: undefined,
       msgInfo: pb([field(1, Buffer.from('image-index'))]),
@@ -131,19 +223,36 @@ describe('direct QQ upload protocol', () => {
     }
     const group = encodeDirectMessageRequest(2, '1002974327', '1002974327', [
       { kind: 'text', text: 'caption' }, { kind: 'image', upload: image },
-      { kind: 'file', spec: fileSpec(), upload: { fileUuid: 'group-file', exists: true, commandId: 71 } },
     ], { clientSequence: 7n, random: 8, nowSeconds: 9 })
     expect(group.command).toBe('MessageSvc.PbSendMsg')
     const request = wire(group.payload)
     expect(request.map((item) => item.tag)).toEqual([1, 2, 3, 4, 5])
     expect(wire(requiredWireBytes(wire(requiredWireBytes(request, 1)), 2))[0]).toMatchObject({ tag: 1, value: 1002974327n })
     const richText = wire(requiredWireBytes(wire(requiredWireBytes(request, 3)), 1))
-    expect(richText.filter((item) => item.tag === 2)).toHaveLength(4)
+    expect(richText.filter((item) => item.tag === 2)).toHaveLength(3)
     expect(group.payload.includes(Buffer.from('caption'))).toBe(true)
     expect(group.payload.includes(Buffer.from('compat-image'))).toBe(true)
     expect(group.payload.includes(image.msgInfo)).toBe(true)
-    expect(group.payload.includes(Buffer.from('group-file'))).toBe(true)
-    expect(group.payload.includes(Buffer.from(fileSpec().sha1, 'hex'))).toBe(true)
+
+    const feed = encodeGroupFileFeedRequest('1002974327', 'group-file', 123456)
+    expect(feed.command).toBe('OidbSvcTrpcTcp.0x6d9_4')
+    const envelope = fromBinary(generated.OidbEnvelopeSchema, feed.payload)
+    expect(envelope).toMatchObject({ command: 0x6d9, subCommand: 4, reserved: 1 })
+    const decodedFeed = fromBinary(generated.GroupFileFeedRequestSchema, envelope.body)
+    expect(decodedFeed.feeds).toMatchObject({
+      groupCode: 1002974327n, appId: 2, multiSendSequence: 0,
+      files: [{ busId: 102, fileUuid: 'group-file', messageRandom: 123456, feedFlag: 1 }],
+    })
+    const acceptedFeed = oidb(pb([field(5, pb([
+      u(1, 0), field(4, pb([u(1, 0), field(3, Buffer.from('group-file')), u(4, 102)])),
+    ]))]))
+    expect(() => decodeGroupFileFeedResponse(acceptedFeed)).not.toThrow()
+    expect(() => decodeGroupFileFeedResponse(oidb(pb([field(5, pb([
+      u(1, 79), field(2, Buffer.from('denied')),
+    ]))])))).toThrow('denied (79)')
+    expect(() => encodeDirectMessageRequest(2, '1002974327', '1002974327', [{
+      kind: 'file', spec: fileSpec(), upload: { fileUuid: 'group-file', exists: true, commandId: 71 },
+    }])).toThrow('0x6d9_4')
 
     expect(decodeDirectMessageResponse(pb([u(3, 123), u(11, 456), u(14, 789)]))).toEqual({
       sendTime: 123, sequence: 456n, clientSequence: 789n,
@@ -163,6 +272,29 @@ describe('direct QQ upload protocol', () => {
         message: 'QQ message send rejected: add the recipient as a friend first (16)',
       })
     }
+  })
+
+  it('sends videos as service-48 rich media instead of QQ group files', () => {
+    const video = {
+      fileUuid: 'video-uuid', thumbnailFileUuid: 'thumbnail-uuid',
+      msgInfo: Buffer.from('complete-video-msg-info'), msgInfoBodies: [],
+      videoIpv4s: [], thumbnailIpv4s: [],
+    }
+    const group = fromBinary(generated.SendMessageRequestSchema, encodeDirectMessageRequest(
+      2, '1002974327', '1002974327', [
+        { kind: 'text', text: 'caption' }, { kind: 'video', upload: video },
+      ], { clientSequence: 7n, random: 8 },
+    ).payload)
+    const privateMessage = fromBinary(generated.SendMessageRequestSchema, encodeDirectMessageRequest(
+      1, 'u_friend', '42', [{ kind: 'video', upload: video }],
+      { clientSequence: 9n, random: 10 },
+    ).payload)
+    expect(group.body?.richText?.elements.at(-1)?.common).toMatchObject({
+      serviceType: 48, businessType: 21, payload: video.msgInfo,
+    })
+    expect(privateMessage.body?.richText?.elements[0]?.common).toMatchObject({
+      serviceType: 48, businessType: 11, payload: video.msgInfo,
+    })
   })
 
   it('keeps stable PbSendMsg vectors for text, mentions, faces, market stickers, and replies', () => {
@@ -299,6 +431,60 @@ describe('direct QQ upload protocol', () => {
       'http://127.0.0.1:8080/cgi-bin/httpconn?htcmd=0x6FF0087&uin=1715311957',
       expect.objectContaining({ method: 'POST' }),
     )
+  })
+
+  it('streams video and its companion thumbnail through the correct Highway commands', async () => {
+    const bytes = Buffer.from('playable-video')
+    const md5 = createHash('md5').update(bytes).digest('hex')
+    const sha1 = createHash('sha1').update(bytes).digest('hex')
+    const videoBody = pb([field(1, pb([field(2, Buffer.from('video-uuid'))]))])
+    const thumbnailBody = pb([field(1, pb([field(2, Buffer.from('thumbnail-uuid'))]))])
+    const videoResponse = oidb(pb([field(2, pb([
+      field(1, Buffer.from('video-ukey')),
+      field(3, pb([u(1, 0x0100007f), u(2, 80)])),
+      field(6, pb([field(1, videoBody), field(1, thumbnailBody)])),
+      field(10, pb([
+        u(1, 100), field(2, Buffer.from('thumbnail-ukey')),
+        field(4, pb([u(1, 0x0100007f), u(2, 80)])),
+      ])),
+    ]))]))
+    const sessionResponse = pb([field(0x501, pb([
+      field(1, Buffer.from('session-ticket')),
+      field(3, pb([u(1, 1), field(2, pb([fixed(2, 0x0100007f), u(3, 8080)]))])),
+    ]))])
+    const sent = vi.fn(async (command: string) => ({
+      rspbuffer: command.startsWith('OidbSvcTrpcTcp') ? videoResponse : sessionResponse,
+    }))
+    const addon = {
+      sendPacket: vi.fn((send, command, payload) => send(command, payload)),
+      installSendHook: vi.fn(() => ({
+        moduleBase: '0x1', locator: 'test', timeDateStamp: 0, sizeOfImage: 0,
+        anchorRva: 0, xrefRva: 0, functionRva: 0, converterRva: 0, responseRva: 0,
+      })),
+    } as unknown as PacketAddon
+    const posted: Buffer[] = []
+    const fetch = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      posted.push(Buffer.from(init!.body as Buffer))
+      return new Response(highwayResponse())
+    }) as typeof globalThis.fetch
+    const client = new QQPacketClient({
+      sendSsoCmdReqByContend: sent as NonNullable<KernelMsgService['sendSsoCmdReqByContend']>,
+    }, { addon, fetch })
+
+    const uploaded = await client.uploadVideo(2, '1002974327', '1715311957', {
+      name: 'clip.mp4', mimeType: 'video/mp4', size: bytes.length, md5, sha1,
+      width: 320, height: 180, duration: 4,
+    }, (async function* () { yield bytes })())
+
+    expect(uploaded.fileUuid).toBe('video-uuid')
+    expect(posted).toHaveLength(2)
+    const heads = posted.map((frame) => fromBinary(
+      generated.HighwayRequestHeadSchema,
+      frame.subarray(9, 9 + frame.readUInt32BE(1)),
+    ))
+    expect(heads.map((head) => head.base?.commandId)).toEqual([1005, 1006])
+    expect(posted.map((frame) => frame.subarray(9 + frame.readUInt32BE(1), -1)))
+      .toEqual([bytes, VIDEO_THUMBNAIL_BYTES])
   })
 
   it('uses the stable Highway session request wire shape and rejects incomplete streams', async () => {

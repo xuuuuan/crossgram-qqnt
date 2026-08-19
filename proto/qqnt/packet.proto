@@ -176,6 +176,139 @@ message ImageIndex {
   string file_uuid = 2;
 }
 
+message VideoUploadRequest {
+  VideoRequestHead head = 1;
+  VideoUploadBody upload = 2;
+}
+
+message VideoRequestHead {
+  VideoCommonHead common = 1;
+  VideoScene scene = 2;
+  VideoClient client = 3;
+}
+
+message VideoCommonHead {
+  uint32 request_id = 1;
+  uint32 command = 2;
+}
+
+message VideoScene {
+  uint32 request_type = 101;
+  uint32 business_type = 102;
+  uint32 scene_type = 200;
+  VideoC2cTarget c2c = 201;
+  VideoGroupTarget group = 202;
+}
+
+message VideoC2cTarget {
+  uint32 account_type = 1;
+  string target_uid = 2;
+}
+
+message VideoGroupTarget {
+  uint32 group_uin = 1;
+}
+
+message VideoClient {
+  uint32 agent_type = 1;
+}
+
+message VideoUploadBody {
+  repeated VideoUploadInfo upload_info = 1;
+  bool try_fast_upload_completed = 2;
+  bool srv_send_msg = 3;
+  uint64 client_random_id = 4;
+  uint32 compat_qmsg_scene_type = 5;
+  VideoExtBizInfo ext_biz_info = 6;
+  uint32 client_seq = 7;
+  bool no_need_compat_msg = 8;
+}
+
+message VideoUploadInfo {
+  VideoFileInfo file_info = 1;
+  uint32 sub_file_type = 2;
+}
+
+message VideoFileInfo {
+  uint32 file_size = 1;
+  string file_hash = 2;
+  string file_sha1 = 3;
+  string file_name = 4;
+  VideoFileType type = 5;
+  uint32 width = 6;
+  uint32 height = 7;
+  uint32 time = 8;
+  uint32 original = 9;
+}
+
+message VideoFileType {
+  uint32 type = 1;
+  uint32 pic_format = 2;
+  uint32 video_format = 3;
+  uint32 voice_format = 4;
+}
+
+message VideoExtBizInfo {
+  VideoPicExtBizInfo pic = 1;
+  VideoVideoExtBizInfo video = 2;
+  VideoPttExtBizInfo ptt = 3;
+}
+
+message VideoPicExtBizInfo {
+  uint32 biz_type = 1;
+  string text_summary = 2;
+}
+
+message VideoVideoExtBizInfo {
+  bytes bytes_pb_reserve = 3;
+}
+
+message VideoPttExtBizInfo {
+  bytes bytes_reserve = 11;
+  bytes bytes_pb_reserve = 12;
+  bytes bytes_general_flags = 13;
+}
+
+message VideoUploadResponse {
+  VideoResponseHead head = 1;
+  VideoUploadResult upload = 2;
+}
+
+message VideoResponseHead {
+  uint32 code = 2;
+  string message = 3;
+}
+
+message VideoUploadResult {
+  string ukey = 1;
+  repeated VideoUploadAddress addresses = 3;
+  bytes msg_info = 6;
+  repeated VideoSubFileInfo sub_file_infos = 10;
+}
+
+message VideoUploadAddress {
+  uint32 host = 1;
+  uint32 port = 2;
+}
+
+message VideoSubFileInfo {
+  uint32 sub_type = 1;
+  string ukey = 2;
+  repeated VideoUploadAddress addresses = 4;
+}
+
+message VideoMsgInfo {
+  repeated bytes bodies = 1;
+}
+
+message VideoMsgInfoBody {
+  VideoIndex index = 1;
+}
+
+message VideoIndex {
+  string file_uuid = 2;
+}
+
 message PrivateFileMetadataRequest {
   uint32 command = 1;
   uint32 field2 = 2;
@@ -242,6 +375,45 @@ message GroupFileUploadResult {
   bytes upload_key = 9;
   uint32 exists = 10;
   uint32 port = 14;
+}
+
+message GroupFileFeedRequest {
+  GroupFileFeedBody feeds = 5;
+}
+
+message GroupFileFeedBody {
+  uint64 group_code = 1;
+  uint32 app_id = 2;
+  repeated GroupFileFeedInfo files = 3;
+  uint32 multi_send_sequence = 4;
+}
+
+message GroupFileFeedInfo {
+  uint32 bus_id = 1;
+  string file_uuid = 2;
+  uint32 message_random = 3;
+  bytes extension = 4;
+  uint32 feed_flag = 5;
+}
+
+message GroupFileFeedResponse {
+  GroupFileFeedResult result = 5;
+}
+
+message GroupFileFeedResult {
+  int64 code = 1;
+  string error = 2;
+  string message = 3;
+  repeated GroupFileFeedFileResult files = 4;
+  uint32 retry_after = 5;
+}
+
+message GroupFileFeedFileResult {
+  int32 code = 1;
+  string error = 2;
+  string file_uuid = 3;
+  uint32 bus_id = 4;
+  uint32 expires_at = 5;
 }
 
 message PrivateFileUploadRequest {

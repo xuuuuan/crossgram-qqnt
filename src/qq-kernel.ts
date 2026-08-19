@@ -12,7 +12,10 @@ import { log, logPath } from './log.js'
 import { resolveMultiForwardParticipants } from './multi-forward-participants.js'
 import type { PCMMediaLease } from './media-gateway.js'
 import { QQPacketClient, type DirectHighwayUpload, type QQPacketClientOptions } from './packet-client.js'
-import { HIGHWAY_BLOCK_SIZE, type DirectMessagePart } from './upload-protocol.js'
+import {
+  HIGHWAY_BLOCK_SIZE, type DirectMessagePart,
+  VIDEO_THUMBNAIL_BYTES,
+} from './upload-protocol.js'
 import { decodePttTo, encodePtt, MAX_VOICE_INPUT_BYTES, transcodePttFallbackTo } from './silk-audio.js'
 import {
   GroupMsgMask,
@@ -346,7 +349,7 @@ export class QQKernelBridge {
     startedAt: number
     expectedText?: string
     expectedMediaName?: string
-    expectedMediaKind?: 'image' | 'file' | 'voice' | 'sticker'
+    expectedMediaKind?: 'image' | 'video' | 'file' | 'voice' | 'sticker'
     originRequestId?: string
     assignedMessageId?: string
   }> = []
@@ -1778,7 +1781,9 @@ export class QQKernelBridge {
 
   async prepareMediaUpload(conversationId: string, spec: QQSendMediaSpec): Promise<QQMediaUploadPlan> {
     const conversation = this.getConversation(conversationId)
-    if (spec.kind !== 'image' && spec.kind !== 'file') throw new Error('media upload kind must be image or file')
+    if (spec.kind !== 'image' && spec.kind !== 'video' && spec.kind !== 'file') {
+      throw new Error('media upload kind must be image, video, or file')
+    }
     if (!spec.name) throw new Error('media upload name is required')
     const size = spec.size
     const md5 = spec.md5
@@ -1799,6 +1804,31 @@ export class QQKernelBridge {
           ...(plan.upload.compatQMsg ? { compatQMsg: plan.upload.compatQMsg.toString('base64url') } : {}),
         },
         ...(plan.highway ? { highway: wireHighwayUpload(plan.highway, config.selfUin, size, md5) } : {}),
+      }
+    }
+    if (spec.kind === 'video') {
+      const plan = await packet.prepareVideoUpload(conversation.chatType as 1 | 2, conversation.peerUid, {
+        name: spec.name, mimeType: spec.mimeType, size, md5, sha1,
+        width: spec.width, height: spec.height, duration: spec.duration,
+        thumbnail: spec.thumbnail,
+      })
+      return {
+        prepared: {
+          kind: 'video' as const,
+          fileUuid: plan.upload.fileUuid,
+          msgInfo: plan.upload.msgInfo.toString('base64url'),
+        },
+        ...(plan.highway ? { highway: wireHighwayUpload(plan.highway, config.selfUin, size, md5) } : {}),
+        ...(plan.thumbnailHighway ? { auxiliaryHighways: [{
+          role: 'thumbnail' as const,
+          ...(!spec.thumbnail ? { bytes: VIDEO_THUMBNAIL_BYTES.toString('base64url') } : {}),
+          highway: wireHighwayUpload(
+            plan.thumbnailHighway,
+            config.selfUin,
+            plan.thumbnail.size,
+            plan.thumbnail.md5,
+          ),
+        }] } : {}),
       }
     }
     if (!spec.file10MMd5) throw new Error('file upload preparation requires 10 MiB MD5')
@@ -1825,6 +1855,15 @@ export class QQKernelBridge {
     }
     const conversation = this.getConversation(manifest.conversationId)
     const peerUin = await this.requireProtocolPeerUin(conversation)
+    const groupFile = conversation.chatType === CHAT_GROUP
+      ? manifest.media?.find((media) => media.kind === 'file')
+      : undefined
+    if (groupFile && (
+      manifest.media?.length !== 1 || manifest.text || manifest.textParts?.length
+      || manifest.replyToId || manifest.replyToSequence || manifest.sticker
+    )) {
+      throw new Error('QQ group file messages must contain exactly one file without a caption or reply')
+    }
     const protocolParts: DirectMessagePart[] = []
     if (manifest.replyToId) protocolParts.push(await this.directReplyPart(conversation, manifest.replyToId))
     if (manifest.textParts?.length) {
@@ -1942,6 +1981,19 @@ export class QQKernelBridge {
               } })
               continue
             }
+            if (prepared.kind === 'video') {
+              const msgInfo = Buffer.from(prepared.msgInfo, 'base64url')
+              if (!prepared.fileUuid || !msgInfo.length) throw new Error(`uploaded video ${index} metadata is incomplete`)
+              protocolParts.push({ kind: 'video', upload: {
+                fileUuid: prepared.fileUuid,
+                thumbnailFileUuid: '',
+                msgInfo,
+                msgInfoBodies: [],
+                videoIpv4s: [],
+                thumbnailIpv4s: [],
+              } })
+              continue
+            }
             if (!spec.file10MMd5) throw new Error(`uploaded file ${index} metadata is incomplete`)
             const expectedCommand = conversation.chatType === CHAT_GROUP ? 71 : 95
             if (!prepared.fileUuid || prepared.commandId !== expectedCommand) {
@@ -2008,6 +2060,21 @@ export class QQKernelBridge {
             protocolParts.push({ kind: 'image', upload: uploaded })
             continue
           }
+          if (spec.kind === 'video') {
+            const uploaded = await this.packetClientForSession().uploadVideo(
+              conversation.chatType as 1 | 2,
+              conversation.peerUid,
+              this.requireConfig().selfUin,
+              {
+                name: spec.name, mimeType: spec.mimeType, size, md5, sha1,
+                width: spec.width, height: spec.height, duration: spec.duration,
+              },
+              uploadBody,
+            )
+            sentMediaPaths.push(path)
+            protocolParts.push({ kind: 'video', upload: uploaded })
+            continue
+          }
           if (!file10MMd5) throw new Error(`file ${index} metadata is incomplete`)
           const config = this.requireConfig()
           const uploaded = await this.packetClientForSession().uploadFile(
@@ -2045,8 +2112,18 @@ export class QQKernelBridge {
         expectedMediaKind: manifest.sticker ? 'sticker' : manifest.media?.[0]?.kind,
         originRequestId: manifest.originRequestId,
       })
+      const groupFilePart = conversation.chatType === CHAT_GROUP
+        ? protocolParts.find((part) => part.kind === 'file')
+        : undefined
+      const protocolName = voicePtt
+        ? 'KernelMsgService.sendMsg'
+        : groupFilePart
+          ? 'OidbSvcTrpcTcp.0x6d9_4'
+          : 'MessageSvc.PbSendMsg'
       const sendRequest = voicePtt
         ? this.sendNativeVoice(conversation, voicePtt)
+        : groupFilePart
+          ? this.packetClientForSession().publishGroupFile(peerUin, groupFilePart.upload.fileUuid)
         : this.packetClientForSession().sendDirectMessage(
           conversation.chatType as 1 | 2,
           conversation.peerUid,
@@ -2054,15 +2131,15 @@ export class QQKernelBridge {
           protocolParts,
           this.requireConfig().selfUid,
         )
-      log('info', `protocol API start name=${voicePtt ? 'KernelMsgService.sendMsg' : 'MessageSvc.PbSendMsg'} conversation=${conversation.id} parts=${protocolParts.length} minimumStatus=${minimumStatus}`)
+      log('info', `protocol API start name=${protocolName} conversation=${conversation.id} parts=${protocolParts.length} minimumStatus=${minimumStatus}`)
       const sendResponse = await Promise.race([
         sendRequest,
         pending.promise.then(() => undefined),
       ])
       if (!sendResponse) {
-        log('info', `protocol API callback arrived before response name=MessageSvc.PbSendMsg conversation=${conversation.id}`)
+        log('info', `protocol API callback arrived before response name=${protocolName} conversation=${conversation.id}`)
       }
-      log('info', `protocol API accepted name=MessageSvc.PbSendMsg conversation=${conversation.id} message=${id}`)
+      log('info', `protocol API accepted name=${protocolName} conversation=${conversation.id} message=${id}`)
       const pollController = new AbortController()
       const confirmationPoll = this.pollSentMessage(
         conversation,
@@ -2072,7 +2149,7 @@ export class QQKernelBridge {
         manifest.media?.[0]?.kind === 'voice' ? undefined : manifest.media?.[0]?.name,
         minimumStatus,
         pollController.signal,
-        !voicePtt && sendResponse
+        !voicePtt && sendResponse && 'sequence' in sendResponse
           ? String(conversation.chatType === CHAT_C2C
               ? sendResponse.clientSequence || sendResponse.sequence
               : sendResponse.sequence || sendResponse.clientSequence)
@@ -2091,7 +2168,7 @@ export class QQKernelBridge {
         })
       this.rememberMessageOrigin(record.msgId, manifest.originRequestId)
       const message = await this.mapMessagePrepared(record)
-      log('info', `protocol API confirmed name=MessageSvc.PbSendMsg conversation=${conversation.id} requestedMessage=${id} confirmedMessage=${message.id} status=${record.sendStatus}`)
+      log('info', `protocol API confirmed name=${protocolName} conversation=${conversation.id} requestedMessage=${id} confirmedMessage=${message.id} status=${record.sendStatus}`)
       if (manifest.media?.length && sentMediaPaths.length) {
         const mediaParts = message.parts.filter((part) => part.type === 'media')
         for (const [index, media] of mediaParts.entries()) {
@@ -4432,7 +4509,7 @@ export class QQKernelBridge {
     conversation: QQConversation,
     expectedText: string | undefined,
     startedAt: number,
-    expectedMediaKind: 'image' | 'file' | 'voice' | 'sticker' | undefined,
+    expectedMediaKind: 'image' | 'video' | 'file' | 'voice' | 'sticker' | undefined,
     expectedMediaName: string | undefined,
     minimumStatus: number,
     signal: AbortSignal,
@@ -4479,6 +4556,7 @@ export class QQKernelBridge {
           matchesElementKind(element, expectedMediaKind)))
         && (expectedMediaName === undefined || expectedMediaKind === 'image' || record.elements.some((element) =>
           element.fileElement?.fileName === expectedMediaName
+          || element.videoElement?.fileName === expectedMediaName
           || element.pttElement?.fileName === expectedMediaName)))
       if (found?.sendStatus === 0) throw new Error(`QQ send failed: ${found.msgId}`)
       if (found && found.sendStatus >= minimumStatus) return found
@@ -5272,7 +5350,7 @@ export class QQKernelBridge {
       }, }
   }
 
-  private stagingPath(kind?: 'image' | 'file' | 'voice'): string {
+  private stagingPath(kind?: 'image' | 'video' | 'file' | 'voice'): string {
     if (kind === 'image') {
       try {
         const nativeDir = this.requireSession().getRichMediaService().getRichMediaFileDir?.(
@@ -6440,9 +6518,10 @@ function favoritePackVersion(stickers: QQSticker[]): number {
 }
 
 function matchesElementKind(
-  element: MsgElement, kind: 'image' | 'file' | 'voice' | 'sticker',
+  element: MsgElement, kind: 'image' | 'video' | 'file' | 'voice' | 'sticker',
 ): boolean {
   if (kind === 'voice') return Boolean(element.pttElement)
+  if (kind === 'video') return Boolean(element.videoElement)
   if (kind === 'file') return Boolean(element.fileElement)
   if (kind === 'sticker') {
     return ( Boolean(element.marketFaceElement)

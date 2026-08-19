@@ -4,6 +4,14 @@ import * as pb from './generated/qqnt/packet_pb.js'
 
 const HIGHWAY_APP_ID = 1_600_001_604
 export const HIGHWAY_BLOCK_SIZE = 1024 * 1024
+export const VIDEO_THUMBNAIL_BYTES = Buffer.from(
+  '/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAYEBAUEBAYFBQUGBgYHCQ4JCQgICRINDQoOFRIWFhUSFBQXGiEcFxgfGRQUHScdHyIjJSUlFhwpLCgkKyEkJST/2wBDAQYGBgkICREJCREkGBQYJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCT/wAARCAC0AUADASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFgEBAQEAAAAAAAAAAAAAAAAAAAEC/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAwDAQACEQMRAD8AgADaAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP/2Q==',
+  'base64',
+)
+export const VIDEO_THUMBNAIL_WIDTH = 320
+export const VIDEO_THUMBNAIL_HEIGHT = 180
+export const VIDEO_THUMBNAIL_MD5 = createHash('md5').update(VIDEO_THUMBNAIL_BYTES).digest('hex')
+export const VIDEO_THUMBNAIL_SHA1 = createHash('sha1').update(VIDEO_THUMBNAIL_BYTES).digest('hex')
 
 export interface DirectImageSpec {
   name: string
@@ -41,6 +49,37 @@ export interface DirectFileSpec {
   md5: string
   sha1: string
   file10MMd5: string
+}
+
+export interface DirectVideoSpec {
+  name: string
+  mimeType?: string
+  size: number
+  md5: string
+  sha1: string
+  width?: number
+  height?: number
+  duration?: number
+  thumbnail?: DirectVideoThumbnailSpec
+}
+
+export interface DirectVideoThumbnailSpec {
+  size: number
+  md5: string
+  sha1: string
+  width: number
+  height: number
+}
+
+export interface PreparedVideoUpload {
+  fileUuid: string
+  thumbnailFileUuid: string
+  msgInfo: Buffer
+  msgInfoBodies: Buffer[]
+  videoUkey?: string
+  videoIpv4s: Array<{ host: string, port: number }>
+  thumbnailUkey?: string
+  thumbnailIpv4s: Array<{ host: string, port: number }>
 }
 
 export interface PreparedFileUpload {
@@ -96,6 +135,7 @@ export type DirectMessagePart =
   | { kind: 'market-face', face: DirectMarketFaceSpec }
   | { kind: 'reply', reply: DirectReplySpec }
   | { kind: 'image', upload: PreparedImageUpload }
+  | { kind: 'video', upload: PreparedVideoUpload }
   | { kind: 'file', spec: DirectFileSpec, upload: PreparedFileUpload }
 
 export interface DirectMessageSendResponse {
@@ -205,6 +245,108 @@ export function decodeImageUploadResponse(payload: Uint8Array): PreparedImageUpl
     msgInfo,
     msgInfoBodies,
     compatQMsg: upload.compatQmsg.length ? Buffer.from(upload.compatQmsg) : undefined,
+  }
+}
+
+export function encodeVideoUploadRequest(
+  chatType: 1 | 2,
+  peerUid: string,
+  spec: DirectVideoSpec,
+): PacketRequest {
+  assertVideoSpec(spec)
+  const thumbnail = videoThumbnailSpec(spec)
+  const group = chatType === 2
+  const command = group ? 0x11ea : 0x11e9
+  const scene = group
+    ? {
+        requestType: 2, businessType: 2, sceneType: 2,
+        group: { groupUin: numericPeer(peerUid) },
+      }
+    : {
+        requestType: 2, businessType: 2, sceneType: 1,
+        c2c: { accountType: 2, targetUid: peerUid },
+      }
+  const body = binary(pb.VideoUploadRequestSchema, {
+    head: {
+      common: { requestId: 3, command: 100 },
+      scene,
+      client: { agentType: 2 },
+    },
+    upload: {
+      uploadInfo: [{
+        fileInfo: {
+          fileSize: spec.size,
+          fileHash: spec.md5.toUpperCase(),
+          fileSha1: spec.sha1.toUpperCase(),
+          fileName: spec.name || 'video.mp4',
+          type: { type: 2, picFormat: 0, videoFormat: videoFormat(spec), voiceFormat: 0 },
+          width: roundedUint32(spec.width), height: roundedUint32(spec.height),
+          time: roundedUint32(spec.duration), original: 0,
+        },
+        subFileType: 0,
+      }, {
+        fileInfo: {
+          fileSize: thumbnail.size,
+          fileHash: thumbnail.md5.toUpperCase(),
+          fileSha1: thumbnail.sha1.toUpperCase(),
+          fileName: `${thumbnail.md5}.jpg`,
+          type: { type: 1, picFormat: 0, videoFormat: 0, voiceFormat: 0 },
+          width: thumbnail.width, height: thumbnail.height, time: 0, original: 0,
+        },
+        subFileType: 100,
+      }],
+      tryFastUploadCompleted: true,
+      srvSendMsg: false,
+      clientRandomId: randomPositiveInt64(),
+      compatQmsgSceneType: 2,
+      extBizInfo: {
+        pic: { bizType: 0, textSummary: 'Nya~' },
+        video: { bytesPbReserve: Uint8Array.of(0x80, 0x01, 0x00) },
+        ptt: {
+          bytesReserve: new Uint8Array(), bytesPbReserve: new Uint8Array(),
+          bytesGeneralFlags: new Uint8Array(),
+        },
+      },
+      clientSeq: 0,
+      noNeedCompatMsg: false,
+    },
+  })
+  return {
+    command: `OidbSvcTrpcTcp.0x${command.toString(16)}_100`,
+    payload: encodeOidb(command, 100, body, true),
+  }
+}
+
+export function decodeVideoUploadResponse(payload: Uint8Array): PreparedVideoUpload {
+  const response = fromBinary(pb.VideoUploadResponseSchema, decodeOidb(payload))
+  if (response.head?.code) {
+    throw new Error(`QQ video upload preparation failed: ${response.head.message} (${response.head.code})`)
+  }
+  const upload = required(response.upload, 'video upload response')
+  const msgInfo = requiredBuffer(upload.msgInfo, 'video MsgInfo')
+  const msgInfoBodies = fromBinary(pb.VideoMsgInfoSchema, msgInfo).bodies.map(Buffer.from)
+  const videoBody = requiredBuffer(msgInfoBodies[0], 'video MsgInfo body')
+  const thumbnailBody = requiredBuffer(msgInfoBodies[1], 'video thumbnail MsgInfo body')
+  const videoIndex = required(fromBinary(pb.VideoMsgInfoBodySchema, videoBody).index, 'video index')
+  const thumbnailIndex = required(
+    fromBinary(pb.VideoMsgInfoBodySchema, thumbnailBody).index,
+    'video thumbnail index',
+  )
+  if (!videoIndex.fileUuid || !thumbnailIndex.fileUuid) {
+    throw new Error('video upload response contained no video or thumbnail UUID')
+  }
+  const thumbnail = upload.subFileInfos[0]
+  return {
+    fileUuid: videoIndex.fileUuid,
+    thumbnailFileUuid: thumbnailIndex.fileUuid,
+    msgInfo,
+    msgInfoBodies,
+    videoUkey: upload.ukey || undefined,
+    videoIpv4s: upload.addresses.map((address) => ({ host: ipv4(address.host), port: address.port })),
+    thumbnailUkey: thumbnail?.ukey || undefined,
+    thumbnailIpv4s: (thumbnail?.addresses ?? []).map((address) => ({
+      host: ipv4(address.host), port: address.port,
+    })),
   }
 }
 
@@ -321,6 +463,38 @@ export function decodeFileUploadResponse(
   return response
 }
 
+export function encodeGroupFileFeedRequest(
+  peerUin: string,
+  fileUuid: string,
+  random = randomGroupFileFeed(),
+): PacketRequest {
+  if (!fileUuid) throw new Error('group file feed requires a file UUID')
+  if (!Number.isInteger(random) || random <= 0 || random > 0x7fff_ffff) {
+    throw new Error('group file feed random must be a positive signed 32-bit integer')
+  }
+  const body = binary(pb.GroupFileFeedRequestSchema, { feeds: {
+    groupCode: BigInt(numericUin(peerUin, 'QQ group')),
+    appId: 2,
+    files: [{ busId: 102, fileUuid, messageRandom: random, feedFlag: 1 }],
+    multiSendSequence: 0,
+  } })
+  return { command: 'OidbSvcTrpcTcp.0x6d9_4', payload: encodeOidb(0x6d9, 4, body, true) }
+}
+
+export function decodeGroupFileFeedResponse(payload: Uint8Array): void {
+  const result = required(
+    fromBinary(pb.GroupFileFeedResponseSchema, decodeOidb(payload)).result,
+    'group file feed response',
+  )
+  if (result.code) {
+    throw new Error(`QQ group file publish failed: ${result.error || result.message} (${result.code})`)
+  }
+  const rejected = result.files.find((file) => file.code)
+  if (rejected) {
+    throw new Error(`QQ group file publish failed: ${rejected.error} (${rejected.code})`)
+  }
+}
+
 export function encodeImageHighwayExt(upload: PreparedImageUpload, sha1Hex: string): Buffer {
   assertHash(sha1Hex, 'SHA-1', 40)
   if (!upload.ukey) throw new Error('image upload has no ukey')
@@ -328,6 +502,28 @@ export function encodeImageHighwayExt(upload: PreparedImageUpload, sha1Hex: stri
     fileUuid: upload.fileUuid,
     ukey: upload.ukey,
     network: { endpoints: upload.ipv4s.map(({ host, port }) => ({
+      host: { enabled: true, host }, port,
+    })) },
+    msgInfoBodies: upload.msgInfoBodies,
+    blockSize: HIGHWAY_BLOCK_SIZE,
+    hash: { sha1: hex(sha1Hex) },
+  })
+}
+
+export function encodeVideoHighwayExt(
+  upload: PreparedVideoUpload,
+  role: 'video' | 'thumbnail',
+  sha1Hex: string,
+): Buffer {
+  assertHash(sha1Hex, 'SHA-1', 40)
+  const thumbnail = role === 'thumbnail'
+  const ukey = thumbnail ? upload.thumbnailUkey : upload.videoUkey
+  if (!ukey) throw new Error(`${role} upload has no ukey`)
+  const addresses = thumbnail ? upload.thumbnailIpv4s : upload.videoIpv4s
+  return binary(pb.ImageHighwayExtSchema, {
+    fileUuid: thumbnail ? upload.thumbnailFileUuid : upload.fileUuid,
+    ukey,
+    network: { endpoints: addresses.map(({ host, port }) => ({
       host: { enabled: true, host }, port,
     })) },
     msgInfoBodies: upload.msgInfoBodies,
@@ -431,6 +627,9 @@ export function encodeDirectMessageRequest(
 ): PacketRequest {
   if (!parts.length) throw new Error('direct protocol message must contain at least one part')
   const files = parts.filter((part) => part.kind === 'file')
+  if (chatType === 2 && files.length) {
+    throw new Error('QQ group files must be published through OidbSvcTrpcTcp.0x6d9_4')
+  }
   const privateFile = chatType === 1 ? files[0] : undefined
   if (chatType === 1 && files.length) {
     if (parts.length !== 1 || files.length !== 1) {
@@ -518,20 +717,12 @@ function directMessageElements(part: DirectMessagePart, chatType: 1 | 2): pb.Ele
     } }))
     return elements
   }
-  if (chatType !== 2) throw new Error('private file must use the 0x211 message route')
-  const extra = binary(pb.GroupFileExtraSchema, {
-    type: 6, name: part.spec.name,
-    body: { info: {
-      type: 102, fileUuid: part.upload.fileUuid, size: BigInt(part.spec.size),
-      name: part.spec.name, sha1: hex(part.spec.sha1), field7: '', md5: hex(part.spec.md5),
-    } },
-  })
-  if (extra.length > 0xffff) throw new Error('group file message metadata is too large')
-  const tlv = Buffer.allocUnsafe(extra.length + 3)
-  tlv[0] = 1
-  tlv.writeUInt16BE(extra.length, 1)
-  extra.copy(tlv, 3)
-  return [create(pb.ElemSchema, { trans: { type: 24, value: tlv } })]
+  if (part.kind === 'video') {
+    return [create(pb.ElemSchema, { common: {
+      serviceType: 48, payload: part.upload.msgInfo, businessType: chatType === 2 ? 21 : 11,
+    } })]
+  }
+  throw new Error('QQ group files must be published through OidbSvcTrpcTcp.0x6d9_4')
 }
 
 function directFaceElement(face: DirectFaceSpec): pb.Elem {
@@ -658,6 +849,64 @@ function assertFileSpec(spec: DirectFileSpec): void {
   }
 }
 
+function assertVideoSpec(spec: DirectVideoSpec): void {
+  assertHash(spec.md5, 'MD5', 32)
+  assertHash(spec.sha1, 'SHA-1', 40)
+  if (!Number.isSafeInteger(spec.size) || spec.size <= 0 || spec.size > 0xffff_ffff) {
+    throw new Error('video size must be a positive 32-bit integer')
+  }
+  roundedUint32(spec.width)
+  roundedUint32(spec.height)
+  roundedUint32(spec.duration)
+  if (spec.thumbnail) assertVideoThumbnailSpec(spec.thumbnail)
+}
+
+export function videoThumbnailSpec(spec: DirectVideoSpec): DirectVideoThumbnailSpec {
+  return spec.thumbnail ?? {
+    size: VIDEO_THUMBNAIL_BYTES.length,
+    md5: VIDEO_THUMBNAIL_MD5,
+    sha1: VIDEO_THUMBNAIL_SHA1,
+    width: VIDEO_THUMBNAIL_WIDTH,
+    height: VIDEO_THUMBNAIL_HEIGHT,
+  }
+}
+
+function assertVideoThumbnailSpec(spec: DirectVideoThumbnailSpec): void {
+  assertHash(spec.md5, 'video thumbnail MD5', 32)
+  assertHash(spec.sha1, 'video thumbnail SHA-1', 40)
+  if (!Number.isSafeInteger(spec.size) || spec.size <= 0 || spec.size > 0xffff_ffff) {
+    throw new Error('video thumbnail size must be a positive 32-bit integer')
+  }
+  if (!Number.isSafeInteger(spec.width) || spec.width <= 0 || spec.width > 0xffff_ffff
+    || !Number.isSafeInteger(spec.height) || spec.height <= 0 || spec.height > 0xffff_ffff) {
+    throw new Error('video thumbnail dimensions must be positive 32-bit integers')
+  }
+}
+
+function roundedUint32(value: number | undefined): number {
+  if (value === undefined) return 0
+  const rounded = Math.round(value)
+  if (!Number.isFinite(value) || rounded < 0 || rounded > 0xffff_ffff) {
+    throw new Error('video dimensions and duration must be non-negative 32-bit numbers')
+  }
+  return rounded
+}
+
+function videoFormat(spec: DirectVideoSpec): number {
+  const extension = spec.name.toLowerCase().match(/\.([^.]+)$/)?.[1]
+  if (spec.mimeType === 'video/quicktime' || extension === 'mov') return 8
+  if (spec.mimeType === 'video/x-msvideo' || extension === 'avi') return 1
+  if (spec.mimeType === 'video/x-matroska' || extension === 'mkv') return 4
+  if (spec.mimeType === 'video/x-ms-wmv' || extension === 'wmv') return 3
+  if (extension === 'rmvb') return 5
+  if (extension === 'rm') return 6
+  if (extension === 'asf') return 7
+  if (extension === 'mod') return 9
+  if (extension === 'ts') return 10
+  if (extension === 'mts' || extension === 'm2ts') return 11
+  return 2
+}
+
 function assertHash(value: string, name: string, length: number): void {
   if (!new RegExp(`^[a-f0-9]{${length}}$`, 'i').test(value)) {
     throw new Error(`${name} must be ${length} hexadecimal characters`)
@@ -670,4 +919,8 @@ function randomPositiveInt64(): bigint {
 
 function randomClientSequence(): bigint {
   return BigInt(10_000 + randomBytes(4).readUInt32BE() % 89_999)
+}
+
+function randomGroupFileFeed(): number {
+  return 1 + randomBytes(4).readUInt32BE() % 0x7fff_fffe
 }

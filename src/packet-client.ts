@@ -4,12 +4,14 @@ import { loadPacketAddon, type PacketAddon } from './packet-addon.js'
 import type { NativeDirectUrl, NativePacketRequest, NativeSysFace } from './packet-addon.js'
 import type { QQMediaLocator } from './protocol.js'
 import {
-  decodeDirectMessageResponse, decodeFileUploadResponse, decodeHighwayResponse, decodeHighwaySessionResponse,
-  decodeImageUploadResponse, decodePrivateFileMetadataResponse, encodeDirectMessageRequest,
-  encodeFileUploadRequest, encodeHighwayFrame, encodeHighwaySessionRequest, encodeImageHighwayExt,
-  encodeImageUploadRequest, encodePrivateFileMetadataRequest,
-  HIGHWAY_BLOCK_SIZE, type DirectFileSpec, type DirectImageSpec, type HighwaySession,
+  decodeDirectMessageResponse, decodeFileUploadResponse, decodeGroupFileFeedResponse, decodeHighwayResponse, decodeHighwaySessionResponse,
+  decodeImageUploadResponse, decodePrivateFileMetadataResponse, decodeVideoUploadResponse, encodeDirectMessageRequest,
+  encodeFileUploadRequest, encodeGroupFileFeedRequest, encodeHighwayFrame, encodeHighwaySessionRequest, encodeImageHighwayExt,
+  encodeImageUploadRequest, encodePrivateFileMetadataRequest, encodeVideoHighwayExt, encodeVideoUploadRequest,
+  HIGHWAY_BLOCK_SIZE, type DirectFileSpec, type DirectImageSpec, type DirectVideoSpec,
+  type DirectVideoThumbnailSpec, type HighwaySession,
   type DirectMessagePart, type DirectMessageSendResponse, type PreparedFileUpload, type PreparedImageUpload,
+  type PreparedVideoUpload, videoThumbnailSpec, VIDEO_THUMBNAIL_BYTES,
 } from './upload-protocol.js'
 
 const PRIVATE_IMAGE_APP_ID = '1406'
@@ -52,6 +54,11 @@ export interface DirectHighwayUpload {
 export interface PreparedDirectUpload<T> {
   upload: T
   highway?: DirectHighwayUpload
+}
+
+export interface PreparedDirectVideoUpload extends PreparedDirectUpload<PreparedVideoUpload> {
+  thumbnail: DirectVideoThumbnailSpec
+  thumbnailHighway?: DirectHighwayUpload
 }
 
 /** Sends OIDB packets through QQNT's native message-service binding. */
@@ -215,6 +222,101 @@ export class QQPacketClient {
     const response = decodeDirectMessageResponse(await this.sendPacket(addon, request))
     log('info', `QQ protocol message accepted conversation=${peerUid} sequence=${response.sequence} clientSequence=${response.clientSequence}`)
     return response
+  }
+
+  async uploadVideo(
+    chatType: 1 | 2,
+    peerUid: string,
+    selfUin: string,
+    spec: DirectVideoSpec,
+    source: AsyncIterable<Uint8Array>,
+    signal?: AbortSignal,
+  ): Promise<PreparedVideoUpload> {
+    if (spec.thumbnail) {
+      throw new Error('direct video upload with a custom thumbnail requires a prepared CDN upload plan')
+    }
+    const plan = await this.prepareVideoUpload(chatType, peerUid, spec)
+    const chunks = exactBlocks(source, spec.size, HIGHWAY_BLOCK_SIZE, signal)
+    if (plan.highway) {
+      await this.uploadHighwaySource(plan.highway, selfUin, spec.size, spec.md5, chunks, signal)
+    } else {
+      for await (const _chunk of chunks) { /* drain a fast-upload request body */ }
+    }
+    if (plan.thumbnailHighway) {
+      await this.uploadHighwaySource(
+        plan.thumbnailHighway,
+        selfUin,
+        plan.thumbnail.size,
+        plan.thumbnail.md5,
+        [VIDEO_THUMBNAIL_BYTES],
+        signal,
+      )
+    }
+    return plan.upload
+  }
+
+  async prepareVideoUpload(
+    chatType: 1 | 2,
+    peerUid: string,
+    spec: DirectVideoSpec,
+  ): Promise<PreparedDirectVideoUpload> {
+    const addon = this.loadAddon()
+    const thumbnail = videoThumbnailSpec(spec)
+    const request = encodeVideoUploadRequest(chatType, peerUid, spec)
+    const upload = decodeVideoUploadResponse(await this.sendPacket(addon, request))
+    if (!upload.videoUkey && !upload.thumbnailUkey) return { upload, thumbnail }
+    const session = await this.getHighwaySession(addon)
+    return {
+      upload,
+      thumbnail,
+      ...(upload.videoUkey ? { highway: {
+        session,
+        extendInfo: encodeVideoHighwayExt(upload, 'video', spec.sha1),
+        commandId: chatType === 2 ? 1005 : 1001,
+        sequenceStart: this.reserveHighwaySequences(spec.size),
+      } } : {}),
+      ...(upload.thumbnailUkey ? { thumbnailHighway: {
+        session,
+        extendInfo: encodeVideoHighwayExt(upload, 'thumbnail', thumbnail.sha1),
+        commandId: chatType === 2 ? 1006 : 1002,
+        sequenceStart: this.reserveHighwaySequences(thumbnail.size),
+      } } : {}),
+    }
+  }
+
+  async publishGroupFile(peerUin: string, fileUuid: string): Promise<{ published: true }> {
+    const addon = this.loadAddon()
+    const request = encodeGroupFileFeedRequest(peerUin, fileUuid)
+    decodeGroupFileFeedResponse(await this.sendPacket(addon, request))
+    log('info', `QQ protocol group file published conversation=${peerUin} file=${fileUuid}`)
+    return { published: true }
+  }
+
+  private async uploadHighwaySource(
+    highway: DirectHighwayUpload,
+    selfUin: string,
+    fileSize: number,
+    fileMd5: string,
+    source: AsyncIterable<Uint8Array> | Iterable<Uint8Array>,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    let offset = 0
+    let blockIndex = 0
+    for await (const chunk of source) {
+      const frame = encodeHighwayFrame({
+        selfUin,
+        commandId: highway.commandId,
+        sequence: highway.sequenceStart + blockIndex++,
+        ticket: highway.session.ticket,
+        fileSize,
+        offset,
+        fileMd5,
+        extendInfo: highway.extendInfo,
+        body: chunk,
+      })
+      await this.uploadHighwayBlock(highway.session, selfUin, frame, signal)
+      offset += chunk.length
+    }
   }
 
   async getImageDirectUrl(locator: QQMediaLocator): Promise<string | undefined> {

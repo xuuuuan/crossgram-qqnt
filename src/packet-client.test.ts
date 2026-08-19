@@ -1,4 +1,6 @@
+import { create, toBinary } from '@bufbuild/protobuf'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import * as generated from './generated/qqnt/packet_pb.js'
 import type { KernelMsgService } from './kernel-types.js'
 import type { NativeRkey, NativeSysFace, PacketAddon } from './packet-addon.js'
 import { QQPacketClient } from './packet-client.js'
@@ -133,6 +135,25 @@ describe('QQPacketClient', () => {
       'https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=group&spec=720&rkey=old',
       '&rkey=group',
     )
+  })
+
+  it('publishes a preuploaded group file through OidbSvcTrpcTcp.0x6d9_4', async () => {
+    const f = fixture()
+    const body = toBinary(generated.GroupFileFeedResponseSchema, create(
+      generated.GroupFileFeedResponseSchema,
+      { result: { files: [{ fileUuid: 'file-uuid', busId: 102 }] } },
+    ))
+    const response = toBinary(generated.OidbEnvelopeSchema, create(
+      generated.OidbEnvelopeSchema,
+      { body },
+    ))
+    f.send.mockResolvedValue({ rspbuffer: Buffer.from(response) })
+
+    await expect(f.client.publishGroupFile('1002974327', 'file-uuid'))
+      .resolves.toEqual({ published: true })
+    expect(f.send).toHaveBeenCalledOnce()
+    expect(f.send.mock.calls[0]?.[0]).toBe('OidbSvcTrpcTcp.0x6d9_4')
+    expect(Buffer.from(f.send.mock.calls[0]![1]).includes(Buffer.from('file-uuid'))).toBe(true)
   })
 
   it('single-flights refreshes and expires the whole cache at the shortest TTL', async () => {
