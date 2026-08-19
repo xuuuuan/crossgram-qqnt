@@ -5476,7 +5476,7 @@ describe('QQBridgeServer', () => {
     const { port } = server.address()
     const base = `http://127.0.0.1:${port}/v1`
     await expect(fetch(`${base}/status`).then((response) => response.json())).resolves.toMatchObject({
-      protocolVersion: 24, ready: true, selfUin: '10000',
+      protocolVersion: 25, ready: true, selfUin: '10000',
     })
     const dialogs = await fetch(`${base}/dialogs`)
     expect(dialogs.status).toBe(200)
