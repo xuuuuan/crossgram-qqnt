@@ -194,7 +194,9 @@ function fixture() {
     fetchFavEmojiList: vi.fn<NonNullable<KernelMsgService['fetchFavEmojiList']>>(async () => ({
       result: 0, errMsg: '', emojiInfoList: [],
     })),
-    addFavEmoji: vi.fn(async () => ({ result: 0, errMsg: '', isExist: 0 })),
+    addFavEmoji: vi.fn<NonNullable<KernelMsgService['addFavEmoji']>>(async () => ({
+      result: 0, errMsg: '', isExist: 0,
+    })),
     deleteFavEmoji: vi.fn(async () => ({ result: 0, errMsg: '' })),
     fetchMarketEmoticonList: vi.fn<NonNullable<KernelMsgService['fetchMarketEmoticonList']>>(async () => ({
       result: 0, errMsg: '', marketEmoticonInfo: { roamEmojiTab: {
@@ -208,6 +210,7 @@ function fixture() {
     fetchMarketEmoticonAioImage: vi.fn(async () => ({ result: 0, errMsg: '' })),
     getMarketEmoticonPath: vi.fn<NonNullable<KernelMsgService['getMarketEmoticonPath']>>(() => new Map()),
     getMarketEmoticonEncryptKeys: vi.fn(async () => ({ result: 0, errMsg: '', encryptKeyMap: new Map() })),
+    fetchMarketEmoticonAuthDetail: vi.fn(async () => ({ result: 0, errMsg: '' })),
     getFavMarketEmoticonInfo: vi.fn(async () => ({
       result: 0, errMsg: '', favMarketEmoticonInfo: { eId: '', width: 240, height: 240, faceName: '' },
     })),
@@ -2637,6 +2640,23 @@ describe('QQKernelBridge', () => {
     const opened = await bridge.openSticker(pack!.stickers[0].reference)
     expect(opened.mimeType).toBe('image/gif')
     expect(await readStream(opened.stream)).toEqual(gif)
+
+    let favoritePath: string | undefined
+    f.msg.addFavEmoji.mockImplementation(async (request) => {
+      favoritePath = request.emojiPath
+      expect(request).toMatchObject({
+        emojiId: 'emoji-a', packageId: 42, isMarkFace: true, isOrigin: false,
+      })
+      expect(request.emojiPath).not.toBe(dynamicPath)
+      expect(await readFile(request.emojiPath)).toEqual(gif)
+      return { result: 0, errMsg: '', isExist: 0 }
+    })
+    await bridge.setSavedSticker(pack!.stickers[0].reference, true)
+    expect(f.msg.fetchMarketEmoticonAuthDetail).toHaveBeenCalledWith({
+      epId: 42, eId: 'emoji-a', scene: 0,
+    })
+    expect(favoritePath).toBeDefined()
+    expect(existsSync(favoritePath!)).toBe(false)
 
     const record = {
       ...f.message,
@@ -5373,6 +5393,43 @@ describe('QQBridgeServer', () => {
     expect(response.status).toBe(200)
     expect(new Uint8Array(await response.arrayBuffer())).toEqual(bytes)
     expect(fetchAsset).toHaveBeenCalledOnce()
+  })
+
+  it('decrypts an animated market sticker across the HTTP favorite pipeline', async () => {
+    const f = fixture()
+    const directory = await mkdtemp(join(tmpdir(), 'qqnt-http-favorite-market-'))
+    tempPaths.push(directory)
+    const dynamicPath = join(directory, 'market.gif.encrypt')
+    const gif = Buffer.from('GIF89a-http-favorite')
+    await writeFile(dynamicPath, gif.map((byte, index) => index % 50 < 20 ? ~byte : byte))
+    let favoritePath: string | undefined
+    f.msg.addFavEmoji.mockImplementation(async (request) => {
+      favoritePath = request.emojiPath
+      expect(await readFile(request.emojiPath)).toEqual(gif)
+      return { result: 0, errMsg: '', isExist: 0 }
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: directory })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/v1/stickers/saved`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+        saved: true,
+        reference: {
+          kind: 'market', packageId: '42', stickerId: 'emoji-a', name: '[Wave]', key: 'secret',
+          width: 320, height: 180, animated: true, dynamicPath,
+        },
+      }),
+    })
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toEqual({ ok: true })
+    expect(f.msg.addFavEmoji).toHaveBeenCalledWith(expect.objectContaining({
+      emojiId: 'emoji-a', packageId: 42, isMarkFace: true,
+    }))
+    expect(favoritePath).toBeDefined()
+    expect(existsSync(favoritePath!)).toBe(false)
   })
 
   it('keeps image and sticker origin IDs across the HTTP-to-WebSocket send pipeline', async () => {

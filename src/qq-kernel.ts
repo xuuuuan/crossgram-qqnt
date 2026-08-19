@@ -1,6 +1,7 @@
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { closeSync, constants as fsConstants, createReadStream, createWriteStream, existsSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { copyFile, open as openFile, readFile, rename, rm, stat } from 'node:fs/promises'
+import { copyFile, mkdtemp, open as openFile, readFile, rename, rm, stat } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { Readable, Transform } from 'node:stream'
@@ -1743,19 +1744,35 @@ export class QQKernelBridge {
         throw new Error(`fetchMarketEmoticonAuthDetail: ${authorization.errMsg} (${authorization.result})`)
       }
     }
-    const path = reference.kind === 'favorite'
-      ? reference.path
-      : (await this.resolveMarketStickerPath(reference)).path
-    if (!path) throw new Error('QQ sticker has no native file path')
-    const result = await service.addFavEmoji(reference.kind === 'market' ? {
-      emojiId: reference.stickerId, packageId: Number(reference.packageId), emojiPath: path,
-      fileSize: '0', fileName: '', md5: '', isMarkFace: true, isOrigin: false,
-    } : {
-      emojiId: '', packageId: 0, emojiPath: path,
-      fileSize: String(reference.size ?? (existsSync(path) ? statSync(path).size : 0)),
-      fileName: reference.name, md5: reference.md5 ?? '', isMarkFace: false, isOrigin: true,
-    })
-    if (result.result !== 0) throw new Error(`addFavEmoji: ${result.errMsg} (${result.result})`)
+    let temporaryDirectory: string | undefined
+    try {
+      let path: string
+      if (reference.kind === 'favorite') {
+        path = reference.path
+      } else {
+        const resolved = await this.resolveMarketStickerPath(reference)
+        path = resolved.path
+        if (resolved.encrypted) {
+          temporaryDirectory = await mkdtemp(join(tmpdir(), 'qqnt-favorite-sticker-'))
+          const mimeType = stickerFileMimeType(resolved.path, true, resolved.animated)
+          const extension = mimeType === 'image/gif' ? '.gif' : mimeType === 'image/apng' ? '.apng' : '.png'
+          path = join(temporaryDirectory, `sticker${extension}`)
+          await pipeline(fileStream(resolved.path, true), createWriteStream(path))
+        }
+      }
+      if (!path) throw new Error('QQ sticker has no native file path')
+      const result = await service.addFavEmoji(reference.kind === 'market' ? {
+        emojiId: reference.stickerId, packageId: Number(reference.packageId), emojiPath: path,
+        fileSize: '0', fileName: '', md5: '', isMarkFace: true, isOrigin: false,
+      } : {
+        emojiId: '', packageId: 0, emojiPath: path,
+        fileSize: String(reference.size ?? (existsSync(path) ? statSync(path).size : 0)),
+        fileName: reference.name, md5: reference.md5 ?? '', isMarkFace: false, isOrigin: true,
+      })
+      if (result.result !== 0) throw new Error(`addFavEmoji: ${result.errMsg} (${result.result})`)
+    } finally {
+      if (temporaryDirectory) await rm(temporaryDirectory, { recursive: true, force: true })
+    }
     this.invalidateFavoriteStickerPack()
   }
 
