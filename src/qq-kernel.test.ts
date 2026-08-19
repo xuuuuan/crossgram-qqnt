@@ -3370,6 +3370,77 @@ describe('QQKernelBridge', () => {
     expect(f.msg.deleteFavEmoji).toHaveBeenCalledWith(['fav-res'])
   })
 
+  it('probes and caches missing remote favorite dimensions without downloading the full asset', async () => {
+    const f = fixture()
+    const png = completePng(512, 286)
+    const gif = Buffer.alloc(10)
+    gif.write('GIF89a', 0, 'ascii')
+    gif.writeUInt16LE(320, 6)
+    gif.writeUInt16LE(180, 8)
+    f.msg.fetchFavEmojiList.mockResolvedValue({
+      result: 0, errMsg: '', emojiInfoList: [{
+        emoPath: '', isExist: false, resId: 'remote-png', url: 'https://cdn.example/remote.png', md5: 'png-md5',
+        emoOriginalPath: '', thumbPath: '', isAPNG: false, isMarkFace: false,
+        eId: '', epId: '', desc: 'Wide PNG',
+      }, {
+        emoPath: '', isExist: false, resId: 'remote-gif', url: 'https://cdn.example/remote.gif', md5: 'gif-md5',
+        emoOriginalPath: '', thumbPath: '', isAPNG: false, isMarkFace: false,
+        eId: '', epId: '', desc: 'Wide GIF',
+      }],
+    })
+    const fetchAsset = vi.fn(async (input: string | URL | Request, _init?: RequestInit) => {
+      const bytes = String(input).endsWith('.gif') ? gif : png
+      const total = String(input).endsWith('.gif') ? 98_765 : 12_345
+      return new Response(bytes, {
+        status: 206,
+        headers: {
+          'content-type': String(input).endsWith('.gif') ? 'image/gif' : 'image/png',
+          'content-range': `bytes 0-${bytes.length - 1}/${total}`,
+        },
+      })
+    })
+    vi.stubGlobal('fetch', fetchAsset)
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    const first = await bridge.getSavedStickers()
+    const second = await bridge.getSavedStickers()
+
+    expect(first.stickers).toMatchObject([{
+      stickerId: 'favorite:remote-png', format: 'static', mimeType: 'image/png',
+      width: 512, height: 286, size: 12_345, version: 2,
+      reference: { width: 512, height: 286, size: 12_345, mimeType: 'image/png' },
+    }, {
+      stickerId: 'favorite:remote-gif', format: 'animated', mimeType: 'image/gif',
+      width: 320, height: 180, size: 98_765, version: 2,
+      reference: { width: 320, height: 180, size: 98_765, mimeType: 'image/gif' },
+    }])
+    expect(second.stickers).toMatchObject(first.stickers)
+    expect(fetchAsset).toHaveBeenCalledTimes(2)
+    for (const [, init] of fetchAsset.mock.calls) {
+      expect(init).toMatchObject({ headers: { range: 'bytes=0-262143' } })
+      expect(init?.signal).toBeInstanceOf(AbortSignal)
+    }
+  })
+
+  it('keeps an unavailable remote favorite in the collection when metadata probing fails', async () => {
+    const f = fixture()
+    f.msg.fetchFavEmojiList.mockResolvedValue({
+      result: 0, errMsg: '', emojiInfoList: [{
+        emoPath: '', isExist: false, resId: 'unavailable', url: 'https://cdn.example/unavailable.png', md5: '',
+        emoOriginalPath: '', thumbPath: '', isAPNG: false, isMarkFace: false,
+        eId: '', epId: '', desc: 'Unavailable',
+      }],
+    })
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 503 })))
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.getSavedStickers()).resolves.toMatchObject({
+      stickers: [{ stickerId: 'favorite:unavailable', width: undefined, height: undefined }],
+    })
+  })
+
   it('refreshes only the first page of the native QQ favorite collection', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
@@ -5543,6 +5614,49 @@ describe('QQBridgeServer', () => {
     expect(response.status).toBe(200)
     expect(new Uint8Array(await response.arrayBuffer())).toEqual(bytes)
     expect(fetchAsset).toHaveBeenCalledOnce()
+  })
+
+  it('preserves a remote QQ favorite aspect ratio across the HTTP collection pipeline', async () => {
+    const f = fixture()
+    f.msg.fetchFavEmojiList.mockResolvedValue({
+      result: 0, errMsg: '', emojiInfoList: [{
+        emoPath: '/missing/wide.png', isExist: false, resId: 'wide-favorite',
+        url: 'https://cdn.example/wide-favorite.png', md5: 'wide-md5',
+        emoOriginalPath: '', thumbPath: '', isAPNG: false, isMarkFace: false,
+        eId: '', epId: '', desc: 'Wide favorite',
+      }],
+    })
+    const originalFetch = globalThis.fetch
+    const png = completePng(640, 360)
+    const fetchAsset = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) => new Response(png, {
+      status: 206,
+      headers: {
+        'content-type': 'image/png',
+        'content-range': `bytes 0-${png.length - 1}/54321`,
+      },
+    }))
+    vi.spyOn(globalThis, 'fetch').mockImplementation((input: string | URL | Request, init?: RequestInit) =>
+      String(input) === 'https://cdn.example/wide-favorite.png'
+        ? fetchAsset(input, init)
+        : originalFetch(input, init))
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/v1/stickers/saved`)
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toMatchObject({
+      stickers: [{
+        stickerId: 'favorite:wide-favorite', width: 640, height: 360, size: 54_321, version: 2,
+        reference: { width: 640, height: 360, size: 54_321, mimeType: 'image/png' },
+      }],
+    })
+    expect(fetchAsset).toHaveBeenCalledWith(
+      'https://cdn.example/wide-favorite.png',
+      expect.objectContaining({ headers: { range: 'bytes=0-262143' } }),
+    )
   })
 
   it('decrypts an animated market sticker across the HTTP favorite pipeline', async () => {
