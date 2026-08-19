@@ -1171,6 +1171,26 @@ export class QQKernelBridge {
     this.updateGroupMsgMask(groupCode, mask)
   }
 
+  async setMemberRole(
+    conversation: QQConversation,
+    userId: string,
+    role: 'administrator' | 'member',
+  ): Promise<void> {
+    if (conversation.chatType !== CHAT_GROUP) throw new Error('member roles are only supported for group conversations')
+    if (!userId) throw new Error('member user id is required')
+    const groupService = this.requireGroupService()
+    const method = groupService.modifyMemberRole
+    if (!method) throw new Error('QQNT does not expose modifyMemberRole')
+    const nativeRole = role === 'administrator' ? MEMBER_ADMIN : 2
+    const groupCode = conversation.peerUin || conversation.peerUid
+    log('info', `native API start name=modifyMemberRole group=${groupCode} user=${userId} role=${nativeRole}`)
+    const result = await method.call(groupService, groupCode, userId, nativeRole)
+    log('info', `native API complete name=modifyMemberRole group=${groupCode} user=${userId} role=${nativeRole} result=${result.result} err=${JSON.stringify(result.errMsg)}`)
+    if (result.result !== 0) {
+      throw new Error(`modifyMemberRole: ${result.errMsg} (${result.result})`)
+    }
+  }
+
   private async hydrateRecentTopMessage(conversation: QQConversation): Promise<QQConversation> {
     const target = this.recentTopMessages.get(conversation.id)
     if (!target || conversation.lastMessage?.id === target.id) return conversation

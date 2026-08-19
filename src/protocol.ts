@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 24
+export const PROTOCOL_VERSION = 25
 
 /** Local Unix-socket PCM media protocol. Audio frames use a 1-byte type plus a 4-byte big-endian length. */
 export const PCM_MEDIA_PROTOCOL_VERSION = 1

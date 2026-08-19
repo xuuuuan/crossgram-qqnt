@@ -286,6 +286,7 @@ function fixture() {
       return { result: 0, errMsg: 'success' }
     }),
     setGroupMsgMask: vi.fn<NonNullable<KernelGroupService['setGroupMsgMask']>>(async () => ({ result: 0, errMsg: 'success' })),
+    modifyMemberRole: vi.fn<NonNullable<KernelGroupService['modifyMemberRole']>>(async () => ({ result: 0, errMsg: 'success' })),
     createMemberListScene: vi.fn(() => 'scene'), destroyMemberListScene: vi.fn(),
     getNextMemberList: vi.fn(async () => ({
       errCode: 0, errMsg: '', result: {
@@ -3911,6 +3912,35 @@ describe('QQKernelBridge', () => {
     })
   })
 
+  it('maps administrator promotion and demotion to QQ native member roles', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const conversation = bridge.getConversation('1058754719')
+
+    await bridge.setMemberRole(conversation, 'member/opaque', 'administrator')
+    await bridge.setMemberRole(conversation, 'member/opaque', 'member')
+
+    expect(f.group.modifyMemberRole).toHaveBeenNthCalledWith(1, '1058754719', 'member/opaque', 3)
+    expect(f.group.modifyMemberRole).toHaveBeenNthCalledWith(2, '1058754719', 'member/opaque', 2)
+  })
+
+  it('fails closed when QQ cannot mutate a member role', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const group = bridge.getConversation('1058754719')
+
+    f.group.modifyMemberRole.mockResolvedValueOnce({ result: 120101005, errMsg: 'not owner' })
+    await expect(bridge.setMemberRole(group, 'member', 'administrator'))
+      .rejects.toThrow('modifyMemberRole: not owner (120101005)')
+
+    const direct = { ...group, id: '1:member', kind: 'direct' as const, chatType: 1 as const }
+    await expect(bridge.setMemberRole(direct, 'member', 'administrator'))
+      .rejects.toThrow('member roles are only supported for group conversations')
+    expect(f.group.modifyMemberRole).toHaveBeenCalledTimes(1)
+  })
+
   it('keeps native member cursors opaque and reports the group profile total on every page', async () => {
     const f = fixture()
     f.group.getNextMemberList
@@ -6271,6 +6301,60 @@ describe('QQBridgeServer', () => {
       expect(response.status).toBe(503)
       const body = await response.json() as { error: string }
       expect(body.error).toMatch(/setGroupMsgMask/)
+    })
+  })
+
+  describe('member-role endpoint', () => {
+    it('promotes and demotes an encoded QQ member through the native API', async () => {
+      const f = fixture()
+      const bridge = new QQKernelBridge()
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      server = new QQBridgeServer(bridge, { port: 0 })
+      await server.start()
+      const base = `http://127.0.0.1:${server.address().port}/v1/conversations/${encodeURIComponent('2:1058754719')}/members/${encodeURIComponent('member/opaque')}/role`
+
+      const promote = await fetch(base, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ role: 'administrator' }),
+      })
+      const demote = await fetch(base, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ role: 'member' }),
+      })
+
+      expect(promote.status).toBe(200)
+      await expect(promote.json()).resolves.toEqual({
+        ok: true, conversationId: '2:1058754719', userId: 'member/opaque', role: 'administrator',
+      })
+      expect(demote.status).toBe(200)
+      expect(f.group.modifyMemberRole).toHaveBeenNthCalledWith(1, '1058754719', 'member/opaque', 3)
+      expect(f.group.modifyMemberRole).toHaveBeenNthCalledWith(2, '1058754719', 'member/opaque', 2)
+    })
+
+    it('rejects invalid roles before invoking QQ and maps native denial to 502', async () => {
+      const f = fixture()
+      const bridge = new QQKernelBridge()
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      server = new QQBridgeServer(bridge, { port: 0 })
+      await server.start()
+      const endpoint = `http://127.0.0.1:${server.address().port}/v1/conversations/${encodeURIComponent('2:1058754719')}/members/member/role`
+
+      const invalid = await fetch(endpoint, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ role: 'owner' }),
+      })
+      expect(invalid.status).toBe(400)
+      expect(f.group.modifyMemberRole).not.toHaveBeenCalled()
+
+      f.group.modifyMemberRole.mockResolvedValueOnce({ result: 120101005, errMsg: 'not owner' })
+      const denied = await fetch(endpoint, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ role: 'administrator' }),
+      })
+      expect(denied.status).toBe(502)
+      await expect(denied.json()).resolves.toEqual({
+        error: 'modifyMemberRole: not owner (120101005)',
+      })
     })
   })
 })

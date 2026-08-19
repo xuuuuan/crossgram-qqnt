@@ -516,6 +516,35 @@ export class QQBridgeServer {
       return
     }
 
+    const memberRoleMatch = /^\/v1\/conversations\/([^/]+)\/members\/([^/]+)\/role$/.exec(path)
+    if (request.method === 'POST' && memberRoleMatch) {
+      const conversation = this.bridge.getConversation(decodeURIComponent(memberRoleMatch[1]))
+      const userId = decodeURIComponent(memberRoleMatch[2])
+      const body = await readJson<{ role?: unknown }>(request)
+      if (body?.role !== 'administrator' && body?.role !== 'member') {
+        json(response, 400, { error: 'role must be administrator or member' })
+        return
+      }
+      if (conversation.chatType !== 2) {
+        json(response, 400, { error: 'member roles are only supported for group conversations' })
+        return
+      }
+      try {
+        await this.bridge.setMemberRole(conversation, userId, body.role)
+      } catch (error) {
+        const message = errorMessage(error)
+        if (/not ready|unavailable|expose/i.test(message)) {
+          json(response, 503, { error: message })
+        } else {
+          json(response, 502, { error: message })
+        }
+        return
+      }
+      log('info', `HTTP API set member role id=${requestId} conversation=${conversation.id} user=${userId} role=${body.role}`)
+      json(response, 200, { ok: true, conversationId: conversation.id, userId, role: body.role })
+      return
+    }
+
     const conversationMatch = /^\/v1\/conversations\/([^/]+)(?:\/(history|members|search))?$/.exec(path)
     if (request.method === 'GET' && conversationMatch) {
       const conversation = this.bridge.getConversation(decodeURIComponent(conversationMatch[1]))

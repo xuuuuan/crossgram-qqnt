@@ -783,6 +783,8 @@ export interface KernelGroupService {
    * a native failure. Verified against the public stub signature only.
    */
   setGroupMsgMask?(groupCode: string, mask: GroupMsgMask): Promise<{ result: number, errMsg: string }>
+  /** Set or revoke QQ group administrator status. Native roles are Member=2 and Admin=3. */
+  modifyMemberRole?(groupCode: string, uid: string, role: 2 | 3): Promise<{ result: number, errMsg: string }>
   createMemberListScene(groupCode: string, scene: string): string
   destroyMemberListScene(sceneId: string): void
   getNextMemberList(sceneId: string, lastId: { uid: string, index: number }, count: number): Promise<{
