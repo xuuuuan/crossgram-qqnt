@@ -1664,6 +1664,48 @@ describe('QQKernelBridge', () => {
     expect(messages.every((message) => message.telegramMessageId === undefined)).toBe(true)
   })
 
+  it('drops zero-peer sidecars while preserving the paired group service message', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const queue = bridge.subscribe()
+    const events = queue[Symbol.asyncIterator]()
+
+    const serviceMessage: MsgRecord = {
+      ...f.message,
+      msgId: 'group-service', msgSeq: '3890313', chatType: 2,
+      sendType: 0,
+      peerUid: '810303476', peerUin: '810303476', peerName: 'BeatSaber',
+      senderUid: '0', senderUin: '0', sendNickName: '0',
+      elements: [{
+        elementType: 8, elementId: 'notice', grayTipElement: {
+          proclamationElement: { isSetProclamation: 1 },
+        },
+      }],
+    }
+    const invalidSidecar: MsgRecord = {
+      ...serviceMessage,
+      msgId: 'group-service-sidecar', peerUid: '0', peerUin: '0', peerName: '0', elements: [],
+    }
+
+    f.emitReceived([invalidSidecar, serviceMessage])
+
+    await expect(events.next()).resolves.toMatchObject({
+      value: {
+        type: 'message',
+        conversation: { id: '810303476', title: 'BeatSaber' },
+        message: {
+          id: 'group-service', conversationId: '810303476',
+          serviceAction: { type: 'custom', text: '群公告已更新' },
+        },
+      },
+    })
+    await expect(bridge.getDialogs()).resolves.toMatchObject({
+      conversations: expect.not.arrayContaining([{ id: '0' }]),
+    })
+    bridge.unsubscribe(queue)
+  })
+
   it('maps AV record elements to structured phone-call service actions', async () => {
     const f = fixture()
     f.message.elements = [{

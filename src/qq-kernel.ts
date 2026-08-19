@@ -4263,6 +4263,13 @@ export class QQKernelBridge {
     await this.resolveGrayTipUsers(records)
     for (const record of records) {
       if (record.chatType !== CHAT_C2C && record.chatType !== CHAT_GROUP) continue
+      if (!hasUsableMessagePeer(record)) {
+        log(
+          'warn',
+          `native message ignored source=${source} reason=invalid-peer id=${record.msgId} seq=${record.msgSeq ?? ''} peer=${JSON.stringify(record.peerUid)} chatType=${record.chatType} elements=${record.elements?.length ?? 0}`,
+        )
+        continue
+      }
       this.rememberRecordSender(record)
       const outgoing = record.senderUid === this.config?.selfUid || SEND_FROM_SELF.has(record.sendType)
       log('info', `native message event source=${source} id=${record.msgId} seq=${record.msgSeq ?? ''} peer=${record.peerUid} chatType=${record.chatType} outgoing=${outgoing} status=${record.sendStatus} elements=${record.elements?.length ?? 0} reactions=${record.emojiLikesList?.length ?? 0}`)
@@ -7173,6 +7180,11 @@ function recordTextContent(record: MsgRecord): string {
 function isRecalledRecord(record: MsgRecord): boolean {
   return ( record.elements?.some((element) => element.grayTipElement?.revokeElement) ?? false
   )
+}
+
+function hasUsableMessagePeer(record: MsgRecord): boolean {
+  const peerUid = record.peerUid.trim()
+  return peerUid !== '' && peerUid !== '0'
 }
 
 function multiForwardTitle(element: NonNullable<MsgElement['multiForwardMsgElement']>): string {
