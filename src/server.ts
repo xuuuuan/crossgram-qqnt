@@ -6,15 +6,17 @@ import type { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import WebSocket, { WebSocketServer } from 'ws'
 import {
-  PROTOCOL_VERSION, type QQMediaLocator, type QQMultiForwardLocator, type QQSendMediaSpec, type QQStickerReference, type SendManifest,
+  PROTOCOL_VERSION, type QQFlashTransferManifest, type QQMediaLocator, type QQMultiForwardLocator, type QQSendMediaSpec, type QQStickerReference, type SendManifest,
 } from './protocol.js'
 import { GroupMsgMask } from './kernel-types.js'
-import { QQKernelBridge, QQMediaLeaseAuthorizationError,
+import { QQFlashTransferError, QQFlashTransferUnavailableError, QQKernelBridge, QQMediaLeaseAuthorizationError,
   QQMediaLeaseUnavailableError, QQRequestApiUnavailableError, QQRequestConflictError, QQRequestCursorError, QQRequestRefreshError, QQRequestResolutionError, QQRequestSessionChangedError, QQRequestUnsupportedError,
   QQStickerAssetNotFoundError ,
 } from './qq-kernel.js'
 import { log, recordSlowHttpRequest, slowHttpLogPath } from './log.js'
 import type { QQLoginController } from './login-controller.js'
+
+const MAX_FLASH_TRANSFER_BYTES = 100 * 1024 ** 3
 
 export interface BridgeServerOptions {
   host?: string
@@ -601,6 +603,27 @@ export class QQBridgeServer {
       json(response, 200, plan)
       return
     }
+    if (request.method === 'POST' && path === '/v1/flash-transfers') {
+      let manifest: QQFlashTransferManifest
+      try {
+        manifest = decodeFlashTransferManifest(request.headers['x-qqnt-flash-manifest'])
+      } catch (error) {
+        request.resume()
+        json(response, 400, { error: errorMessage(error) })
+        return
+      }
+      log('info', `HTTP API flash transfer start id=${requestId} files=${manifest.files.length} bytes=${manifest.files.reduce((sum, file) => sum + file.size, 0)}`)
+      try {
+        const result = await this.bridge.createFlashTransfer(manifest, request)
+        log('info', `HTTP API flash transfer complete id=${requestId} fileSet=${result.fileSetId}`)
+        json(response, 200, result)
+      } catch (error) {
+        if (error instanceof QQFlashTransferUnavailableError) json(response, 503, { error: error.message })
+        else if (error instanceof QQFlashTransferError) json(response, 502, { error: error.message })
+        else throw error
+      }
+      return
+    }
     if (request.method === 'POST' && path === '/v1/messages') {
       const manifest = decodeManifest(request.headers['x-qqnt-manifest'])
       const contentLength = Number(request.headers['content-length'])
@@ -954,6 +977,29 @@ function decodeManifest(value: string | string[] | undefined): SendManifest {
   if (typeof value !== 'string') throw new Error('x-qqnt-manifest is required')
   const manifest = JSON.parse(Buffer.from(value, 'base64url').toString()) as SendManifest
   if (!manifest || typeof manifest.conversationId !== 'string') throw new Error('invalid send manifest')
+  return manifest
+}
+
+function decodeFlashTransferManifest(value: string | string[] | undefined): QQFlashTransferManifest {
+  if (typeof value !== 'string') throw new Error('x-qqnt-flash-manifest is required')
+  const manifest = JSON.parse(Buffer.from(value, 'base64url').toString()) as QQFlashTransferManifest
+  if (!manifest || manifest.framing !== 'length-prefixed-v1' || !Array.isArray(manifest.files)
+    || manifest.files.length < 1 || manifest.files.length > 100) {
+    throw new Error('invalid flash transfer manifest')
+  }
+  if (manifest.name !== undefined && (typeof manifest.name !== 'string' || manifest.name.length > 255)) {
+    throw new Error('invalid flash transfer name')
+  }
+  for (const file of manifest.files) {
+    if (!file || typeof file.name !== 'string' || !file.name || file.name.length > 255
+      || !Number.isSafeInteger(file.size) || file.size < 0) {
+      throw new Error('invalid flash transfer file')
+    }
+  }
+  const totalBytes = manifest.files.reduce((sum, file) => sum + file.size, 0)
+  if (!Number.isSafeInteger(totalBytes) || totalBytes > MAX_FLASH_TRANSFER_BYTES) {
+    throw new Error('flash transfer is too large')
+  }
   return manifest
 }
 

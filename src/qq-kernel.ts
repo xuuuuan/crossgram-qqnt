@@ -1,6 +1,6 @@
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { closeSync, constants as fsConstants, createReadStream, createWriteStream, existsSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { copyFile, mkdtemp, open as openFile, readFile, rename, rm, stat } from 'node:fs/promises'
+import { copyFile, mkdir, mkdtemp, open as openFile, readFile, readdir, rename, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { pipeline } from 'node:stream/promises'
@@ -20,12 +20,12 @@ import { decodePttTo, encodePtt, MAX_VOICE_INPUT_BYTES, transcodePttFallbackTo }
 import {
   GroupMsgMask,
   type BuddyRequest, type CustomEmotionData, type DoubtBuddyReqChange, type DoubtBuddyRequest, type EmojiLikesUserInfo, type FileTransNotifyInfo, type GroupMsgMaskInfo, type GroupNotify, type GroupProfileInfo,
-  type InitSessionConfig, type KernelAVSDKService, type KernelModule, type KernelSession, type MarketStickerPackInfo, type MemberInfo, type MsgElement,
+  type InitSessionConfig, type KernelAVSDKService, type KernelFlashTransferService, type KernelModule, type KernelSession, type MarketStickerPackInfo, type MemberInfo, type MsgElement,
   type MsgRecord, type ProfileSimpleInfo, type RecentContactInfo, type SearchMsgKeywordsResult,
 } from './kernel-types.js'
 import {
   conversationId, parseConversationId, type HistoryQuery, type MemberPage, type QQCallSignalEvent, type QQCard, type QQConversation, type QQEvent, type QQMedia, type QQMediaLocator, type QQMediaUploadPlan, type QQMessage, type QQMultiForwardLocator, type QQReactionActorPage, type QQReactionContext, type QQReactionDefinition, type QQReactionState,
-  type QQGroupJoinContractProbe, type QQGroupJoinContractProbeMethod, type QQRequest, type QQRequestKind, type QQRequestPage, type QQRequestStatus, type QQSendMediaSpec, type QQSticker, type QQStickerPack, type QQStickerPackSummary, type QQStickerReference, type QQTextPart, type SearchPage, type SearchQuery, type SendManifest,
+  type QQFlashTransferManifest, type QQFlashTransferResult, type QQGroupJoinContractProbe, type QQGroupJoinContractProbeMethod, type QQRequest, type QQRequestKind, type QQRequestPage, type QQRequestStatus, type QQSendMediaSpec, type QQSticker, type QQStickerPack, type QQStickerPackSummary, type QQStickerReference, type QQTextPart, type SearchPage, type SearchQuery, type SendManifest,
 } from './protocol.js'
 
 const CHAT_C2C = 1
@@ -39,6 +39,7 @@ const ELEMENT_MARKET_FACE = 11
 const ELEMENT_MULTI_FORWARD = 16
 const ELEMENT_AV_RECORD = 21
 const QQ_VOICE_WAVE_AMPLITUDES = [0, 18, 9, 23, 16, 17, 16, 15, 44, 17, 24, 20, 14, 15, 17]
+const FLASH_TRANSFER_RETENTION_MS = 8 * 24 * 60 * 60_000
 const SEND_FROM_SELF = new Set([1, 2])
 const MEMBER_ADMIN = 3
 const MEMBER_OWNER = 4
@@ -190,6 +191,20 @@ export class QQRequestSessionChangedError extends Error {
   constructor() {
     super('QQNT request session changed during resolution')
     this.name = 'QQRequestSessionChangedError'
+  }
+}
+
+export class QQFlashTransferUnavailableError extends Error {
+  constructor() {
+    super('QQNT flash transfer API is unavailable')
+    this.name = 'QQFlashTransferUnavailableError'
+  }
+}
+
+export class QQFlashTransferError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'QQFlashTransferError'
   }
 }
 
@@ -393,6 +408,7 @@ export class QQKernelBridge {
   private avsdkListenerRetry?: NodeJS.Timeout
   private readonly tempPath: string
   private readonly voiceCachePath: string
+  private readonly flashTransferPath: string
   private readonly voicePreparations = new Map<string, Promise<QQMedia | undefined>>()
   private readonly sendTimeoutMs: number
   private readonly userResolveTimeoutMs: number
@@ -416,6 +432,7 @@ export class QQKernelBridge {
     }
     this.tempPath = options.tempPath ?? join(process.env.TMPDIR ?? '/tmp', 'qqnt-mtproto-bridge')
     this.voiceCachePath = join(this.tempPath, 'voice-cache')
+    this.flashTransferPath = join(this.tempPath, 'flash-transfer')
     this.sendTimeoutMs = options.sendTimeoutMs ?? 60_000
     this.userResolveTimeoutMs = options.userResolveTimeoutMs ?? 2_000
     this.packetClientOptions = options.packetClient ?? {}
@@ -439,6 +456,7 @@ export class QQKernelBridge {
     }
     mkdirSync(this.tempPath, { recursive: true })
     this.clearVoiceCache()
+    this.pruneFlashTransferFiles()
   }
 
   get status() {
@@ -462,6 +480,73 @@ export class QQKernelBridge {
 
   get voiceInputLimit(): number {
     return this.voiceInputLimitBytes
+  }
+
+  async createFlashTransfer(
+    manifest: QQFlashTransferManifest,
+    body: Readable,
+  ): Promise<QQFlashTransferResult> {
+    const service = this.requireFlashTransferService()
+    const directory = join(this.flashTransferPath, `${Date.now()}-${randomUUID()}`)
+    const reader = new FramedUploadReader(body)
+    const paths: string[] = []
+    try {
+      await mkdir(directory, { recursive: true })
+      for (const [index, file] of manifest.files.entries()) {
+        const fileDirectory = join(directory, String(index).padStart(4, '0'))
+        await mkdir(fileDirectory)
+        const path = join(fileDirectory, safeFlashTransferName(file.name))
+        await pipeline(
+          Readable.from(verifiedFlashTransferFile(reader.media(index), file.size, file.name)),
+          createWriteStream(path, { flags: 'wx' }),
+        )
+        paths.push(path)
+      }
+      await reader.finish()
+      const config = this.requireConfig()
+      const result = await service.createFlashTransferUploadTask(Date.now(), {
+        screen: 1,
+        name: manifest.name?.trim() || manifest.files[0]?.name || '',
+        uploaders: [{
+          uin: config.selfUin,
+          uid: config.selfUid,
+          nickname: this.users.get(config.selfUid)?.name ?? '',
+          sendEntrance: '',
+        }],
+        coverPath: '',
+        paths,
+        excludePaths: [],
+        expireLeftTime: 0,
+        isNeedDelDeviceInfo: false,
+        isNeedDelLocation: false,
+        coverOriginalInfos: paths[0] ? [{ path: paths[0], thumbnailPath: '' }] : [],
+        uploadSceneType: 10,
+        detectPrivacyInfoResult: { exists: false, allDetectResults: new Map() },
+      })
+      if (result.result !== 0 || !result.createFlashTransferResult?.fileSetId) {
+        throw new QQFlashTransferError(`QQ flash transfer creation failed (${result.result})`)
+      }
+      const created = result.createFlashTransferResult
+      let shareLink = created.shareLink
+      let expiresAt = flashTransferExpiry(created.expireTime)
+      if (!shareLink && service.getShareLinkReq) {
+        const shared = await service.getShareLinkReq(created.fileSetId)
+        if (shared.result !== 0 || !shared.shareLink) {
+          throw new QQFlashTransferError(`QQ flash transfer share link failed (${shared.result})`)
+        }
+        shareLink = shared.shareLink
+        expiresAt ??= flashTransferExpiry(shared.expireTimestamp)
+      }
+      if (!shareLink) throw new QQFlashTransferError('QQ flash transfer did not return a share link')
+      const timer = setTimeout(() => {
+        void rm(directory, { recursive: true, force: true })
+      }, FLASH_TRANSFER_RETENTION_MS)
+      timer.unref()
+      return { fileSetId: created.fileSetId, shareLink, ...(expiresAt ? { expiresAt } : {}) }
+    } catch (error) {
+      await rm(directory, { recursive: true, force: true }).catch(() => undefined)
+      throw error
+    }
   }
 
   issueMediaLease(callId: unknown): PCMMediaLease {
@@ -2963,6 +3048,20 @@ export class QQKernelBridge {
     mkdirSync(this.voiceCachePath, { recursive: true, mode: 0o700 })
   }
 
+  private pruneFlashTransferFiles(): void {
+    mkdirSync(this.flashTransferPath, { recursive: true, mode: 0o700 })
+    void (async () => {
+      const entries = await readdir(this.flashTransferPath, { withFileTypes: true })
+      await Promise.all(entries.filter((entry) => entry.isDirectory()).map(async (entry) => {
+        const path = join(this.flashTransferPath, entry.name)
+        const info = await stat(path).catch(() => undefined)
+        if (info && Date.now() - info.mtimeMs > FLASH_TRANSFER_RETENTION_MS) {
+          await rm(path, { recursive: true, force: true })
+        }
+      }))
+    })().catch((error) => log('error', 'flash transfer staging cleanup failed', error))
+  }
+
   private trustedMediaRoots(): string[] {
     return [
       this.config?.userPath,
@@ -5453,6 +5552,12 @@ export class QQKernelBridge {
     return (this.searchService = service)
   }
 
+  private requireFlashTransferService(): KernelFlashTransferService {
+    const service = this.requireSession().getFlashTransferService?.()
+    if (!service?.createFlashTransferUploadTask) throw new QQFlashTransferUnavailableError()
+    return service
+  }
+
   private getAvatarService(): NonNullable<ReturnType<NonNullable<KernelSession['getAvatarService']>>> | undefined {
     if (this.avatarService) return this.avatarService
     try {
@@ -6055,6 +6160,37 @@ function safeCancelSearch(
 
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds))
+}
+
+function safeFlashTransferName(value: string): string {
+  const leaf = basename(value.replace(/\0/gu, '')).replace(/[<>:"/\\|?*\u0000-\u001f]/gu, '_')
+    .replace(/[. ]+$/u, '').slice(0, 180)
+  if (!leaf || leaf === '.' || leaf === '..') return 'file'
+  return /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/iu.test(leaf) ? `_${leaf}` : leaf
+}
+
+async function* verifiedFlashTransferFile(
+  source: AsyncIterable<Buffer>,
+  expectedSize: number,
+  name: string,
+): AsyncIterable<Buffer> {
+  let size = 0
+  for await (const chunk of source) {
+    size += chunk.length
+    if (size > expectedSize) throw new Error(`flash transfer file exceeds declared size: ${name}`)
+    yield chunk
+  }
+  if (size !== expectedSize) {
+    throw new Error(`flash transfer file size mismatch for ${name}: expected ${expectedSize}, received ${size}`)
+  }
+}
+
+function flashTransferExpiry(value: string | undefined): number | undefined {
+  if (!value) return
+  const raw = Number(value)
+  if (!Number.isFinite(raw) || raw <= 0) return
+  const milliseconds = raw >= 1_000_000_000_000 ? raw : raw * 1_000
+  return milliseconds > Date.now() ? milliseconds : undefined
 }
 
 class FramedUploadReader {

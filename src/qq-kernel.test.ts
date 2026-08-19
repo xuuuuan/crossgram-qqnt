@@ -9,7 +9,7 @@ import { execFile } from 'node:child_process'
 import { promisify, types } from 'node:util'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import WebSocket from 'ws'
-import { GroupMsgMask, type ContactMsgBoxInfo, type KernelBuddyService, type KernelGroupService, type KernelModule, type KernelMsgService, type KernelSession, type MsgElement, type MsgRecord } from './kernel-types.js'
+import { GroupMsgMask, type ContactMsgBoxInfo, type KernelBuddyService, type KernelFlashTransferService, type KernelGroupService, type KernelModule, type KernelMsgService, type KernelSession, type MsgElement, type MsgRecord } from './kernel-types.js'
 import type { PacketAddon } from './packet-addon.js'
 import { parseConversationId, type QQEvent } from './protocol.js'
 import { QQKernelBridge } from './qq-kernel.js'
@@ -39,6 +39,17 @@ function completePng(width: number, height: number, padding = 0): Buffer {
   Buffer.from([0, 0, 0, 0, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82])
     .copy(bytes, bytes.length - 12)
   return bytes
+}
+
+function framedUpload(...files: Uint8Array[]): Buffer {
+  const chunks: Buffer[] = []
+  for (const file of files) {
+    const bytes = Buffer.from(file)
+    const header = Buffer.alloc(4)
+    header.writeUInt32BE(bytes.length)
+    chunks.push(header, bytes, Buffer.alloc(4))
+  }
+  return Buffer.concat(chunks)
 }
 
 function packetAddonFixture(): PacketAddon {
@@ -558,6 +569,22 @@ describe('QQKernelBridge', () => {
       1, 'uid-1715311957', '1715311957', [{ kind: 'text', text: 'hello' }], 'self',
     )
     expect(f.msg.sendMsg).not.toHaveBeenCalled()
+  })
+
+  it('rejects a flash-transfer stream whose framed bytes do not match the declared file size', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'qqnt-flash-unit-'))
+    tempPaths.push(directory)
+    const f = fixture()
+    const createFlashTransferUploadTask = vi.fn<KernelFlashTransferService['createFlashTransferUploadTask']>()
+    ;(f.session as unknown as { getFlashTransferService: () => KernelFlashTransferService }).getFlashTransferService =
+      () => ({ createFlashTransferUploadTask })
+    const bridge = new QQKernelBridge({ tempPath: directory })
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: directory })
+
+    await expect(bridge.createFlashTransfer({
+      framing: 'length-prefixed-v1', files: [{ name: 'short.txt', size: 5 }],
+    }, Readable.from(framedUpload(Buffer.from('abc'))))).rejects.toThrow(/size mismatch/)
+    expect(createFlashTransferUploadTask).not.toHaveBeenCalled()
   })
 
   it('leaves the static group-join wrapper probe off without reading native candidates', async () => {
@@ -5150,6 +5177,59 @@ describe('QQBridgeServer', () => {
     await Promise.all(tempPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })))
   })
 
+  it('streams a multi-file flash transfer into native staging and returns its share link', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'qqnt-flash-server-'))
+    tempPaths.push(directory)
+    const f = fixture()
+    const staged: Array<{ names: string[], bodies: Buffer[] }> = []
+    const createFlashTransferUploadTask = vi.fn<KernelFlashTransferService['createFlashTransferUploadTask']>(
+      async (_timestamp, request) => {
+        staged.push({
+          names: request.paths.map((path) => basename(path)),
+          bodies: await Promise.all(request.paths.map((path) => readFile(path))),
+        })
+        return {
+          result: 0, errMsg: '', seq: 1,
+          createFlashTransferResult: {
+            fileSetId: 'fileset-1', shareLink: 'https://qq.example/flash/share-code',
+            expireTime: '2000000000', expireLeftTime: '0',
+          },
+        }
+      },
+    )
+    ;(f.session as unknown as { getFlashTransferService: () => KernelFlashTransferService }).getFlashTransferService =
+      () => ({ createFlashTransferUploadTask })
+    const bridge = new QQKernelBridge({ tempPath: directory })
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: directory })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const manifest = {
+      name: 'Telegram files', framing: 'length-prefixed-v1',
+      files: [{ name: 'alpha.txt', size: 5 }, { name: 'beta.bin', size: 3 }],
+    }
+
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/v1/flash-transfers`, {
+      method: 'POST',
+      headers: {
+        'x-qqnt-flash-manifest': Buffer.from(JSON.stringify(manifest)).toString('base64url'),
+      },
+      body: framedUpload(Buffer.from('alpha'), Uint8Array.of(1, 2, 3)),
+    })
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toEqual({
+      fileSetId: 'fileset-1', shareLink: 'https://qq.example/flash/share-code', expiresAt: 2_000_000_000_000,
+    })
+    expect(staged).toEqual([{
+      names: ['alpha.txt', 'beta.bin'], bodies: [Buffer.from('alpha'), Buffer.from([1, 2, 3])],
+    }])
+    expect(createFlashTransferUploadTask).toHaveBeenCalledWith(expect.any(Number), expect.objectContaining({
+      name: 'Telegram files', paths: expect.any(Array), uploaders: [{
+        uin: '10000', uid: 'self', nickname: 'Self', sendEntrance: '',
+      }], uploadSceneType: 10,
+    }))
+  })
+
   it.runIf(process.platform === 'linux')('requires a configured bearer token for the inert wrapper probe and redacts encoded targets', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'qqnt-group-join-server-'))
     tempPaths.push(directory)
@@ -5476,7 +5556,7 @@ describe('QQBridgeServer', () => {
     const { port } = server.address()
     const base = `http://127.0.0.1:${port}/v1`
     await expect(fetch(`${base}/status`).then((response) => response.json())).resolves.toMatchObject({
-      protocolVersion: 25, ready: true, selfUin: '10000',
+      protocolVersion: 26, ready: true, selfUin: '10000',
     })
     const dialogs = await fetch(`${base}/dialogs`)
     expect(dialogs.status).toBe(200)
