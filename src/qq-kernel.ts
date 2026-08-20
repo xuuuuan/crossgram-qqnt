@@ -255,6 +255,7 @@ interface SearchContext {
 interface MessageMappingContext {
   multiForwardRootId?: string
   multiForwardConversationId?: string
+  deferVoicePreparation?: boolean
   sender?: NonNullable<QQMessage['sender']>
   outgoing?: boolean
 }
@@ -1707,6 +1708,11 @@ export class QQKernelBridge {
       return this.mapMessagePrepared(record, {
         multiForwardRootId: locator.rootMessageId,
         multiForwardConversationId: locator.conversationId,
+        // A transcript may contain hundreds of PTT records. Converting every
+        // item before returning the first page makes opening the archive wait
+        // for all media. Preserve a trusted source identity here and perform
+        // the OGG conversion only when Telegram actually requests that voice.
+        deferVoicePreparation: true,
         sender: {
           id: participant.id,
           name: participant.name,
@@ -3596,6 +3602,30 @@ export class QQKernelBridge {
     return preparation
   }
 
+  private deferVoiceMedia(media: QQMedia): QQMedia | undefined {
+    const source = this.trustedVoiceSource(media.locator.filePath)
+    if (!source) return
+    const name = media.name?.replace(/(?:\.[^./\\]+)?$/, '.ogg') || 'voice.ogg'
+    return {
+      ...media,
+      name,
+      mimeType: 'audio/ogg',
+      // Silk and OGG sizes differ. Do not publish the source size as the final
+      // Telegram document size before the lazy conversion has happened.
+      size: undefined,
+      locator: {
+        ...media.locator,
+        kind: 'voice',
+        fileName: name,
+        fileSize: undefined,
+        filePath: undefined,
+        sourcePath: source.path,
+        sourceSize: source.size,
+        sourceMtimeMs: source.mtimeMs,
+      },
+    }
+  }
+
   private async prepareVoiceMediaFromLocator(locator: QQMediaLocator): Promise<QQMedia | undefined> {
     const { sourcePath, sourceSize, sourceMtimeMs } = locator
     if (typeof sourcePath !== 'string'
@@ -3663,7 +3693,9 @@ export class QQKernelBridge {
     let changed = false
     const parts = await Promise.all(message.parts.map(async (part) => {
       if (part.type !== 'media' || !part.media.voice) return part
-      const media = await this.prepareVoiceMedia(part.media)
+      const media = context.deferVoicePreparation
+        ? this.deferVoiceMedia(part.media)
+        : await this.prepareVoiceMedia(part.media)
       if (media) {
         changed = true
         return { type: 'media' as const, media }

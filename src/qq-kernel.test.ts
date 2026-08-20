@@ -2539,6 +2539,53 @@ describe('QQKernelBridge', () => {
     }])
   })
 
+  it('defers merged-forward voice conversion until the media is opened', async () => {
+    const f = fixture()
+    const root = await mkdtemp(join(tmpdir(), 'qqnt-merged-voice-'))
+    tempPaths.push(root)
+    const wav = join(root, 'voice.wav')
+    const silk = join(root, 'voice.silk')
+    await execFileAsync('ffmpeg', [
+      '-nostdin', '-y', '-v', 'error', '-f', 'lavfi', '-i',
+      'anullsrc=r=24000:cl=mono', '-t', '0.04', wav,
+    ])
+    await encodePtt(wav, silk)
+    const sourceSize = (await readFile(silk)).length
+    const forwarded = {
+      ...f.message,
+      msgId: 'merged-voice',
+      elements: [{ elementType: 4, elementId: 'voice', pttElement: {
+        duration: 1, fileName: 'voice.silk', filePath: silk, fileSize: String(sourceSize),
+      } }],
+    }
+    f.msg.getMultiMsg.mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [forwarded] })
+    const cacheRoot = join(root, 'cache-root')
+    const bridge = new QQKernelBridge({ tempPath: cacheRoot })
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: root })
+    await bridge.getDialogs()
+
+    const [message] = await bridge.getMultiForwardMessages({
+      conversationId: 'uid-1715311957', rootMessageId: 'merged-root',
+    })
+    const part = message!.parts[0]
+    if (!part || part.type !== 'media') throw new Error('expected deferred merged-forward voice media')
+    expect(part.media).toMatchObject({
+      voice: true, name: 'voice.ogg', mimeType: 'audio/ogg', duration: 1,
+      locator: {
+        kind: 'voice', sourcePath: silk, sourceSize,
+      },
+    })
+    expect(part.media.size).toBeUndefined()
+    expect(part.media.locator.filePath).toBeUndefined()
+    await expect(readdir(join(cacheRoot, 'voice-cache'))).resolves.toEqual([])
+
+    const opened = await bridge.openMedia(part.media.locator)
+    expect(opened).toMatchObject({ mimeType: 'audio/ogg', offset: 0 })
+    expect(opened!.size).toBeGreaterThan(0)
+    expect(await readStream(opened!.stream)).toHaveLength(opened!.size)
+    await expect(readdir(join(cacheRoot, 'voice-cache'))).resolves.toHaveLength(1)
+  })
+
   it('creates transcript-scoped virtual participants from forwarded names and avatars', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
