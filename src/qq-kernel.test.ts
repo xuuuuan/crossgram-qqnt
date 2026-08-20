@@ -158,6 +158,7 @@ function fixture() {
   }>([['self', { uid: 'self', uin: '10000', nick: 'Self', remark: '', avatarUrl: '' }]])
   let avatarPath = avatarFixturePath
   const forceDownloadAvatar = vi.fn(async () => ({ result: 0, errMsg: '' }))
+  const avatarUrls = new Map<string, string>()
   const sentBodies: Buffer[] = []
   const message: MsgRecord = {
     msgId: 'm1', msgSeq: 'seq1', chatType: 1, sendType: 1, senderUid: 'self', senderUin: '10000',
@@ -258,6 +259,10 @@ function fixture() {
     approvalFriendRequest: vi.fn<NonNullable<KernelBuddyService['approvalFriendRequest']>>(async () => ({ result: 0, errMsg: '' })),
     getBuddyNick: vi.fn((uids: string[]) => new Map(uids.map((uid) => [uid, `nick-${uid}`]))),
     getBuddyRemark: vi.fn(() => new Map<string, string>()),
+    getAvatarUrl: vi.fn((uids: string[], sizeType: number) => {
+      expect(sizeType).toBe(2)
+      return new Map(uids.flatMap((uid) => avatarUrls.has(uid) ? [[uid, avatarUrls.get(uid)!]] : []))
+    }),
   }
   const profile = {
     addKernelProfileListener: vi.fn((listener: { handlers?: typeof profileHandlers }) => {
@@ -526,6 +531,9 @@ function fixture() {
     },
     setAvatarPath(path: string) {
       avatarPath = path
+    },
+    setAvatarUrl(uid: string, url: string) {
+      avatarUrls.set(uid, url)
     },
   }
 }
@@ -1003,7 +1011,7 @@ describe('QQKernelBridge', () => {
 
     await expect(bridge.getUser('self')).resolves.toMatchObject({
       id: 'self', numericId: '10000', name: 'Canonical Self',
-      avatar: { locator: { filePath: avatarFixturePath } },
+      avatar: { locator: { avatarUin: '10000' } },
     })
     f.emitMessages([{ ...f.message, sendNickName: 'A transient message name' }])
     await expect(bridge.getUser('self')).resolves.toMatchObject({ name: 'Canonical Self' })
@@ -4303,8 +4311,9 @@ describe('QQKernelBridge', () => {
     })
   })
 
-  it('keeps a group member personal name and alias separate and upgrades its qlogo avatar on profile resolve', async () => {
+  it('keeps a group member personal name and alias separate and uses a QQNT direct avatar URL on profile resolve', async () => {
     const f = fixture()
+    f.setAvatarUrl('member', 'https://thirdqq.qlogo.cn/avatar/member/140')
     const bridge = new QQKernelBridge()
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
     const page = await bridge.getMembers(bridge.getConversation('1058754719'))
@@ -4324,43 +4333,33 @@ describe('QQKernelBridge', () => {
     await expect(bridge.getUser('member')).resolves.toMatchObject({
       id: 'member',
       name: 'Personal Name',
-      avatar: { locator: { filePath: avatarFixturePath } },
+      avatar: { locator: { avatarUrl: 'https://thirdqq.qlogo.cn/avatar/member/140' } },
     })
   })
 
-  it('forces a UID-scoped native avatar before falling back to qlogo for a numeric QQ user', async () => {
+  it('prefers the UID-scoped QQNT avatar URL over the legacy UIN qlogo endpoint', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
-    f.setAvatarPath('')
-    f.forceDownloadAvatar.mockImplementationOnce(async () => {
-      f.setAvatarPath(avatarFixturePath)
-      return { result: 0, errMsg: '' }
-    })
-    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: dirname(avatarFixturePath) })
+    f.setAvatarUrl('special-avatar', 'https://thirdqq.qlogo.cn/avatar/special/140')
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
     f.emitBuddyList([{ buddyList: [{
       uid: 'special-avatar', uin: '472247053', nick: 'Be Amdish', remark: '', avatarUrl: '',
     }] }])
 
     const contacts = await bridge.getContacts()
     expect(contacts.users.find((user) => user.id === 'special-avatar')?.avatar).toMatchObject({
-      locator: { avatarUin: '472247053' },
+      locator: {
+        avatarUrl: 'https://thirdqq.qlogo.cn/avatar/special/140',
+        peerUid: 'special-avatar',
+      },
     })
+    expect(contacts.users.find((user) => user.id === 'special-avatar')?.avatar?.locator)
+      .not.toHaveProperty('avatarUin')
     expect(f.forceDownloadAvatar).not.toHaveBeenCalled()
-
-    await expect(bridge.getUser('special-avatar')).resolves.toMatchObject({
-      id: 'special-avatar', numericId: '472247053',
-      avatar: { locator: { filePath: avatarFixturePath } },
-    })
-    expect(f.forceDownloadAvatar).toHaveBeenCalledOnce()
-    expect(f.forceDownloadAvatar).toHaveBeenCalledWith('special-avatar', 0)
-
-    f.setAvatarPath('')
-    expect((await bridge.getContacts()).users.find((user) => user.id === 'special-avatar')?.avatar).toMatchObject({
-      locator: { filePath: avatarFixturePath },
-    })
+    expect(f.buddy.getAvatarUrl).toHaveBeenCalledWith(['special-avatar'], 2)
   })
 
-  it('keeps qlogo as the fallback when QQNT cannot resolve a native avatar file', async () => {
+  it('keeps qlogo as the zero-copy fallback when QQNT has no UID-scoped avatar URL', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
     f.setAvatarPath('')
@@ -4372,7 +4371,7 @@ describe('QQKernelBridge', () => {
     await expect(bridge.getUser('ordinary-avatar')).resolves.toMatchObject({
       avatar: { locator: { avatarUin: '123456789' } },
     })
-    expect(f.forceDownloadAvatar).toHaveBeenCalledWith('ordinary-avatar', 0)
+    expect(f.forceDownloadAvatar).not.toHaveBeenCalled()
   })
 
   it('maps administrator promotion and demotion to QQ native member roles', async () => {
@@ -4819,8 +4818,9 @@ describe('QQKernelBridge', () => {
     ])
   })
 
-  it('normalizes numeric reaction actors to QQ UIDs and upgrades their qlogo avatars on profile resolve', async () => {
+  it('normalizes numeric reaction actors to QQ UIDs and uses their QQNT direct avatar URLs', async () => {
     const f = fixture()
+    f.setAvatarUrl('actor-uid', 'https://thirdqq.qlogo.cn/avatar/actor/140')
     f.setProfile({
       uid: 'actor-uid', uin: '3998401572', nick: '', remark: '', avatarUrl: '', coreInfo: { nick: 'Alice' },
     })
@@ -4845,7 +4845,7 @@ describe('QQKernelBridge', () => {
     })
     await expect(bridge.getUser('actor-uid')).resolves.toMatchObject({
       id: 'actor-uid', numericId: '3998401572', name: 'Alice',
-      avatar: { locator: { filePath: avatarFixturePath } },
+      avatar: { locator: { avatarUrl: 'https://thirdqq.qlogo.cn/avatar/actor/140' } },
     })
   })
 
@@ -5860,20 +5860,11 @@ describe('QQBridgeServer', () => {
     expect(getUser).not.toHaveBeenCalled()
   })
 
-  it('resolves and streams a UID-scoped native user avatar through the HTTP API', async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'qqnt-user-avatar-http-'))
-    tempPaths.push(directory)
-    const avatarPath = join(directory, 'special-avatar.jpg')
-    const avatarBytes = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x00, 0xff, 0xd9])
-    await writeFile(avatarPath, avatarBytes)
+  it('resolves a UID-scoped QQNT avatar URL through the authenticated direct-url API', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
-    f.setAvatarPath('')
-    f.forceDownloadAvatar.mockImplementationOnce(async () => {
-      f.setAvatarPath(avatarPath)
-      return { result: 0, errMsg: '' }
-    })
-    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: directory })
+    f.setAvatarUrl('uid-1715311957', 'https://thirdqq.qlogo.cn/avatar/http/140')
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
     f.emitBuddyList([{ buddyList: [{
       uid: 'uid-1715311957', uin: '1715311957', nick: 'xuuuuan', remark: '', avatarUrl: '',
     }] }])
@@ -5887,25 +5878,26 @@ describe('QQBridgeServer', () => {
       avatar: { locator: Record<string, unknown> }
     }
     expect(resolved.avatar.locator).toMatchObject({
-      peerUid: 'uid-1715311957', filePath: avatarPath,
+      peerUid: 'uid-1715311957', avatarUrl: 'https://thirdqq.qlogo.cn/avatar/http/140',
     })
     expect(resolved.avatar.locator).not.toHaveProperty('avatarUin')
-    expect(f.forceDownloadAvatar).toHaveBeenCalledWith('uid-1715311957', 0)
+    expect(f.forceDownloadAvatar).not.toHaveBeenCalled()
 
     const userResponse = await fetch(`${base}/users/uid-1715311957`)
     expect(userResponse.status).toBe(200)
     await expect(userResponse.json()).resolves.toMatchObject({
       id: 'uid-1715311957', numericId: '1715311957',
-      avatar: { locator: { filePath: avatarPath } },
+      avatar: { locator: { avatarUrl: 'https://thirdqq.qlogo.cn/avatar/http/140' } },
     })
 
-    const asset = await fetch(`${base}/files/asset`, {
+    const direct = await fetch(`${base}/files/direct-url`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify(resolved.avatar.locator),
     })
-    expect(asset.status).toBe(200)
-    expect(asset.headers.get('content-type')).toBe('image/jpeg')
-    expect(Buffer.from(await asset.arrayBuffer())).toEqual(avatarBytes)
+    expect(direct.status).toBe(200)
+    await expect(direct.json()).resolves.toEqual({
+      url: 'https://thirdqq.qlogo.cn/avatar/http/140', expiresAt: Number.MAX_SAFE_INTEGER,
+    })
   })
 
   it('issues media leases only to an authorized active call and fails closed otherwise', async () => {

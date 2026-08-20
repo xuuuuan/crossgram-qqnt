@@ -219,6 +219,20 @@ describe('QQPacketClient', () => {
     expect(loadAddon).not.toHaveBeenCalled()
   })
 
+  it('prefers a UID-scoped QQNT avatar URL over the legacy qlogo fallback', async () => {
+    const loadAddon = vi.fn<() => PacketAddon>()
+    const client = new QQPacketClient({ sendSsoCmdReqByContend: vi.fn() }, { loadAddon })
+    await expect(client.getMediaDirectUrl({
+      messageId: 'avatar:user:uid', elementId: 'avatar:user:uid', chatType: 1, peerUid: 'uid',
+      kind: 'image', fileName: '472247053.jpg', avatarUin: '472247053',
+      avatarUrl: 'https://thirdqq.qlogo.cn/avatar/uid/140',
+    }, 'self-uid')).resolves.toEqual({
+      url: 'https://thirdqq.qlogo.cn/avatar/uid/140',
+      expiresAt: Number.MAX_SAFE_INTEGER,
+    })
+    expect(loadAddon).not.toHaveBeenCalled()
+  })
+
   it('single-flights and caches packet-resolved video URLs for concurrent Telegram ranges', async () => {
     const f = fixture()
     let resolve!: (value: unknown) => void

@@ -804,6 +804,7 @@ export interface KernelBuddyService {
   }): Promise<unknown>
   getBuddyNick?(uids: string[]): Map<string, string>
   getBuddyRemark?(uids: string[]): Map<string, string>
+  getAvatarUrl?(uids: string[], sizeType: number): Map<string, string>
 }
 
 export interface KernelProfileService {

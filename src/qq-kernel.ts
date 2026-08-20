@@ -3079,7 +3079,7 @@ export class QQKernelBridge {
           cached.name,
           cached.numericId,
           cached.id,
-        ), avatar: await this.userAvatar(uid),
+        ), avatar: await this.userAvatar(uid, false),
       } }
     let numericId: string | undefined
     try {
@@ -3107,7 +3107,7 @@ export class QQKernelBridge {
         resolved.numericId,
         resolved.id,
       ),
-      avatar: await this.userAvatar(uid),
+      avatar: await this.userAvatar(uid, false),
     }
   }
 
@@ -5933,48 +5933,69 @@ export class QQKernelBridge {
 
   private async userAvatar(uid: string, force = true): Promise<QQMedia | undefined> {
     const cacheKey = `user:${uid}`
-    const cached = this.avatarCache.get(cacheKey)
-    // A native avatar is keyed by QQ's stable UID and can represent account
-    // avatar variants that the legacy public qlogo endpoint returns as the
-    // generic silhouette. Keep using an already resolved native file even on
-    // cheap list reads, and refresh it for explicit peer/profile requests.
-    if (cached && hasAvatarFile(cached)) return cached
     const numericId = this.seenUsers.get(uid)?.numericId
       ?? this.users.get(uid)?.numericId
       ?? (uid === this.config?.selfUid ? this.config.selfUin : undefined)
-    try {
-      const service = this.getAvatarService()
-      if (service) {
-        let filePath = service.getAvatarPath(uid, 0)
-        log('info', `avatar lookup kind=user peer=${uid} force=${force} cached=${Boolean(cached)} path=${JSON.stringify(filePath || '')}`)
-        if (force && (!filePath || !existsSync(filePath))) {
-          const result = await service.forceDownloadAvatar(uid, 0).catch((error) => {
-            log('error', `avatar force download threw kind=user peer=${uid}`, error)
-            return undefined
-          })
-          if (result) log('info', `avatar force download complete kind=user peer=${uid} result=${result.result} err=${JSON.stringify(result.errMsg)}`)
-          filePath = await waitForAvatarPath(() => service.getAvatarPath(uid, 0))
-        }
-        if (filePath && existsSync(filePath)) {
-          const avatar = avatarMedia(cacheKey, filePath)
-          this.avatarCache.set(cacheKey, avatar)
-          return avatar
-        }
-      }
-    } catch (error) {
-      log('error', `avatar lookup failed kind=user peer=${uid}`, error)
+    const directUrl = this.userAvatarUrl(uid)
+    if (directUrl) {
+      const avatar = directAvatarMedia(uid, directUrl, numericId)
+      this.avatarCache.set(cacheKey, avatar)
+      return avatar
     }
-    // qlogo remains the zero-copy fallback for ordinary accounts and list
-    // pages. Explicit profile resolution above first gives QQNT a chance to
-    // fetch the UID-scoped avatar, avoiding a permanent default silhouette.
     if (numericId && /^\d+$/.test(numericId)) {
       const avatar = qlogoAvatarMedia(uid, numericId)
       this.avatarCache.set(cacheKey, avatar)
       return avatar
     }
-    const placeholder = cached ?? avatarMedia(cacheKey)
-    this.avatarCache.set(cacheKey, placeholder)
-    return placeholder
+    const cached = this.avatarCache.get(cacheKey)
+    if (cached && !force && hasAvatarFile(cached)) return cached
+    try {
+      const service = this.getAvatarService()
+      if (!service) return cached ?? avatarMedia(cacheKey)
+      let filePath = service.getAvatarPath(uid, 0)
+      log('info', `avatar lookup kind=user peer=${uid} force=${force} cached=${Boolean(cached)} path=${JSON.stringify(filePath || '')}`)
+      if (force && (!filePath || !existsSync(filePath))) {
+        const result = await service.forceDownloadAvatar(uid, 0).catch((error) => {
+          log('error', `avatar force download threw kind=user peer=${uid}`, error)
+          return undefined
+        })
+        if (result) log('info', `avatar force download complete kind=user peer=${uid} result=${result.result} err=${JSON.stringify(result.errMsg)}`)
+        filePath = await waitForAvatarPath(() => service.getAvatarPath(uid, 0))
+      }
+      if (filePath && existsSync(filePath)) {
+        const avatar = avatarMedia(cacheKey, filePath)
+        this.avatarCache.set(cacheKey, avatar)
+        return avatar
+      }
+      const placeholder = cached ?? avatarMedia(cacheKey)
+      this.avatarCache.set(cacheKey, placeholder)
+      return placeholder
+    } catch (error) {
+      log('error', `avatar lookup failed kind=user peer=${uid}`, error)
+      const placeholder = cached ?? avatarMedia(cacheKey)
+      this.avatarCache.set(cacheKey, placeholder)
+      return placeholder
+    }
+  }
+
+  private userAvatarUrl(uid: string): string | undefined {
+    const known = this.seenUsers.get(uid)?.avatarUrl ?? this.users.get(uid)?.avatarUrl
+    const cached = httpUrl(known)
+    if (cached) return cached
+    const method = this.buddyService?.getAvatarUrl
+    if (!method) return
+    try {
+      const url = httpUrl(method.call(this.buddyService, [uid], 2).get(uid))
+      if (!url) return
+      const seen = this.seenUsers.get(uid)
+      if (seen) this.seenUsers.set(uid, { ...seen, avatarUrl: url })
+      const contact = this.users.get(uid)
+      if (contact) this.users.set(uid, { ...contact, avatarUrl: url })
+      return url
+    } catch (error) {
+      log('warn', `QQ avatar URL lookup failed peer=${uid}`, error)
+      return
+    }
   }
 
   private async withConversationAvatar(conversation: QQConversation, force = true): Promise<QQConversation> {
@@ -8686,6 +8707,35 @@ function qlogoAvatarMedia(uid: string, uin: string): QQMedia {
   }
 }
 
+function directAvatarMedia(uid: string, url: string, uin?: string): QQMedia {
+  const id = `user:${uid}`
+  return {
+    id: `avatar:${id}`,
+    kind: 'image',
+    name: uin ? `${uin}.jpg` : `${uid}.jpg`,
+    mimeType: 'image/jpeg',
+    locator: {
+      messageId: `avatar:${id}`,
+      elementId: `avatar:${id}`,
+      chatType: CHAT_C2C,
+      peerUid: uid,
+      kind: 'image',
+      fileName: uin ? `${uin}.jpg` : `${uid}.jpg`,
+      avatarUrl: url,
+    },
+  }
+}
+
+function httpUrl(value: string | undefined): string | undefined {
+  if (!value) return
+  try {
+    const url = new URL(value)
+    return url.protocol === 'https:' || url.protocol === 'http:' ? url.toString() : undefined
+  } catch {
+    return
+  }
+}
+
 function reactionKey(emojiType: string, emojiId: string): string {
   return `${emojiType}:${emojiId}`
 }
@@ -8744,7 +8794,6 @@ function telegramMessageId(value?: string): number | undefined {
   const id = Number(value)
   return Number.isSafeInteger(id) && id > 0 && id <= 0x7fffffff ? id : undefined
 }
-
 
 function isGrayTipRecord(record: MsgRecord): boolean {
   return record.elements.some((element) => Boolean(element.grayTipElement))

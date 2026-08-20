@@ -67,6 +67,8 @@ export interface QQMediaLocator {
   videoCodecFormat?: number
   /** Numeric QQ account used to fetch a user avatar from the fixed qlogo endpoint. */
   avatarUin?: string
+  /** UID-scoped avatar URL returned by QQNT when the legacy UIN endpoint has no image. */
+  avatarUrl?: string
 }
 
 export interface QQMedia {

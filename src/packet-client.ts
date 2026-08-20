@@ -364,6 +364,10 @@ export class QQPacketClient {
   }
 
   async getMediaDirectUrl(locator: QQMediaLocator, selfUid: string): Promise<QQDirectUrl | undefined> {
+    if (locator.avatarUrl) {
+      const url = httpUrl(locator.avatarUrl)
+      return url ? { url, expiresAt: Number.MAX_SAFE_INTEGER } : undefined
+    }
     if (locator.avatarUin) {
       if (!/^\d+$/.test(locator.avatarUin)) return
       const url = new URL('https://q1.qlogo.cn/g')
@@ -536,6 +540,15 @@ export class QQPacketClient {
     const location = addon.installSendHook()
     this.located = true
     log('info', `QQNT packet hook installed module=${location.moduleBase} profile=${location.profile} timeDateStamp=0x${location.timeDateStamp.toString(16)} sizeOfImage=0x${location.sizeOfImage.toString(16)} anchorRva=0x${location.anchorRva.toString(16)} xrefRva=0x${location.xrefRva.toString(16)} functionRva=0x${location.functionRva.toString(16)} converterRva=0x${location.converterRva.toString(16)} responseRva=0x${location.responseRva.toString(16)}`)
+  }
+}
+
+function httpUrl(value: string): string | undefined {
+  try {
+    const url = new URL(value)
+    return url.protocol === 'https:' || url.protocol === 'http:' ? url.toString() : undefined
+  } catch {
+    return undefined
   }
 }
 
