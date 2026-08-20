@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 26
+export const PROTOCOL_VERSION = 27
 
 /** Local Unix-socket PCM media protocol. Audio frames use a 1-byte type plus a 4-byte big-endian length. */
 export const PCM_MEDIA_PROTOCOL_VERSION = 1
@@ -27,7 +27,8 @@ export interface QQPCMMediaFrame {
   payload: Uint8Array
 }
 
-export type QQChatType = 1 | 2
+/** QQ buddy/group chats plus the desktop/mobile data-line device sessions. */
+export type QQChatType = 1 | 2 | 8 | 134
 
 export interface QQContact {
   chatType: QQChatType
@@ -338,6 +339,7 @@ export interface QQCallSignalEvent {
 export type QQEvent =
   | QQRequestEvent
   | { type: 'message', conversation: QQConversation, message: QQMessage }
+  | { type: 'message-edit', eventId: string, conversation: QQConversation, message: QQMessage }
   | { type: 'message-delete', eventId: string, conversation: QQConversation, messageIds: string[], timestamp: number }
   | {
       type: 'message-reactions'
@@ -575,12 +577,15 @@ export interface BridgeStatus {
 }
 
 export function conversationId(chatType: QQChatType, peerUid: string): string {
+  if (chatType === 8 || chatType === 134) return `device:${chatType}:${peerUid}`
   // QQ UID and group code are already stable opaque identifiers. Keeping the
   // native value also makes a direct conversation line up with its IM user.
   return peerUid
 }
 
 export function parseConversationId(value: string): { chatType: QQChatType, peerUid: string } {
+  const device = /^device:(8|134):(.+)$/.exec(value)
+  if (device) return { chatType: Number(device[1]) as QQChatType, peerUid: device[2] }
   // Accept IDs emitted by older builds during a rolling restart. New responses
   // never add a synthetic chat-type prefix.
   const match = /^(1|2):(.+)$/.exec(value)

@@ -1182,6 +1182,94 @@ describe('QQKernelBridge', () => {
     expect(second.nextCursor).toBe('2')
   })
 
+  it('exposes QQ data-line sessions as device conversations with native history', async () => {
+    const f = fixture()
+    const deviceMessage: MsgRecord = {
+      ...f.message,
+      msgId: 'device-message',
+      chatType: 8,
+      peerUid: 'device-peer',
+      peerUin: '',
+      peerName: '我的手机',
+      elements: [{ elementType: 1, elementId: 'device-text', textElement: { content: 'saved' } }],
+    }
+    f.recent.getRecentContactInfos.mockResolvedValue({
+      result: 0,
+      errMsg: '',
+      relation: [{
+        chatType: 8, peerUid: 'device-peer', peerUin: '', peerName: '我的手机',
+        remark: '', avatarUrl: '', unreadCnt: '0', msgId: 'device-message', msgTime: '1800000000',
+        senderUid: 'self', senderUin: '10000', abstractContent: [],
+      }],
+    })
+    f.msg.getMsgsByMsgId.mockResolvedValue({ result: 0, errMsg: '', msgList: [deviceMessage] })
+    f.msg.getLatestDbMsgs.mockResolvedValue({ result: 0, errMsg: '', msgList: [deviceMessage] })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    const dialogs = await bridge.getDialogs()
+    expect(dialogs.conversations).toMatchObject([{
+      id: 'device:8:device-peer', kind: 'direct', title: '我的手机', chatType: 8,
+      avatar: undefined,
+      lastMessage: { id: 'device-message', conversationId: 'device:8:device-peer' },
+    }])
+    await expect(bridge.getHistory(dialogs.conversations[0])).resolves.toMatchObject({
+      messages: [{ id: 'device-message', conversationId: 'device:8:device-peer' }],
+    })
+    expect(f.msg.getLatestDbMsgs).toHaveBeenCalledWith(
+      { chatType: 8, peerUid: 'device-peer', guildId: '' }, 50,
+    )
+  })
+
+  it('sends text and images to a data-line session through the native QQ API', async () => {
+    const f = fixture()
+    const root = await mkdtemp(join(tmpdir(), 'qqnt-device-send-'))
+    tempPaths.push(root)
+    const bridge = new QQKernelBridge({ tempPath: root })
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: root })
+    const conversation = bridge.getConversation('device:8:device-peer')
+    let sequence = 0
+    f.msg.sendMsg.mockImplementation(async (_id, peer, elements) => {
+      expect(peer).toMatchObject({ chatType: 8, peerUid: 'device-peer', guildId: 'generated-m1' })
+      const record: MsgRecord = {
+        ...f.message,
+        msgId: `device-sent-${++sequence}`,
+        msgSeq: String(sequence),
+        chatType: 8,
+        peerUid: 'device-peer',
+        peerUin: '',
+        peerName: '我的设备',
+        sendStatus: 2,
+        elements,
+      }
+      queueMicrotask(() => f.emitSent(record))
+      return { result: 0, errMsg: '' }
+    })
+
+    await expect(bridge.send(
+      { conversationId: conversation.id, text: 'keep this' }, Readable.from([]),
+    )).resolves.toMatchObject({
+      conversationId: 'device:8:device-peer',
+      parts: [{ type: 'text', text: 'keep this' }],
+    })
+    const png = completePng(7, 9)
+    await expect(bridge.send({
+      conversationId: conversation.id,
+      media: [{ kind: 'image', name: 'saved.png', width: 7, height: 9 }],
+    }, Readable.from(png))).resolves.toMatchObject({
+      conversationId: 'device:8:device-peer',
+      parts: [{ type: 'media', media: { kind: 'image', name: 'saved.png', width: 7, height: 9 } }],
+    })
+    expect(f.msg.sendMsg).toHaveBeenCalledTimes(2)
+    expect(f.protocolSend).not.toHaveBeenCalled()
+    const image = f.msg.sendMsg.mock.calls[1]![2][0]?.picElement
+    expect(image).toMatchObject({
+      fileName: 'saved.png', fileSize: String(png.length), picWidth: 7, picHeight: 9,
+      md5HexStr: createHash('md5').update(png).digest('hex'), original: true,
+    })
+    expect(await readFile(image!.sourcePath!)).toEqual(png)
+  })
+
   it('searches a conversation with native filters and preserves buffered pagination', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
@@ -5731,6 +5819,67 @@ describe('QQBridgeServer', () => {
     expect(f.msg.sendMsg).not.toHaveBeenCalled()
   })
 
+  it('serves a data-line dialog, history, and native send through the HTTP API', async () => {
+    const f = fixture()
+    const deviceRecord: MsgRecord = {
+      ...f.message,
+      msgId: 'device-http-message',
+      chatType: 134,
+      peerUid: 'mobile-device',
+      peerUin: '',
+      peerName: '我的电脑',
+      elements: [{ elementType: 1, elementId: 'text', textElement: { content: 'from device' } }],
+    }
+    f.recent.getRecentContactInfos.mockResolvedValue({
+      result: 0,
+      errMsg: '',
+      relation: [{
+        chatType: 134, peerUid: 'mobile-device', peerUin: '', peerName: '我的电脑',
+        remark: '', avatarUrl: '', unreadCnt: '0', msgId: deviceRecord.msgId,
+        msgTime: deviceRecord.msgTime, senderUid: 'self', senderUin: '10000', abstractContent: [],
+      }],
+    })
+    f.msg.getMsgsByMsgId.mockResolvedValue({ result: 0, errMsg: '', msgList: [deviceRecord] })
+    f.msg.getLatestDbMsgs.mockResolvedValue({ result: 0, errMsg: '', msgList: [deviceRecord] })
+    f.msg.sendMsg.mockImplementationOnce(async (_id, peer, elements) => {
+      expect(peer).toMatchObject({ chatType: 134, peerUid: 'mobile-device' })
+      queueMicrotask(() => f.emitSent({
+        ...deviceRecord, msgId: 'device-http-sent', sendStatus: 2, elements,
+      }))
+      return { result: 0, errMsg: '' }
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const base = `http://127.0.0.1:${server.address().port}/v1`
+
+    const dialogsResponse = await fetch(`${base}/dialogs`)
+    expect(dialogsResponse.status).toBe(200)
+    await expect(dialogsResponse.json()).resolves.toMatchObject({
+      conversations: [{ id: 'device:134:mobile-device', title: '我的电脑', chatType: 134 }],
+    })
+    const historyResponse = await fetch(
+      `${base}/conversations/${encodeURIComponent('device:134:mobile-device')}/history?limit=20`,
+    )
+    expect(historyResponse.status).toBe(200)
+    await expect(historyResponse.json()).resolves.toMatchObject({
+      messages: [{ id: 'device-http-message', conversationId: 'device:134:mobile-device' }],
+    })
+    const manifest = Buffer.from(JSON.stringify({
+      conversationId: 'device:134:mobile-device', text: 'saved over HTTP',
+    })).toString('base64url')
+    const sendResponse = await fetch(`${base}/messages`, {
+      method: 'POST', headers: { 'x-qqnt-manifest': manifest }, body: new Uint8Array(),
+    })
+    expect(sendResponse.status).toBe(200)
+    await expect(sendResponse.json()).resolves.toMatchObject({
+      id: 'device-http-sent', conversationId: 'device:134:mobile-device',
+      parts: [{ type: 'text', text: 'saved over HTTP' }],
+    })
+    expect(f.protocolSend).not.toHaveBeenCalled()
+  })
+
   it('serves status, dialogs, and a chunked send endpoint', async () => {
     const f = fixture()
     f.search.searchChatMsgs.mockImplementation(() => {
@@ -5749,7 +5898,7 @@ describe('QQBridgeServer', () => {
     const { port } = server.address()
     const base = `http://127.0.0.1:${port}/v1`
     await expect(fetch(`${base}/status`).then((response) => response.json())).resolves.toMatchObject({
-      protocolVersion: 26, ready: true, selfUin: '10000',
+      protocolVersion: 27, ready: true, selfUin: '10000',
     })
     const dialogs = await fetch(`${base}/dialogs`)
     expect(dialogs.status).toBe(200)

@@ -30,6 +30,8 @@ import {
 
 const CHAT_C2C = 1
 const CHAT_GROUP = 2
+const CHAT_DATA_LINE = 8
+const CHAT_DATA_LINE_MOBILE = 134
 const ELEMENT_TEXT = 1
 const ELEMENT_IMAGE = 2
 const ELEMENT_FILE = 3
@@ -2121,6 +2123,9 @@ export class QQKernelBridge {
       throw new Error('voice messages cannot be replies')
     }
     const conversation = this.getConversation(manifest.conversationId)
+    if (isDeviceChatType(conversation.chatType)) {
+      return this.sendDeviceMessage(conversation, manifest, body)
+    }
     const peerUin = await this.requireProtocolPeerUin(conversation)
     const groupFile = conversation.chatType === CHAT_GROUP
       ? manifest.media?.find((media) => media.kind === 'file')
@@ -2462,6 +2467,275 @@ export class QQKernelBridge {
       } else {
         await Promise.all(cleanup.map((path) => rm(path, { force: true }).catch(() => undefined)))
       }
+    }
+  }
+
+  private async sendDeviceMessage(
+    conversation: QQConversation,
+    manifest: SendManifest,
+    body: Readable,
+  ): Promise<QQMessage> {
+    if (manifest.uploadedMedia?.length) {
+      throw new Error('QQ device conversations require streaming media uploads')
+    }
+    const cleanup: string[] = []
+    let preserveUntil: number | undefined
+    try {
+      const elements: MsgElement[] = []
+      if (manifest.replyToId) {
+        const reply = await this.directReplyPart(conversation, manifest.replyToId)
+        if (reply.kind !== 'reply') throw new Error('QQ device reply mapping failed')
+        elements.push({
+          elementType: ELEMENT_REPLY,
+          elementId: '',
+          replyElement: {
+            replayMsgId: reply.reply.messageId,
+            replayMsgSeq: reply.reply.sequence,
+            replyMsgClientSeq: reply.reply.clientSequence,
+            replyMsgTime: reply.reply.time ? String(reply.reply.time) : undefined,
+            sourceMsgTextElems: [],
+            replyMsgRevokeType: 0,
+            sourceMsgIsIncPic: false,
+            sourceMsgExpired: false,
+          },
+        })
+      }
+      for (const part of manifest.textParts?.length
+        ? manifest.textParts
+        : manifest.text ? [{ type: 'text' as const, text: manifest.text }] : []) {
+        elements.push({
+          elementType: ELEMENT_TEXT,
+          elementId: '',
+          textElement: { content: part.text, atType: 0, atUid: '', atTinyId: '', atNtUid: '' },
+        })
+      }
+      if (manifest.sticker?.kind === 'sysface') {
+        elements.push({
+          elementType: ELEMENT_FACE,
+          elementId: '',
+          faceElement: {
+            faceIndex: Number(manifest.sticker.faceId),
+            faceType: manifest.sticker.faceType,
+            faceText: manifest.sticker.name,
+            packId: manifest.sticker.packId,
+            stickerId: manifest.sticker.stickerId,
+            sourceType: manifest.sticker.sourceType,
+            stickerType: manifest.sticker.stickerType,
+            resultId: manifest.sticker.resultId,
+          },
+        })
+      } else if (manifest.sticker?.kind === 'market') {
+        elements.push({
+          elementType: ELEMENT_MARKET_FACE,
+          elementId: '',
+          marketFaceElement: {
+            itemType: 6,
+            faceInfo: 1,
+            emojiPackageId: Number(manifest.sticker.packageId),
+            subType: 3,
+            mediaType: 0,
+            imageWidth: manifest.sticker.width,
+            imageHeight: manifest.sticker.height,
+            faceName: manifest.sticker.name,
+            emojiId: manifest.sticker.stickerId,
+            key: manifest.sticker.key,
+          },
+        })
+      } else if (manifest.sticker?.kind === 'favorite') {
+        let sourcePath = manifest.sticker.path && existsSync(manifest.sticker.path)
+          ? manifest.sticker.path
+          : undefined
+        if (!sourcePath) {
+          const asset = await this.openSticker(manifest.sticker)
+          sourcePath = await this.stageDeviceMedia(
+            manifest.sticker.name, asset.stream, 'image', cleanup,
+          )
+        }
+        elements.push(await this.deviceImageElement(sourcePath, manifest.sticker.name))
+      }
+
+      const media = manifest.media ?? []
+      const reader = media.length > 1
+        ? manifest.mediaFraming === 'length-prefixed-v1'
+          ? new FramedUploadReader(body)
+          : undefined
+        : undefined
+      if (media.length > 1 && !reader) throw new Error('multiple media items require length-prefixed-v1 framing')
+      for (const [index, spec] of media.entries()) {
+        const source = reader ? reader.media(index) : body
+        if (spec.kind === 'voice') {
+          const input = await this.stageDeviceMedia(spec.name, source, 'voice', cleanup)
+          const silk = `${input}.silk`
+          cleanup.push(silk)
+          const duration = await encodePtt(input, silk)
+          if (!Number.isFinite(duration) || duration < 0) throw new Error('voice duration is invalid')
+          elements.push(await this.nativePttElement(silk, duration))
+          continue
+        }
+        const path = await this.stageDeviceMedia(spec.name, source, spec.kind === 'image' ? 'image' : 'file', cleanup)
+        elements.push(spec.kind === 'image'
+          ? await this.deviceImageElement(path, spec.name, spec.width, spec.height)
+          : this.deviceFileElement(path, spec.name))
+      }
+      await reader?.finish()
+      if (!media.length) body.resume()
+      if (!elements.length) throw new Error('message must contain text, media, or sticker')
+
+      const message = await this.sendNativeMessage(conversation, elements, manifest)
+      if (media.length || manifest.sticker?.kind === 'favorite') preserveUntil = Date.now() + 10 * 60_000
+      return message
+    } finally {
+      if (preserveUntil) {
+        const delay = Math.max(0, preserveUntil - Date.now())
+        for (const path of cleanup) {
+          const timer = setTimeout(() => void rm(path, { force: true }).catch(() => undefined), delay)
+          timer.unref()
+        }
+      } else {
+        await Promise.all(cleanup.map((path) => rm(path, { force: true }).catch(() => undefined)))
+      }
+    }
+  }
+
+  private async stageDeviceMedia(
+    name: string,
+    source: AsyncIterable<Uint8Array>,
+    kind: 'image' | 'file' | 'voice',
+    cleanup: string[],
+  ): Promise<string> {
+    const root = this.stagingPath(kind)
+    mkdirSync(root, { recursive: true })
+    const path = join(root, `${randomUUID()}${safeExtension(name)}`)
+    cleanup.push(path)
+    await pipeline(source, createWriteStream(path, { flags: 'wx' }))
+    if (!statSync(path).size) throw new Error(`incomplete upload: ${name}`)
+    return path
+  }
+
+  private async deviceImageElement(
+    path: string,
+    name: string,
+    width?: number,
+    height?: number,
+  ): Promise<MsgElement> {
+    const dimensions = width && height ? { width, height } : await imageFileDimensions(path)
+    return {
+      elementType: ELEMENT_IMAGE,
+      elementId: '',
+      picElement: {
+        md5HexStr: await hashFile(path, 'md5'),
+        fileSize: String(statSync(path).size),
+        picWidth: dimensions?.width ?? 0,
+        picHeight: dimensions?.height ?? 0,
+        fileName: name,
+        sourcePath: path,
+        original: true,
+        picType: imagePicType(name),
+        picSubType: 0,
+        fileUuid: '',
+        fileSubId: '',
+        thumbFileSize: 0,
+      },
+    }
+  }
+
+  private deviceFileElement(path: string, name: string): MsgElement {
+    return {
+      elementType: ELEMENT_FILE,
+      elementId: '',
+      fileElement: {
+        fileName: name,
+        filePath: path,
+        fileSize: String(statSync(path).size),
+        fileMd5: '',
+        file10MMd5: '',
+        fileSha: '',
+        fileSha3: '',
+        fileUuid: '',
+        fileSubId: '',
+      },
+    }
+  }
+
+  private async nativePttElement(path: string, duration: number): Promise<MsgElement> {
+    return {
+      elementType: 4,
+      elementId: '',
+      pttElement: {
+        fileName: basename(path),
+        filePath: path,
+        md5HexStr: await hashFile(path, 'md5'),
+        fileSize: String(statSync(path).size),
+        duration,
+        formatType: 1,
+        voiceType: 1,
+        voiceChangeType: 0,
+        canConvert2Text: true,
+        waveAmplitudes: QQ_VOICE_WAVE_AMPLITUDES,
+        fileSubId: '',
+        playState: 1,
+        autoConvertText: 0,
+        storeID: 0,
+        otherBusinessInfo: { aiVoiceType: 0 },
+      },
+    }
+  }
+
+  private async sendNativeMessage(
+    conversation: QQConversation,
+    elements: MsgElement[],
+    manifest: SendManifest,
+  ): Promise<QQMessage> {
+    const service = this.requireMsgService()
+    if (typeof service.sendMsg !== 'function') throw new Error('native QQ device sending is unavailable')
+    const serverTime = String(Math.floor(Date.now() / 1_000))
+    const generatedMessageId = typeof service.generateMsgUniqueId === 'function'
+      ? service.generateMsgUniqueId(conversation.chatType, serverTime)
+      : service.getMsgUniqueId?.(serverTime)
+    if (!generatedMessageId || generatedMessageId === '0') {
+      throw new Error('native QQ device sending could not generate a message ID')
+    }
+    const startedAt = Math.floor(Date.now() / 1_000)
+    const pending = deferred<MsgRecord>()
+    const accepted = deferred<void>()
+    const minimumStatus = manifest.media?.length || manifest.sticker ? 2 : 1
+    this.pendingUnassigned.push({
+      conversationId: conversation.id,
+      pending,
+      accepted,
+      minimumStatus,
+      startedAt,
+      expectedText: manifest.textParts?.map((part) => part.text).join('') || manifest.text,
+      expectedMediaName: manifest.media?.[0]?.kind === 'voice' ? undefined : manifest.media?.[0]?.name,
+      expectedMediaKind: manifest.sticker ? 'sticker' : manifest.media?.[0]?.kind,
+      originRequestId: manifest.originRequestId,
+    })
+    const pollController = new AbortController()
+    try {
+      const result = await service.sendMsg(
+        '0',
+        { chatType: conversation.chatType, peerUid: conversation.peerUid, guildId: generatedMessageId },
+        elements,
+        new Map<number, unknown>(),
+      )
+      if (result.result !== 0) throw new Error(`native QQ device send failed (${result.result}): ${result.errMsg}`)
+      const record = await withTimeout(Promise.race([
+        pending.promise,
+        this.pollSentMessage(
+          conversation,
+          manifest.textParts?.map((part) => part.text).join('') || manifest.text,
+          startedAt,
+          manifest.sticker ? 'sticker' : manifest.media?.[0]?.kind,
+          manifest.media?.[0]?.kind === 'voice' ? undefined : manifest.media?.[0]?.name,
+          minimumStatus,
+          pollController.signal,
+        ),
+      ]), this.sendTimeoutMs, 'QQ did not confirm device message')
+      this.rememberMessageOrigin(record.msgId, manifest.originRequestId)
+      return this.mapMessagePrepared(record)
+    } finally {
+      pollController.abort()
+      removePending(this.pendingUnassigned, pending)
     }
   }
 
@@ -4308,8 +4582,8 @@ export class QQKernelBridge {
   private consumeRecentContactList(sortedContactList: string[] | undefined, changedList: RecentContactInfo[]): void {
     for (const item of changedList) {
       this.upsertRecent(item)
-      if (item.chatType !== CHAT_C2C && item.chatType !== CHAT_GROUP) continue
-      const id = conversationId(item.chatType as 1 | 2, item.peerUid)
+      if (!isMessageChatType(item.chatType)) continue
+      const id = conversationId(item.chatType, item.peerUid)
       if (item.contactId) this.recentContactIds.set(item.contactId, id)
       if (item.id) this.recentContactIds.set(item.id, id)
     }
@@ -4557,7 +4831,7 @@ export class QQKernelBridge {
     await this.resolveReplyTargets(records)
     await this.resolveGrayTipUsers(records)
     for (const record of records) {
-      if (record.chatType !== CHAT_C2C && record.chatType !== CHAT_GROUP) continue
+      if (!isMessageChatType(record.chatType)) continue
       if (!hasUsableMessagePeer(record)) {
         log(
           'warn',
@@ -4583,7 +4857,7 @@ export class QQKernelBridge {
         this.pendingMessages.delete(record.msgId)
         pending.resolve(record)
       } else if (record.msgId !== '0') {
-        const id = conversationId(record.chatType as 1 | 2, record.peerUid)
+        const id = conversationId(record.chatType, record.peerUid)
         let index = this.pendingUnassigned.findIndex((item) => item.assignedMessageId === record.msgId)
         if (index < 0) index = this.pendingUnassigned.findIndex((item) =>
           !item.assignedMessageId
@@ -4718,7 +4992,7 @@ export class QQKernelBridge {
 
 
   private onDelete(chatType: number, peerUid: string, ids: string[]): void {
-    if (chatType !== CHAT_C2C && chatType !== CHAT_GROUP) return
+    if (!isMessageChatType(chatType)) return
     const uniqueIds = [...new Set(ids.filter(Boolean))].sort()
     if (!uniqueIds.length) return
     const now = Date.now()
@@ -4754,7 +5028,7 @@ export class QQKernelBridge {
   }
 
   private onRecall(chatType: number, peerUid: string, msgSeq: string): void {
-    if ((chatType !== CHAT_C2C && chatType !== CHAT_GROUP) || !msgSeq) return
+    if (!isMessageChatType(chatType) || !msgSeq) return
     const id = conversationId(chatType, peerUid)
     const cached = (this.messages.get(id) ?? []).find((message) => message.msgSeq === msgSeq)
     if (cached) {
@@ -4876,7 +5150,7 @@ export class QQKernelBridge {
   }
 
   private upsertRecent(item: RecentContactInfo): void {
-    if (item.chatType !== CHAT_C2C && item.chatType !== CHAT_GROUP) return
+    if (!isMessageChatType(item.chatType)) return
     if (item.chatType === CHAT_C2C) {
       this.rememberSeenUser({
         id: item.peerUid,
@@ -4904,7 +5178,8 @@ export class QQKernelBridge {
     const conversation: QQConversation = {
       id,
       kind: item.chatType === CHAT_GROUP ? 'group' : 'direct',
-      title: user?.name || group?.name || item.remark || item.peerName || item.peerUin || item.peerUid,
+      title: user?.name || group?.name || item.remark || item.peerName
+        || (isDeviceChatType(item.chatType) ? '我的设备' : item.peerUin || item.peerUid),
       peerUid: item.peerUid,
       peerUin: item.peerUin || (item.chatType === CHAT_GROUP ? item.peerUid : ''),
       chatType: item.chatType,
@@ -5056,8 +5331,10 @@ export class QQKernelBridge {
       : this.users.get(next.peerUid)?.name
     const title = firstUsefulTitle(peerKey, profileTitle, next.title, current?.title, next.peerUin, next.peerUid)
     const cacheKey = `${next.chatType === CHAT_C2C ? 'user' : 'group'}:${peerKey}`
-    const avatar = next.avatar ?? current?.avatar ?? this.avatarCache.get(cacheKey) ?? avatarMedia(cacheKey)
-    this.avatarCache.set(cacheKey, avatar)
+    const avatar = isDeviceChatType(next.chatType)
+      ? undefined
+      : next.avatar ?? current?.avatar ?? this.avatarCache.get(cacheKey) ?? avatarMedia(cacheKey)
+    if (avatar) this.avatarCache.set(cacheKey, avatar)
     const merged: QQConversation = {
       ...current,
       ...next,
@@ -5148,7 +5425,8 @@ export class QQKernelBridge {
   }
 
   private conversationFromRecord(record: MsgRecord, message = this.mapMessage(record)): QQConversation {
-    const id = conversationId(record.chatType as 1 | 2, record.peerUid)
+    if (!isMessageChatType(record.chatType)) throw new Error(`unsupported QQ chat type: ${record.chatType}`)
+    const id = conversationId(record.chatType, record.peerUid)
     const current = this.contacts.get(id)
     const conversation: QQConversation = {
       id,
@@ -5156,7 +5434,7 @@ export class QQKernelBridge {
       title: current?.title || record.peerName || record.peerUin || record.peerUid,
       peerUid: record.peerUid,
       peerUin: current?.peerUin || record.peerUin || (record.chatType === CHAT_GROUP ? record.peerUid : ''),
-      chatType: record.chatType as 1 | 2,
+      chatType: record.chatType,
       avatarUrl: current?.avatarUrl,
       avatar: current?.avatar,
       unreadCount: current?.unreadCount,
@@ -5166,6 +5444,7 @@ export class QQKernelBridge {
   }
 
   private mapMessage(record: MsgRecord, context: MessageMappingContext = {}): QQMessage {
+    if (!isMessageChatType(record.chatType)) throw new Error(`unsupported QQ chat type: ${record.chatType}`)
     if (!context.sender) this.rememberRecordSender(record)
     let senderId = context.sender?.id ?? (record.senderUid || record.senderUin)
     const parts: QQMessage['parts'] = []
@@ -5216,7 +5495,7 @@ export class QQKernelBridge {
           preview: multiForwardPreview(element.multiForwardMsgElement),
           locator: {
             conversationId: context.multiForwardConversationId
-              ?? conversationId(record.chatType as 1 | 2, record.peerUid),
+              ?? conversationId(record.chatType, record.peerUid),
             rootMessageId: context.multiForwardRootId ?? record.msgId,
             ...(context.multiForwardRootId ? { parentMessageId: record.msgId } : {}),
           },
@@ -5228,7 +5507,7 @@ export class QQKernelBridge {
           preview: arkMultiForwardPreview(element.arkElement.bytesData),
           locator: {
             conversationId: context.multiForwardConversationId
-              ?? conversationId(record.chatType as 1 | 2, record.peerUid),
+              ?? conversationId(record.chatType, record.peerUid),
             rootMessageId: context.multiForwardRootId ?? record.msgId,
             ...(context.multiForwardRootId ? { parentMessageId: record.msgId } : {}),
           },
@@ -5261,7 +5540,7 @@ export class QQKernelBridge {
     const nativeReply = record.elements?.find((element) => element.replyElement)?.replyElement
     return {
       id: record.msgId,
-      conversationId: conversationId(record.chatType as 1 | 2, record.peerUid),
+      conversationId: conversationId(record.chatType, record.peerUid),
       senderId,
       sender: context.sender ?? {
         id: senderId,
@@ -5320,24 +5599,26 @@ export class QQKernelBridge {
 
   private async resolveReplyTargets(records: MsgRecord[]): Promise<void> {
     const batchBySeq = new Map(records.flatMap((record) => {
-      if (!record.msgSeq) return []
-      const conversation = conversationId(record.chatType as 1 | 2, record.peerUid)
+      if (!record.msgSeq || !isMessageChatType(record.chatType)) return []
+      const conversation = conversationId(record.chatType, record.peerUid)
       return [[`${conversation}\u0000${record.msgSeq}`, record.msgId] as const]
     }))
     const cachedBySeq = new Map(records.flatMap((record) => {
-      const conversation = conversationId(record.chatType as 1 | 2, record.peerUid)
+      if (!isMessageChatType(record.chatType)) return []
+      const conversation = conversationId(record.chatType, record.peerUid)
       return (this.messages.get(conversation) ?? []).flatMap((message) =>
         message.msgSeq ? [[`${conversation}\u0000${message.msgSeq}`, message.id] as const] : [])
     }))
     await Promise.all(
       records.map(async (record) => {
+      if (!isMessageChatType(record.chatType)) return
       // QQ group msgSeq is the Telegram megagroup message ID, so group replies
       // never need a target msgId lookup.
       if (record.chatType === CHAT_GROUP) return
       if (this.resolvedReplyTargets.has(record.msgId)) return
       const reply = record.elements?.find((element) => element.replyElement)?.replyElement
       if (!reply) return
-      const conversation = conversationId(record.chatType as 1 | 2, record.peerUid)
+      const conversation = conversationId(record.chatType, record.peerUid)
       const local = reply.replayMsgSeq
         ? (batchBySeq.get(`${conversation}\u0000${reply.replayMsgSeq}`)
           ??
@@ -5576,6 +5857,7 @@ export class QQKernelBridge {
   }
 
   private async withConversationAvatar(conversation: QQConversation, force = true): Promise<QQConversation> {
+    if (isDeviceChatType(conversation.chatType)) return conversation
     const peerKey = conversation.chatType === CHAT_GROUP ? conversation.peerUin || conversation.peerUid : conversation.peerUid
     const cacheKey = `${conversation.chatType === CHAT_C2C ? 'user' : 'group'}:${peerKey}`
     const cached = conversation.avatar ?? this.avatarCache.get(cacheKey)
@@ -5678,6 +5960,7 @@ export class QQKernelBridge {
   }
 
   private async requireProtocolPeerUin(conversation: QQConversation): Promise<string> {
+    if (isDeviceChatType(conversation.chatType)) return conversation.peerUin
     if (conversation.chatType === CHAT_GROUP) return conversation.peerUin || conversation.peerUid
     if (conversation.peerUin) return conversation.peerUin
     const cached = this.users.get(conversation.peerUid)?.numericId
@@ -6327,6 +6610,14 @@ function contact(conversation: QQConversation) {
   return { chatType: conversation.chatType, peerUid: conversation.peerUid, guildId: '' }
 }
 
+function isDeviceChatType(chatType: number): chatType is 8 | 134 {
+  return chatType === CHAT_DATA_LINE || chatType === CHAT_DATA_LINE_MOBILE
+}
+
+function isMessageChatType(chatType: number): chatType is 1 | 2 | 8 | 134 {
+  return chatType === CHAT_C2C || chatType === CHAT_GROUP || isDeviceChatType(chatType)
+}
+
 function latestMessage(current: QQMessage | undefined, candidate: QQMessage): QQMessage {
   if (!current || current.id === candidate.id) return candidate
   return compareMessagePosition(candidate, current) > 0 ? candidate : current
@@ -6570,10 +6861,11 @@ async function hashFilePrefix(path: string, algorithm: string, limit: number): P
 }
 
 function mapMedia(record: MsgRecord, element: MsgElement): QQMedia | undefined {
+  if (!isMessageChatType(record.chatType)) return
   const base = {
     messageId: record.msgId,
     elementId: element.elementId,
-    chatType: record.chatType as 1 | 2,
+    chatType: record.chatType,
     peerUid: record.peerUid,
   }
   if (element.pttElement) {
