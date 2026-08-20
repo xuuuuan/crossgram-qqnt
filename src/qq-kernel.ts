@@ -5103,7 +5103,65 @@ export class QQKernelBridge {
       } else {
         log('info', `native message duplicate suppressed source=${source} id=${message.id} peer=${record.peerUid} status=${record.sendStatus}`)
       }
+      const reactionGrayTipSeq = reactionGrayTipSequence(record)
+      if (reactionGrayTipSeq) {
+        await this.refreshReactionsFromGrayTip(conversation, reactionGrayTipSeq).catch((error) => {
+          log('error', `reaction gray-tip refresh failed conversation=${conversation.id} seq=${reactionGrayTipSeq}`, error)
+        })
+      }
     }
+  }
+
+  private async refreshReactionsFromGrayTip(
+    conversation: QQConversation,
+    msgSeq: string,
+  ): Promise<void> {
+    const cached = (this.messages.get(conversation.id) ?? [])
+      .find((message) => message.msgSeq === msgSeq && !message.serviceAction)
+    const service = this.requireMsgService()
+    let record: MsgRecord | undefined
+    if (cached) {
+      const response = await retryTransientInvalidArgument(() =>
+        service.getMsgsByMsgId(contact(conversation), [cached.id]))
+      if (response.result !== 0) throw new Error(`getMsgsByMsgId: ${response.errMsg} (${response.result})`)
+      record = response.msgList.find((item) => item.msgId === cached.id && !isRecalledRecord(item))
+    }
+    if (!record && service.getMsgsBySeqAndCount) {
+      const peer = contact(conversation)
+      const responses = await Promise.all([true, false].map((queryOrder) =>
+        retryHistoryCall(() => service.getMsgsBySeqAndCount!(peer, msgSeq, 4, queryOrder, true))))
+      record = responses.flatMap((response) => response.msgList)
+        .find((item) => item.msgSeq === msgSeq && !isGrayTipRecord(item) && !isRecalledRecord(item))
+    }
+    if (!record) {
+      log('warn', `reaction gray-tip target lookup failed conversation=${conversation.id} seq=${msgSeq}`)
+      return
+    }
+
+    const previous = cached
+      ?? (this.messages.get(conversation.id) ?? []).find((message) => message.id === record.msgId)
+    let refreshed = await this.mapMessagePrepared(record)
+    if (record.emojiLikesList === undefined && previous?.reactionContext) {
+      refreshed.reactionContext = previous.reactionContext
+    } else if (refreshed.reactionContext) {
+      refreshed = {
+        ...refreshed,
+        reactionContext: await this.withReactionActors(conversation, record, refreshed.reactionContext, 3),
+      }
+    }
+    this.rememberMessage(refreshed)
+    if (!refreshed.reactionContext
+      || JSON.stringify(previous?.reactionContext?.reactions)
+      === JSON.stringify(refreshed.reactionContext.reactions)) return
+
+    this.dispatch({
+      type: 'message-reactions',
+      eventId: `reaction-graytip:${refreshed.id}:${Date.now()}:${++this.reactionEventSequence}`,
+      conversation,
+      target: { conversationId: conversation.id, messageId: refreshed.id, targetId: refreshed.id },
+      context: refreshed.reactionContext,
+      timestamp: Math.floor(Date.now() / 1000),
+    })
   }
 
 
@@ -8793,6 +8851,19 @@ function telegramMessageId(value?: string): number | undefined {
   if (!value || !/^\d+$/.test(value)) return
   const id = Number(value)
   return Number.isSafeInteger(id) && id > 0 && id <= 0x7fffffff ? id : undefined
+}
+
+function reactionGrayTipSequence(record: MsgRecord): string | undefined {
+  if (record.chatType !== CHAT_GROUP) return
+  const xml = record.elements.find((element) =>
+    element.grayTipElement?.xmlElement?.templId === '10382')?.grayTipElement?.xmlElement
+  if (!xml) return
+  return xmlTagAttribute(xml.content, 'url', 'msgseq') || record.msgSeq
+}
+
+function xmlTagAttribute(xml: string, tag: string, attribute: string): string {
+  const match = new RegExp(`<${tag}\\b([^>]*)`, 'i').exec(xml)
+  return match ? xmlAttribute(match[1] ?? '', attribute) : ''
 }
 
 function isGrayTipRecord(record: MsgRecord): boolean {
