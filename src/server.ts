@@ -1052,8 +1052,12 @@ function decodeFlashTransferManifest(value: string | string[] | undefined): QQFl
   }
   for (const file of manifest.files) {
     if (!file || typeof file.name !== 'string' || !file.name || file.name.length > 255
-      || !Number.isSafeInteger(file.size) || file.size < 0) {
+      || !Number.isSafeInteger(file.size) || file.size < 0
+      || (file.source !== 'upload' && file.source !== 'qq-media')) {
       throw new Error('invalid flash transfer file')
+    }
+    if (file.source === 'qq-media' && !validFlashTransferLocator(file.locator)) {
+      throw new Error('invalid QQ flash transfer media locator')
     }
   }
   const totalBytes = manifest.files.reduce((sum, file) => sum + file.size, 0)
@@ -1061,6 +1065,17 @@ function decodeFlashTransferManifest(value: string | string[] | undefined): QQFl
     throw new Error('flash transfer is too large')
   }
   return manifest
+}
+
+function validFlashTransferLocator(value: unknown): value is QQMediaLocator {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const locator = value as Partial<QQMediaLocator>
+  return typeof locator.messageId === 'string'
+    && typeof locator.elementId === 'string'
+    && (locator.chatType === 1 || locator.chatType === 2 || locator.chatType === 8 || locator.chatType === 134)
+    && typeof locator.peerUid === 'string'
+    && (locator.kind === 'image' || locator.kind === 'file' || locator.kind === 'voice')
+    && typeof locator.fileName === 'string'
 }
 
 async function readJson<T>(request: IncomingMessage, max = 1024 * 1024): Promise<T> {

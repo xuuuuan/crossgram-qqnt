@@ -157,6 +157,7 @@ function fixture() {
     baseInfo?: { longNick?: string }
   }>([['self', { uid: 'self', uin: '10000', nick: 'Self', remark: '', avatarUrl: '' }]])
   let avatarPath = avatarFixturePath
+  const forceDownloadAvatar = vi.fn(async () => ({ result: 0, errMsg: '' }))
   const sentBodies: Buffer[] = []
   const message: MsgRecord = {
     msgId: 'm1', msgSeq: 'seq1', chatType: 1, sendType: 1, senderUid: 'self', senderUin: '10000',
@@ -369,7 +370,7 @@ function fixture() {
     getAVSDKService: vi.fn(() => avsdkAvailable ? avsdk : undefined),
     getRichMediaService: () => richMedia,
     getAvatarService: () => ({
-      getAvatarPath: () => avatarPath, forceDownloadAvatar: async () => ({ result: 0, errMsg: '' }),
+      getAvatarPath: () => avatarPath, forceDownloadAvatar,
       getGroupAvatarPath: () => avatarPath, getConfGroupAvatarPath: () => '',
       forceDownloadGroupAvatar: async () => ({ result: 0, errMsg: '' }),
     }),
@@ -414,6 +415,7 @@ function fixture() {
     })
   return {
     kernel, session, msg, recent, buddy, profile, group, search, avsdk, richMedia, uix, message, sentBodies,
+    forceDownloadAvatar,
     imageUpload, fileUpload, protocolSend, groupFilePublish,
     emitMessages(records: MsgRecord[]) {
       return msgHandlers.onMsgInfoListUpdate?.(records)
@@ -593,8 +595,34 @@ describe('QQKernelBridge', () => {
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: directory })
 
     await expect(bridge.createFlashTransfer({
-      framing: 'length-prefixed-v1', files: [{ name: 'short.txt', size: 5 }],
+      framing: 'length-prefixed-v1', files: [{ source: 'upload', name: 'short.txt', size: 5 }],
     }, Readable.from(framedUpload(Buffer.from('abc'))))).rejects.toThrow(/size mismatch/)
+    expect(createFlashTransferUploadTask).not.toHaveBeenCalled()
+  })
+
+  it('rejects QQ flash-transfer reuse outside QQNT trusted media roots', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'qqnt-flash-unit-'))
+    const outside = await mkdtemp(join(tmpdir(), 'qqnt-flash-outside-'))
+    tempPaths.push(directory, outside)
+    const path = join(outside, 'outside.bin')
+    await writeFile(path, Buffer.from('outside'))
+    const f = fixture()
+    const createFlashTransferUploadTask = vi.fn<KernelFlashTransferService['createFlashTransferUploadTask']>()
+    ;(f.session as unknown as { getFlashTransferService: () => KernelFlashTransferService }).getFlashTransferService =
+      () => ({ createFlashTransferUploadTask })
+    const bridge = new QQKernelBridge({ tempPath: join(directory, 'bridge-cache') })
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: directory })
+
+    await expect(bridge.createFlashTransfer({
+      framing: 'length-prefixed-v1',
+      files: [{
+        source: 'qq-media', name: 'outside.bin', size: 7,
+        locator: {
+          messageId: 'm1', elementId: 'e1', chatType: 1, peerUid: 'friend',
+          kind: 'file', fileName: 'outside.bin', filePath: path,
+        },
+      }],
+    }, Readable.from([]))).rejects.toThrow(/not trusted/)
     expect(createFlashTransferUploadTask).not.toHaveBeenCalled()
   })
 
@@ -4275,7 +4303,7 @@ describe('QQKernelBridge', () => {
     })
   })
 
-  it('keeps a group member personal name and alias separate and adds a qlogo avatar', async () => {
+  it('keeps a group member personal name and alias separate and upgrades its qlogo avatar on profile resolve', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
@@ -4296,8 +4324,55 @@ describe('QQKernelBridge', () => {
     await expect(bridge.getUser('member')).resolves.toMatchObject({
       id: 'member',
       name: 'Personal Name',
-      avatar: { locator: { avatarUin: '42' } },
+      avatar: { locator: { filePath: avatarFixturePath } },
     })
+  })
+
+  it('forces a UID-scoped native avatar before falling back to qlogo for a numeric QQ user', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    f.setAvatarPath('')
+    f.forceDownloadAvatar.mockImplementationOnce(async () => {
+      f.setAvatarPath(avatarFixturePath)
+      return { result: 0, errMsg: '' }
+    })
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: dirname(avatarFixturePath) })
+    f.emitBuddyList([{ buddyList: [{
+      uid: 'special-avatar', uin: '472247053', nick: 'Be Amdish', remark: '', avatarUrl: '',
+    }] }])
+
+    const contacts = await bridge.getContacts()
+    expect(contacts.users.find((user) => user.id === 'special-avatar')?.avatar).toMatchObject({
+      locator: { avatarUin: '472247053' },
+    })
+    expect(f.forceDownloadAvatar).not.toHaveBeenCalled()
+
+    await expect(bridge.getUser('special-avatar')).resolves.toMatchObject({
+      id: 'special-avatar', numericId: '472247053',
+      avatar: { locator: { filePath: avatarFixturePath } },
+    })
+    expect(f.forceDownloadAvatar).toHaveBeenCalledOnce()
+    expect(f.forceDownloadAvatar).toHaveBeenCalledWith('special-avatar', 0)
+
+    f.setAvatarPath('')
+    expect((await bridge.getContacts()).users.find((user) => user.id === 'special-avatar')?.avatar).toMatchObject({
+      locator: { filePath: avatarFixturePath },
+    })
+  })
+
+  it('keeps qlogo as the fallback when QQNT cannot resolve a native avatar file', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    f.setAvatarPath('')
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.emitBuddyList([{ buddyList: [{
+      uid: 'ordinary-avatar', uin: '123456789', nick: 'Ordinary', remark: '', avatarUrl: '',
+    }] }])
+
+    await expect(bridge.getUser('ordinary-avatar')).resolves.toMatchObject({
+      avatar: { locator: { avatarUin: '123456789' } },
+    })
+    expect(f.forceDownloadAvatar).toHaveBeenCalledWith('ordinary-avatar', 0)
   })
 
   it('maps administrator promotion and demotion to QQ native member roles', async () => {
@@ -5539,14 +5614,17 @@ describe('QQBridgeServer', () => {
     await Promise.all(tempPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })))
   })
 
-  it('streams a multi-file flash transfer into native staging and returns its share link', async () => {
+  it('reuses QQ cache paths and streams only new files into native flash transfer staging', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'qqnt-flash-server-'))
     tempPaths.push(directory)
+    const reusedPath = join(directory, 'cached-qq.bin')
+    await writeFile(reusedPath, Uint8Array.of(9, 8, 7, 6))
     const f = fixture()
-    const staged: Array<{ names: string[], bodies: Buffer[] }> = []
+    const staged: Array<{ paths: string[], names: string[], bodies: Buffer[] }> = []
     const createFlashTransferUploadTask = vi.fn<KernelFlashTransferService['createFlashTransferUploadTask']>(
       async (_timestamp, request) => {
         staged.push({
+          paths: request.paths,
           names: request.paths.map((path) => basename(path)),
           bodies: await Promise.all(request.paths.map((path) => readFile(path))),
         })
@@ -5567,7 +5645,13 @@ describe('QQBridgeServer', () => {
     await server.start()
     const manifest = {
       name: 'Telegram files', framing: 'length-prefixed-v1',
-      files: [{ name: 'alpha.txt', size: 5 }, { name: 'beta.bin', size: 3 }],
+      files: [{
+        source: 'qq-media', name: 'cached-qq.bin', size: 4,
+        locator: {
+          messageId: 'm1', elementId: 'e1', chatType: 1, peerUid: 'friend',
+          kind: 'file', fileName: 'cached-qq.bin', filePath: reusedPath,
+        },
+      }, { source: 'upload', name: 'alpha.txt', size: 5 }],
     }
 
     const response = await fetch(`http://127.0.0.1:${server.address().port}/v1/flash-transfers`, {
@@ -5575,16 +5659,20 @@ describe('QQBridgeServer', () => {
       headers: {
         'x-qqnt-flash-manifest': Buffer.from(JSON.stringify(manifest)).toString('base64url'),
       },
-      body: framedUpload(Buffer.from('alpha'), Uint8Array.of(1, 2, 3)),
+      body: framedUpload(Buffer.from('alpha')),
     })
 
     expect(response.status).toBe(200)
     await expect(response.json()).resolves.toEqual({
       fileSetId: 'fileset-1', shareLink: 'https://qq.example/flash/share-code', expiresAt: 2_000_000_000_000,
     })
-    expect(staged).toEqual([{
-      names: ['alpha.txt', 'beta.bin'], bodies: [Buffer.from('alpha'), Buffer.from([1, 2, 3])],
-    }])
+    expect(staged).toHaveLength(1)
+    expect(staged[0]!.paths[0]).toBe(reusedPath)
+    expect(staged[0]!.paths[1]).not.toBe(reusedPath)
+    expect(staged[0]).toMatchObject({
+      names: ['cached-qq.bin', 'alpha.txt'],
+      bodies: [Buffer.from([9, 8, 7, 6]), Buffer.from('alpha')],
+    })
     expect(createFlashTransferUploadTask).toHaveBeenCalledWith(expect.any(Number), expect.objectContaining({
       name: 'Telegram files', paths: expect.any(Array), uploaders: [{
         uin: '10000', uid: 'self', nickname: 'Self', sendEntrance: '',
@@ -5770,6 +5858,54 @@ describe('QQBridgeServer', () => {
     expect(response.status).toBe(400)
     await expect(response.json()).resolves.toEqual({ error: 'user ID is required' })
     expect(getUser).not.toHaveBeenCalled()
+  })
+
+  it('resolves and streams a UID-scoped native user avatar through the HTTP API', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'qqnt-user-avatar-http-'))
+    tempPaths.push(directory)
+    const avatarPath = join(directory, 'special-avatar.jpg')
+    const avatarBytes = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x00, 0xff, 0xd9])
+    await writeFile(avatarPath, avatarBytes)
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    f.setAvatarPath('')
+    f.forceDownloadAvatar.mockImplementationOnce(async () => {
+      f.setAvatarPath(avatarPath)
+      return { result: 0, errMsg: '' }
+    })
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: directory })
+    f.emitBuddyList([{ buddyList: [{
+      uid: 'uid-1715311957', uin: '1715311957', nick: 'xuuuuan', remark: '', avatarUrl: '',
+    }] }])
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const base = `http://127.0.0.1:${server.address().port}/v1`
+
+    const resolvedResponse = await fetch(`${base}/conversations/resolve?kind=direct&id=1715311957`)
+    expect(resolvedResponse.status).toBe(200)
+    const resolved = await resolvedResponse.json() as {
+      avatar: { locator: Record<string, unknown> }
+    }
+    expect(resolved.avatar.locator).toMatchObject({
+      peerUid: 'uid-1715311957', filePath: avatarPath,
+    })
+    expect(resolved.avatar.locator).not.toHaveProperty('avatarUin')
+    expect(f.forceDownloadAvatar).toHaveBeenCalledWith('uid-1715311957', 0)
+
+    const userResponse = await fetch(`${base}/users/uid-1715311957`)
+    expect(userResponse.status).toBe(200)
+    await expect(userResponse.json()).resolves.toMatchObject({
+      id: 'uid-1715311957', numericId: '1715311957',
+      avatar: { locator: { filePath: avatarPath } },
+    })
+
+    const asset = await fetch(`${base}/files/asset`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(resolved.avatar.locator),
+    })
+    expect(asset.status).toBe(200)
+    expect(asset.headers.get('content-type')).toBe('image/jpeg')
+    expect(Buffer.from(await asset.arrayBuffer())).toEqual(avatarBytes)
   })
 
   it('issues media leases only to an authorized active call and fails closed otherwise', async () => {
@@ -6015,7 +6151,7 @@ describe('QQBridgeServer', () => {
     const { port } = server.address()
     const base = `http://127.0.0.1:${port}/v1`
     await expect(fetch(`${base}/status`).then((response) => response.json())).resolves.toMatchObject({
-      protocolVersion: 27, ready: true, selfUin: '10000',
+      protocolVersion: 28, ready: true, selfUin: '10000',
     })
     const dialogs = await fetch(`${base}/dialogs`)
     expect(dialogs.status).toBe(200)

@@ -529,14 +529,19 @@ export class QQKernelBridge {
     const directory = join(this.flashTransferPath, `${Date.now()}-${randomUUID()}`)
     const reader = new FramedUploadReader(body)
     const paths: string[] = []
+    let uploadIndex = 0
     try {
       await mkdir(directory, { recursive: true })
       for (const [index, file] of manifest.files.entries()) {
+        if (file.source === 'qq-media') {
+          paths.push(this.flashTransferReusePath(file.locator, file.size))
+          continue
+        }
         const fileDirectory = join(directory, String(index).padStart(4, '0'))
         await mkdir(fileDirectory)
         const path = join(fileDirectory, safeFlashTransferName(file.name))
         await pipeline(
-          Readable.from(verifiedFlashTransferFile(reader.media(index), file.size, file.name)),
+          Readable.from(verifiedFlashTransferFile(reader.media(uploadIndex++), file.size, file.name)),
           createWriteStream(path, { flags: 'wx' }),
         )
         paths.push(path)
@@ -586,6 +591,26 @@ export class QQKernelBridge {
       await rm(directory, { recursive: true, force: true }).catch(() => undefined)
       throw error
     }
+  }
+
+  private flashTransferReusePath(locator: QQMediaLocator, expectedSize: number): string {
+    let path: string | undefined
+    try {
+      path = locator.filePath && realpathSync(locator.filePath)
+    } catch {
+      throw new QQFlashTransferError(`QQ media is not available in the local cache: ${locator.fileName}`)
+    }
+    if (!path || !this.trustedMediaRoots().some((root) => isPathInside(root, path))) {
+      throw new QQFlashTransferError(`QQ media cache path is not trusted: ${locator.fileName}`)
+    }
+    const info = statSync(path)
+    if (!info.isFile()) throw new QQFlashTransferError(`QQ media cache entry is not a file: ${locator.fileName}`)
+    if (info.size !== expectedSize) {
+      throw new QQFlashTransferError(
+        `QQ media cache size mismatch for ${locator.fileName}: expected ${expectedSize}, got ${info.size}`,
+      )
+    }
+    return path
   }
 
   issueMediaLease(callId: unknown): PCMMediaLease {
@@ -3054,7 +3079,7 @@ export class QQKernelBridge {
           cached.name,
           cached.numericId,
           cached.id,
-        ), avatar: await this.userAvatar(uid, false),
+        ), avatar: await this.userAvatar(uid),
       } }
     let numericId: string | undefined
     try {
@@ -3082,7 +3107,7 @@ export class QQKernelBridge {
         resolved.numericId,
         resolved.id,
       ),
-      avatar: await this.userAvatar(uid, false),
+      avatar: await this.userAvatar(uid),
     }
   }
 
@@ -5908,43 +5933,48 @@ export class QQKernelBridge {
 
   private async userAvatar(uid: string, force = true): Promise<QQMedia | undefined> {
     const cacheKey = `user:${uid}`
+    const cached = this.avatarCache.get(cacheKey)
+    // A native avatar is keyed by QQ's stable UID and can represent account
+    // avatar variants that the legacy public qlogo endpoint returns as the
+    // generic silhouette. Keep using an already resolved native file even on
+    // cheap list reads, and refresh it for explicit peer/profile requests.
+    if (cached && hasAvatarFile(cached)) return cached
     const numericId = this.seenUsers.get(uid)?.numericId
       ?? this.users.get(uid)?.numericId
       ?? (uid === this.config?.selfUid ? this.config.selfUin : undefined)
+    try {
+      const service = this.getAvatarService()
+      if (service) {
+        let filePath = service.getAvatarPath(uid, 0)
+        log('info', `avatar lookup kind=user peer=${uid} force=${force} cached=${Boolean(cached)} path=${JSON.stringify(filePath || '')}`)
+        if (force && (!filePath || !existsSync(filePath))) {
+          const result = await service.forceDownloadAvatar(uid, 0).catch((error) => {
+            log('error', `avatar force download threw kind=user peer=${uid}`, error)
+            return undefined
+          })
+          if (result) log('info', `avatar force download complete kind=user peer=${uid} result=${result.result} err=${JSON.stringify(result.errMsg)}`)
+          filePath = await waitForAvatarPath(() => service.getAvatarPath(uid, 0))
+        }
+        if (filePath && existsSync(filePath)) {
+          const avatar = avatarMedia(cacheKey, filePath)
+          this.avatarCache.set(cacheKey, avatar)
+          return avatar
+        }
+      }
+    } catch (error) {
+      log('error', `avatar lookup failed kind=user peer=${uid}`, error)
+    }
+    // qlogo remains the zero-copy fallback for ordinary accounts and list
+    // pages. Explicit profile resolution above first gives QQNT a chance to
+    // fetch the UID-scoped avatar, avoiding a permanent default silhouette.
     if (numericId && /^\d+$/.test(numericId)) {
       const avatar = qlogoAvatarMedia(uid, numericId)
       this.avatarCache.set(cacheKey, avatar)
       return avatar
     }
-    const cached = this.avatarCache.get(cacheKey)
-    if (cached && !force && hasAvatarFile(cached)) return cached
-    try {
-      const service = this.getAvatarService()
-      if (!service) return cached ?? avatarMedia(cacheKey)
-      let filePath = service.getAvatarPath(uid, 0)
-      log('info', `avatar lookup kind=user peer=${uid} force=${force} cached=${Boolean(cached)} path=${JSON.stringify(filePath || '')}`)
-      if (force && (!filePath || !existsSync(filePath))) {
-        const result = await service.forceDownloadAvatar(uid, 0).catch((error) => {
-          log('error', `avatar force download threw kind=user peer=${uid}`, error)
-          return undefined
-        })
-        if (result) log('info', `avatar force download complete kind=user peer=${uid} result=${result.result} err=${JSON.stringify(result.errMsg)}`)
-        filePath = await waitForAvatarPath(() => service.getAvatarPath(uid, 0))
-      }
-      if (filePath && existsSync(filePath)) {
-        const avatar = avatarMedia(cacheKey, filePath)
-        this.avatarCache.set(cacheKey, avatar)
-        return avatar
-      }
-      const placeholder = cached ?? avatarMedia(cacheKey)
-      this.avatarCache.set(cacheKey, placeholder)
-      return placeholder
-    } catch (error) {
-      log('error', `avatar lookup failed kind=user peer=${uid}`, error)
-      const placeholder = cached ?? avatarMedia(cacheKey)
-      this.avatarCache.set(cacheKey, placeholder)
-      return placeholder
-    }
+    const placeholder = cached ?? avatarMedia(cacheKey)
+    this.avatarCache.set(cacheKey, placeholder)
+    return placeholder
   }
 
   private async withConversationAvatar(conversation: QQConversation, force = true): Promise<QQConversation> {

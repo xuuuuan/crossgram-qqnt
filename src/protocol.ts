@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 27
+export const PROTOCOL_VERSION = 28
 
 /** Local Unix-socket PCM media protocol. Audio frames use a 1-byte type plus a 4-byte big-endian length. */
 export const PCM_MEDIA_PROTOCOL_VERSION = 1
@@ -482,13 +482,30 @@ export interface SendManifest {
   uploadedMedia?: QQPreparedMedia[]
 }
 
-/** One local file streamed into a QQ Flash Transfer file set. */
-export interface QQFlashTransferFile {
+/** One file uploaded from the caller into a QQ Flash Transfer file set. */
+export interface QQFlashTransferUploadFile {
+  source: 'upload'
   name: string
   size: number
 }
 
-/** Length-prefixed upload contract for POST /v1/flash-transfers. */
+/** One existing QQ media file reused from QQNT's trusted local cache. */
+export interface QQFlashTransferQQMediaFile {
+  source: 'qq-media'
+  name: string
+  size: number
+  locator: QQMediaLocator
+}
+
+export type QQFlashTransferFile = QQFlashTransferUploadFile | QQFlashTransferQQMediaFile
+
+/**
+ * Hybrid reuse/upload contract for POST /v1/flash-transfers.
+ *
+ * Only `source: 'upload'` entries consume a length-prefixed body item. Existing
+ * QQ media is passed by locator and reused from QQNT's cache without crossing
+ * the HTTP boundary again.
+ */
 export interface QQFlashTransferManifest {
   name?: string
   files: QQFlashTransferFile[]

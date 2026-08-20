@@ -180,7 +180,7 @@ Authorization: Bearer <QQNT_BRIDGE_TOKEN>
 | `GET` | `/v1/conversations/:id/search` | 会话内搜索。 |
 | `POST` | `/v1/conversations/1\|2/:peerUin/notification-mask` | 设置群消息屏蔽。 |
 | `POST` | `/v1/uploads/prepare` | 准备媒体上传（返回 Highway/直传计划）。 |
-| `POST` | `/v1/flash-transfers` | 把长度分帧的本地文件创建为 QQ 闪传文件集并返回分享链接。 |
+| `POST` | `/v1/flash-transfers` | 复用 QQNT 本地媒体缓存，并仅为新上传文件接收长度分帧数据，创建 QQ 闪传文件集并返回分享链接。 |
 | `POST` | `/v1/messages` | 发送消息（正文通过 `x-qqnt-manifest` 传递）。 |
 | `POST` | `/v1/messages/delete` | 删除消息。 |
 | `POST` | `/v1/messages/get` | 按 ID 获取消息。 |
