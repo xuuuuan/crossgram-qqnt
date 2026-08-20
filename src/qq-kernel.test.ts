@@ -4576,110 +4576,235 @@ describe('QQKernelBridge', () => {
     )
   })
 
-  it('refreshes the reacted message immediately when QQ sends its reaction gray tip', async () => {
+  it('polls an active group and publishes another user\'s first reaction without a native callback', async () => {
+    let bridge: QQKernelBridge | undefined
+    try {
+      const f = fixture()
+      bridge = new QQKernelBridge({ reactionPollIntervalMs: 25, reactionPollActiveTtlMs: 1_000 })
+      vi.spyOn(bridge as unknown as { initializePlatformData(): Promise<void> }, 'initializePlatformData').mockResolvedValue()
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      const conversation = bridge.getConversation('1058754719')
+      const target = {
+        ...f.message,
+        msgId: 'reaction-target', msgSeq: '799177', chatType: 2 as const,
+        peerUid: '1058754719', peerUin: '1058754719', peerName: 'Test Group',
+        sendType: 0, senderUid: 'member-a', senderUin: '42', emojiLikesList: [],
+      }
+      f.msg.getLatestDbMsgs.mockResolvedValue({ result: 0, errMsg: '', msgList: [target] })
+      await bridge.getHistory(conversation)
+      f.msg.getMsgsByMsgId.mockResolvedValue({
+        result: 0, errMsg: '', msgList: [{
+          ...target,
+          emojiLikesList: [{ emojiType: '1', emojiId: '424', likesCnt: '1', isClicked: false }],
+        }],
+      })
+      f.msg.getMsgEmojiLikesList.mockResolvedValue({
+        result: 0, errMsg: '', cookie: '', isFirstPage: true, isLastPage: true,
+        emojiLikesList: [{ tinyId: 'actor-a', nickName: 'Alice', headUrl: '' }],
+      })
+      vi.useFakeTimers()
+      const queue = bridge.subscribe()
+      const events = queue[Symbol.asyncIterator]()
+
+      await vi.advanceTimersByTimeAsync(25)
+
+      await expect(events.next()).resolves.toMatchObject({ value: {
+        type: 'message-reactions',
+        eventId: expect.stringMatching(/^reaction-poll:reaction-target:/),
+        target: { messageId: 'reaction-target' },
+        context: {
+          reactions: [{ key: '1:424', count: 1, recentActors: [{ userId: 'actor-a' }] }],
+        },
+      } })
+      expect(f.msg.getMsgsByMsgId).toHaveBeenCalledWith(
+        expect.objectContaining({ peerUid: '1058754719' }), ['reaction-target'],
+      )
+      bridge.unsubscribe(queue)
+    } finally {
+      bridge?.detach()
+      vi.useRealTimers()
+    }
+  })
+
+  it('polls reaction actor swaps, count changes, and authoritative clears', async () => {
+    let bridge: QQKernelBridge | undefined
+    try {
+      const f = fixture()
+      bridge = new QQKernelBridge({
+        reactionPollIntervalMs: 25,
+        reactionPollActiveTtlMs: 1_000,
+        reactionPollActorIntervalMs: 25,
+      })
+      vi.spyOn(bridge as unknown as { initializePlatformData(): Promise<void> }, 'initializePlatformData').mockResolvedValue()
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      const conversation = bridge.getConversation('1058754719')
+      const target = {
+        ...f.message,
+        msgId: 'reaction-mutations', msgSeq: '799178', chatType: 2 as const,
+        peerUid: '1058754719', peerUin: '1058754719', peerName: 'Test Group',
+        sendType: 0, senderUid: 'member-a', senderUin: '42',
+        emojiLikesList: [{ emojiType: '2', emojiId: '10068', likesCnt: '1', isClicked: false }],
+      }
+      f.msg.getLatestDbMsgs.mockResolvedValue({ result: 0, errMsg: '', msgList: [target] })
+      await bridge.getHistory(conversation)
+      let snapshot = target
+      let actors = [{ tinyId: 'actor-a', nickName: 'Alice', headUrl: '' }]
+      f.msg.getMsgsByMsgId.mockImplementation(async () => ({ result: 0, errMsg: '', msgList: [snapshot] }))
+      f.msg.getMsgEmojiLikesList.mockImplementation(async () => ({
+        result: 0, errMsg: '', cookie: '', isFirstPage: true, isLastPage: true, emojiLikesList: actors,
+      }))
+      vi.useFakeTimers()
+      const queue = bridge.subscribe()
+      const events = queue[Symbol.asyncIterator]()
+
+      await vi.advanceTimersByTimeAsync(25)
+      await expect(events.next()).resolves.toMatchObject({ value: {
+        type: 'message-reactions', context: { reactions: [{ recentActors: [{ userId: 'actor-a' }] }] },
+      } })
+
+      actors = [{ tinyId: 'actor-b', nickName: 'Bob', headUrl: '' }]
+      await vi.advanceTimersByTimeAsync(25)
+      await expect(events.next()).resolves.toMatchObject({ value: {
+        type: 'message-reactions',
+        context: { reactions: [{ key: '2:10068', count: 1, recentActors: [{ userId: 'actor-b' }] }] },
+      } })
+
+      snapshot = {
+        ...target,
+        emojiLikesList: [{ emojiType: '2', emojiId: '10068', likesCnt: '2', isClicked: false }],
+      }
+      actors = [
+        { tinyId: 'actor-b', nickName: 'Bob', headUrl: '' },
+        { tinyId: 'actor-c', nickName: 'Carol', headUrl: '' },
+      ]
+      await vi.advanceTimersByTimeAsync(25)
+      await expect(events.next()).resolves.toMatchObject({ value: {
+        type: 'message-reactions', context: { reactions: [{ count: 2 }] },
+      } })
+
+      snapshot = { ...target, emojiLikesList: [] }
+      await vi.advanceTimersByTimeAsync(25)
+      await expect(events.next()).resolves.toMatchObject({ value: {
+        type: 'message-reactions', context: { reactions: [], maxSelected: 20 },
+      } })
+      bridge.unsubscribe(queue)
+    } finally {
+      bridge?.detach()
+      vi.useRealTimers()
+    }
+  })
+
+  it('batches cached messages only for active groups and stops after the activity TTL', async () => {
     const f = fixture()
-    const bridge = new QQKernelBridge()
+    const bridge = new QQKernelBridge({ reactionPollIntervalMs: 20, reactionPollActiveTtlMs: 30 })
+    vi.spyOn(bridge as unknown as { initializePlatformData(): Promise<void> }, 'initializePlatformData').mockResolvedValue()
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
-    const conversation = await bridge.resolveConversation(2, '1058754719')
+    const active = bridge.getConversation('1058754719')
+    const activeMessages = ['active-one', 'active-two'].map((msgId, index) => ({
+      ...f.message, msgId, msgSeq: String(100 + index), chatType: 2 as const,
+      peerUid: '1058754719', peerUin: '1058754719', emojiLikesList: [],
+    }))
+    f.msg.getLatestDbMsgs.mockResolvedValue({ result: 0, errMsg: '', msgList: activeMessages })
+    await bridge.getHistory(active)
+    await f.emitMessages([{
+      ...f.message, msgId: 'inactive-message', msgSeq: '200', chatType: 2,
+      peerUid: '2000000000', peerUin: '2000000000', emojiLikesList: [],
+    }])
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    f.msg.getMsgsByMsgId.mockImplementation(async (...args: unknown[]) => ({
+      result: 0, errMsg: '',
+      msgList: activeMessages.filter((message) => (args[1] as string[]).includes(message.msgId)),
+    }))
+    vi.useFakeTimers()
+    try {
+      await vi.advanceTimersByTimeAsync(20)
+      expect(f.msg.getMsgsByMsgId).not.toHaveBeenCalled()
+      await bridge.markRead(active, 'active-two')
+      const queue = bridge.subscribe()
+      await vi.advanceTimersByTimeAsync(20)
+      expect(f.msg.getMsgsByMsgId).toHaveBeenCalledTimes(1)
+      expect(f.msg.getMsgsByMsgId).toHaveBeenCalledWith(
+        expect.objectContaining({ peerUid: '1058754719' }), ['active-one', 'active-two'],
+      )
+
+      await vi.advanceTimersByTimeAsync(100)
+      expect(f.msg.getMsgsByMsgId).toHaveBeenCalledTimes(1)
+      bridge.unsubscribe(queue)
+    } finally {
+      bridge.detach()
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not re-enter a reaction poll and does not reschedule it after detach', async () => {
+    let bridge: QQKernelBridge | undefined
+    try {
+      const f = fixture()
+      bridge = new QQKernelBridge({ reactionPollIntervalMs: 20, reactionPollActiveTtlMs: 1_000 })
+      vi.spyOn(bridge as unknown as { initializePlatformData(): Promise<void> }, 'initializePlatformData').mockResolvedValue()
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      const conversation = bridge.getConversation('1058754719')
+      const target = {
+        ...f.message, msgId: 'slow-poll', msgSeq: '300', chatType: 2 as const,
+        peerUid: '1058754719', peerUin: '1058754719', emojiLikesList: [],
+      }
+      f.msg.getLatestDbMsgs.mockResolvedValue({ result: 0, errMsg: '', msgList: [target] })
+      await bridge.getHistory(conversation)
+      let resolvePoll!: (value: { result: number, errMsg: string, msgList: MsgRecord[] }) => void
+      f.msg.getMsgsByMsgId.mockImplementation(() => new Promise((resolve) => { resolvePoll = resolve }))
+      vi.useFakeTimers()
+      bridge.subscribe()
+
+      await vi.advanceTimersByTimeAsync(100)
+      expect(f.msg.getMsgsByMsgId).toHaveBeenCalledOnce()
+      bridge.detach()
+      resolvePoll({ result: 0, errMsg: '', msgList: [target] })
+      await Promise.resolve()
+      await vi.advanceTimersByTimeAsync(100)
+      expect(f.msg.getMsgsByMsgId).toHaveBeenCalledOnce()
+    } finally {
+      bridge?.detach()
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not use a reaction gray tip as a refresh trigger', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge({ reactionPollIntervalMs: 60_000 })
+    vi.spyOn(bridge as unknown as { initializePlatformData(): Promise<void> }, 'initializePlatformData').mockResolvedValue()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const conversation = bridge.getConversation('1058754719')
     const target = {
       ...f.message,
-      msgId: 'reaction-target', msgSeq: '799177', chatType: 2 as const,
-      peerUid: '1058754719', peerUin: '1058754719', peerName: 'Test Group',
-      sendType: 1, senderUid: 'self', senderUin: '10000', emojiLikesList: [],
+      msgId: 'graytip-target', msgSeq: '799179', chatType: 2 as const,
+      peerUid: '1058754719', peerUin: '1058754719', emojiLikesList: [],
     }
     f.msg.getLatestDbMsgs.mockResolvedValue({ result: 0, errMsg: '', msgList: [target] })
     await bridge.getHistory(conversation)
-    f.msg.getMsgsByMsgId.mockResolvedValue({
-      result: 0, errMsg: '', msgList: [{
-        ...target,
-        emojiLikesList: [{ emojiType: '1', emojiId: '424', likesCnt: '1', isClicked: false }],
-      }],
-    })
-    f.msg.getMsgEmojiLikesList.mockResolvedValue({
-      result: 0, errMsg: '', cookie: '', isFirstPage: true, isLastPage: true,
-      emojiLikesList: [{ tinyId: 'actor-a', nickName: 'Alice', headUrl: '' }],
-    })
-    const events = bridge.subscribe()[Symbol.asyncIterator]()
-    const startedAt = Math.floor(Date.now() / 1000)
+    f.msg.getMsgsByMsgId.mockClear()
+    f.msg.getMsgsBySeqAndCount.mockClear()
+    const queue = bridge.subscribe()
+    const events = queue[Symbol.asyncIterator]()
 
     f.emitReceived([{
       ...target,
-      msgId: 'reaction-graytip', msgSeq: '799177', sendType: 0,
-      senderUid: '0', senderUin: '0', sendNickName: '', emojiLikesList: undefined,
+      msgId: 'reaction-graytip', sendType: 0, senderUid: '0', senderUin: '0',
+      emojiLikesList: undefined,
       elements: [{ elementType: 8, elementId: 'reaction-notice', grayTipElement: {
         xmlElement: {
           templId: '10382',
-          content: '<gtip><qq jp="doable~"/><nor txt="回应了你的"/><url msgseq="799177"/><face id="424"/></gtip>',
+          content: '<gtip><nor txt="Alice回应了你的"/><url msgseq="799179"/></gtip>',
         },
       } }],
     }])
 
     await expect(events.next()).resolves.toMatchObject({
-      value: {
-        type: 'message',
-        message: { id: 'reaction-graytip', serviceAction: { text: 'doable~回应了你的' } },
-      },
+      value: { type: 'message', message: { id: 'reaction-graytip' } },
     })
-    const reaction = await events.next()
-    expect(reaction).toMatchObject({ value: {
-      type: 'message-reactions', timestamp: expect.any(Number),
-      eventId: expect.stringMatching(/^reaction-graytip:reaction-target:/),
-      target: { messageId: 'reaction-target', targetId: 'reaction-target' },
-      context: {
-        reactions: [{ key: '1:424', count: 1, recentActors: [{ userId: 'actor-a' }] }],
-      },
-    } })
-    expect(reaction.value?.type === 'message-reactions' ? reaction.value.timestamp : 0)
-      .toBeGreaterThanOrEqual(startedAt)
-    expect(f.msg.getMsgsByMsgId).toHaveBeenCalledWith(
-      expect.objectContaining({ chatType: 2, peerUid: '1058754719' }), ['reaction-target'],
-    )
-    expect(f.msg.getMsgEmojiLikesList).toHaveBeenCalledWith(
-      expect.objectContaining({ peerUid: '1058754719' }), '799177', '424', '1', '', false, 3,
-    )
-  })
-
-  it('finds an uncached reaction target by sequence without selecting the gray tip itself', async () => {
-    const f = fixture()
-    const bridge = new QQKernelBridge()
-    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
-    await bridge.resolveConversation(2, '1058754719')
-    const target = {
-      ...f.message,
-      msgId: 'cold-reaction-target', msgSeq: '799178', chatType: 2 as const,
-      peerUid: '1058754719', peerUin: '1058754719', peerName: 'Test Group',
-      emojiLikesList: [{ emojiType: '2', emojiId: '10068', likesCnt: '2', isClicked: false }],
-    }
-    const grayTip = {
-      ...target,
-      msgId: 'cold-reaction-graytip', sendType: 0, senderUid: '0', senderUin: '0',
-      emojiLikesList: undefined,
-      elements: [{ elementType: 8, elementId: 'reaction-notice', grayTipElement: {
-        xmlElement: {
-          templId: '10382',
-          content: '<gtip><nor txt="Alice回应了你的"/><url msgseq="799178"/></gtip>',
-        },
-      } }],
-    }
-    f.msg.getMsgsBySeqAndCount.mockResolvedValue({
-      result: 0, errMsg: '', msgList: [grayTip, target],
-    })
-    const events = bridge.subscribe()[Symbol.asyncIterator]()
-
-    f.emitReceived([grayTip])
-
-    await expect(events.next()).resolves.toMatchObject({
-      value: { type: 'message', message: { id: 'cold-reaction-graytip' } },
-    })
-    await expect(events.next()).resolves.toMatchObject({ value: {
-      type: 'message-reactions',
-      target: { messageId: 'cold-reaction-target' },
-      context: { reactions: [{ key: '2:10068', count: 2 }] },
-    } })
-    expect(f.msg.getMsgsBySeqAndCount.mock.calls).toEqual([
-      [expect.objectContaining({ peerUid: '1058754719' }), '799178', 4, true, true],
-      [expect.objectContaining({ peerUid: '1058754719' }), '799178', 4, false, true],
-    ])
+    expect(f.msg.getMsgsByMsgId).not.toHaveBeenCalled()
+    expect(f.msg.getMsgsBySeqAndCount).not.toHaveBeenCalled()
+    bridge.unsubscribe(queue)
+    bridge.detach()
   })
 
   it('retracts an optimistic outgoing event when QQ later rejects it', async () => {
@@ -6669,16 +6794,17 @@ describe('QQBridgeServer', () => {
     )
   })
 
-  it('streams a gray-tip-triggered reaction refresh over WebSocket', async () => {
+  it('streams a polled reaction update over WebSocket without any native callback', async () => {
     const f = fixture()
-    const bridge = new QQKernelBridge()
+    const bridge = new QQKernelBridge({ reactionPollIntervalMs: 20, reactionPollActiveTtlMs: 1_000 })
+    vi.spyOn(bridge as unknown as { initializePlatformData(): Promise<void> }, 'initializePlatformData').mockResolvedValue()
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
-    const conversation = await bridge.resolveConversation(2, '1058754719')
+    const conversation = bridge.getConversation('1058754719')
     const target = {
       ...f.message,
       msgId: 'ws-reaction-target', msgSeq: '799177', chatType: 2 as const,
       peerUid: '1058754719', peerUin: '1058754719', peerName: 'Test Group',
-      emojiLikesList: [],
+      sendType: 0, senderUid: 'member-a', senderUin: '42', emojiLikesList: [],
     }
     f.msg.getLatestDbMsgs.mockResolvedValue({ result: 0, errMsg: '', msgList: [target] })
     await bridge.getHistory(conversation)
@@ -6688,6 +6814,10 @@ describe('QQBridgeServer', () => {
         emojiLikesList: [{ emojiType: '2', emojiId: '10068', likesCnt: '1', isClicked: false }],
       }],
     })
+    f.msg.getMsgEmojiLikesList.mockResolvedValue({
+      result: 0, errMsg: '', cookie: '', isFirstPage: true, isLastPage: true,
+      emojiLikesList: [{ tinyId: 'actor-a', nickName: 'Alice', headUrl: '' }],
+    })
     server = new QQBridgeServer(bridge, { port: 0 })
     await server.start()
     const socket = new WebSocket(`ws://127.0.0.1:${server.address().port}/v1/events/ws`)
@@ -6695,25 +6825,15 @@ describe('QQBridgeServer', () => {
     const frames: Array<{ event: { type: string, target?: { messageId?: string } } }> = []
     socket.on('message', (raw) => frames.push(JSON.parse(raw.toString())))
 
-    f.emitReceived([{
-      ...target,
-      msgId: 'ws-reaction-graytip', sendType: 0, senderUid: '0', senderUin: '0',
-      emojiLikesList: undefined,
-      elements: [{ elementType: 8, elementId: 'reaction-notice', grayTipElement: {
-        xmlElement: {
-          templId: '10382',
-          content: '<gtip><nor txt="doable~回应了你的"/><url msgseq="799177"/></gtip>',
-        },
-      } }],
-    }])
-
-    await vi.waitFor(() => expect(frames).toHaveLength(2))
-    expect(frames).toMatchObject([
-      { event: { type: 'message' } },
+    await vi.waitFor(() => expect(frames).toMatchObject([
       { event: { type: 'message-reactions', target: { messageId: 'ws-reaction-target' } } },
-    ])
+    ]))
+    expect(f.msg.getMsgsByMsgId).toHaveBeenCalledWith(
+      expect.objectContaining({ peerUid: '1058754719' }), ['ws-reaction-target'],
+    )
     socket.close()
     await once(socket, 'close')
+    bridge.detach()
   })
 
   it('streams events over WebSocket, resumes by event id, and removes closed subscribers', async () => {

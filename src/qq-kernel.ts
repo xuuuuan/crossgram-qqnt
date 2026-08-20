@@ -50,6 +50,14 @@ const MEMBER_SCENE_LIMIT = 64
 const DELETE_DEDUP_TTL_MS = 60_000
 const STICKER_MISSING_CACHE_TTL_MS = 30_000
 const STALE_CURSOR_REPLAY_LIMIT = 512
+const REACTION_POLL_INTERVAL_MS = 2_500
+const REACTION_POLL_ACTIVE_TTL_MS = 10 * 60_000
+const REACTION_POLL_MESSAGE_LIMIT = 50
+const REACTION_POLL_CONVERSATION_LIMIT = 4
+const REACTION_POLL_ACTOR_LOOKUP_LIMIT = 4
+const REACTION_POLL_ACTOR_INTERVAL_MS = 10_000
+const REACTION_POLL_ACTOR_TIMESTAMP_LIMIT = 4_096
+const REACTION_POLL_ACTIVE_CONVERSATION_LIMIT = 32
 const CALL_SIGNAL_EVENT_WINDOW_MS = 60_000
 const CALL_SIGNAL_MAX_EVENTS_PER_WINDOW = 10
 const CALL_SIGNAL_RELATION_ID_MAX_BYTES = 32
@@ -121,6 +129,12 @@ export interface QQKernelOptions {
   deleteDedupTtlMs?: number
   stickerMissingCacheTtlMs?: number
   marketStickerMimeCacheDir?: string | false
+  /** Test-only override; production polls active group conversations every 2.5 seconds. */
+  reactionPollIntervalMs?: number
+  /** Test-only override; production keeps a viewed group active for ten minutes. */
+  reactionPollActiveTtlMs?: number
+  /** Test-only override; production refreshes actor previews at most every ten seconds. */
+  reactionPollActorIntervalMs?: number
   /** Test-only override; production uses the 32 MiB voice body limit. */
   voiceInputLimitBytes?: number
   mediaGateway?: QQMediaLeaseIssuer
@@ -378,6 +392,15 @@ export class QQKernelBridge {
   private readonly reactionAssets = new Map<string, { path: string, mimeType: 'image/png' | 'image/apng' }>()
   private reactionCatalogPromise?: Promise<void>
   private reactionEventSequence = 0
+  private readonly activeReactionConversations = new Map<string, {
+    conversation: QQConversation
+    lastActive: number
+  }>()
+  private reactionPollTimer?: NodeJS.Timeout
+  private reactionPollRunning = false
+  private reactionPollCursor = 0
+  private reactionPollGeneration = 0
+  private readonly reactionActorPollTimes = new Map<string, number>()
   private messageEditEventSequence = 0
   private readonly stickerPacks = new Map<string, QQStickerPack>()
   private readonly stickerPackInfo = new Map<string, MarketStickerPackInfo>()
@@ -451,6 +474,9 @@ export class QQKernelBridge {
   private readonly packetClientOptions: QQPacketClientOptions
   private readonly deleteDedupTtlMs: number
   private readonly stickerMissingCacheTtlMs: number
+  private readonly reactionPollIntervalMs: number
+  private readonly reactionPollActiveTtlMs: number
+  private readonly reactionPollActorIntervalMs: number
   private readonly marketStickerMimeCacheDir?: string
   private readonly voiceInputLimitBytes: number
 
@@ -475,6 +501,18 @@ export class QQKernelBridge {
     this.packetClientOptions = options.packetClient ?? {}
     this.deleteDedupTtlMs = options.deleteDedupTtlMs ?? DELETE_DEDUP_TTL_MS
     this.stickerMissingCacheTtlMs = options.stickerMissingCacheTtlMs ?? STICKER_MISSING_CACHE_TTL_MS
+    this.reactionPollIntervalMs = options.reactionPollIntervalMs ?? REACTION_POLL_INTERVAL_MS
+    this.reactionPollActiveTtlMs = options.reactionPollActiveTtlMs ?? REACTION_POLL_ACTIVE_TTL_MS
+    this.reactionPollActorIntervalMs = options.reactionPollActorIntervalMs ?? REACTION_POLL_ACTOR_INTERVAL_MS
+    if (!Number.isFinite(this.reactionPollIntervalMs) || this.reactionPollIntervalMs <= 0) {
+      throw new Error('reaction poll interval must be positive')
+    }
+    if (!Number.isFinite(this.reactionPollActiveTtlMs) || this.reactionPollActiveTtlMs <= 0) {
+      throw new Error('reaction poll active TTL must be positive')
+    }
+    if (!Number.isFinite(this.reactionPollActorIntervalMs) || this.reactionPollActorIntervalMs <= 0) {
+      throw new Error('reaction poll actor interval must be positive')
+    }
     this.voiceInputLimitBytes = options.voiceInputLimitBytes ?? MAX_VOICE_INPUT_BYTES
     if (!Number.isSafeInteger(this.voiceInputLimitBytes) || this.voiceInputLimitBytes <= 0) {
       throw new Error('voice input limit must be a positive integer')
@@ -741,6 +779,12 @@ export class QQKernelBridge {
   }
 
   detach(): void {
+    this.reactionPollGeneration++
+    if (this.reactionPollTimer) clearTimeout(this.reactionPollTimer)
+    this.reactionPollTimer = undefined
+    this.activeReactionConversations.clear()
+    this.reactionPollCursor = 0
+    this.reactionActorPollTimes.clear()
     this.groupJoinContractProbe = this.groupJoinContractProbeEnabled
       ? unavailableGroupJoinContractProbe(true)
       : DISABLED_GROUP_JOIN_CONTRACT_PROBE
@@ -842,6 +886,7 @@ export class QQKernelBridge {
   subscribe(lastEventId?: string): AsyncQueue<QQEvent> {
     const queue = new AsyncQueue<QQEvent>()
     this.events.add(queue)
+    this.scheduleReactionPoll()
     if (lastEventId) {
       const cursor = this.recentEvents.findIndex((item) => item.id === lastEventId)
       const available = cursor >= 0 ? this.recentEvents.slice(cursor + 1) : this.recentEvents
@@ -872,6 +917,181 @@ export class QQKernelBridge {
     this.events.delete(queue)
     this.replayStates.delete(queue)
     queue.close()
+    if (!this.events.size && this.reactionPollTimer) {
+      clearTimeout(this.reactionPollTimer)
+      this.reactionPollTimer = undefined
+    }
+  }
+
+  private markReactionConversationActive(conversation: QQConversation): void {
+    if (conversation.chatType !== CHAT_GROUP) return
+    // QQNT has no universal reaction callback. Its "reacted to your message"
+    // gray tip only covers messages sent by the current account, so refresh
+    // viewed groups from independent message snapshots instead.
+    this.activeReactionConversations.delete(conversation.id)
+    this.activeReactionConversations.set(conversation.id, { conversation, lastActive: Date.now() })
+    if (this.activeReactionConversations.size > REACTION_POLL_ACTIVE_CONVERSATION_LIMIT) {
+      let oldestId: string | undefined
+      let oldestTimestamp = Number.POSITIVE_INFINITY
+      for (const [id, active] of this.activeReactionConversations) {
+        if (active.lastActive < oldestTimestamp) {
+          oldestId = id
+          oldestTimestamp = active.lastActive
+        }
+      }
+      if (oldestId) this.activeReactionConversations.delete(oldestId)
+    }
+    this.scheduleReactionPoll()
+  }
+
+  private pruneReactionConversations(now = Date.now()): void {
+    for (const [id, active] of this.activeReactionConversations) {
+      if (now - active.lastActive >= this.reactionPollActiveTtlMs) {
+        this.activeReactionConversations.delete(id)
+      }
+    }
+  }
+
+  private scheduleReactionPoll(): void {
+    if (this.reactionPollTimer || this.reactionPollRunning || !this.session || !this.events.size) return
+    this.pruneReactionConversations()
+    if (!this.activeReactionConversations.size) return
+    this.reactionPollTimer = setTimeout(() => {
+      this.reactionPollTimer = undefined
+      void this.pollActiveReactions()
+    }, this.reactionPollIntervalMs)
+    this.reactionPollTimer.unref()
+  }
+
+  private async pollActiveReactions(): Promise<void> {
+    if (this.reactionPollRunning) return
+    this.reactionPollRunning = true
+    const generation = this.reactionPollGeneration
+    try {
+      if (!this.session || !this.events.size) return
+      this.pruneReactionConversations()
+      const active = [...this.activeReactionConversations.values()]
+      if (!active.length) return
+      const count = Math.min(active.length, REACTION_POLL_CONVERSATION_LIMIT)
+      const start = this.reactionPollCursor % active.length
+      const selected = Array.from({ length: count }, (_, index) => active[(start + index) % active.length]!)
+      this.reactionPollCursor = (start + count) % active.length
+      const actorBudget = { remaining: REACTION_POLL_ACTOR_LOOKUP_LIMIT }
+      for (const item of selected) {
+        if (generation !== this.reactionPollGeneration || !this.session || !this.events.size) return
+        await this.pollConversationReactions(item.conversation, generation, actorBudget).catch((error) => {
+          log('error', `reaction poll failed conversation=${item.conversation.id}`, error)
+        })
+      }
+    } finally {
+      this.reactionPollRunning = false
+      this.scheduleReactionPoll()
+    }
+  }
+
+  private async pollConversationReactions(
+    conversation: QQConversation,
+    generation: number,
+    actorBudget: { remaining: number },
+  ): Promise<void> {
+    const cached = (this.messages.get(conversation.id) ?? [])
+      .filter((message) => message.id && message.id !== '0' && !message.serviceAction)
+      .sort((left, right) => right.timestamp - left.timestamp)
+      .slice(0, REACTION_POLL_MESSAGE_LIMIT)
+    if (!cached.length) return
+    const ids = [...new Set(cached.map((message) => message.id))]
+    const service = this.requireMsgService()
+    log('info', `native API start name=getMsgsByMsgId(reaction-poll) conversation=${conversation.id} messages=${ids.length}`)
+    const response = await withTimeout(
+      retryTransientInvalidArgument(() => service.getMsgsByMsgId(contact(conversation), ids)),
+      5_000,
+      'QQ reaction poll timed out',
+    )
+    log('info', `native API complete name=getMsgsByMsgId(reaction-poll) conversation=${conversation.id} result=${response.result} err=${JSON.stringify(response.errMsg)} records=${response.msgList.length}`)
+    if (response.result !== 0) {
+      throw new Error(`getMsgsByMsgId(reaction-poll): ${response.errMsg} (${response.result})`)
+    }
+    if (generation !== this.reactionPollGeneration || !this.session || !this.events.size) return
+
+    const recordsById = new Map(response.msgList.map((record) => [record.msgId, record]))
+    for (const previous of cached) {
+      const record = recordsById.get(previous.id)
+      if (!record) continue
+      if (record.chatType !== CHAT_GROUP
+        || conversationId(record.chatType, record.peerUid) !== conversation.id
+        || record.emojiLikesList === undefined) continue
+      if (isRecalledRecord(record)) continue
+      const context = await this.polledReactionState(conversation, record, previous.reactionContext, actorBudget)
+      if (generation !== this.reactionPollGeneration || !this.session || !this.events.size) return
+      const previousRevision = reactionStateRevision(previous.reactionContext)
+      const currentRevision = reactionStateRevision(context)
+      this.rememberMessage({
+        ...previous,
+        reactionContext: context.reactions.length ? context : undefined,
+      })
+      if (previousRevision === currentRevision) continue
+      this.dispatch({
+        type: 'message-reactions',
+        eventId: `reaction-poll:${previous.id}:${Date.now()}:${++this.reactionEventSequence}`,
+        conversation,
+        target: { conversationId: conversation.id, messageId: previous.id, targetId: previous.id },
+        context,
+        timestamp: Math.floor(Date.now() / 1000),
+      })
+    }
+  }
+
+  private async polledReactionState(
+    conversation: QQConversation,
+    record: MsgRecord,
+    previous: QQReactionState | undefined,
+    actorBudget: { remaining: number },
+  ): Promise<QQReactionState> {
+    const previousByKey = new Map((previous?.reactions ?? []).map((reaction) => [reaction.key, reaction]))
+    const nativeByKey = new Map((record.emojiLikesList ?? []).map((item) => [
+      this.reactionByKey.get(reactionKey(item.emojiType, item.emojiId))?.key
+        ?? reactionKey(item.emojiType, item.emojiId),
+      item,
+    ]))
+    const summaries = this.mapReactionState(record).reactions
+      .filter((reaction) => reaction.count > 0 || reaction.selected)
+    const reactions = [] as QQReactionState['reactions']
+    const now = Date.now()
+    for (const summary of summaries) {
+      const previousReaction = previousByKey.get(summary.key)
+      let recentActors = previousReaction?.recentActors
+      const native = nativeByKey.get(summary.key)
+      const actorPollKey = `${conversation.id}\u0000${record.msgId}\u0000${summary.key}`
+      const summaryChanged = !previousReaction
+        || previousReaction.count !== summary.count
+        || Boolean(previousReaction.selected) !== Boolean(summary.selected)
+      const actorPollDue = now - (this.reactionActorPollTimes.get(actorPollKey) ?? 0)
+        >= this.reactionPollActorIntervalMs
+      if (native && record.msgSeq && actorBudget.remaining > 0 && (summaryChanged || actorPollDue)) {
+        actorBudget.remaining--
+        this.rememberReactionActorPoll(actorPollKey, now)
+        try {
+          const actors = await withTimeout(
+            this.getReactionActors(conversation, record.msgSeq, native.emojiId, native.emojiType, 3),
+            3_000,
+            'QQ reaction actor poll timed out',
+          )
+          recentActors = actors.map((actor) => ({ userId: actor.tinyId }))
+        } catch (error) {
+          log('error', `reaction poll actor lookup failed conversation=${conversation.id} message=${record.msgId} emoji=${native.emojiType}:${native.emojiId}`, error)
+        }
+      }
+      reactions.push({ ...summary, ...(recentActors !== undefined ? { recentActors } : {}) })
+    }
+    return { reactions, maxSelected: 20 }
+  }
+
+  private rememberReactionActorPoll(key: string, timestamp: number): void {
+    this.reactionActorPollTimes.delete(key)
+    this.reactionActorPollTimes.set(key, timestamp)
+    if (this.reactionActorPollTimes.size > REACTION_POLL_ACTOR_TIMESTAMP_LIMIT) {
+      this.reactionActorPollTimes.delete(this.reactionActorPollTimes.keys().next().value!)
+    }
   }
 
   async refreshContacts(): Promise<void> {
@@ -1185,6 +1405,7 @@ export class QQKernelBridge {
 
   async getHistory(conversation: QQConversation, query: HistoryQuery = {}): Promise<{ messages: QQMessage[], nextCursor?: string }> {
     const service = this.requireMsgService()
+    this.markReactionConversationActive(conversation)
     const limit = clamp(query.limit ?? 50, 1, 200)
     const anchor = query.beforeId ?? query.afterId ?? query.cursor ?? '0'
     const peer = contact(conversation)
@@ -1442,6 +1663,7 @@ export class QQKernelBridge {
 
   async markRead(conversation: QQConversation, messageId: string): Promise<void> {
     const service = this.requireMsgService()
+    this.markReactionConversationActive(conversation)
     if (!service.setSpecificMsgReadAndReport) {
       throw new Error('QQNT does not expose setSpecificMsgReadAndReport')
     }
@@ -5103,67 +5325,8 @@ export class QQKernelBridge {
       } else {
         log('info', `native message duplicate suppressed source=${source} id=${message.id} peer=${record.peerUid} status=${record.sendStatus}`)
       }
-      const reactionGrayTipSeq = reactionGrayTipSequence(record)
-      if (reactionGrayTipSeq) {
-        await this.refreshReactionsFromGrayTip(conversation, reactionGrayTipSeq).catch((error) => {
-          log('error', `reaction gray-tip refresh failed conversation=${conversation.id} seq=${reactionGrayTipSeq}`, error)
-        })
-      }
     }
   }
-
-  private async refreshReactionsFromGrayTip(
-    conversation: QQConversation,
-    msgSeq: string,
-  ): Promise<void> {
-    const cached = (this.messages.get(conversation.id) ?? [])
-      .find((message) => message.msgSeq === msgSeq && !message.serviceAction)
-    const service = this.requireMsgService()
-    let record: MsgRecord | undefined
-    if (cached) {
-      const response = await retryTransientInvalidArgument(() =>
-        service.getMsgsByMsgId(contact(conversation), [cached.id]))
-      if (response.result !== 0) throw new Error(`getMsgsByMsgId: ${response.errMsg} (${response.result})`)
-      record = response.msgList.find((item) => item.msgId === cached.id && !isRecalledRecord(item))
-    }
-    if (!record && service.getMsgsBySeqAndCount) {
-      const peer = contact(conversation)
-      const responses = await Promise.all([true, false].map((queryOrder) =>
-        retryHistoryCall(() => service.getMsgsBySeqAndCount!(peer, msgSeq, 4, queryOrder, true))))
-      record = responses.flatMap((response) => response.msgList)
-        .find((item) => item.msgSeq === msgSeq && !isGrayTipRecord(item) && !isRecalledRecord(item))
-    }
-    if (!record) {
-      log('warn', `reaction gray-tip target lookup failed conversation=${conversation.id} seq=${msgSeq}`)
-      return
-    }
-
-    const previous = cached
-      ?? (this.messages.get(conversation.id) ?? []).find((message) => message.id === record.msgId)
-    let refreshed = await this.mapMessagePrepared(record)
-    if (record.emojiLikesList === undefined && previous?.reactionContext) {
-      refreshed.reactionContext = previous.reactionContext
-    } else if (refreshed.reactionContext) {
-      refreshed = {
-        ...refreshed,
-        reactionContext: await this.withReactionActors(conversation, record, refreshed.reactionContext, 3),
-      }
-    }
-    this.rememberMessage(refreshed)
-    if (!refreshed.reactionContext
-      || JSON.stringify(previous?.reactionContext?.reactions)
-      === JSON.stringify(refreshed.reactionContext.reactions)) return
-
-    this.dispatch({
-      type: 'message-reactions',
-      eventId: `reaction-graytip:${refreshed.id}:${Date.now()}:${++this.reactionEventSequence}`,
-      conversation,
-      target: { conversationId: conversation.id, messageId: refreshed.id, targetId: refreshed.id },
-      context: refreshed.reactionContext,
-      timestamp: Math.floor(Date.now() / 1000),
-    })
-  }
-
 
   private onDelete(chatType: number, peerUid: string, ids: string[]): void {
     if (!isMessageChatType(chatType)) return
@@ -6722,6 +6885,17 @@ function messageProjectionRevision(message: QQMessage): string {
     message.telegramReplyToMessageId,
     message.replyToId,
   ])
+}
+
+function reactionStateRevision(state: QQReactionState | undefined): string {
+  return JSON.stringify((state?.reactions ?? [])
+    .map((reaction) => ({
+      key: reaction.key,
+      count: reaction.count,
+      selected: Boolean(reaction.selected),
+      recentActors: (reaction.recentActors ?? []).map((actor) => actor.userId),
+    }))
+    .sort((left, right) => left.key.localeCompare(right.key)))
 }
 
 function unavailableGroupJoinContractProbe(enabled: boolean): QQGroupJoinContractProbe {
@@ -8851,19 +9025,6 @@ function telegramMessageId(value?: string): number | undefined {
   if (!value || !/^\d+$/.test(value)) return
   const id = Number(value)
   return Number.isSafeInteger(id) && id > 0 && id <= 0x7fffffff ? id : undefined
-}
-
-function reactionGrayTipSequence(record: MsgRecord): string | undefined {
-  if (record.chatType !== CHAT_GROUP) return
-  const xml = record.elements.find((element) =>
-    element.grayTipElement?.xmlElement?.templId === '10382')?.grayTipElement?.xmlElement
-  if (!xml) return
-  return xmlTagAttribute(xml.content, 'url', 'msgseq') || record.msgSeq
-}
-
-function xmlTagAttribute(xml: string, tag: string, attribute: string): string {
-  const match = new RegExp(`<${tag}\\b([^>]*)`, 'i').exec(xml)
-  return match ? xmlAttribute(match[1] ?? '', attribute) : ''
 }
 
 function isGrayTipRecord(record: MsgRecord): boolean {
