@@ -1003,7 +1003,7 @@ describe('QQKernelBridge', () => {
 
     await expect(bridge.getUser('self')).resolves.toMatchObject({
       id: 'self', numericId: '10000', name: 'Canonical Self',
-      avatar: { locator: { avatarUin: '10000' } },
+      avatar: { locator: { filePath: avatarFixturePath } },
     })
     f.emitMessages([{ ...f.message, sendNickName: 'A transient message name' }])
     await expect(bridge.getUser('self')).resolves.toMatchObject({ name: 'Canonical Self' })
@@ -4819,7 +4819,7 @@ describe('QQKernelBridge', () => {
     ])
   })
 
-  it('normalizes numeric reaction actors to QQ UIDs and exposes profile names and qlogo avatars', async () => {
+  it('normalizes numeric reaction actors to QQ UIDs and upgrades their qlogo avatars on profile resolve', async () => {
     const f = fixture()
     f.setProfile({
       uid: 'actor-uid', uin: '3998401572', nick: '', remark: '', avatarUrl: '', coreInfo: { nick: 'Alice' },
@@ -4845,7 +4845,7 @@ describe('QQKernelBridge', () => {
     })
     await expect(bridge.getUser('actor-uid')).resolves.toMatchObject({
       id: 'actor-uid', numericId: '3998401572', name: 'Alice',
-      avatar: { locator: { avatarUin: '3998401572' } },
+      avatar: { locator: { filePath: avatarFixturePath } },
     })
   })
 
