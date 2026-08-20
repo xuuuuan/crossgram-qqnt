@@ -6,7 +6,7 @@ if [ -z "${QQNT_BINARY:-}" ] || [ ! -x "$QQNT_BINARY" ]; then
   exit 1
 fi
 
-for command_name in Xvfb dbus-run-session curl; do
+for command_name in Xvfb dbus-run-session curl setsid; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
     echo "required command is missing: $command_name" >&2
     exit 1
@@ -28,13 +28,18 @@ qq_pid=
 stop_qq() {
   [ -n "$qq_pid" ] || return 0
   if kill -0 "$qq_pid" 2>/dev/null; then
-    kill "$qq_pid" 2>/dev/null || true
+    # dbus-run-session owns both a D-Bus daemon and the QQ process. Killing
+    # only its wrapper can orphan QQ, leaving the HTTP port and login-state
+    # files active while session recovery starts another instance.
+    kill -TERM -"$qq_pid" 2>/dev/null || kill "$qq_pid" 2>/dev/null || true
     tries=0
     while kill -0 "$qq_pid" 2>/dev/null && [ "$tries" -lt 20 ]; do
       sleep 1
       tries=$((tries + 1))
     done
-    if kill -0 "$qq_pid" 2>/dev/null; then kill -KILL "$qq_pid" 2>/dev/null || true; fi
+    if kill -0 "$qq_pid" 2>/dev/null; then
+      kill -KILL -"$qq_pid" 2>/dev/null || kill -KILL "$qq_pid" 2>/dev/null || true
+    fi
   fi
   wait "$qq_pid" 2>/dev/null || true
   qq_pid=
@@ -51,7 +56,7 @@ export DISPLAY=$display
 sleep 1
 
 start_qq() {
-  dbus-run-session -- "$QQNT_BINARY" --no-sandbox --disable-gpu --disable-dev-shm-usage &
+  setsid dbus-run-session -- "$QQNT_BINARY" --no-sandbox --disable-gpu --disable-dev-shm-usage &
   qq_pid=$!
 }
 

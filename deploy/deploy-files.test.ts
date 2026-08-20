@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process'
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { platform, tmpdir } from 'node:os'
 import { delimiter, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
@@ -105,8 +105,9 @@ describe('Linux deployment files', () => {
       mkdirSync(join(temp, 'custom QQ'), { recursive: true })
       writeFileSync(join(temp, 'Xvfb'), '#!/bin/sh\ntrap \'exit 0\' TERM INT\nwhile :; do sleep 1; done\n')
       writeFileSync(join(temp, 'dbus-run-session'), '#!/bin/sh\n[ "$1" = -- ] && shift\nexec "$@"\n')
+      writeFileSync(join(temp, 'setsid'), '#!/bin/sh\nexec "$@"\n')
       writeFileSync(qq, '#!/bin/sh\nprintf \'%s\\n\' "$@" > "$QQNT_LAUNCH_MARKER"\n')
-      for (const file of ['Xvfb', 'dbus-run-session', join('custom QQ', 'qq')]) chmodSync(join(temp, file), 0o755)
+      for (const file of ['Xvfb', 'dbus-run-session', 'setsid', join('custom QQ', 'qq')]) chmodSync(join(temp, file), 0o755)
       execFileSync('sh', [join(root, 'deploy', 'run-headless.sh')], {
         env: {
           ...process.env,
@@ -151,14 +152,18 @@ describe('Linux deployment files', () => {
     const temp = mkdtempSync(join(tmpdir(), 'qqnt-session-recovery-'))
     const qq = join(temp, 'qq')
     const launches = join(temp, 'launches')
+    const stopped = join(temp, 'stopped')
     const stateCalls = join(temp, 'session-state-calls')
     try {
       writeFileSync(join(temp, 'Xvfb'), '#!/bin/sh\ntrap \'exit 0\' TERM INT\nwhile :; do sleep 1; done\n')
-      writeFileSync(join(temp, 'dbus-run-session'), '#!/bin/sh\n[ "$1" = -- ] && shift\nexec "$@"\n')
-      writeFileSync(qq, '#!/bin/sh\ncount=0\n[ ! -f "$QQNT_LAUNCHES" ] || count=$(cat "$QQNT_LAUNCHES")\ncount=$((count + 1))\nprintf \'%s\' "$count" > "$QQNT_LAUNCHES"\nif [ "$count" -eq 1 ]; then trap \'exit 0\' TERM INT; while :; do sleep 1; done; else sleep 2; fi\n')
+      if (platform() === 'win32') writeFileSync(join(temp, 'setsid'), '#!/bin/sh\nexec "$@"\n')
+      writeFileSync(join(temp, 'dbus-run-session'), platform() === 'win32'
+        ? '#!/bin/sh\n[ "$1" = -- ] && shift\nexec "$@"\n'
+        : '#!/bin/sh\n[ "$1" = -- ] && shift\n"$@" &\nchild=$!\ntrap \'wait "$child" 2>/dev/null || true; exit 0\' TERM INT\nwait "$child"\n')
+      writeFileSync(qq, '#!/bin/sh\ncount=0\n[ ! -f "$QQNT_LAUNCHES" ] || count=$(cat "$QQNT_LAUNCHES")\ncount=$((count + 1))\nprintf \'%s\' "$count" > "$QQNT_LAUNCHES"\nif [ "$count" -eq 1 ]; then trap \'printf stopped > "$QQNT_STOPPED"; exit 0\' TERM INT; while :; do sleep 1; done; else sleep 2; fi\n')
       writeFileSync(join(temp, 'curl'), '#!/bin/sh\ncount=0\n[ ! -f "$QQNT_LAUNCHES" ] || count=$(cat "$QQNT_LAUNCHES")\nif [ "$count" -ge 2 ]; then printf \'{"ready":true}\n\'; else printf \'{"ready":false}\n\'; fi\n')
       writeFileSync(join(temp, 'session-state'), '#!/bin/sh\nprintf \'%s\\n\' "$1" >> "$QQNT_SESSION_CALLS"\ncase "$1" in has-lkg) exit 0;; esac\n')
-      for (const file of ['Xvfb', 'dbus-run-session', 'qq', 'curl', 'session-state']) {
+      for (const file of ['Xvfb', 'dbus-run-session', 'qq', 'curl', 'session-state', ...(platform() === 'win32' ? ['setsid'] : [])]) {
         chmodSync(join(temp, file), 0o755)
       }
       execFileSync('sh', [join(root, 'deploy', 'run-headless.sh')], {
@@ -172,11 +177,13 @@ describe('Linux deployment files', () => {
           QQNT_BRIDGE_SESSION_READY_TIMEOUT_SECONDS: '3',
           QQNT_BRIDGE_SESSION_STABILIZE_SECONDS: '0',
           QQNT_LAUNCHES: launches,
+          QQNT_STOPPED: stopped,
           QQNT_SESSION_CALLS: stateCalls,
         },
         timeout: 15_000,
       })
       expect(readFileSync(launches, 'utf8')).toBe('2')
+      expect(readFileSync(stopped, 'utf8')).toBe('stopped')
       expect(readFileSync(stateCalls, 'utf8').trim().split('\n')).toEqual([
         'has-lkg', 'restore-lkg', 'save-lkg',
       ])
