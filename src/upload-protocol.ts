@@ -13,6 +13,14 @@ export const VIDEO_THUMBNAIL_HEIGHT = 180
 export const VIDEO_THUMBNAIL_MD5 = createHash('md5').update(VIDEO_THUMBNAIL_BYTES).digest('hex')
 export const VIDEO_THUMBNAIL_SHA1 = createHash('sha1').update(VIDEO_THUMBNAIL_BYTES).digest('hex')
 
+/** QQ permanently rejected the submitted media metadata before Highway upload. */
+export class QQMediaUploadRejectedError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'QQMediaUploadRejectedError'
+  }
+}
+
 export interface DirectImageSpec {
   name: string
   size: number
@@ -230,7 +238,9 @@ export function encodeImageUploadRequest(
 export function decodeImageUploadResponse(payload: Uint8Array): PreparedImageUpload {
   const response = fromBinary(pb.ImageUploadResponseSchema, decodeOidb(payload))
   if (response.head?.code) {
-    throw new Error(`QQ image upload preparation failed: ${response.head.message} (${response.head.code})`)
+    throw new QQMediaUploadRejectedError(
+      `QQ image upload preparation failed: ${response.head.message} (${response.head.code})`,
+    )
   }
   const upload = required(response.upload, 'image upload response')
   const msgInfo = requiredBuffer(upload.msgInfo, 'image MsgInfo')
@@ -320,7 +330,9 @@ export function encodeVideoUploadRequest(
 export function decodeVideoUploadResponse(payload: Uint8Array): PreparedVideoUpload {
   const response = fromBinary(pb.VideoUploadResponseSchema, decodeOidb(payload))
   if (response.head?.code) {
-    throw new Error(`QQ video upload preparation failed: ${response.head.message} (${response.head.code})`)
+    throw new QQMediaUploadRejectedError(
+      `QQ video upload preparation failed: ${response.head.message} (${response.head.code})`,
+    )
   }
   const upload = required(response.upload, 'video upload response')
   const msgInfo = requiredBuffer(upload.msgInfo, 'video MsgInfo')
@@ -426,7 +438,9 @@ export function decodeFileUploadResponse(
       'group file upload response',
     )
     if (upload.code) {
-      throw new Error(`QQ group file upload preparation failed: ${upload.message || upload.error} (${upload.code})`)
+      throw new QQMediaUploadRejectedError(
+        `QQ group file upload preparation failed: ${upload.message || upload.error} (${upload.code})`,
+      )
     }
     const response: PreparedFileUpload = {
       fileUuid: upload.fileUuid, exists: Boolean(upload.exists), commandId: 71,
@@ -445,7 +459,11 @@ export function decodeFileUploadResponse(
     fromBinary(pb.PrivateFileUploadResponseSchema, body).upload,
     'private file upload response',
   )
-  if (upload.code) throw new Error(`QQ private file upload preparation failed: ${upload.error} (${upload.code})`)
+  if (upload.code) {
+    throw new QQMediaUploadRejectedError(
+      `QQ private file upload preparation failed: ${upload.error} (${upload.code})`,
+    )
+  }
   const response: PreparedFileUpload = {
     fileUuid: upload.fileUuid, fileHash: upload.fileHash || undefined,
     exists: Boolean(upload.exists), commandId: 95,

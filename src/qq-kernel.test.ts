@@ -11,12 +11,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import WebSocket from 'ws'
 import { GroupMsgMask, type ContactMsgBoxInfo, type KernelBuddyService, type KernelFlashTransferService, type KernelGroupService, type KernelModule, type KernelMsgService, type KernelRichMediaService, type KernelSession, type MsgElement, type MsgRecord } from './kernel-types.js'
 import type { PacketAddon } from './packet-addon.js'
-import { parseConversationId, type QQEvent } from './protocol.js'
+import { parseConversationId, type QQEvent, type QQStickerReference } from './protocol.js'
 import { QQKernelBridge } from './qq-kernel.js'
 import { QQBridgeServer } from './server.js'
 import { QQPacketClient } from './packet-client.js'
 import {
-  HIGHWAY_BLOCK_SIZE, type DirectMessagePart,
+  HIGHWAY_BLOCK_SIZE, QQMediaUploadRejectedError, type DirectMessagePart,
 } from './upload-protocol.js'
 import { encodePtt } from './silk-audio.js'
 
@@ -2919,6 +2919,66 @@ describe('QQKernelBridge', () => {
     })
   })
 
+  it('serializes concurrent QQ market downloads and refreshes missing encryption keys', async () => {
+    const f = fixture()
+    const directory = await mkdtemp(join(tmpdir(), 'qqnt-market-queue-'))
+    tempPaths.push(directory)
+    const gif = Buffer.from('GIF89a-queued-market-sticker')
+    const encrypted = gif.map((byte, index) => index % 50 < 20 ? ~byte : byte)
+    const paths = new Map([
+      ['first', join(directory, 'first.gif.encrypt')],
+      ['second', join(directory, 'second.gif.encrypt')],
+    ])
+    let active = 0
+    let maxActive = 0
+    f.msg.getMarketEmoticonPath.mockImplementation(async (_epId, ids, serviceType) => ({
+      result: 0, errMsg: '',
+      pathMap: new Map(ids.map((id: string) => [id, {
+        isExist: serviceType === 5 && existsSync(paths.get(id)!),
+        path: serviceType === 5 ? paths.get(id)! : '',
+      }])),
+    }))
+    f.msg.getMarketEmoticonEncryptKeys = vi.fn(async (_epId: number, ids: string[]) => ({
+      result: 0, errMsg: '', encryptKeyMap: new Map(ids.map((id) => [id, `key-${id}`])),
+    }))
+    f.msg.fetchMarketEmoticonAioImage = vi.fn(async (request: {
+      epId: number
+      eId: string
+      name: string
+      encryptKey: string
+      width: number
+      height: number
+      jobType: number
+    }) => {
+      active++
+      maxActive = Math.max(maxActive, active)
+      try {
+        expect(request.encryptKey).toBe(`key-${request.eId}`)
+        await new Promise((resolve) => setTimeout(resolve, 10))
+        await writeFile(paths.get(request.eId)!, encrypted)
+        return { result: 0, errMsg: '' }
+      } finally {
+        active--
+      }
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: directory })
+    const reference = (stickerId: string): QQStickerReference => ({
+      kind: 'market', packageId: '42', stickerId, name: stickerId, key: '',
+      width: 240, height: 240, animated: true, mimeType: 'image/gif',
+    })
+
+    const [first, second] = await Promise.all([
+      bridge.openSticker(reference('first')),
+      bridge.openSticker(reference('second')),
+    ])
+
+    expect(maxActive).toBe(1)
+    expect(f.msg.fetchMarketEmoticonAioImage).toHaveBeenCalledTimes(2)
+    expect(await readStream(first.stream)).toEqual(gif)
+    expect(await readStream(second.stream)).toEqual(gif)
+  })
+
   it('detects encrypted APNG market bytes for both pack and received-message sticker metadata', async () => {
     const f = fixture()
     const directory = await mkdtemp(join(tmpdir(), 'qqnt-market-apng-'))
@@ -5665,6 +5725,20 @@ describe('QQBridgeServer', () => {
     expect(prepare).toHaveBeenCalledWith('uid-1715311957', expect.objectContaining({
       kind: 'image', name: 'http.png', size: 3,
     }))
+    prepare.mockRejectedValueOnce(new QQMediaUploadRejectedError(
+      'QQ group file upload preparation failed: 永久空间不足, 请清理文件列表后重试 (-403)',
+    ))
+    const rejectedUpload = await fetch(`${base}/uploads/prepare`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ conversationId: '1058754719', media: {
+        kind: 'file', name: 'full.bin', size: 3,
+        md5: '5289df737df57326fcdd22597afb1fac', sha1: '7037807198c22a7d2b0807371d763779a84fdfcf',
+      } }),
+    })
+    expect(rejectedUpload.status).toBe(422)
+    await expect(rejectedUpload.json()).resolves.toEqual({
+      error: 'QQ group file upload preparation failed: 永久空间不足, 请清理文件列表后重试 (-403)',
+    })
     const manifest = Buffer.from(JSON.stringify({
       conversationId: 'uid-1715311957', text: 'via HTTP',
     })).toString('base64url')

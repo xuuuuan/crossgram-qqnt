@@ -119,6 +119,38 @@ describe.skipIf(!enabled)('live QQNT bridge E2E', () => {
     }
   }, 60_000)
 
+  it('serves concurrent Telegram-style market sticker range prefetches without queue timeouts', async () => {
+    const packsResponse = await fetch(`${base}/stickers/packs?limit=100`, { headers: headers() })
+    expect(packsResponse.status, await packsResponse.clone().text()).toBe(200)
+    const page = await packsResponse.json() as { packs: Array<{ packId: string }> }
+    const selected: Array<{ stickerId: string, reference: unknown }> = []
+    for (const summary of page.packs.filter((pack) => pack.packId !== 'qq-favorites')) {
+      const response = await fetch(`${base}/stickers/packs/${encodeURIComponent(summary.packId)}`, {
+        headers: headers(),
+      })
+      if (!response.ok) continue
+      const pack = await response.json() as {
+        stickers: Array<{ stickerId: string, format: string, reference: unknown }>
+      }
+      selected.push(...pack.stickers.filter((sticker) => sticker.format === 'animated'))
+      if (selected.length >= 5) break
+    }
+    expect(selected.length, 'expected multiple QQ market stickers for concurrent prefetch').toBeGreaterThan(1)
+
+    const responses = await Promise.all(selected.slice(0, 5).map(async (sticker) => {
+      const response = await fetch(`${base}/stickers/asset`, {
+        method: 'POST',
+        headers: headers({ 'content-type': 'application/json', range: 'bytes=0-1023' }),
+        body: JSON.stringify(sticker.reference),
+      })
+      return { stickerId: sticker.stickerId, response, text: response.ok ? '' : await response.text() }
+    }))
+    for (const { stickerId, response, text } of responses) {
+      expect(response.status, `${stickerId}: ${text}`).toBe(206)
+      expect(Number(response.headers.get('content-length')), stickerId).toBeGreaterThan(0)
+    }
+  }, 180_000)
+
   it('keeps real QQ favorites byte-sniffed through catalog, asset, and native send echo', async () => {
     const packResponse = await fetch(`${base}/stickers/packs/qq-favorites`, { headers: headers() })
     expect(packResponse.status, await packResponse.clone().text()).toBe(200)

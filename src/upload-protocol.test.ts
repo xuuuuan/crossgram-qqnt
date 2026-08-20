@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { fromBinary, toBinary } from '@bufbuild/protobuf'
+import { create, fromBinary, toBinary } from '@bufbuild/protobuf'
 import { describe, expect, it, vi } from 'vitest'
 import * as generated from './generated/qqnt/packet_pb.js'
 import type { KernelMsgService } from './kernel-types.js'
@@ -11,7 +11,7 @@ import {
   encodeDirectMessageRequest, encodeFileUploadRequest, encodeGroupFileFeedRequest, encodeHighwayFrame,
   encodeHighwaySessionRequest, encodeImageUploadRequest, encodePrivateFileMetadataRequest,
   encodeVideoHighwayExt, encodeVideoUploadRequest,
-  HIGHWAY_BLOCK_SIZE, QQMessageSendRejectedError, VIDEO_THUMBNAIL_BYTES,
+  HIGHWAY_BLOCK_SIZE, QQMediaUploadRejectedError, QQMessageSendRejectedError, VIDEO_THUMBNAIL_BYTES,
   VIDEO_THUMBNAIL_HEIGHT, VIDEO_THUMBNAIL_MD5, VIDEO_THUMBNAIL_SHA1, VIDEO_THUMBNAIL_WIDTH,
 } from './upload-protocol.js'
 
@@ -60,8 +60,14 @@ describe('direct QQ upload protocol', () => {
       ipv4s: [{ host: '127.0.0.1', port: 80 }],
       msgInfo: pb([field(1, msgInfoBody)]), msgInfoBodies: [msgInfoBody], compatQMsg: undefined,
     })
-    expect(() => decodeImageUploadResponse(pb([u(3, 7), field(5, Buffer.from('denied'))])))
-      .toThrow('denied (7)')
+    const rejected = () => decodeImageUploadResponse(oidb(Buffer.from(toBinary(
+      generated.ImageUploadResponseSchema,
+      create(generated.ImageUploadResponseSchema, {
+        head: create(generated.ImageResponseHeadSchema, { code: 7, message: 'denied' }),
+      }),
+    ))))
+    expect(rejected).toThrow('denied (7)')
+    expect(rejected).toThrow(QQMediaUploadRejectedError)
   })
 
   it('negotiates playable video with main and thumbnail rich-media uploads', () => {

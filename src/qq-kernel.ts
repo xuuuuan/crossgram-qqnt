@@ -396,6 +396,12 @@ export class QQKernelBridge {
   private readonly groupProfileAttempts = new Map<string, number>()
   private readonly recentDeletes = new Map<string, number>()
   private readonly missingStickerAssets = new Map<string, number>()
+  private readonly marketStickerAssetPromises = new Map<string, Promise<{
+    path: string
+    encrypted: boolean
+    animated: boolean
+  }>>()
+  private marketStickerDownloadTail = Promise.resolve()
   private unreadBatchState = ''
   private unreadBatchPromise?: Promise<void>
   private listenerId?: string
@@ -5892,6 +5898,23 @@ export class QQKernelBridge {
     encrypted: boolean
     animated: boolean
   }> {
+    const key = marketStickerId(reference.packageId, reference.stickerId)
+    const active = this.marketStickerAssetPromises.get(key)
+    if (active) return active
+    const pending = this.resolveMarketStickerPathOnce(reference).finally(() => {
+      if (this.marketStickerAssetPromises.get(key) === pending) {
+        this.marketStickerAssetPromises.delete(key)
+      }
+    })
+    this.marketStickerAssetPromises.set(key, pending)
+    return pending
+  }
+
+  private async resolveMarketStickerPathOnce(reference: Extract<QQStickerReference, { kind: 'market' }>): Promise<{
+    path: string
+    encrypted: boolean
+    animated: boolean
+  }> {
     if (reference.animated && reference.dynamicPath && existsSync(reference.dynamicPath)) {
       return { path: reference.dynamicPath, encrypted: true, animated: true }
     }
@@ -5905,24 +5928,37 @@ export class QQKernelBridge {
       return { path: dynamic.path, encrypted: true, animated: true }
     }
     if (service.fetchMarketEmoticonAioImage) {
-      const result = await service.fetchMarketEmoticonAioImage({
-        epId, eId: reference.stickerId, name: reference.name, encryptKey: reference.key,
-        width: reference.width, height: reference.height, jobType: 0,
-      })
-      if (result.result !== 0) throw new Error(`fetchMarketEmoticonAioImage: ${result.errMsg} (${result.result})`)
-      if (service.getMarketEmoticonPath) {
-        // Telegram Desktop commonly prefetches every document in a set at
-        // once. QQ serializes those downloads internally, so a later item can
-        // finish well after fetchMarketEmoticonAioImage has accepted it.
-        for (let attempt = 0; attempt < 300; attempt++) {
-          const downloaded = (await this.getMarketEmoticonPaths(epId, [reference.stickerId], 5))
-            .get(reference.stickerId)
-          if (reference.animated && downloaded?.path && existsSync(downloaded.path)) {
-            reference.dynamicPath = downloaded.path
-            return { path: downloaded.path, encrypted: true, animated: true }
-          }
-          if (attempt < 299) await delay(100)
+      // QQ accepts concurrent requests but processes market assets through one
+      // internal download slot. Giving every Telegram prefetch its own timeout
+      // makes later stickers expire while they are merely waiting in QQ's
+      // queue. Serialize the complete native fetch + path observation instead.
+      const previous = this.marketStickerDownloadTail.catch(() => undefined)
+      let release!: () => void
+      this.marketStickerDownloadTail = new Promise<void>((resolve) => { release = resolve })
+      await previous
+      try {
+        if (!reference.key && service.getMarketEmoticonEncryptKeys) {
+          const keys = await service.getMarketEmoticonEncryptKeys(epId, [reference.stickerId])
+          if (keys.result === 0) reference.key = keys.encryptKeyMap.get(reference.stickerId) ?? ''
         }
+        const result = await service.fetchMarketEmoticonAioImage({
+          epId, eId: reference.stickerId, name: reference.name, encryptKey: reference.key,
+          width: reference.width, height: reference.height, jobType: 0,
+        })
+        if (result.result !== 0) throw new Error(`fetchMarketEmoticonAioImage: ${result.errMsg} (${result.result})`)
+        if (service.getMarketEmoticonPath) {
+          for (let attempt = 0; attempt < 300; attempt++) {
+            const downloaded = (await this.getMarketEmoticonPaths(epId, [reference.stickerId], 5))
+              .get(reference.stickerId)
+            if (reference.animated && downloaded?.path && existsSync(downloaded.path)) {
+              reference.dynamicPath = downloaded.path
+              return { path: downloaded.path, encrypted: true, animated: true }
+            }
+            if (attempt < 299) await delay(100)
+          }
+        }
+      } finally {
+        release()
       }
     }
     let staticPath = reference.staticPath
@@ -5933,7 +5969,9 @@ export class QQKernelBridge {
           .get(reference.stickerId)?.path
     }
     if (!staticPath || !existsSync(staticPath)) {
-      throw new Error(`QQ market sticker file is missing: ${reference.packageId}/${reference.stickerId}`)
+      throw new QQStickerAssetNotFoundError(
+        `QQ market sticker file is missing: ${reference.packageId}/${reference.stickerId}`,
+      )
     }
     reference.staticPath = staticPath
     return { path: staticPath, encrypted: false, animated: false }

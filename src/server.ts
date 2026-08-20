@@ -9,6 +9,7 @@ import {
   PROTOCOL_VERSION, type QQFlashTransferManifest, type QQMediaLocator, type QQMultiForwardLocator, type QQSendMediaSpec, type QQStickerReference, type SendManifest,
 } from './protocol.js'
 import { GroupMsgMask } from './kernel-types.js'
+import { QQMediaUploadRejectedError } from './upload-protocol.js'
 import { QQFlashTransferError, QQFlashTransferUnavailableError, QQKernelBridge, QQMediaLeaseAuthorizationError,
   QQMediaLeaseUnavailableError, QQRequestApiUnavailableError, QQRequestConflictError, QQRequestCursorError, QQRequestRefreshError, QQRequestResolutionError, QQRequestSessionChangedError, QQRequestUnsupportedError,
   QQStickerAssetNotFoundError ,
@@ -606,7 +607,16 @@ export class QQBridgeServer {
         throw new Error('invalid media upload preparation request')
       }
       log('info', `HTTP API upload prepare start id=${requestId} conversation=${body.conversationId} kind=${body.media.kind} name=${JSON.stringify(body.media.name)} size=${body.media.size ?? '?'}`)
-      const plan = await this.bridge.prepareMediaUpload(body.conversationId, body.media)
+      let plan
+      try {
+        plan = await this.bridge.prepareMediaUpload(body.conversationId, body.media)
+      } catch (error) {
+        if (error instanceof QQMediaUploadRejectedError) {
+          json(response, 422, { error: error.message })
+          return
+        }
+        throw error
+      }
       log('info', `HTTP API upload prepare complete id=${requestId} conversation=${body.conversationId} kind=${body.media.kind} highway=${Boolean(plan.highway)} servers=${plan.highway?.servers.length ?? 0}`)
       json(response, 200, plan)
       return
@@ -643,7 +653,16 @@ export class QQBridgeServer {
         return
       }
       log('info', `HTTP API send start id=${requestId} conversation=${manifest.conversationId} textLength=${manifest.text?.length ?? 0} media=${manifest.media?.map((item) => `${item.kind}:${item.name}:${item.size ?? '?'}`).join(',') || '<none>'}`)
-      const message = await this.bridge.send(manifest, request)
+      let message
+      try {
+        message = await this.bridge.send(manifest, request)
+      } catch (error) {
+        if (error instanceof QQMediaUploadRejectedError) {
+          json(response, 422, { error: error.message })
+          return
+        }
+        throw error
+      }
       log('info', `HTTP API send complete id=${requestId} conversation=${manifest.conversationId} message=${message.id} parts=${message.parts.length}`)
       json(response, 200, message)
       return
