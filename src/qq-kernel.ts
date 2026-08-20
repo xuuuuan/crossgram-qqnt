@@ -354,6 +354,7 @@ export class QQKernelBridge {
   private readonly reactionAssets = new Map<string, { path: string, mimeType: 'image/png' | 'image/apng' }>()
   private reactionCatalogPromise?: Promise<void>
   private reactionEventSequence = 0
+  private messageEditEventSequence = 0
   private readonly stickerPacks = new Map<string, QQStickerPack>()
   private readonly stickerPackInfo = new Map<string, MarketStickerPackInfo>()
   private readonly stickers = new Map<string, QQSticker>()
@@ -4667,6 +4668,8 @@ export class QQKernelBridge {
       this.rememberMessage(message)
       const reactionsChanged = Boolean(previous)
         && JSON.stringify(previous?.reactionContext?.reactions) !== JSON.stringify(message.reactionContext?.reactions)
+      const projectionChanged = Boolean(previous)
+        && messageProjectionRevision(previous!) !== messageProjectionRevision(message)
       if (source === 'onMsgInfoListUpdate' && record.emojiLikesList !== undefined) {
         this.pendingReactions.get(`${conversation.id}\u0000${message.id}`)?.resolve(
           message.reactionContext ?? { reactions: [], maxSelected: 20 },
@@ -4688,6 +4691,13 @@ export class QQKernelBridge {
             timestamp: Math.floor(Date.now() / 1000),
           })
         }
+      } else if (projectionChanged) {
+        this.dispatch({
+          type: 'message-edit',
+          eventId: `message-info:${message.id}:${Date.now()}:${++this.messageEditEventSequence}`,
+          conversation,
+          message,
+        })
       } else if (reactionsChanged) {
         this.dispatch({
           type: 'message-reactions',
@@ -6203,8 +6213,11 @@ export class QQKernelBridge {
         !before.has(record.msgId)
         && Number(record.msgTime) >= startedAt - 1
         && (SEND_FROM_SELF.has(record.sendType) || record.senderUid === this.config?.selfUid)
-        && (!requireMergedCard ||
-            (record.sendStatus >= 2 && isMultiForwardRecord(record))),
+        // onAddSendMsg can expose the previous group msgSeq while status=1.
+        // Wait for QQ's authoritative success record so replies target the
+        // finalized sequence rather than a neighboring message.
+        && record.sendStatus >= 2
+        && (!requireMergedCard || isMultiForwardRecord(record)),
       )
       if (forwarded.length >= expected) {
         return Promise.all(forwarded.slice(0, expected).reverse().map(async (record) => {
@@ -6217,6 +6230,15 @@ export class QQKernelBridge {
     } while (Date.now() < deadline)
     throw new Error(`QQ did not expose ${expected} ${requireMergedCard ? 'merged-forward card' : 'forwarded message'}(s) in ${conversation.id}`)
   }
+}
+
+function messageProjectionRevision(message: QQMessage): string {
+  return JSON.stringify([
+    message.msgSeq,
+    message.telegramMessageId,
+    message.telegramReplyToMessageId,
+    message.replyToId,
+  ])
 }
 
 function unavailableGroupJoinContractProbe(enabled: boolean): QQGroupJoinContractProbe {
@@ -8125,8 +8147,8 @@ function safeRemoveListener(service: string, id: string, remove: () => void): vo
 }
 
 function eventSummary(event: QQEvent): string {
-  if (event.type === 'message') {
-    return `type=message conversation=${event.conversation.id} title=${JSON.stringify(event.conversation.title)} avatar=${event.conversation.avatar?.id ?? '<none>'} message=${event.message.id} outgoing=${event.message.outgoing}`
+  if (event.type === 'message' || event.type === 'message-edit') {
+    return `type=${event.type} conversation=${event.conversation.id} title=${JSON.stringify(event.conversation.title)} avatar=${event.conversation.avatar?.id ?? '<none>'} message=${event.message.id} outgoing=${event.message.outgoing}`
   }
   if (event.type === 'message-delete') {
     return `type=message-delete conversation=${event.conversation.id} title=${JSON.stringify(event.conversation.title)} avatar=${event.conversation.avatar?.id ?? '<none>'} messages=${event.messageIds.join(',')}`

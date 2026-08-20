@@ -2283,15 +2283,21 @@ describe('QQKernelBridge', () => {
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
     await bridge.getDialogs()
     const conversation = bridge.getConversation('uid-1715311957')
-    const forwarded = {
+    const optimisticForward = {
       ...f.message, msgId: 'forwarded-1', msgTime: String(Math.floor(Date.now() / 1000)),
+      msgSeq: '463083', sendStatus: 1,
       elements: [{ elementType: 1, elementId: 'forwarded-text', textElement: { content: 'forwarded' } }],
     }
+    const forwarded = { ...optimisticForward, msgSeq: '463084', sendStatus: 2 }
     f.msg.getLatestDbMsgs
       .mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [f.message] })
+      .mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [optimisticForward, f.message] })
       .mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [forwarded, f.message] })
     await expect(bridge.forwardMessages(conversation, ['m1'], conversation)).resolves.toMatchObject([
-      { id: 'forwarded-1', parts: [{ type: 'text', text: 'forwarded' }] },
+      {
+        id: 'forwarded-1', msgSeq: '463084',
+        parts: [{ type: 'text', text: 'forwarded' }],
+      },
     ])
     expect(f.msg.forwardMsg).toHaveBeenCalledWith(['m1'], expect.anything(), [expect.anything()], expect.any(Map))
 
@@ -4341,6 +4347,35 @@ describe('QQKernelBridge', () => {
     })
     await expect(events.next()).resolves.toMatchObject({
       value: { type: 'message-delete', messageIds: ['eventually-failed'] },
+    })
+  })
+
+  it('publishes an edit when QQ replaces an optimistic group sequence with the final value', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const events = bridge.subscribe()[Symbol.asyncIterator]()
+    const optimistic = {
+      ...f.message, msgId: 'finalized-sequence', msgSeq: '463083', chatType: 2,
+      peerUid: '1058754719', peerUin: '1058754719', sendStatus: 1,
+    }
+    const confirmed = { ...optimistic, msgSeq: '463084', sendStatus: 2 }
+
+    await f.emitSent(optimistic)
+    await f.emitMessages([confirmed])
+
+    await expect(events.next()).resolves.toMatchObject({
+      value: {
+        type: 'message',
+        message: { id: 'finalized-sequence', msgSeq: '463083', telegramMessageId: 463083 },
+      },
+    })
+    await expect(events.next()).resolves.toMatchObject({
+      value: {
+        type: 'message-edit',
+        eventId: expect.stringMatching(/^message-info:finalized-sequence:/),
+        message: { id: 'finalized-sequence', msgSeq: '463084', telegramMessageId: 463084 },
+      },
     })
   })
 
