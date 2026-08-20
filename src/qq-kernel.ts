@@ -10,6 +10,7 @@ import { AsyncQueue, deferred } from './async.js'
 import { markBridgeListener, observeAVSDKActions } from './listener-tee.js'
 import { log, logPath } from './log.js'
 import { resolveMultiForwardParticipants } from './multi-forward-participants.js'
+import { decodeGroupReactionPush, type QQGroupReactionPush } from './reaction-push.js'
 import type { PCMMediaLease } from './media-gateway.js'
 import { QQPacketClient, type DirectHighwayUpload, type QQPacketClientOptions } from './packet-client.js'
 import {
@@ -3831,6 +3832,11 @@ export class QQKernelBridge {
         void this.onMessages(normalizeSingleMessageRecord(value), 'onAddSendMsg'),
       onMsgInfoListUpdate: (value: MsgRecord[] | { msgList: MsgRecord[] }) =>
         void this.onMessages(normalizeMessageRecords(value), 'onMsgInfoListUpdate'),
+      onRecvS2CMsg: (value: unknown) => {
+        const reaction = decodeGroupReactionPush(value)
+        if (reaction) void this.onReactionPush(reaction).catch((error) =>
+          log('error', `native reaction push failed group=${reaction.groupUin} seq=${reaction.messageSequence}`, error))
+      },
       onMsgRecall: (
         value: number | { chatType: number, peerUid: string, seq: string },
         peerUid?: string,
@@ -5106,6 +5112,110 @@ export class QQKernelBridge {
     }
   }
 
+  private async onReactionPush(push: QQGroupReactionPush): Promise<void> {
+    log('info', `native reaction push group=${push.groupUin} seq=${push.messageSequence} operator=${push.operatorUid} code=${push.code} operation=${push.operation} count=${push.currentCount}`)
+    const id = conversationId(CHAT_GROUP, push.groupUin)
+    let conversation = this.contacts.get(id) ?? this.getConversation(id)
+    let message = (this.messages.get(id) ?? [])
+      .find((item) => item.msgSeq === push.messageSequence && !item.serviceAction)
+    if (!message) {
+      const record = await this.reactionPushTarget(conversation, push.messageSequence)
+      if (!record) {
+        log('warn', `native reaction push target not found group=${push.groupUin} seq=${push.messageSequence}`)
+        return
+      }
+      message = await this.mapMessagePrepared(record)
+      conversation = this.conversationFromRecord(record, message)
+    }
+
+    const previous = message.reactionContext
+    const context = this.applyReactionPush(previous, push)
+    this.rememberMessage({
+      ...message,
+      reactionContext: context.reactions.length ? context : undefined,
+    })
+    this.rememberSeenUser({
+      id: push.operatorUid,
+      name: this.seenUsers.get(push.operatorUid)?.name
+        ?? this.users.get(push.operatorUid)?.name
+        ?? push.operatorUid,
+    })
+    this.pendingReactions.get(`${conversation.id}\u0000${message.id}`)?.resolve(context)
+    if (reactionStateRevision(previous) === reactionStateRevision(context)) return
+    this.dispatch({
+      type: 'message-reactions',
+      eventId: `reaction-push:${message.id}:${Date.now()}:${++this.reactionEventSequence}`,
+      conversation,
+      target: { conversationId: conversation.id, messageId: message.id, targetId: message.id },
+      context,
+      timestamp: Math.floor(Date.now() / 1000),
+    })
+  }
+
+  private async reactionPushTarget(
+    conversation: QQConversation,
+    messageSequence: string,
+  ): Promise<MsgRecord | undefined> {
+    const service = this.requireMsgService()
+    if (!service.getMsgsBySeqAndCount) return
+    const peer = contact(conversation)
+    const responses = await Promise.all([true, false].map((queryOrder) =>
+      retryHistoryCall(() => service.getMsgsBySeqAndCount!(peer, messageSequence, 4, queryOrder, true))))
+    return responses.flatMap((response) => response.msgList)
+      .find((record) => record.msgSeq === messageSequence
+        && !isGrayTipRecord(record)
+        && !isRecalledRecord(record))
+  }
+
+  private applyReactionPush(
+    previous: QQReactionState | undefined,
+    push: QQGroupReactionPush,
+  ): QQReactionState {
+    const resolved = this.reactionPushKey(push.code)
+    const reactions = (previous?.reactions ?? []).map((reaction) => ({
+      ...reaction,
+      ...(reaction.recentActors ? { recentActors: [...reaction.recentActors] } : {}),
+    }))
+    const index = reactions.findIndex((reaction) => resolved.aliases.has(reaction.key))
+    const existing = index >= 0 ? reactions[index]! : undefined
+    if (push.currentCount <= 0) {
+      if (index >= 0) reactions.splice(index, 1)
+      return { reactions, maxSelected: previous?.maxSelected ?? 20 }
+    }
+
+    const actors = existing?.recentActors ? [...existing.recentActors] : []
+    const actorIndex = actors.findIndex((actor) => actor.userId === push.operatorUid)
+    if (actorIndex >= 0) actors.splice(actorIndex, 1)
+    if (push.operation === 'add') actors.unshift({ userId: push.operatorUid })
+    actors.splice(Math.min(3, push.currentCount))
+    const selected = push.operatorUid === this.config?.selfUid
+      ? push.operation === 'add' || undefined
+      : existing?.selected
+    const updated = {
+      key: existing?.key ?? resolved.key,
+      count: push.currentCount,
+      ...(selected ? { selected } : {}),
+      ...(actors.length ? { recentActors: actors } : {}),
+    }
+    if (index >= 0) reactions[index] = updated
+    else reactions.push(updated)
+    return { reactions, maxSelected: previous?.maxSelected ?? 20 }
+  }
+
+  private reactionPushKey(code: string): { key: string, aliases: Set<string> } {
+    const face = reactionKey('1', code)
+    const emoji = reactionKey('2', code)
+    const native = this.reactionByKey.has(face) && !this.reactionByKey.has(emoji)
+      ? face
+      : this.reactionByKey.has(emoji) && !this.reactionByKey.has(face)
+        ? emoji
+        : code.length > 3 ? emoji : face
+    const mapped = this.reactionByKey.get(native)?.key ?? native
+    return {
+      key: mapped,
+      aliases: new Set([native, mapped]),
+    }
+  }
 
   private onDelete(chatType: number, peerUid: string, ids: string[]): void {
     if (!isMessageChatType(chatType)) return
@@ -6666,6 +6776,17 @@ function messageProjectionRevision(message: QQMessage): string {
   ])
 }
 
+function reactionStateRevision(state: QQReactionState | undefined): string {
+  return JSON.stringify((state?.reactions ?? [])
+    .map((reaction) => ({
+      key: reaction.key,
+      count: reaction.count,
+      selected: Boolean(reaction.selected),
+      recentActors: (reaction.recentActors ?? []).map((actor) => actor.userId),
+    }))
+    .sort((left, right) => left.key.localeCompare(right.key)))
+}
+
 function unavailableGroupJoinContractProbe(enabled: boolean): QQGroupJoinContractProbe {
   return {
     enabled,
@@ -8056,7 +8177,11 @@ function makeListener(
   // QQNT 6.9.96 exports listener wrapper constructors. QQNT 6.9.98 accepts a
   // plain callback object directly and no longer exports those constructors.
   const protectedHandlers = Object.fromEntries(Object.entries(handlers).map(([event, handler]) => [event, (...args: unknown[]) => {
-    log('info', `native callback listener=${name} event=${event} ${summarizeCallbackArgs(args)}`)
+    // onRecvS2CMsg is the raw online-push stream and can fire for every packet.
+    // Its decoded handlers log the small subset that the bridge consumes.
+    if (event !== 'onRecvS2CMsg') {
+      log('info', `native callback listener=${name} event=${event} ${summarizeCallbackArgs(args)}`)
+    }
     try {
       const result = (handler as (...values: unknown[]) => unknown)(...args)
       if (result && typeof (result as PromiseLike<unknown>).then === 'function') {

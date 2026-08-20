@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { execFile } from 'node:child_process'
 import { promisify, types } from 'node:util'
+import { create, toBinary } from '@bufbuild/protobuf'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import WebSocket from 'ws'
 import { GroupMsgMask, type ContactMsgBoxInfo, type KernelBuddyService, type KernelFlashTransferService, type KernelGroupService, type KernelModule, type KernelMsgService, type KernelRichMediaService, type KernelSession, type MsgElement, type MsgRecord } from './kernel-types.js'
@@ -19,6 +20,7 @@ import {
   HIGHWAY_BLOCK_SIZE, QQMediaUploadRejectedError, type DirectMessagePart,
 } from './upload-protocol.js'
 import { encodePtt } from './silk-audio.js'
+import { GroupReactionNotifySchema, PushMessageEnvelopeSchema } from './generated/qqnt/packet_pb.js'
 
 const execFileAsync = promisify(execFile)
 const avatarFixturePath = process.platform === 'win32' ? process.execPath : '/dev/null'
@@ -28,6 +30,35 @@ const GROUP_JOIN_WRAPPER_MARKERS = [
   'reqToJoinGroup needs 2 arguments',
   'joinGroup needs 3 arguments',
 ].join('\n')
+
+function groupReactionPushBytes(options: {
+  groupUin?: bigint
+  messageSequence?: bigint
+  operatorUid?: string
+  code?: string
+  currentCount?: number
+  operation?: 1 | 2
+} = {}): Uint8Array {
+  const notify = toBinary(GroupReactionNotifySchema, create(GroupReactionNotifySchema, {
+    groupUin: options.groupUin ?? 1_058_754_719n,
+    subType: 35,
+    reaction: { data: { data: {
+      target: { sequence: options.messageSequence ?? 799_177n },
+      data: {
+        code: options.code ?? '10068',
+        currentCount: options.currentCount ?? 1,
+        operatorUid: options.operatorUid ?? 'actor-a',
+        operation: options.operation ?? 1,
+      },
+    } } },
+  }))
+  return toBinary(PushMessageEnvelopeSchema, create(PushMessageEnvelopeSchema, {
+    message: {
+      contentHead: { type: 732, subType: 16 },
+      body: { msgContent: Uint8Array.from([...new Uint8Array(7), ...notify]) },
+    },
+  }))
+}
 
 function completePng(width: number, height: number, padding = 0): Buffer {
   const bytes = Buffer.alloc(24 + padding + 12)
@@ -427,6 +458,9 @@ function fixture() {
     },
     emitReceived(records: MsgRecord[]) {
       msgHandlers.onRecvMsg?.(records)
+    },
+    emitS2C(bytes: Uint8Array) {
+      return msgHandlers.onRecvS2CMsg?.([...bytes])
     },
     emitSent(record: MsgRecord) {
       return msgHandlers.onAddSendMsg?.(record)
@@ -4576,6 +4610,119 @@ describe('QQKernelBridge', () => {
     )
   })
 
+  it('applies pushed group reactions to a cached message without polling or gray tips', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    vi.spyOn(bridge as unknown as { initializePlatformData(): Promise<void> }, 'initializePlatformData').mockResolvedValue()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const conversation = bridge.getConversation('1058754719')
+    const target = {
+      ...f.message,
+      msgId: 'pushed-reaction-target', msgSeq: '799177', chatType: 2 as const,
+      peerUid: '1058754719', peerUin: '1058754719', sendType: 0,
+      senderUid: 'member-a', senderUin: '42', emojiLikesList: [],
+    }
+    f.msg.getLatestDbMsgs.mockResolvedValue({ result: 0, errMsg: '', msgList: [target] })
+    await bridge.getHistory(conversation)
+    f.msg.getMsgsByMsgId.mockClear()
+    f.msg.getMsgsBySeqAndCount.mockClear()
+    const events = bridge.subscribe()[Symbol.asyncIterator]()
+
+    f.emitS2C(groupReactionPushBytes({ operatorUid: 'actor-a', currentCount: 1 }))
+    await expect(events.next()).resolves.toMatchObject({ value: {
+      type: 'message-reactions',
+      eventId: expect.stringMatching(/^reaction-push:pushed-reaction-target:/),
+      target: { messageId: 'pushed-reaction-target' },
+      context: {
+        reactions: [{ key: '2:10068', count: 1, recentActors: [{ userId: 'actor-a' }] }],
+      },
+    } })
+
+    f.emitS2C(groupReactionPushBytes({ operatorUid: 'actor-b', currentCount: 2 }))
+    await expect(events.next()).resolves.toMatchObject({ value: {
+      type: 'message-reactions',
+      context: { reactions: [{
+        key: '2:10068', count: 2,
+        recentActors: [{ userId: 'actor-b' }, { userId: 'actor-a' }],
+      }] },
+    } })
+
+    f.emitS2C(groupReactionPushBytes({ operatorUid: 'actor-a', currentCount: 1, operation: 2 }))
+    await expect(events.next()).resolves.toMatchObject({ value: {
+      type: 'message-reactions',
+      context: { reactions: [{ count: 1, recentActors: [{ userId: 'actor-b' }] }] },
+    } })
+
+    f.emitS2C(groupReactionPushBytes({ operatorUid: 'actor-b', currentCount: 0, operation: 2 }))
+    await expect(events.next()).resolves.toMatchObject({ value: {
+      type: 'message-reactions', context: { reactions: [], maxSelected: 20 },
+    } })
+    expect(f.msg.getMsgsByMsgId).not.toHaveBeenCalled()
+    expect(f.msg.getMsgsBySeqAndCount).not.toHaveBeenCalled()
+  })
+
+  it('preserves other reaction kinds and updates the selected state from self pushes', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    vi.spyOn(bridge as unknown as { initializePlatformData(): Promise<void> }, 'initializePlatformData').mockResolvedValue()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const conversation = bridge.getConversation('1058754719')
+    const target = {
+      ...f.message,
+      msgId: 'self-pushed-reaction-target', msgSeq: '799177', chatType: 2 as const,
+      peerUid: '1058754719', peerUin: '1058754719', emojiLikesList: [
+        { emojiType: '1', emojiId: '424', likesCnt: '2', isClicked: false },
+      ],
+    }
+    f.msg.getLatestDbMsgs.mockResolvedValue({ result: 0, errMsg: '', msgList: [target] })
+    await bridge.getHistory(conversation)
+    const events = bridge.subscribe()[Symbol.asyncIterator]()
+
+    f.emitS2C(groupReactionPushBytes({ operatorUid: 'self', currentCount: 1 }))
+    await expect(events.next()).resolves.toMatchObject({ value: {
+      type: 'message-reactions',
+      context: { reactions: [
+        { key: '1:424', count: 2 },
+        { key: '2:10068', count: 1, selected: true, recentActors: [{ userId: 'self' }] },
+      ] },
+    } })
+
+    f.emitS2C(groupReactionPushBytes({ operatorUid: 'self', currentCount: 0, operation: 2 }))
+    await expect(events.next()).resolves.toMatchObject({ value: {
+      type: 'message-reactions',
+      context: { reactions: [{ key: '1:424', count: 2 }] },
+    } })
+  })
+
+  it('resolves an uncached reaction-push target by its group sequence', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    vi.spyOn(bridge as unknown as { initializePlatformData(): Promise<void> }, 'initializePlatformData').mockResolvedValue()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const target = {
+      ...f.message,
+      msgId: 'cold-pushed-reaction-target', msgSeq: '799178', chatType: 2 as const,
+      peerUid: '1058754719', peerUin: '1058754719', sendType: 0,
+      senderUid: 'member-a', senderUin: '42', emojiLikesList: [],
+    }
+    f.msg.getMsgsBySeqAndCount.mockResolvedValue({ result: 0, errMsg: '', msgList: [target] })
+    const events = bridge.subscribe()[Symbol.asyncIterator]()
+
+    f.emitS2C(groupReactionPushBytes({
+      messageSequence: 799_178n, code: '424', operatorUid: 'actor-a', currentCount: 1,
+    }))
+
+    await expect(events.next()).resolves.toMatchObject({ value: {
+      type: 'message-reactions',
+      target: { messageId: 'cold-pushed-reaction-target' },
+      context: { reactions: [{ key: '1:424', count: 1, recentActors: [{ userId: 'actor-a' }] }] },
+    } })
+    expect(f.msg.getMsgsBySeqAndCount.mock.calls).toEqual([
+      [expect.objectContaining({ peerUid: '1058754719' }), '799178', 4, true, true],
+      [expect.objectContaining({ peerUid: '1058754719' }), '799178', 4, false, true],
+    ])
+  })
+
   it('retracts an optimistic outgoing event when QQ later rejects it', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
@@ -6561,6 +6708,39 @@ describe('QQBridgeServer', () => {
     expect(f.msg.getMsgsBySeqAndCount).toHaveBeenCalledWith(
       expect.objectContaining({ peerUid: '1058754719' }), '411715', 1, true, true,
     )
+  })
+
+  it('streams an S2C-pushed reaction over WebSocket', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    vi.spyOn(bridge as unknown as { initializePlatformData(): Promise<void> }, 'initializePlatformData').mockResolvedValue()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const conversation = bridge.getConversation('1058754719')
+    const target = {
+      ...f.message,
+      msgId: 'ws-pushed-reaction-target', msgSeq: '799177', chatType: 2 as const,
+      peerUid: '1058754719', peerUin: '1058754719', sendType: 0,
+      senderUid: 'member-a', senderUin: '42', emojiLikesList: [],
+    }
+    f.msg.getLatestDbMsgs.mockResolvedValue({ result: 0, errMsg: '', msgList: [target] })
+    await bridge.getHistory(conversation)
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const socket = new WebSocket(`ws://127.0.0.1:${server.address().port}/v1/events/ws`)
+    await once(socket, 'open')
+    const frame = once(socket, 'message')
+
+    f.emitS2C(groupReactionPushBytes({ operatorUid: 'actor-a', currentCount: 1 }))
+
+    const [raw] = await frame
+    expect(JSON.parse(raw.toString())).toMatchObject({ event: {
+      type: 'message-reactions',
+      eventId: expect.stringMatching(/^reaction-push:ws-pushed-reaction-target:/),
+      target: { messageId: 'ws-pushed-reaction-target' },
+      context: { reactions: [{ key: '2:10068', count: 1 }] },
+    } })
+    socket.close()
+    await once(socket, 'close')
   })
 
   it('streams events over WebSocket, resumes by event id, and removes closed subscribers', async () => {

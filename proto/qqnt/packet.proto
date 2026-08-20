@@ -775,3 +775,54 @@ message SendMessageResponse {
   uint64 sequence = 11;
   uint64 client_sequence = 14;
 }
+
+// Unsolicited group reaction notifications delivered through
+// NodeIKernelMsgListener.onRecvS2CMsg(). The wire layout is shared with
+// trpc.msg.olpush.OlPushService.MsgPush.
+message PushMessageEnvelope {
+  PushMessage message = 1;
+}
+
+message PushMessage {
+  PushContentHead content_head = 2;
+  PushMessageBody body = 3;
+}
+
+message PushContentHead {
+  uint32 type = 1;
+  uint32 sub_type = 2;
+}
+
+message PushMessageBody {
+  bytes msg_content = 2;
+}
+
+message GroupReactionNotify {
+  uint64 group_uin = 4;
+  uint32 sub_type = 13;
+  GroupReactionData0 reaction = 44;
+}
+
+message GroupReactionData0 {
+  GroupReactionData1 data = 1;
+}
+
+message GroupReactionData1 {
+  GroupReactionData2 data = 1;
+}
+
+message GroupReactionData2 {
+  GroupReactionTarget target = 2;
+  GroupReactionDataContent data = 3;
+}
+
+message GroupReactionTarget {
+  uint64 sequence = 1;
+}
+
+message GroupReactionDataContent {
+  string code = 1;
+  uint32 current_count = 3;
+  string operator_uid = 4;
+  uint32 operation = 5;
+}
