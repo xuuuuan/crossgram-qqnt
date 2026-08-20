@@ -422,6 +422,68 @@ export interface FileTransNotifyInfo {
   trasferStatus: number
 }
 
+export interface GroupFileListParams {
+  sortType: number
+  fileCount: number
+  startIndex: number
+  sortOrder: number
+  showOnlinedocFolder: number
+  folderId?: string
+}
+
+export interface GroupFileListItem {
+  peerId: string
+  type: number
+  folderInfo?: {
+    folderId: string
+    parentFolderId: string
+    folderName: string
+    createTime: number
+    modifyTime: number
+    createUin: string
+    creatorName: string
+    totalFileCount: number
+    modifyUin: string
+    modifyName: string
+    usedSpace: string
+  }
+  fileInfo?: {
+    fileModelId: string
+    fileId: string
+    fileName: string
+    fileSize: string
+    busId: number
+    uploadedSize: string
+    uploadTime: number
+    deadTime: number
+    modifyTime: number
+    downloadTimes: number
+    sha: string
+    sha3: string
+    md5: string
+    uploaderLocalPath: string
+    uploaderName: string
+    uploaderUin: string
+    parentFolderId: string
+    localPath: string
+    transStatus: number
+    transType: number
+    elementId: string
+    isFolder: boolean
+  }
+}
+
+export interface GroupFileListResult {
+  retCode: number
+  retMsg: string
+  clientWording: string
+  isEnd: boolean
+  item: GroupFileListItem[]
+  allFileCount: number
+  nextIndex: number
+  reqId: number
+}
+
 export interface KernelMsgService {
   sendSsoCmdReqByContend?(
     command: string,
@@ -796,6 +858,18 @@ export interface KernelGroupService {
 
 export interface KernelRichMediaService {
   getRichMediaFileDir?(elementType: number, downType: number, isTemp: boolean): string
+  getGroupFileList?(groupCode: string, params: GroupFileListParams): Promise<{
+    result: number
+    errMsg: string
+    groupSpaceResult?: {
+      retCode: number
+      retMsg: string
+      clientWording: string
+      totalSpace: number
+      usedSpace: number
+      allUpload: boolean
+    }
+  }>
 }
 
 export interface KernelFlashTransferService {

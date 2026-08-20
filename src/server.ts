@@ -547,7 +547,7 @@ export class QQBridgeServer {
       return
     }
 
-    const conversationMatch = /^\/v1\/conversations\/([^/]+)(?:\/(history|members|search))?$/.exec(path)
+    const conversationMatch = /^\/v1\/conversations\/([^/]+)(?:\/(history|members|search|group-files))?$/.exec(path)
     if (request.method === 'GET' && conversationMatch) {
       const conversation = this.bridge.getConversation(decodeURIComponent(conversationMatch[1]))
       if (!conversationMatch[2]) {
@@ -580,6 +580,14 @@ export class QQBridgeServer {
           mediaKind: (requestedKind as 'image' | 'file' | null) ?? undefined,
         })
         log('info', `HTTP API search id=${requestId} conversation=${conversation.id} query=${JSON.stringify(url.searchParams.get('q') ?? '')} count=${page.messages.length} next=${page.nextCursor ?? ''}`)
+        json(response, 200, page)
+      } else if (conversationMatch[2] === 'group-files') {
+        const page = await this.bridge.getGroupFiles(conversation, {
+          folderId: url.searchParams.get('folderId') ?? undefined,
+          cursor: url.searchParams.get('cursor') ?? undefined,
+          limit: numberParam(url, 'limit', 100),
+        })
+        log('info', `HTTP API group files id=${requestId} conversation=${conversation.id} folder=${JSON.stringify(url.searchParams.get('folderId') ?? '')} count=${page.items.length} next=${page.nextCursor ?? ''}`)
         json(response, 200, page)
       } else {
         const page = await this.bridge.getMembers(

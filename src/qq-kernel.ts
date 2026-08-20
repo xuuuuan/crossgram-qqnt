@@ -19,12 +19,12 @@ import {
 import { decodePttTo, encodePtt, MAX_VOICE_INPUT_BYTES, transcodePttFallbackTo } from './silk-audio.js'
 import {
   GroupMsgMask,
-  type BuddyRequest, type CustomEmotionData, type DoubtBuddyReqChange, type DoubtBuddyRequest, type EmojiLikesUserInfo, type FileTransNotifyInfo, type GroupMsgMaskInfo, type GroupNotify, type GroupProfileInfo,
+  type BuddyRequest, type CustomEmotionData, type DoubtBuddyReqChange, type DoubtBuddyRequest, type EmojiLikesUserInfo, type FileTransNotifyInfo, type GroupFileListResult, type GroupMsgMaskInfo, type GroupNotify, type GroupProfileInfo,
   type InitSessionConfig, type KernelAVSDKService, type KernelFlashTransferService, type KernelModule, type KernelSession, type MarketStickerPackInfo, type MemberInfo, type MsgElement,
   type MsgRecord, type ProfileSimpleInfo, type RecentContactInfo, type SearchMsgKeywordsResult,
 } from './kernel-types.js'
 import {
-  conversationId, parseConversationId, type HistoryQuery, type MemberPage, type QQCallSignalEvent, type QQCard, type QQConversation, type QQEvent, type QQMedia, type QQMediaLocator, type QQMediaUploadPlan, type QQMessage, type QQMultiForwardLocator, type QQReactionActorPage, type QQReactionContext, type QQReactionDefinition, type QQReactionState,
+  conversationId, parseConversationId, type HistoryQuery, type MemberPage, type QQCallSignalEvent, type QQCard, type QQConversation, type QQEvent, type QQGroupFilePage, type QQMedia, type QQMediaLocator, type QQMediaUploadPlan, type QQMessage, type QQMultiForwardLocator, type QQReactionActorPage, type QQReactionContext, type QQReactionDefinition, type QQReactionState,
   type QQFlashTransferManifest, type QQFlashTransferResult, type QQGroupJoinContractProbe, type QQGroupJoinContractProbeMethod, type QQRequest, type QQRequestKind, type QQRequestPage, type QQRequestStatus, type QQSendMediaSpec, type QQSticker, type QQStickerPack, type QQStickerPackSummary, type QQStickerReference, type QQTextPart, type SearchPage, type SearchQuery, type SendManifest,
 } from './protocol.js'
 
@@ -381,6 +381,11 @@ export class QQKernelBridge {
   }> = []
   private readonly pendingReactions = new Map<string, ReturnType<typeof deferred<QQReactionState>>>()
   private readonly pendingGroupProfiles = new Map<string, ReturnType<typeof deferred<void>>>()
+  private pendingGroupFilePage?: {
+    groupCode: string
+    result: ReturnType<typeof deferred<GroupFileListResult>>
+  }
+  private groupFileQueryTail = Promise.resolve()
   private readonly pendingUserProfiles = new Map<string, ReturnType<typeof deferred<void>>>()
   private readonly pendingMemberPages = new Map<string, ReturnType<typeof deferred<{
     ids: Array<{ uid: string, index: number }>
@@ -737,6 +742,8 @@ export class QQKernelBridge {
     this.pendingReactions.clear()
     for (const pending of this.pendingGroupProfiles.values()) pending.reject(new Error('QQNT session detached'))
     this.pendingGroupProfiles.clear()
+    this.pendingGroupFilePage?.result.reject(new Error('QQNT session detached'))
+    this.pendingGroupFilePage = undefined
     for (const pending of this.pendingUserProfiles.values()) pending.reject(new Error('QQNT session detached'))
     this.pendingUserProfiles.clear()
     for (const pending of this.pendingMemberPages.values()) pending.reject(new Error('QQNT session detached'))
@@ -1159,6 +1166,121 @@ export class QQKernelBridge {
     }
     const last = response.msgList.at(-1)
     return { messages, nextCursor: messages.length === limit ? last?.msgId : undefined }
+  }
+
+  async getGroupFiles(
+    conversation: QQConversation,
+    query: { folderId?: string, cursor?: string, limit?: number } = {},
+  ): Promise<QQGroupFilePage> {
+    if (conversation.chatType !== CHAT_GROUP) throw new Error('QQ group files are only available for group conversations')
+    const service = this.requireSession().getRichMediaService()
+    if (!service.getGroupFileList) throw new Error('QQNT group file listing is unavailable')
+    const startIndex = parseGroupFileCursor(query.cursor)
+    const limit = clamp(query.limit ?? 100, 1, 200)
+    return this.withGroupFileQueryLock(async () => {
+      const groupCode = conversation.peerUin || conversation.peerUid
+      const pending = deferred<GroupFileListResult>()
+      const pendingPage = { groupCode, result: pending }
+      this.pendingGroupFilePage = pendingPage
+      try {
+        const accepted = await service.getGroupFileList!(conversation.peerUin || conversation.peerUid, {
+          sortType: 1,
+          fileCount: limit,
+          startIndex,
+          sortOrder: 2,
+          showOnlinedocFolder: 0,
+          ...(query.folderId ? { folderId: query.folderId } : {}),
+        })
+        if (accepted.result !== 0) {
+          throw new Error(`QQNT group file listing failed: ${accepted.errMsg || accepted.result}`)
+        }
+        const result = await withTimeout(
+          pending.promise,
+          5_000,
+          `QQ group file listing timed out: ${conversation.id}`,
+        )
+        if (result.retCode !== 0) {
+          throw new Error(`QQNT group file listing failed: ${result.clientWording || result.retMsg || result.retCode}`)
+        }
+        const peerUid = groupCode
+        return {
+          items: result.item.reduce<QQGroupFilePage['items']>((items, item) => {
+            if (item.folderInfo) {
+              const folder = item.folderInfo
+              items.push({
+                type: 'folder' as const,
+                id: folder.folderId,
+                parentId: folder.parentFolderId || query.folderId || '',
+                name: folder.folderName,
+                createTime: folder.createTime,
+                modifyTime: folder.modifyTime,
+                creatorId: folder.createUin,
+                creatorName: folder.creatorName,
+                fileCount: folder.totalFileCount,
+              })
+              return items
+            }
+            if (!item.fileInfo) return items
+            const file = item.fileInfo
+            const size = safeNonNegativeNumber(file.fileSize)
+            const locator: QQMediaLocator = {
+              messageId: `group-file:${file.fileId}`,
+              elementId: file.elementId || file.fileModelId || file.fileId,
+              chatType: CHAT_GROUP,
+              peerUid,
+              kind: 'file',
+              fileName: file.fileName,
+              fileSize: file.fileSize,
+              fileUuid: file.fileId,
+              fileBizId: file.busId,
+              md5: file.md5 || undefined,
+              sha: file.sha || undefined,
+              sha3: file.sha3 || undefined,
+            }
+            items.push({
+              type: 'file' as const,
+              id: file.fileId,
+              parentId: file.parentFolderId || query.folderId || '',
+              name: file.fileName,
+              size,
+              uploadTime: file.uploadTime,
+              modifyTime: file.modifyTime,
+              ...(file.deadTime > 0 ? { expiresAt: file.deadTime } : {}),
+              downloadCount: file.downloadTimes,
+              uploaderId: file.uploaderUin,
+              uploaderName: file.uploaderName,
+              busId: file.busId,
+              media: {
+                id: `group-file:${peerUid}:${file.fileId}`,
+                kind: 'file' as const,
+                name: file.fileName,
+                size,
+                locator,
+              },
+            })
+            return items
+          }, []),
+          ...(!result.isEnd && result.nextIndex > startIndex
+            ? { nextCursor: String(result.nextIndex) }
+            : {}),
+          ...(result.allFileCount >= 0 ? { total: result.allFileCount } : {}),
+        }
+      } finally {
+        if (this.pendingGroupFilePage === pendingPage) this.pendingGroupFilePage = undefined
+      }
+    })
+  }
+
+  private async withGroupFileQueryLock<T>(callback: () => Promise<T>): Promise<T> {
+    const previous = this.groupFileQueryTail.catch(() => undefined)
+    let release!: () => void
+    this.groupFileQueryTail = new Promise<void>((resolve) => { release = resolve })
+    await previous
+    try {
+      return await callback()
+    } finally {
+      release()
+    }
   }
 
   private async latestHistoryFallback(
@@ -3317,6 +3439,14 @@ export class QQKernelBridge {
         } else {
           log('info', `QQ media upload completed ${details}`)
         }
+      },
+      onGroupFileInfoUpdate: (value: GroupFileListResult | { groupFileListResult: GroupFileListResult }) => {
+        const result = 'groupFileListResult' in value ? value.groupFileListResult : value
+        const pending = this.pendingGroupFilePage
+        if (!pending) return
+        const peerIds = new Set(result.item.map((item) => item.peerId).filter(Boolean))
+        if (peerIds.size && !peerIds.has(pending.groupCode)) return
+        pending.result.resolve(result)
       },
       },
     ))
@@ -6729,6 +6859,19 @@ function parseCursor(value?: string): number {
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, Math.trunc(value)))
+}
+
+function parseGroupFileCursor(cursor: string | undefined): number {
+  if (!cursor) return 0
+  if (!/^\d+$/.test(cursor)) throw new Error('invalid QQ group file cursor')
+  const value = Number(cursor)
+  if (!Number.isSafeInteger(value) || value < 0) throw new Error('invalid QQ group file cursor')
+  return value
+}
+
+function safeNonNegativeNumber(value: string | number): number {
+  const numeric = typeof value === 'number' ? value : Number(value)
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : 0
 }
 
 function numberOrUndefined(value?: string | number): number | undefined {

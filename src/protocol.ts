@@ -91,6 +91,40 @@ export interface QQMedia {
   locator: QQMediaLocator
 }
 
+export interface QQGroupFile {
+  type: 'file'
+  id: string
+  parentId: string
+  name: string
+  size: number
+  uploadTime: number
+  modifyTime: number
+  expiresAt?: number
+  downloadCount: number
+  uploaderId: string
+  uploaderName: string
+  busId: number
+  media: QQMedia
+}
+
+export interface QQGroupFileFolder {
+  type: 'folder'
+  id: string
+  parentId: string
+  name: string
+  createTime: number
+  modifyTime: number
+  creatorId: string
+  creatorName: string
+  fileCount: number
+}
+
+export interface QQGroupFilePage {
+  items: Array<QQGroupFile | QQGroupFileFolder>
+  nextCursor?: string
+  total?: number
+}
+
 export type QQStickerReference =
   | {
       kind: 'sysface'

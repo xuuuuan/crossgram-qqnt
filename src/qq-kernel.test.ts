@@ -9,7 +9,7 @@ import { execFile } from 'node:child_process'
 import { promisify, types } from 'node:util'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import WebSocket from 'ws'
-import { GroupMsgMask, type ContactMsgBoxInfo, type KernelBuddyService, type KernelFlashTransferService, type KernelGroupService, type KernelModule, type KernelMsgService, type KernelSession, type MsgElement, type MsgRecord } from './kernel-types.js'
+import { GroupMsgMask, type ContactMsgBoxInfo, type KernelBuddyService, type KernelFlashTransferService, type KernelGroupService, type KernelModule, type KernelMsgService, type KernelRichMediaService, type KernelSession, type MsgElement, type MsgRecord } from './kernel-types.js'
 import type { PacketAddon } from './packet-addon.js'
 import { parseConversationId, type QQEvent } from './protocol.js'
 import { QQKernelBridge } from './qq-kernel.js'
@@ -329,7 +329,15 @@ function fixture() {
     }),
     removeKernelAVSDKListener: vi.fn(),
   }
-  const richMedia = {}
+  const richMedia = {
+    getGroupFileList: vi.fn<NonNullable<KernelRichMediaService['getGroupFileList']>>(async () => {
+      queueMicrotask(() => msgHandlers.onGroupFileInfoUpdate?.({
+        retCode: 0, retMsg: '', clientWording: '', isEnd: true,
+        item: [], allFileCount: 0, nextIndex: 0, reqId: 1,
+      }))
+      return { result: 0, errMsg: '' }
+    }),
+  }
   const uix = {
     getUid: vi.fn(async (uins: Set<string>) => ({ uidInfo: new Map([...uins].flatMap((uin) => {
       if (uin === '1715311957') return [[uin, 'uid-1715311957']]
@@ -489,6 +497,9 @@ function fixture() {
     },
     emitSearch(result: import('./kernel-types.js').SearchMsgKeywordsResult) {
       searchHandlers.onSearchMsgKeywordsResult?.(result)
+    },
+    emitGroupFiles(result: import('./kernel-types.js').GroupFileListResult) {
+      msgHandlers.onGroupFileInfoUpdate?.(result)
     },
     emitAVSDK(callback: string, ...args: unknown[]) {
       if (callback === 'OnInviteActionToAVSDK' && !types.isProxy(args[0]) && args[0] && typeof args[0] === 'object') {
@@ -1249,6 +1260,50 @@ describe('QQKernelBridge', () => {
     expect(page).toMatchObject({ messages: [{ id: 'image', parts: [{ type: 'media' }] }] })
     expect(page.nextCursor).toBeUndefined()
     expect(f.search.searchMoreChatMsgs).toHaveBeenCalledWith(71)
+  })
+
+  it('lists native QQ group folders and files with downloadable media locators', async () => {
+    const f = fixture()
+    f.richMedia.getGroupFileList.mockImplementation(async (_groupCode, params) => {
+      queueMicrotask(() => f.emitGroupFiles({
+        retCode: 0, retMsg: '', clientWording: '', isEnd: false,
+        allFileCount: 3, nextIndex: 2, reqId: 7,
+        item: [{
+          peerId: '1058754719', type: 2,
+          folderInfo: {
+            folderId: 'folder-a', parentFolderId: '', folderName: '资料',
+            createTime: 100, modifyTime: 110, createUin: '42', creatorName: 'Alice',
+            totalFileCount: 2, modifyUin: '42', modifyName: 'Alice', usedSpace: '9',
+          },
+        }, {
+          peerId: '1058754719', type: 1,
+          fileInfo: {
+            fileModelId: 'model-a', fileId: 'uuid-a', fileName: 'manual.pdf', fileSize: '9',
+            busId: 102, uploadedSize: '9', uploadTime: 200, deadTime: 0, modifyTime: 210,
+            downloadTimes: 4, sha: 'sha', sha3: 'sha3', md5: 'md5', uploaderLocalPath: '',
+            uploaderName: 'Bob', uploaderUin: '43', parentFolderId: '', localPath: '',
+            transStatus: 0, transType: 0, elementId: 'element-a', isFolder: false,
+          },
+        }],
+      }))
+      expect(params).toMatchObject({ startIndex: 0, fileCount: 2, sortType: 1, sortOrder: 2 })
+      return { result: 0, errMsg: '' }
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    const page = await bridge.getGroupFiles(bridge.getConversation('2:1058754719'), { limit: 2 })
+
+    expect(page).toMatchObject({
+      total: 3, nextCursor: '2',
+      items: [{ type: 'folder', id: 'folder-a', name: '资料' }, {
+        type: 'file', id: 'uuid-a', name: 'manual.pdf', size: 9,
+        media: { locator: {
+          chatType: 2, peerUid: '1058754719', fileUuid: 'uuid-a', fileBizId: 102,
+          fileName: 'manual.pdf', fileSize: '9', kind: 'file',
+        } },
+      }],
+    })
   })
 
   it('paginates the complete ordered recent-contact snapshot instead of the small infos cache', async () => {
@@ -5588,6 +5643,11 @@ describe('QQBridgeServer', () => {
       .then((response) => response.json())).resolves.toMatchObject({
       messages: [{ id: 'http-search' }],
     })
+    await expect(fetch(`${base}/conversations/${encodeURIComponent('2:1058754719')}/group-files?limit=20`)
+      .then((response) => response.json())).resolves.toEqual({ items: [], total: 0 })
+    expect(f.richMedia.getGroupFileList).toHaveBeenCalledWith('1058754719', expect.objectContaining({
+      startIndex: 0, fileCount: 20,
+    }))
     const prepare = vi.spyOn(bridge, 'prepareMediaUpload').mockResolvedValueOnce({
       prepared: { kind: 'image', fileUuid: 'http-prepared', msgInfo: 'bXNn' },
     })
