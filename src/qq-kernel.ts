@@ -1667,7 +1667,11 @@ export class QQKernelBridge {
     }))
   }
 
-  private async getMessageRecord(conversation: QQConversation, id: string): Promise<MsgRecord | null> {
+  private async getMessageRecord(
+    conversation: QQConversation,
+    id: string,
+    sequence?: string,
+  ): Promise<MsgRecord | null> {
     const service = this.requireMsgService()
     const peer = contact(conversation)
     log('info', `native API start name=getMsgsByMsgId conversation=${conversation.id} message=${id}`)
@@ -1675,7 +1679,23 @@ export class QQKernelBridge {
     log('info', `native API complete name=getMsgsByMsgId conversation=${conversation.id} message=${id} result=${response.result} err=${JSON.stringify(response.errMsg)} records=${response.msgList.length}`)
     if (response.result !== 0) throw new Error(`getMsgsByMsgId: ${response.errMsg} (${response.result})`)
     const record = response.msgList.find((item) => item.msgId === id)
-    return record && !isRecalledRecord(record) ? record : null
+    if (record && !isRecalledRecord(record)) return record
+
+    // QQNT may evict an older message from its msgId index while the
+    // conversation-scoped group msgSeq remains queryable. Crossgram persists
+    // both identifiers, so use the sequence as an authoritative fallback for
+    // reaction previews, actor lists, and writes.
+    if (conversation.chatType !== CHAT_GROUP || !sequence || !service.getMsgsBySeqAndCount) return null
+    log('info', `native API start name=getMsgsBySeqAndCount(message) conversation=${conversation.id} sequence=${sequence}`)
+    const bySequence = await retryHistoryCall(
+      () => service.getMsgsBySeqAndCount!(peer, sequence, 1, true, true),
+    )
+    log('info', `native API complete name=getMsgsBySeqAndCount(message) conversation=${conversation.id} sequence=${sequence} result=${bySequence.result} err=${JSON.stringify(bySequence.errMsg)} records=${bySequence.msgList.length}`)
+    if (bySequence.result !== 0 && !bySequence.msgList.length) {
+      throw new Error(`getMsgsBySeqAndCount: ${bySequence.errMsg} (${bySequence.result})`)
+    }
+    const sequenceRecord = bySequence.msgList.find((item) => item.msgSeq === sequence)
+    return sequenceRecord && !isRecalledRecord(sequenceRecord) ? sequenceRecord : null
   }
 
   async getStickerPacks(cursor?: string, limit = 100): Promise<{
@@ -2763,10 +2783,14 @@ export class QQKernelBridge {
     }
   }
 
-  async getMessageReactions(conversation: QQConversation, messageId: string): Promise<QQReactionState> {
+  async getMessageReactions(
+    conversation: QQConversation,
+    messageId: string,
+    messageSequence?: string,
+  ): Promise<QQReactionState> {
     if (conversation.chatType !== CHAT_GROUP) return { reactions: [], maxSelected: 0 }
     const record = await withTimeout(
-      this.getMessageRecord(conversation, messageId),
+      this.getMessageRecord(conversation, messageId, messageSequence),
       5_000,
       'QQ reaction lookup timed out',
     )
@@ -2777,7 +2801,7 @@ export class QQKernelBridge {
       message.reactionContext = previous.reactionContext
     }
     if (message.reactionContext) {
-      message.reactionContext = await this.withReactionActors(conversation, record, message.reactionContext)
+      message.reactionContext = await this.withReactionActors(conversation, record, message.reactionContext, 3)
     }
     this.rememberMessage(message)
     return message.reactionContext ?? { reactions: [], maxSelected: 20 }
@@ -2789,12 +2813,13 @@ export class QQKernelBridge {
     filterReactionKey: string | undefined,
     offset: string | undefined,
     limit: number,
+    messageSequence?: string,
   ): Promise<QQReactionActorPage> {
     if (conversation.chatType !== CHAT_GROUP) {
       return { state: { reactions: [], maxSelected: 0 }, actors: [] }
     }
     const record = await withTimeout(
-      this.getMessageRecord(conversation, messageId),
+      this.getMessageRecord(conversation, messageId, messageSequence),
       5_000,
       'QQ reaction lookup timed out',
     )
@@ -2898,7 +2923,7 @@ export class QQKernelBridge {
       if (!page.nextCookie) break
       cookie = page.nextCookie
     }
-    return [...actors.values()]
+    return [...actors.values()].slice(0, limit)
   }
 
   private async getReactionActorsPage(
@@ -2974,6 +2999,7 @@ export class QQKernelBridge {
     conversation: QQConversation,
     messageId: string,
     reactionKeys: readonly string[],
+    messageSequence?: string,
   ): Promise<QQReactionState> {
     if (conversation.chatType !== CHAT_GROUP) throw new Error('QQ reactions are unavailable in direct conversations')
     const service = this.requireMsgService()
@@ -2983,7 +3009,7 @@ export class QQKernelBridge {
     // stable msgId can already be returned to callers, but reaction writes must
     // refresh the record and use QQ's final msgSeq.
     let record = await withTimeout(
-      this.getMessageRecord(conversation, messageId),
+      this.getMessageRecord(conversation, messageId, messageSequence),
       5_000,
       'QQ reaction target refresh timed out',
     ).catch(() => null)

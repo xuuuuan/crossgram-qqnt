@@ -4431,12 +4431,55 @@ describe('QQKernelBridge', () => {
       }],
     })
     expect(f.msg.getMsgEmojiLikesList.mock.calls).toEqual([
-      [expect.objectContaining({ peerUid: '1058754719' }), 'seq1', '128522', '2', '', false, 10],
-      [expect.objectContaining({ peerUid: '1058754719' }), 'seq1', '128522', '2', 'next', false, 10],
+      [expect.objectContaining({ peerUid: '1058754719' }), 'seq1', '128522', '2', '', false, 3],
+      [expect.objectContaining({ peerUid: '1058754719' }), 'seq1', '128522', '2', 'next', false, 1],
     ])
     await expect(bridge.getUser('actor-a')).resolves.toMatchObject({
       id: 'actor-a', name: 'Alice', avatarUrl: 'https://example.com/a.jpg',
     })
+  })
+
+  it('falls back to the persisted group sequence when QQNT no longer resolves a message id', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const conversation = await bridge.resolveConversation(2, '1058754719')
+    const groupMessage = {
+      ...f.message,
+      msgId: 'current-id',
+      msgSeq: '411715',
+      chatType: 2 as const,
+      peerUid: '1058754719',
+      peerUin: '1058754719',
+      emojiLikesList: [{ emojiType: '2', emojiId: '128522', likesCnt: '4', isClicked: false }],
+    }
+    f.msg.getMsgsByMsgId.mockResolvedValue({ result: 0, errMsg: '', msgList: [] })
+    f.msg.getMsgsBySeqAndCount.mockResolvedValue({ result: 0, errMsg: '', msgList: [groupMessage] })
+    f.msg.getMsgEmojiLikesList.mockResolvedValue({
+      result: 0, errMsg: '', cookie: 'more', isFirstPage: true, isLastPage: false,
+      emojiLikesList: [
+        { tinyId: 'actor-a', nickName: 'Alice', headUrl: '' },
+        { tinyId: 'actor-b', nickName: 'Bob', headUrl: '' },
+        { tinyId: 'actor-c', nickName: 'Carol', headUrl: '' },
+        { tinyId: 'actor-d', nickName: 'Dave', headUrl: '' },
+      ],
+    })
+
+    await expect(bridge.getMessageReactions(conversation, 'stale-id', '411715'))
+      .resolves.toMatchObject({
+        reactions: [{
+          key: '2:128522', count: 4,
+          recentActors: [
+            { userId: 'actor-a' }, { userId: 'actor-b' }, { userId: 'actor-c' },
+          ],
+        }],
+      })
+    expect(f.msg.getMsgsBySeqAndCount).toHaveBeenCalledWith(
+      expect.objectContaining({ peerUid: '1058754719' }), '411715', 1, true, true,
+    )
+    expect(f.msg.getMsgEmojiLikesList).toHaveBeenCalledWith(
+      expect.objectContaining({ peerUid: '1058754719' }), '411715', '128522', '2', '', false, 3,
+    )
   })
 
   it('continues reaction actor pages from the opaque Telegram offset', async () => {
@@ -6055,6 +6098,40 @@ describe('QQBridgeServer', () => {
     expect(second).toMatchObject({
       actors: [{ reactionKey: '2:128522', actor: { userId: 'actor-b' } }],
     })
+  })
+
+  it('passes the persisted message sequence through reaction HTTP lookups', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const message = {
+      ...f.message,
+      msgId: 'current-id',
+      msgSeq: '411715',
+      chatType: 2 as const,
+      peerUid: '1058754719',
+      peerUin: '1058754719',
+      emojiLikesList: [{ emojiType: '2', emojiId: '128522', likesCnt: '1', isClicked: false }],
+    }
+    f.msg.getMsgsByMsgId.mockResolvedValue({ result: 0, errMsg: '', msgList: [] })
+    f.msg.getMsgsBySeqAndCount.mockResolvedValue({ result: 0, errMsg: '', msgList: [message] })
+    f.msg.getMsgEmojiLikesList.mockResolvedValue({
+      result: 0, errMsg: '', cookie: '', isFirstPage: true, isLastPage: true,
+      emojiLikesList: [{ tinyId: 'actor-a', nickName: 'Alice', headUrl: '' }],
+    })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const base = `http://127.0.0.1:${server.address().port}/v1/messages/reactions`
+    const response = await fetch(
+      `${base}?conversationId=1058754719&messageId=stale-id&messageSequence=411715`,
+    ).then((value) => value.json())
+
+    expect(response).toMatchObject({
+      reactions: [{ key: '2:128522', recentActors: [{ userId: 'actor-a' }] }],
+    })
+    expect(f.msg.getMsgsBySeqAndCount).toHaveBeenCalledWith(
+      expect.objectContaining({ peerUid: '1058754719' }), '411715', 1, true, true,
+    )
   })
 
   it('streams events over WebSocket, resumes by event id, and removes closed subscribers', async () => {
