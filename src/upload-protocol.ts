@@ -4,6 +4,8 @@ import * as pb from './generated/qqnt/packet_pb.js'
 
 const HIGHWAY_APP_ID = 1_600_001_604
 export const HIGHWAY_BLOCK_SIZE = 1024 * 1024
+export const FLASH_TRANSFER_BLOCK_SIZE = 1024 * 1024
+export const FLASH_TRANSFER_APP_ID = 14_901
 export const VIDEO_THUMBNAIL_BYTES = Buffer.from(
   '/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAYEBAUEBAYFBQUGBgYHCQ4JCQgICRINDQoOFRIWFhUSFBQXGiEcFxgfGRQUHScdHyIjJSUlFhwpLCgkKyEkJST/2wBDAQYGBgkICREJCREkGBQYJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCT/wAARCAC0AUADASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFgEBAQEAAAAAAAAAAAAAAAAAAAEC/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAwDAQACEQMRAD8AgADaAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP/2Q==',
   'base64',
@@ -77,6 +79,36 @@ export interface DirectVideoThumbnailSpec {
   sha1: string
   width: number
   height: number
+}
+
+export interface FlashTransferUploader {
+  uin: string
+  uid: string
+  nickname: string
+}
+
+export interface FlashTransferFileSpec {
+  fileUuid: string
+  fileIndex: number
+  name: string
+  size: number
+  md5: string
+  sha1: string
+  formatCode: number
+}
+
+export interface FlashTransferFileset {
+  fileSetId: string
+  uploadKey: string
+  shareLink: string
+  expiresAt?: number
+}
+
+export interface PreparedFlashTransferUpload {
+  rkey?: string
+  fileId: string
+  uploadTime: number
+  expireLeftTime: number
 }
 
 export interface PreparedVideoUpload {
@@ -157,6 +189,268 @@ export class QQMessageSendRejectedError extends Error {
   constructor(readonly result: number, readonly detail: string) {
     super(`QQ message send rejected: ${detail} (${result})`)
   }
+}
+
+export function encodeFlashApplyFilesetRequest(options: {
+  name: string
+  files: FlashTransferFileSpec[]
+  uploader: FlashTransferUploader
+}): PacketRequest {
+  assertFlashTransferFiles(options.files)
+  if (!options.uploader.uin || !options.uploader.uid || !options.uploader.nickname.trim()) {
+    throw new Error('flash transfer uploader requires UIN, UID, and nickname')
+  }
+  const name = options.name.trim() || options.files[0]!.name
+  const totalSize = options.files.reduce((sum, file) => sum + file.size, 0)
+  if (!Number.isSafeInteger(totalSize)) throw new Error('flash transfer total size exceeds the safe integer range')
+  const body = binary(pb.FlashApplyFilesetRequestSchema, {
+    totalFileCount: options.files.length,
+    meta: {
+      title: name,
+      subtitle: name,
+      field4: 1,
+      totalFileSize: BigInt(totalSize),
+      uploader: {
+        uin: options.uploader.uin,
+        nickname: options.uploader.nickname,
+        uid: options.uploader.uid,
+        field4: {},
+      },
+      field16: 1,
+      field20: 0,
+      field21: 0,
+      field23: 0,
+      field24: { field2: 0, field3: new Uint8Array() },
+    },
+    scene: 20,
+  })
+  return { command: 'OidbSvcTrpcTcp.0x93cf_1', payload: encodeOidb(0x93cf, 1, body, false) }
+}
+
+export function decodeFlashApplyFilesetResponse(payload: Uint8Array): FlashTransferFileset {
+  const response = fromBinary(pb.FlashApplyFilesetResponseSchema, decodeOidb(payload))
+  if (!response.filesetId || !response.shareLink) {
+    throw new Error('QQ flash transfer fileset response contained no ID or share link')
+  }
+  const expireSeconds = Number(response.expireTime)
+  return {
+    fileSetId: response.filesetId,
+    uploadKey: response.uploadKey || response.filesetId,
+    shareLink: response.shareLink,
+    ...(Number.isSafeInteger(expireSeconds) && expireSeconds > 0
+      ? { expiresAt: expireSeconds * 1_000 }
+      : {}),
+  }
+}
+
+export function encodeFlashCommitFilesRequest(
+  fileset: Pick<FlashTransferFileset, 'fileSetId' | 'uploadKey'>,
+  files: FlashTransferFileSpec[],
+): PacketRequest {
+  assertFlashTransferFiles(files)
+  if (!fileset.fileSetId) throw new Error('flash transfer fileset ID is missing')
+  const uploadKey = fileset.uploadKey || fileset.fileSetId
+  const body = binary(pb.FlashCommitFilesRequestSchema, {
+    field1: 1,
+    filesetId: fileset.fileSetId,
+    uploadKey,
+    files: files.map((file) => ({
+      filesetId: fileset.fileSetId,
+      fileUuid: file.fileUuid,
+      field3: 0,
+      field4: {},
+      field5: 1,
+      fileIndex: file.fileIndex,
+      formatCode: file.formatCode,
+      fileName: file.name,
+      originalName: file.name,
+      field10: 0,
+      fileSize: BigInt(file.size),
+      field12: 0,
+      sha1: file.sha1.toLowerCase(),
+      field24: {},
+      md5: file.md5.toLowerCase(),
+    })),
+    field5: 1,
+    field6: 1,
+  })
+  return { command: 'OidbSvcTrpcTcp.0x93d0_1', payload: encodeOidb(0x93d0, 1, body, false) }
+}
+
+export function decodeFlashCommitFilesResponse(payload: Uint8Array, fileSetId: string): void {
+  const response = fromBinary(pb.FlashCommitFilesResponseSchema, decodeOidb(payload))
+  if (response.filesetId && response.filesetId !== fileSetId) {
+    throw new Error('QQ flash transfer commit returned a different fileset ID')
+  }
+}
+
+export function encodeFlashCompleteFilesetRequest(fileSetId: string): PacketRequest {
+  if (!fileSetId) throw new Error('flash transfer fileset ID is missing')
+  const body = binary(pb.FlashCompleteFilesetRequestSchema, {
+    filesetId: fileSetId,
+    field2: new Uint8Array(),
+  })
+  return { command: 'OidbSvcTrpcTcp.0x93db_1', payload: encodeOidb(0x93db, 1, body, false) }
+}
+
+export function decodeFlashCompleteFilesetResponse(payload: Uint8Array): void {
+  decodeOidb(payload)
+}
+
+export function encodeFlashPrepareUploadRequest(
+  fileset: Pick<FlashTransferFileset, 'fileSetId' | 'uploadKey'>,
+  file: FlashTransferFileSpec,
+  sequence: number,
+): PacketRequest {
+  assertFlashTransferFiles([file])
+  assertFlashSequence(sequence)
+  const body = binary(pb.FlashPrepareUploadRequestSchema, {
+    head: flashRequestHead(sequence, 100),
+    upload: {
+      file: {
+        info: flashFileInfo(file, ''),
+        field2: 0,
+      },
+      field2: 1,
+      field3: 0,
+      field4: 0,
+      field5: 0,
+      ext: {
+        field1: { field1: 0, field2: {} },
+        field2: { field3: {} },
+        field3: { field11: {}, field12: {} },
+        field4: { field1: new Uint8Array() },
+        field10: 0,
+      },
+      field7: 0,
+      field8: 0,
+      target: flashFilesetTarget(fileset, file),
+    },
+  })
+  return { command: 'OidbSvcTrpcTcp.0x12a9_100', payload: encodeOidb(0x12a9, 100, body, true) }
+}
+
+export function decodeFlashPrepareUploadResponse(payload: Uint8Array): PreparedFlashTransferUpload {
+  const response = fromBinary(pb.FlashPrepareUploadResponseSchema, decodeOidb(payload))
+  const upload = required(response.upload, 'flash transfer prepare response')
+  const summary = upload.fastUpload?.entries[0]?.summary
+  if (!summary?.fileId) throw new Error('QQ flash transfer prepare response contained no file ID')
+  return {
+    ...(upload.rkey ? { rkey: upload.rkey } : {}),
+    fileId: summary.fileId,
+    uploadTime: summary.uploadTime,
+    expireLeftTime: summary.expireLeftTime,
+  }
+}
+
+export function encodeFlashApplyUploadRequest(
+  fileset: Pick<FlashTransferFileset, 'fileSetId' | 'uploadKey'>,
+  file: FlashTransferFileSpec,
+  prepared: PreparedFlashTransferUpload,
+  sequence: number,
+): PacketRequest {
+  assertFlashTransferFiles([file])
+  assertFlashSequence(sequence)
+  if (!prepared.fileId) throw new Error('flash transfer file ID is missing')
+  const body = binary(pb.FlashApplyUploadRequestSchema, {
+    head: flashRequestHead(sequence, 103),
+    upload: {
+      file: {
+        info: flashFileInfo(file, file.md5.toLowerCase()),
+        fileId: prepared.fileId,
+        field3: 1,
+        uploadTime: prepared.uploadTime,
+        expireLeftTime: prepared.expireLeftTime,
+        field6: 0,
+      },
+      flag: { field1: 2 },
+      extra: { field1: 0, field2: 0, field3: 0, field4: {} },
+      field4: { field1: 0, field2: new Uint8Array() },
+      target: flashFilesetTarget(fileset, file),
+    },
+  })
+  return { command: 'OidbSvcTrpcTcp.0x12a9_103', payload: encodeOidb(0x12a9, 103, body, true) }
+}
+
+export function decodeFlashApplyUploadResponse(payload: Uint8Array): void {
+  const response = fromBinary(pb.FlashApplyUploadResponseSchema, decodeOidb(payload))
+  const error = response.result?.error
+  if (error?.code || error?.message) {
+    throw new QQMediaUploadRejectedError(
+      `QQ flash transfer apply failed: ${error.message || 'unknown error'} (${error.code})`,
+    )
+  }
+}
+
+export function encodeFlashSetFilesetStatusRequest(fileSetId: string): PacketRequest {
+  if (!fileSetId) throw new Error('flash transfer fileset ID is missing')
+  const body = binary(pb.FlashSetFilesetStatusRequestSchema, { filesetId: fileSetId, status: 6 })
+  return { command: 'OidbSvcTrpcTcp.0x93d1_1', payload: encodeOidb(0x93d1, 1, body, false) }
+}
+
+export function decodeFlashSetFilesetStatusResponse(payload: Uint8Array): void {
+  decodeOidb(payload)
+}
+
+export function encodeFlashSliceUploadRequest(options: {
+  rkey: string
+  start: number
+  chunk: Uint8Array
+  chunkSha1: Uint8Array
+  sha1State: Uint8Array[]
+}): Buffer {
+  if (!options.rkey) throw new Error('flash transfer slice rkey is missing')
+  if (!Number.isSafeInteger(options.start) || options.start < 0 || !options.chunk.length) {
+    throw new Error('flash transfer slice has an invalid range')
+  }
+  if (options.chunkSha1.length !== 20 || options.sha1State.some((value) => value.length !== 20)) {
+    throw new Error('flash transfer slice SHA-1 values must contain 20 bytes')
+  }
+  return binary(pb.FlashSliceUploadRequestSchema, {
+    field1: 0,
+    appId: FLASH_TRANSFER_APP_ID,
+    field3: 2,
+    payload: {
+      field1: {},
+      rkey: options.rkey,
+      start: BigInt(options.start),
+      end: BigInt(options.start + options.chunk.length - 1),
+      sha1: options.chunkSha1,
+      state: { values: options.sha1State },
+      chunk: options.chunk,
+    },
+  })
+}
+
+export function decodeFlashSliceUploadResponse(payload: Uint8Array): void {
+  const response = fromBinary(pb.FlashSliceUploadResponseSchema, payload)
+  if (response.status !== 'success') {
+    throw new Error(`QQ flash transfer slice upload failed: ${response.status || 'empty response'}`)
+  }
+}
+
+export function flashTransferFormatCode(name: string): number {
+  const extension = name.toLowerCase().match(/\.([^.]+)$/)?.[1] ?? ''
+  if (['mp3', 'wav', 'flac', 'm4a', 'aac', 'ogg'].includes(extension)) return 1
+  if (['mp4', 'mov', 'avi', 'mkv', 'webm', 'flv'].includes(extension)) return 2
+  if (['doc', 'docx'].includes(extension)) return 3
+  if (['rar', 'zip', '7z', 'gz', 'tar', 'bz2'].includes(extension)) return 4
+  if (extension === 'apk') return 5
+  if (['xls', 'xlsx'].includes(extension)) return 6
+  if (['ppt', 'pptx'].includes(extension)) return 7
+  if (extension === 'pdf') return 9
+  if (extension === 'txt') return 10
+  if (extension === 'psd') return 12
+  if (['ttf', 'otf'].includes(extension)) return 16
+  if (extension === 'ipa') return 17
+  if (extension === 'key') return 18
+  if (extension === 'numbers') return 20
+  if (extension === 'pages') return 21
+  if (extension === 'sketch') return 22
+  if (extension === 'dmg') return 23
+  if (extension === 'pkg') return 24
+  if (['png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp'].includes(extension)) return 26
+  return 11
 }
 
 export function encodeHighwaySessionRequest(): PacketRequest {
@@ -806,6 +1100,80 @@ function privateFileContent(
       selfUid, peerUid,
     } },
   })
+}
+
+function flashRequestHead(sequence: number, command: 100 | 103): MessageInitShape<typeof pb.FlashRequestHeadSchema> {
+  return {
+    operation: { sequence, command },
+    scene: { requestType: 2, businessType: 4, mediaType: 22, sceneType: 5 },
+    client: { agentType: 1 },
+  }
+}
+
+function flashFileInfo(
+  file: FlashTransferFileSpec,
+  md5: string,
+): MessageInitShape<typeof pb.FlashFileInfoSchema> {
+  return {
+    fileSize: BigInt(file.size),
+    md5,
+    sha1: file.sha1.toLowerCase(),
+    fileName: file.name,
+    dimensions: { field1: 0, field2: 0, field3: 0, field4: 0 },
+    width: 0,
+    height: 0,
+    field8: 0,
+    field9: 1,
+  }
+}
+
+function flashFilesetTarget(
+  fileset: Pick<FlashTransferFileset, 'fileSetId' | 'uploadKey'>,
+  file: FlashTransferFileSpec,
+): MessageInitShape<typeof pb.FlashFilesetTargetSchema> {
+  if (!fileset.fileSetId) throw new Error('flash transfer fileset ID is missing')
+  return {
+    filesetId: fileset.fileSetId,
+    uploadKey: fileset.uploadKey || fileset.fileSetId,
+    fileUuid: file.fileUuid,
+    fileIndex: file.fileIndex,
+    field5: 0,
+    field6: 0,
+    formatCode: file.formatCode,
+    field8: {},
+    field9: 1,
+    field10: 0,
+    field11: 0,
+    field12: 0,
+    field13: 0,
+    field14: [0, 0],
+  }
+}
+
+function assertFlashTransferFiles(files: FlashTransferFileSpec[]): void {
+  if (!files.length) throw new Error('flash transfer requires at least one file')
+  const indexes = new Set<number>()
+  for (const file of files) {
+    if (!file.fileUuid || !file.name) throw new Error('flash transfer file requires UUID and name')
+    if (!Number.isSafeInteger(file.fileIndex) || file.fileIndex <= 0 || indexes.has(file.fileIndex)) {
+      throw new Error('flash transfer file indexes must be unique positive integers')
+    }
+    indexes.add(file.fileIndex)
+    if (!Number.isSafeInteger(file.size) || file.size <= 0) {
+      throw new Error('flash transfer file size must be a positive safe integer')
+    }
+    assertHash(file.md5, 'flash transfer MD5', 32)
+    assertHash(file.sha1, 'flash transfer SHA-1', 40)
+    if (!Number.isInteger(file.formatCode) || file.formatCode <= 0) {
+      throw new Error('flash transfer format code must be a positive integer')
+    }
+  }
+}
+
+function assertFlashSequence(sequence: number): void {
+  if (!Number.isInteger(sequence) || sequence <= 0 || sequence > 0xffff_ffff) {
+    throw new Error('flash transfer sequence must be a positive 32-bit integer')
+  }
 }
 
 function binary<Desc extends DescMessage>(schema: Desc, init: MessageInitShape<Desc>): Buffer {

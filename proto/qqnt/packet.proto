@@ -826,3 +826,329 @@ message GroupReactionDataContent {
   string operator_uid = 4;
   uint32 operation = 5;
 }
+
+message FlashEmpty {}
+
+message FlashUploader {
+  string uin = 1;
+  string nickname = 2;
+  string uid = 3;
+  FlashEmpty field4 = 4;
+}
+
+message FlashFilesetMetaField24 {
+  uint32 field2 = 2;
+  bytes field3 = 3;
+}
+
+message FlashFilesetMeta {
+  string title = 2;
+  string subtitle = 3;
+  uint32 field4 = 4;
+  uint64 total_file_size = 5;
+  FlashUploader uploader = 10;
+  uint32 field16 = 16;
+  uint32 field20 = 20;
+  uint32 field21 = 21;
+  uint32 field23 = 23;
+  FlashFilesetMetaField24 field24 = 24;
+}
+
+message FlashApplyFilesetRequest {
+  uint32 total_file_count = 1;
+  FlashFilesetMeta meta = 2;
+  uint32 scene = 3;
+}
+
+message FlashApplyFilesetResponse {
+  string fileset_id = 1;
+  string upload_key = 2;
+  string share_link = 3;
+  uint64 expire_time = 4;
+  uint32 expire_left_time = 5;
+}
+
+message FlashCommitFileInfo {
+  string fileset_id = 1;
+  string file_uuid = 2;
+  uint32 field3 = 3;
+  FlashEmpty field4 = 4;
+  uint32 field5 = 5;
+  uint32 file_index = 6;
+  uint32 format_code = 7;
+  string file_name = 8;
+  string original_name = 9;
+  uint32 field10 = 10;
+  uint64 file_size = 11;
+  uint32 field12 = 12;
+  string sha1 = 20;
+  FlashEmpty field24 = 24;
+  string md5 = 25;
+}
+
+message FlashCommitFilesRequest {
+  uint32 field1 = 1;
+  string fileset_id = 2;
+  string upload_key = 3;
+  repeated FlashCommitFileInfo files = 4;
+  uint32 field5 = 5;
+  uint32 field6 = 6;
+}
+
+message FlashCommitFilesResponse {
+  uint32 field1 = 1;
+  string fileset_id = 2;
+  string upload_key = 3;
+}
+
+message FlashCompleteFilesetRequest {
+  string fileset_id = 1;
+  bytes field2 = 2;
+}
+
+message FlashSetFilesetStatusRequest {
+  string fileset_id = 1;
+  uint32 status = 2;
+}
+
+message FlashRequestOperation {
+  uint32 sequence = 1;
+  uint32 command = 2;
+}
+
+message FlashRequestScene {
+  uint32 request_type = 101;
+  uint32 business_type = 102;
+  uint32 media_type = 103;
+  uint32 scene_type = 200;
+}
+
+message FlashRequestClient {
+  uint32 agent_type = 1;
+}
+
+message FlashRequestHead {
+  FlashRequestOperation operation = 1;
+  FlashRequestScene scene = 2;
+  FlashRequestClient client = 3;
+}
+
+message FlashFileDimensions {
+  uint32 field1 = 1;
+  uint32 field2 = 2;
+  uint32 field3 = 3;
+  uint32 field4 = 4;
+}
+
+message FlashFileInfo {
+  uint64 file_size = 1;
+  string md5 = 2;
+  string sha1 = 3;
+  string file_name = 4;
+  FlashFileDimensions dimensions = 5;
+  uint32 width = 6;
+  uint32 height = 7;
+  uint32 field8 = 8;
+  uint32 field9 = 9;
+}
+
+message FlashFilesetTarget {
+  string fileset_id = 1;
+  string upload_key = 2;
+  string file_uuid = 3;
+  uint32 file_index = 4;
+  uint32 field5 = 5;
+  uint32 field6 = 6;
+  uint32 format_code = 7;
+  FlashEmpty field8 = 8;
+  uint32 field9 = 9;
+  uint32 field10 = 10;
+  uint32 field11 = 11;
+  uint32 field12 = 12;
+  uint32 field13 = 13;
+  repeated uint32 field14 = 14 [features.repeated_field_encoding = EXPANDED];
+}
+
+message FlashPrepareFile {
+  FlashFileInfo info = 1;
+  uint32 field2 = 2;
+}
+
+message FlashPrepareExtField1 {
+  uint32 field1 = 1;
+  FlashEmpty field2 = 2;
+}
+
+message FlashPrepareExtField2 {
+  FlashEmpty field3 = 3;
+}
+
+message FlashPrepareExtField3 {
+  FlashEmpty field11 = 11;
+  FlashEmpty field12 = 12;
+}
+
+message FlashPrepareExtField4 {
+  bytes field1 = 1;
+}
+
+message FlashPrepareExt {
+  FlashPrepareExtField1 field1 = 1;
+  FlashPrepareExtField2 field2 = 2;
+  FlashPrepareExtField3 field3 = 3;
+  FlashPrepareExtField4 field4 = 4;
+  uint32 field10 = 10;
+}
+
+message FlashPrepareUploadBody {
+  FlashPrepareFile file = 1;
+  uint32 field2 = 2;
+  uint32 field3 = 3;
+  uint32 field4 = 4;
+  uint32 field5 = 5;
+  FlashPrepareExt ext = 6;
+  uint32 field7 = 7;
+  uint32 field8 = 8;
+  FlashFilesetTarget target = 9;
+}
+
+message FlashPrepareUploadRequest {
+  FlashRequestHead head = 1;
+  FlashPrepareUploadBody upload = 2;
+}
+
+message FlashResponseOperation {
+  uint32 sequence = 1;
+  uint32 command = 2;
+}
+
+message FlashResponseHead {
+  FlashResponseOperation operation = 1;
+  string message = 3;
+}
+
+message FlashUploadSummary {
+  FlashFileInfo info = 1;
+  string file_id = 2;
+  uint32 field3 = 3;
+  uint32 upload_time = 4;
+  uint32 expire_left_time = 5;
+  uint32 field6 = 6;
+  uint32 app_id = 7;
+}
+
+message FlashUploadSummaryEntry {
+  FlashUploadSummary summary = 1;
+}
+
+message FlashFastUploadInfo {
+  repeated FlashUploadSummaryEntry entries = 1;
+}
+
+message FlashPrepareFilesetResult {
+  uint32 field2 = 2;
+  FlashPrepareFilesetTarget target = 3;
+}
+
+message FlashPrepareFilesetTarget {
+  string fileset_id = 1;
+  string upload_key = 2;
+  string file_uuid = 3;
+  uint32 file_index = 4;
+  uint32 field5 = 5;
+  uint32 field6 = 6;
+  uint32 format_code = 7;
+  string node_id = 8;
+  uint32 field9 = 9;
+}
+
+message FlashPrepareUploadResult {
+  string rkey = 1;
+  FlashFastUploadInfo fast_upload = 6;
+  FlashPrepareFilesetResult fileset = 7;
+  string host = 11;
+  string fallback_host = 17;
+}
+
+message FlashPrepareUploadResponse {
+  FlashResponseHead head = 1;
+  FlashPrepareUploadResult upload = 2;
+}
+
+message FlashApplyUploadFile {
+  FlashFileInfo info = 1;
+  string file_id = 2;
+  uint32 field3 = 3;
+  uint32 upload_time = 4;
+  uint32 expire_left_time = 5;
+  uint32 field6 = 6;
+}
+
+message FlashApplyUploadFlag {
+  uint32 field1 = 1;
+}
+
+message FlashApplyUploadExtra {
+  uint32 field1 = 1;
+  uint32 field2 = 2;
+  uint32 field3 = 3;
+  FlashEmpty field4 = 4;
+}
+
+message FlashApplyUploadField4 {
+  uint32 field1 = 1;
+  bytes field2 = 2;
+}
+
+message FlashApplyUploadBody {
+  FlashApplyUploadFile file = 1;
+  FlashApplyUploadFlag flag = 2;
+  FlashApplyUploadExtra extra = 3;
+  FlashApplyUploadField4 field4 = 4;
+  FlashFilesetTarget target = 10;
+}
+
+message FlashApplyUploadRequest {
+  FlashRequestHead head = 1;
+  FlashApplyUploadBody upload = 12;
+}
+
+message FlashApplyUploadError {
+  uint32 code = 1;
+  string message = 2;
+}
+
+message FlashApplyUploadResult {
+  FlashPrepareFilesetTarget target = 1;
+  FlashApplyUploadError error = 2;
+}
+
+message FlashApplyUploadResponse {
+  FlashResponseHead head = 1;
+  FlashApplyUploadResult result = 12;
+}
+
+message FlashSha1State {
+  repeated bytes values = 1;
+}
+
+message FlashSlicePayload {
+  FlashEmpty field1 = 1;
+  string rkey = 2;
+  uint64 start = 3;
+  uint64 end = 4;
+  bytes sha1 = 5;
+  FlashSha1State state = 6;
+  bytes chunk = 7;
+}
+
+message FlashSliceUploadRequest {
+  uint32 field1 = 1;
+  uint32 app_id = 2;
+  uint32 field3 = 3;
+  FlashSlicePayload payload = 107;
+}
+
+message FlashSliceUploadResponse {
+  string status = 5;
+}

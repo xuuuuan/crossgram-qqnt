@@ -481,6 +481,59 @@ describe.skipIf(!enabled)('live QQNT bridge E2E', () => {
     expect(message.parts.filter((part) => part.type === 'media')).toHaveLength(2)
   }, 180_000)
 
+  it('creates a multi-slice flash transfer and reuses its QQ remote identity without local bytes', async () => {
+    const content = Buffer.from('crossgram-pure-protocol-flash-'.repeat(60_000)).subarray(0, 1_468_006)
+    const md5 = createHash('md5').update(content).digest('hex')
+    const sha1 = createHash('sha1').update(content).digest('hex')
+    const uploadManifest = Buffer.from(JSON.stringify({
+      name: 'Crossgram pure protocol E2E', framing: 'length-prefixed-v1',
+      files: [{ source: 'upload', name: 'pure-protocol-1.4MiB.bin', size: content.length }],
+    })).toString('base64url')
+    const uploadBody = Readable.from((async function* () {
+      for (let offset = 0; offset < content.length; offset += 1024 * 1024) {
+        const chunk = content.subarray(offset, offset + 1024 * 1024)
+        const header = Buffer.allocUnsafe(4)
+        header.writeUInt32BE(chunk.length)
+        yield header
+        yield chunk
+      }
+      yield Buffer.alloc(4)
+    })())
+    const uploaded = await fetch(`${base}/flash-transfers`, {
+      method: 'POST', headers: headers({ 'x-qqnt-flash-manifest': uploadManifest }),
+      body: uploadBody as never, duplex: 'half',
+    } as RequestInit)
+    const uploadedBody = await uploaded.text()
+    expect(uploaded.status, uploadedBody).toBe(200)
+    const created = JSON.parse(uploadedBody) as { fileSetId: string, shareLink: string, expiresAt?: number }
+    expect(created.fileSetId).toMatch(/^[0-9a-f-]{36}$/u)
+    expect(created.shareLink).toMatch(/^https:\/\/qfile\.qq\.com\/q\//u)
+    expect(created.expiresAt).toBeGreaterThan(Date.now())
+    const sharePage = await fetch(created.shareLink)
+    expect(sharePage.status).toBe(200)
+    expect(await sharePage.text()).toContain('Crossgram pure protocol E2E')
+
+    const reuseManifest = Buffer.from(JSON.stringify({
+      name: 'Crossgram QQ remote reuse E2E', framing: 'length-prefixed-v1',
+      files: [{
+        source: 'qq-media', name: 'pure-protocol-1.4MiB.bin', size: content.length,
+        locator: {
+          messageId: 'remote-e2e', elementId: 'remote-e2e', chatType: 1, peerUid: 'remote',
+          kind: 'file', fileName: 'pure-protocol-1.4MiB.bin', fileSize: String(content.length),
+          filePath: 'Z:\\QQ\\cache\\definitely-missing.bin', md5, sha: sha1,
+        },
+      }],
+    })).toString('base64url')
+    const reused = await fetch(`${base}/flash-transfers`, {
+      method: 'POST', headers: headers({ 'x-qqnt-flash-manifest': reuseManifest }), body: Buffer.alloc(0),
+    })
+    const reusedBody = await reused.text()
+    expect(reused.status, reusedBody).toBe(200)
+    const reusedResult = JSON.parse(reusedBody) as { fileSetId: string, shareLink: string }
+    expect(reusedResult.fileSetId).not.toBe(created.fileSetId)
+    expect(reusedResult.shareLink).toMatch(/^https:\/\/qfile\.qq\.com\/q\//u)
+  }, 180_000)
+
   it.runIf(Boolean(process.env.QQNT_BRIDGE_E2E_FILE))('streams a private file and resolves a ranged CDN direct URL', async () => {
     const path = process.env.QQNT_BRIDGE_E2E_FILE!
     const info = await stat(path)

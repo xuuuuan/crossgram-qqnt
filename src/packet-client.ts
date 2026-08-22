@@ -1,23 +1,31 @@
 import type { KernelMsgService } from './kernel-types.js'
+import { createHash } from 'node:crypto'
 import { log } from './log.js'
 import { loadPacketAddon, type PacketAddon } from './packet-addon.js'
 import type { NativeDirectUrl, NativePacketRequest, NativeSysFace } from './packet-addon.js'
 import type { QQMediaLocator } from './protocol.js'
 import {
   decodeDirectMessageResponse, decodeFileUploadResponse, decodeGroupFileFeedResponse, decodeHighwayResponse, decodeHighwaySessionResponse,
-  decodeImageUploadResponse, decodePrivateFileMetadataResponse, decodeVideoUploadResponse, encodeDirectMessageRequest,
-  encodeFileUploadRequest, encodeGroupFileFeedRequest, encodeHighwayFrame, encodeHighwaySessionRequest, encodeImageHighwayExt,
-  encodeImageUploadRequest, encodePrivateFileMetadataRequest, encodeVideoHighwayExt, encodeVideoUploadRequest,
+  decodeFlashApplyFilesetResponse, decodeFlashApplyUploadResponse, decodeFlashCommitFilesResponse,
+  decodeFlashCompleteFilesetResponse, decodeFlashPrepareUploadResponse, decodeFlashSetFilesetStatusResponse,
+  decodeFlashSliceUploadResponse, decodeImageUploadResponse, decodePrivateFileMetadataResponse, decodeVideoUploadResponse,
+  encodeDirectMessageRequest, encodeFileUploadRequest, encodeFlashApplyFilesetRequest, encodeFlashApplyUploadRequest,
+  encodeFlashCommitFilesRequest, encodeFlashCompleteFilesetRequest, encodeFlashPrepareUploadRequest,
+  encodeFlashSetFilesetStatusRequest, encodeFlashSliceUploadRequest, encodeGroupFileFeedRequest, encodeHighwayFrame,
+  encodeHighwaySessionRequest, encodeImageHighwayExt, encodeImageUploadRequest, encodePrivateFileMetadataRequest,
+  encodeVideoHighwayExt, encodeVideoUploadRequest, FLASH_TRANSFER_BLOCK_SIZE,
   HIGHWAY_BLOCK_SIZE, type DirectFileSpec, type DirectImageSpec, type DirectVideoSpec,
   type DirectVideoThumbnailSpec, type HighwaySession,
   type DirectMessagePart, type DirectMessageSendResponse, type PreparedFileUpload, type PreparedImageUpload,
-  type PreparedVideoUpload, videoThumbnailSpec, VIDEO_THUMBNAIL_BYTES,
+  type FlashTransferFileset, type FlashTransferFileSpec, type FlashTransferUploader,
+  type PreparedFlashTransferUpload, type PreparedVideoUpload, videoThumbnailSpec, VIDEO_THUMBNAIL_BYTES,
 } from './upload-protocol.js'
 
 const PRIVATE_IMAGE_APP_ID = '1406'
 const PRIVATE_IMAGE_RKEY_KIND = 10
 const GROUP_IMAGE_RKEY_KIND = 20
 const QQ_IMAGE_ORIGIN = 'https://multimedia.nt.qq.com.cn'
+const QQ_FLASH_SLICE_UPLOAD_URL = 'https://multimedia.qfile.qq.com/sliceupload'
 const DEFAULT_PACKET_TIMEOUT_MS = 10_000
 
 type PacketResponse = Buffer | Uint8Array | {
@@ -77,6 +85,7 @@ export class QQPacketClient {
   private highwaySession?: { value: HighwaySession, createdAt: number }
   private highwaySessionRefresh?: Promise<HighwaySession>
   private highwaySequence = 0
+  private flashTransferSequence = 0
 
   constructor(
     private readonly msgService: Pick<KernelMsgService, 'sendSsoCmdReqByContend'>,
@@ -292,6 +301,104 @@ export class QQPacketClient {
     return { published: true }
   }
 
+  async applyFlashTransferFileset(options: {
+    name: string
+    files: FlashTransferFileSpec[]
+    uploader: FlashTransferUploader
+  }): Promise<FlashTransferFileset> {
+    const addon = this.loadAddon()
+    return decodeFlashApplyFilesetResponse(
+      await this.sendPacket(addon, encodeFlashApplyFilesetRequest(options)),
+    )
+  }
+
+  async commitFlashTransferFiles(
+    fileset: FlashTransferFileset,
+    files: FlashTransferFileSpec[],
+  ): Promise<void> {
+    const addon = this.loadAddon()
+    decodeFlashCommitFilesResponse(
+      await this.sendPacket(addon, encodeFlashCommitFilesRequest(fileset, files)),
+      fileset.fileSetId,
+    )
+  }
+
+  async completeFlashTransferFileset(fileset: FlashTransferFileset): Promise<void> {
+    const addon = this.loadAddon()
+    decodeFlashCompleteFilesetResponse(
+      await this.sendPacket(addon, encodeFlashCompleteFilesetRequest(fileset.fileSetId)),
+    )
+  }
+
+  async prepareFlashTransferUpload(
+    fileset: FlashTransferFileset,
+    file: FlashTransferFileSpec,
+  ): Promise<PreparedFlashTransferUpload> {
+    const addon = this.loadAddon()
+    return decodeFlashPrepareUploadResponse(await this.sendPacket(
+      addon,
+      encodeFlashPrepareUploadRequest(fileset, file, this.nextFlashTransferSequence()),
+    ))
+  }
+
+  async uploadFlashTransferFile(
+    file: FlashTransferFileSpec,
+    prepared: PreparedFlashTransferUpload,
+    source: AsyncIterable<Uint8Array>,
+    sha1State: Uint8Array[],
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (!prepared.rkey) return
+    let offset = 0
+    for await (const chunk of exactBlocks(source, file.size, FLASH_TRANSFER_BLOCK_SIZE, signal)) {
+      const request = encodeFlashSliceUploadRequest({
+        rkey: prepared.rkey,
+        start: offset,
+        chunk,
+        chunkSha1: createHash('sha1').update(chunk).digest(),
+        sha1State,
+      })
+      const response = await this.fetchImpl(QQ_FLASH_SLICE_UPLOAD_URL, {
+        method: 'POST',
+        body: request,
+        signal,
+        headers: {
+          accept: '*/*',
+          connection: 'keep-alive',
+          'content-type': 'application/octet-stream',
+          'content-length': String(request.length),
+        },
+      })
+      const responseBody = Buffer.from(await response.arrayBuffer())
+      if (!response.ok) {
+        throw new Error(
+          `QQ flash transfer slice HTTP ${response.status}: ${responseBody.toString('utf8').slice(0, 300)}`,
+        )
+      }
+      decodeFlashSliceUploadResponse(responseBody)
+      offset += chunk.length
+    }
+  }
+
+  async applyFlashTransferUpload(
+    fileset: FlashTransferFileset,
+    file: FlashTransferFileSpec,
+    prepared: PreparedFlashTransferUpload,
+  ): Promise<void> {
+    const addon = this.loadAddon()
+    decodeFlashApplyUploadResponse(await this.sendPacket(
+      addon,
+      encodeFlashApplyUploadRequest(fileset, file, prepared, this.nextFlashTransferSequence()),
+    ))
+  }
+
+  async setFlashTransferFilesetReady(fileset: FlashTransferFileset): Promise<void> {
+    const addon = this.loadAddon()
+    decodeFlashSetFilesetStatusResponse(
+      await this.sendPacket(addon, encodeFlashSetFilesetStatusRequest(fileset.fileSetId)),
+    )
+  }
+
   private async uploadHighwaySource(
     highway: DirectHighwayUpload,
     selfUin: string,
@@ -495,6 +602,11 @@ export class QQPacketClient {
     const sequenceStart = this.highwaySequence + 1
     this.highwaySequence += blocks
     return sequenceStart
+  }
+
+  private nextFlashTransferSequence(): number {
+    if (this.flashTransferSequence >= 0xffff_fffe) this.flashTransferSequence = 0
+    return ++this.flashTransferSequence
   }
 
   private async uploadHighwayBlock(

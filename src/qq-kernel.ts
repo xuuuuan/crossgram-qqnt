@@ -14,14 +14,15 @@ import { decodeGroupReactionPush, type QQGroupReactionPush } from './reaction-pu
 import type { PCMMediaLease } from './media-gateway.js'
 import { QQPacketClient, type DirectHighwayUpload, type QQPacketClientOptions } from './packet-client.js'
 import {
-  HIGHWAY_BLOCK_SIZE, type DirectMessagePart,
+  FLASH_TRANSFER_BLOCK_SIZE, flashTransferFormatCode, HIGHWAY_BLOCK_SIZE, type DirectMessagePart,
+  type FlashTransferFileSpec,
   VIDEO_THUMBNAIL_BYTES,
 } from './upload-protocol.js'
 import { decodePttTo, encodePtt, MAX_VOICE_INPUT_BYTES, transcodePttFallbackTo } from './silk-audio.js'
 import {
   GroupMsgMask,
   type BuddyRequest, type CustomEmotionData, type DoubtBuddyReqChange, type DoubtBuddyRequest, type EmojiLikesUserInfo, type FileTransNotifyInfo, type GroupFileListResult, type GroupMsgMaskInfo, type GroupNotify, type GroupProfileInfo,
-  type InitSessionConfig, type KernelAVSDKService, type KernelFlashTransferService, type KernelModule, type KernelSession, type MarketStickerPackInfo, type MemberInfo, type MsgElement,
+  type InitSessionConfig, type KernelAVSDKService, type KernelModule, type KernelSession, type MarketStickerPackInfo, type MemberInfo, type MsgElement,
   type MsgRecord, type ProfileSimpleInfo, type RecentContactInfo, type SearchMsgKeywordsResult,
 } from './kernel-types.js'
 import {
@@ -126,8 +127,6 @@ export interface QQKernelOptions {
   voiceInputLimitBytes?: number
   mediaGateway?: QQMediaLeaseIssuer
   callController?: QQCallController
-  /** Test-only override; Linux QQ currently exposes a non-functional flash-transfer stub. */
-  flashTransferSupported?: boolean
 }
 
 export type QQCallOperation = 'accept' | 'reject' | 'hangup'
@@ -217,13 +216,6 @@ export class QQRequestSessionChangedError extends Error {
   constructor() {
     super('QQNT request session changed during resolution')
     this.name = 'QQRequestSessionChangedError'
-  }
-}
-
-export class QQFlashTransferUnavailableError extends Error {
-  constructor(message = 'QQNT flash transfer API is unavailable') {
-    super(message)
-    this.name = 'QQFlashTransferUnavailableError'
   }
 }
 
@@ -456,7 +448,6 @@ export class QQKernelBridge {
   private readonly stickerMissingCacheTtlMs: number
   private readonly marketStickerMimeCacheDir?: string
   private readonly voiceInputLimitBytes: number
-  private readonly flashTransferSupported: boolean
 
   private readonly mediaGateway?: QQMediaLeaseIssuer
   private readonly groupJoinContractProbeEnabled: boolean
@@ -483,7 +474,6 @@ export class QQKernelBridge {
     if (!Number.isSafeInteger(this.voiceInputLimitBytes) || this.voiceInputLimitBytes <= 0) {
       throw new Error('voice input limit must be a positive integer')
     }
-    this.flashTransferSupported = options.flashTransferSupported ?? process.platform !== 'linux'
     this.marketStickerMimeCacheDir = options.marketStickerMimeCacheDir === false
       || (options.marketStickerMimeCacheDir === undefined && Boolean(process.env.VITEST))
       ? undefined
@@ -508,7 +498,7 @@ export class QQKernelBridge {
       ready: Boolean(this.session),
       selfUin: this.config?.selfUin,
       selfUid: this.config?.selfUid,
-      flashTransferSupported: this.flashTransferSupported,
+      flashTransferSupported: true,
     }
   }
 
@@ -531,92 +521,103 @@ export class QQKernelBridge {
     manifest: QQFlashTransferManifest,
     body: Readable,
   ): Promise<QQFlashTransferResult> {
-    const service = this.requireFlashTransferService()
     const directory = join(this.flashTransferPath, `${Date.now()}-${randomUUID()}`)
     const reader = new FramedUploadReader(body)
-    const paths: string[] = []
+    const staged: Array<{
+      file: FlashTransferFileSpec
+      source: 'upload' | 'qq-media'
+      path?: string
+      sha1State?: Buffer[]
+    }> = []
     let uploadIndex = 0
+    let stage = 'staging input'
     try {
       await mkdir(directory, { recursive: true })
       for (const [index, file] of manifest.files.entries()) {
+        const name = safeFlashTransferName(file.name)
         if (file.source === 'qq-media') {
-          paths.push(this.flashTransferReusePath(file.locator, file.size))
+          const hashes = flashTransferRemoteHashes(file.locator, file.size)
+          staged.push({
+            source: 'qq-media',
+            file: {
+              fileUuid: randomUUID(), fileIndex: index + 1, name, size: file.size,
+              md5: hashes.md5, sha1: hashes.sha1, formatCode: flashTransferFormatCode(name),
+            },
+          })
           continue
         }
         const fileDirectory = join(directory, String(index).padStart(4, '0'))
         await mkdir(fileDirectory)
-        const path = join(fileDirectory, safeFlashTransferName(file.name))
+        const path = join(fileDirectory, name)
         await pipeline(
           Readable.from(verifiedFlashTransferFile(reader.media(uploadIndex++), file.size, file.name)),
           createWriteStream(path, { flags: 'wx' }),
         )
-        paths.push(path)
+        const hashes = await hashFlashTransferPath(path, file.size)
+        staged.push({
+          source: 'upload', path, sha1State: hashes.sha1State,
+          file: {
+            fileUuid: randomUUID(), fileIndex: index + 1, name, size: file.size,
+            md5: hashes.md5, sha1: hashes.sha1, formatCode: flashTransferFormatCode(name),
+          },
+        })
       }
       await reader.finish()
       const config = this.requireConfig()
-      const result = await service.createFlashTransferUploadTask(Date.now(), {
-        screen: 1,
-        name: manifest.name?.trim() || manifest.files[0]?.name || '',
-        uploaders: [{
+      const packetClient = this.packetClientForSession()
+      const files = staged.map((item) => item.file)
+      stage = 'creating fileset'
+      const fileset = await packetClient.applyFlashTransferFileset({
+        name: manifest.name?.trim() || files[0]!.name,
+        files,
+        uploader: {
           uin: config.selfUin,
           uid: config.selfUid,
-          nickname: this.users.get(config.selfUid)?.name ?? '',
-          sendEntrance: '',
-        }],
-        coverPath: '',
-        paths,
-        excludePaths: [],
-        expireLeftTime: 0,
-        isNeedDelDeviceInfo: false,
-        isNeedDelLocation: false,
-        coverOriginalInfos: paths[0] ? [{ path: paths[0], thumbnailPath: '' }] : [],
-        uploadSceneType: 10,
-        detectPrivacyInfoResult: { exists: false, allDetectResults: new Map() },
+          nickname: this.users.get(config.selfUid)?.name?.trim() || 'QQ用户',
+        },
       })
-      if (result.result !== 0 || !result.createFlashTransferResult?.fileSetId) {
-        throw new QQFlashTransferError(`QQ flash transfer creation failed (${result.result})`)
-      }
-      const created = result.createFlashTransferResult
-      let shareLink = created.shareLink
-      let expiresAt = flashTransferExpiry(created.expireTime)
-      if (!shareLink && service.getShareLinkReq) {
-        const shared = await service.getShareLinkReq(created.fileSetId)
-        if (shared.result !== 0 || !shared.shareLink) {
-          throw new QQFlashTransferError(`QQ flash transfer share link failed (${shared.result})`)
+      stage = 'committing file metadata'
+      await packetClient.commitFlashTransferFiles(fileset, files)
+      stage = 'preparing fileset'
+      await packetClient.completeFlashTransferFileset(fileset)
+      for (const item of staged) {
+        stage = `preparing ${item.file.name}`
+        const prepared = await packetClient.prepareFlashTransferUpload(fileset, item.file)
+        if (item.source === 'qq-media' && prepared.rkey) {
+          throw new QQFlashTransferError(
+            `QQ remote media cannot be reused without downloading it: ${item.file.name}`,
+          )
         }
-        shareLink = shared.shareLink
-        expiresAt ??= flashTransferExpiry(shared.expireTimestamp)
+        if (prepared.rkey) {
+          if (!item.path || !item.sha1State) {
+            throw new QQFlashTransferError(`QQ flash transfer upload source is missing: ${item.file.name}`)
+          }
+          stage = `uploading ${item.file.name}`
+          await packetClient.uploadFlashTransferFile(
+            item.file,
+            prepared,
+            createReadStream(item.path),
+            item.sha1State,
+          )
+        }
+        stage = `applying ${item.file.name}`
+        await packetClient.applyFlashTransferUpload(fileset, item.file, prepared)
       }
-      if (!shareLink) throw new QQFlashTransferError('QQ flash transfer did not return a share link')
-      const timer = setTimeout(() => {
-        void rm(directory, { recursive: true, force: true })
-      }, FLASH_TRANSFER_RETENTION_MS)
-      timer.unref()
-      return { fileSetId: created.fileSetId, shareLink, ...(expiresAt ? { expiresAt } : {}) }
+      stage = 'finalizing fileset'
+      await packetClient.setFlashTransferFilesetReady(fileset)
+      return {
+        fileSetId: fileset.fileSetId,
+        shareLink: fileset.shareLink,
+        ...(fileset.expiresAt ? { expiresAt: fileset.expiresAt } : {}),
+      }
     } catch (error) {
-      await rm(directory, { recursive: true, force: true }).catch(() => undefined)
-      throw error
-    }
-  }
-
-  private flashTransferReusePath(locator: QQMediaLocator, expectedSize: number): string {
-    let path: string | undefined
-    try {
-      path = locator.filePath && realpathSync(locator.filePath)
-    } catch {
-      throw new QQFlashTransferError(`QQ media is not available in the local cache: ${locator.fileName}`)
-    }
-    if (!path || !this.trustedMediaRoots().some((root) => isPathInside(root, path))) {
-      throw new QQFlashTransferError(`QQ media cache path is not trusted: ${locator.fileName}`)
-    }
-    const info = statSync(path)
-    if (!info.isFile()) throw new QQFlashTransferError(`QQ media cache entry is not a file: ${locator.fileName}`)
-    if (info.size !== expectedSize) {
+      if (error instanceof QQFlashTransferError) throw error
       throw new QQFlashTransferError(
-        `QQ media cache size mismatch for ${locator.fileName}: expected ${expectedSize}, got ${info.size}`,
+        `QQ flash transfer ${stage} failed: ${error instanceof Error ? error.message : String(error)}`,
       )
+    } finally {
+      await rm(directory, { recursive: true, force: true }).catch(() => undefined)
     }
-    return path
   }
 
   issueMediaLease(callId: unknown): PCMMediaLease {
@@ -6264,15 +6265,6 @@ export class QQKernelBridge {
     return (this.searchService = service)
   }
 
-  private requireFlashTransferService(): KernelFlashTransferService {
-    if (!this.flashTransferSupported) {
-      throw new QQFlashTransferUnavailableError('QQ Flash Transfer is not supported by Linux QQ')
-    }
-    const service = this.requireSession().getFlashTransferService?.()
-    if (!service?.createFlashTransferUploadTask) throw new QQFlashTransferUnavailableError()
-    return service
-  }
-
   private getAvatarService(): NonNullable<ReturnType<NonNullable<KernelSession['getAvatarService']>>> | undefined {
     if (this.avatarService) return this.avatarService
     try {
@@ -6947,6 +6939,141 @@ function safeFlashTransferName(value: string): string {
   return /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/iu.test(leaf) ? `_${leaf}` : leaf
 }
 
+function flashTransferRemoteHashes(
+  locator: QQMediaLocator,
+  expectedSize: number,
+): { md5: string, sha1: string } {
+  if (!Number.isSafeInteger(expectedSize) || expectedSize <= 0) {
+    throw new QQFlashTransferError(`QQ flash transfer file has an invalid size: ${locator.fileName}`)
+  }
+  const locatorSize = locator.fileSize === undefined ? undefined : Number(locator.fileSize)
+  if (locatorSize !== undefined && (!Number.isSafeInteger(locatorSize) || locatorSize !== expectedSize)) {
+    throw new QQFlashTransferError(
+      `QQ remote media size mismatch for ${locator.fileName}: expected ${expectedSize}, got ${locator.fileSize}`,
+    )
+  }
+  const md5 = locator.md5?.toLowerCase()
+  const sha1 = locator.sha?.toLowerCase()
+  if (!md5 || !/^[a-f0-9]{32}$/u.test(md5) || !sha1 || !/^[a-f0-9]{40}$/u.test(sha1)) {
+    throw new QQFlashTransferError(
+      `QQ remote media has no reusable MD5/SHA-1 identity: ${locator.fileName}`,
+    )
+  }
+  return { md5, sha1 }
+}
+
+async function hashFlashTransferPath(
+  path: string,
+  expectedSize: number,
+): Promise<{ md5: string, sha1: string, sha1State: Buffer[] }> {
+  if (!Number.isSafeInteger(expectedSize) || expectedSize <= 0) {
+    throw new Error('flash transfer file size must be a positive safe integer')
+  }
+  const md5 = createHash('md5')
+  const sha1 = createHash('sha1')
+  const intermediateSha1 = new FlashSha1IntermediateState()
+  const sha1State: Buffer[] = []
+  let buffered = Buffer.alloc(0)
+  let received = 0
+  const consume = (block: Buffer) => {
+    md5.update(block)
+    sha1.update(block)
+    if (block.length === FLASH_TRANSFER_BLOCK_SIZE) {
+      intermediateSha1.update(block)
+      sha1State.push(intermediateSha1.digest())
+    }
+  }
+  for await (const value of createReadStream(path, { highWaterMark: FLASH_TRANSFER_BLOCK_SIZE })) {
+    const chunk = Buffer.from(value)
+    received += chunk.length
+    if (received > expectedSize) throw new Error(`flash transfer staged file exceeded ${expectedSize} bytes`)
+    buffered = buffered.length ? Buffer.concat([buffered, chunk]) : chunk
+    while (buffered.length >= FLASH_TRANSFER_BLOCK_SIZE) {
+      consume(Buffer.from(buffered.subarray(0, FLASH_TRANSFER_BLOCK_SIZE)))
+      buffered = Buffer.from(buffered.subarray(FLASH_TRANSFER_BLOCK_SIZE))
+    }
+  }
+  if (received !== expectedSize) {
+    throw new Error(`flash transfer staged file size mismatch: expected ${expectedSize}, received ${received}`)
+  }
+  if (buffered.length) consume(buffered)
+  const sha1Hex = sha1.digest('hex')
+  const finalSha1 = Buffer.from(sha1Hex, 'hex')
+  if (expectedSize % FLASH_TRANSFER_BLOCK_SIZE === 0) sha1State[sha1State.length - 1] = finalSha1
+  else sha1State.push(finalSha1)
+  return { md5: md5.digest('hex'), sha1: sha1Hex, sha1State }
+}
+
+class FlashSha1IntermediateState {
+  private h0 = 0x67452301
+  private h1 = 0xefcdab89
+  private h2 = 0x98badcfe
+  private h3 = 0x10325476
+  private h4 = 0xc3d2e1f0
+  private readonly words = new Uint32Array(80)
+
+  update(input: Uint8Array): void {
+    const buffer = Buffer.from(input)
+    if (buffer.length % 64 !== 0) throw new Error('flash SHA-1 intermediate input must contain whole blocks')
+    for (let offset = 0; offset < buffer.length; offset += 64) this.compress(buffer, offset)
+  }
+
+  digest(): Buffer {
+    const output = Buffer.allocUnsafe(20)
+    output.writeUInt32LE(this.h0, 0)
+    output.writeUInt32LE(this.h1, 4)
+    output.writeUInt32LE(this.h2, 8)
+    output.writeUInt32LE(this.h3, 12)
+    output.writeUInt32LE(this.h4, 16)
+    return output
+  }
+
+  private compress(buffer: Buffer, offset: number): void {
+    const words = this.words
+    for (let index = 0; index < 16; index++) words[index] = buffer.readUInt32BE(offset + index * 4)
+    for (let index = 16; index < 80; index++) {
+      words[index] = rotateLeft(words[index - 3]! ^ words[index - 8]! ^ words[index - 14]! ^ words[index - 16]!, 1)
+    }
+    let a = this.h0
+    let b = this.h1
+    let c = this.h2
+    let d = this.h3
+    let e = this.h4
+    for (let index = 0; index < 80; index++) {
+      let value: number
+      let constant: number
+      if (index < 20) {
+        value = (b & c) | (~b & d)
+        constant = 0x5a827999
+      } else if (index < 40) {
+        value = b ^ c ^ d
+        constant = 0x6ed9eba1
+      } else if (index < 60) {
+        value = (b & c) | (b & d) | (c & d)
+        constant = 0x8f1bbcdc
+      } else {
+        value = b ^ c ^ d
+        constant = 0xca62c1d6
+      }
+      const next = (rotateLeft(a, 5) + value + e + constant + words[index]!) >>> 0
+      e = d
+      d = c
+      c = rotateLeft(b, 30)
+      b = a
+      a = next
+    }
+    this.h0 = (this.h0 + a) >>> 0
+    this.h1 = (this.h1 + b) >>> 0
+    this.h2 = (this.h2 + c) >>> 0
+    this.h3 = (this.h3 + d) >>> 0
+    this.h4 = (this.h4 + e) >>> 0
+  }
+}
+
+function rotateLeft(value: number, bits: number): number {
+  return ((value << bits) | (value >>> (32 - bits))) >>> 0
+}
+
 async function* verifiedFlashTransferFile(
   source: AsyncIterable<Buffer>,
   expectedSize: number,
@@ -6961,14 +7088,6 @@ async function* verifiedFlashTransferFile(
   if (size !== expectedSize) {
     throw new Error(`flash transfer file size mismatch for ${name}: expected ${expectedSize}, received ${size}`)
   }
-}
-
-function flashTransferExpiry(value: string | undefined): number | undefined {
-  if (!value) return
-  const raw = Number(value)
-  if (!Number.isFinite(raw) || raw <= 0) return
-  const milliseconds = raw >= 1_000_000_000_000 ? raw : raw * 1_000
-  return milliseconds > Date.now() ? milliseconds : undefined
 }
 
 class FramedUploadReader {

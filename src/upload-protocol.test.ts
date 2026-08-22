@@ -6,12 +6,15 @@ import type { KernelMsgService } from './kernel-types.js'
 import type { PacketAddon } from './packet-addon.js'
 import { QQPacketClient } from './packet-client.js'
 import {
-  decodeDirectMessageResponse, decodeGroupFileFeedResponse, decodeHighwayResponse, decodeHighwaySessionResponse,
-  decodeImageUploadResponse, decodeFileUploadResponse, decodePrivateFileMetadataResponse, decodeVideoUploadResponse,
-  encodeDirectMessageRequest, encodeFileUploadRequest, encodeGroupFileFeedRequest, encodeHighwayFrame,
-  encodeHighwaySessionRequest, encodeImageUploadRequest, encodePrivateFileMetadataRequest,
-  encodeVideoHighwayExt, encodeVideoUploadRequest,
-  HIGHWAY_BLOCK_SIZE, QQMediaUploadRejectedError, QQMessageSendRejectedError, VIDEO_THUMBNAIL_BYTES,
+  decodeDirectMessageResponse, decodeFlashApplyFilesetResponse, decodeFlashApplyUploadResponse,
+  decodeFlashPrepareUploadResponse, decodeFlashSliceUploadResponse, decodeGroupFileFeedResponse,
+  decodeHighwayResponse, decodeHighwaySessionResponse, decodeImageUploadResponse, decodeFileUploadResponse,
+  decodePrivateFileMetadataResponse, decodeVideoUploadResponse, encodeDirectMessageRequest,
+  encodeFileUploadRequest, encodeFlashApplyFilesetRequest, encodeFlashApplyUploadRequest,
+  encodeFlashCommitFilesRequest, encodeFlashPrepareUploadRequest, encodeFlashSliceUploadRequest,
+  encodeGroupFileFeedRequest, encodeHighwayFrame, encodeHighwaySessionRequest, encodeImageUploadRequest,
+  encodePrivateFileMetadataRequest, encodeVideoHighwayExt, encodeVideoUploadRequest, flashTransferFormatCode,
+  FLASH_TRANSFER_BLOCK_SIZE, HIGHWAY_BLOCK_SIZE, QQMediaUploadRejectedError, QQMessageSendRejectedError, VIDEO_THUMBNAIL_BYTES,
   VIDEO_THUMBNAIL_HEIGHT, VIDEO_THUMBNAIL_MD5, VIDEO_THUMBNAIL_SHA1, VIDEO_THUMBNAIL_WIDTH,
 } from './upload-protocol.js'
 
@@ -68,6 +71,121 @@ describe('direct QQ upload protocol', () => {
     ))))
     expect(rejected).toThrow('denied (7)')
     expect(rejected).toThrow(QQMediaUploadRejectedError)
+  })
+
+  it('matches captured QQ flash-transfer prepare and apply packets byte-for-byte', () => {
+    const preparedFile = {
+      fileUuid: 'e6b2198e-92d5-9f54-3f67-78ac90056f67', fileIndex: 1,
+      name: 'cg-06bce93d1f7df08e.bin', size: 4119,
+      md5: '00'.repeat(16), sha1: '3eb2902bf1166a4e30c4a59be9336c37c06bc20f', formatCode: 11,
+    }
+    const preparedFileset = {
+      fileSetId: '33b01f7b-9c62-4a0a-a341-20e4778c0e08',
+      uploadKey: '33b01f7b-9c62-4a0a-a341-20e4778c0e08',
+    }
+    const prepare = encodeFlashPrepareUploadRequest(preparedFileset, preparedFile, 33)
+    const prepareEnvelope = fromBinary(generated.OidbEnvelopeSchema, prepare.payload)
+    expect(prepare.command).toBe('OidbSvcTrpcTcp.0x12a9_100')
+    expect(Buffer.from(prepareEnvelope.body).toString('hex')).toBe(
+      '0a180a0408211064120ca80602b00604b80616c00c051a0208011291020a5e0a5a08972012001a2833656232393032626631313636613465333063346135396265393333366333376330366263323066221763672d303662636539336431663764663038652e62696e2a08080010001800200030003800400048011000100118002000280032160a040800120012021a001a045a00620022020a005000380040004a8a010a2433336230316637622d396336322d346130612d613334312d323065343737386330653038122433336230316637622d396336322d346130612d613334312d3230653437373863306530381a2465366232313938652d393264352d396635342d336636372d373861633930303536663637200128003000380b42004801500058006000680070007000',
+    )
+
+    const appliedFile = {
+      fileUuid: '8c483d63-6527-3ac5-acb2-10372fd2b880', fileIndex: 1,
+      name: 'cg-7e4ee65ace285b31.bin', size: 4119,
+      md5: 'f9ca465fc95c3b7ca218272f89efd1c0',
+      sha1: '31ad94d181cff5f47a84cd742971fde32088f177', formatCode: 11,
+    }
+    const appliedFileset = {
+      fileSetId: '98e4fcba-e427-4bdf-bb57-339fee81fa30',
+      uploadKey: '98e4fcba-e427-4bdf-bb57-339fee81fa30',
+    }
+    const apply = encodeFlashApplyUploadRequest(appliedFileset, appliedFile, {
+      fileId: 'EhQxrZTRgc_19HqEzXQpcf3jIIjxdxiXICC1dCjRp7TsirWWAzIEcHJvZFD_6UlaEB2Hw5qdx9qy62vITuRxlrR6A4LX_4IBAmd6',
+      uploadTime: 1787430861,
+      expireLeftTime: 1209599,
+    }, 36)
+    const applyEnvelope = fromBinary(generated.OidbEnvelopeSchema, apply.payload)
+    expect(apply.command).toBe('OidbSvcTrpcTcp.0x12a9_103')
+    expect(Buffer.from(applyEnvelope.body).toString('hex')).toBe(
+      '0a180a0408241067120ca80602b00604b80616c00c051a0208016294030af0010a7a089720122066396361343635666339356333623763613231383237326638396566643163301a2833316164393464313831636666356634376138346364373432393731666465333230383866313737221763672d376534656536356163653238356233312e62696e2a0808001000180020003000380040004801126445685178725a545267635f31394871457a5851706366336a49496a78647869584943433164436a527037547369725757417a494563484a765a46445f36556c6145423248773571647839717936327649547552786c72523641344c585f344942416d6436180120cd8fa8d40628ffe9493000120208021a080800100018002200220408001200528a010a2439386534666362612d653432372d346264662d626235372d333339666565383166613330122439386534666362612d653432372d346264662d626235372d3333396665653831666133301a2438633438336436332d363532372d336163352d616362322d313033373266643262383830200128003000380b42004801500058006000680070007000',
+    )
+  })
+
+  it('encodes the complete fileset flow and decodes fast reuse, slice upload, and apply errors', () => {
+    const file = {
+      fileUuid: 'file-uuid', fileIndex: 1, name: 'report.pdf', size: 3,
+      md5: '900150983cd24fb0d6963f7d28e17f72',
+      sha1: 'a9993e364706816aba3e25717850c26c9cd0d89d', formatCode: flashTransferFormatCode('report.pdf'),
+    }
+    const apply = encodeFlashApplyFilesetRequest({
+      name: 'Reports', files: [file], uploader: { uin: '10001', uid: 'u_self', nickname: 'Tester' },
+    })
+    const applyEnvelope = fromBinary(generated.OidbEnvelopeSchema, apply.payload)
+    const applyBody = fromBinary(generated.FlashApplyFilesetRequestSchema, applyEnvelope.body)
+    expect(applyEnvelope).toMatchObject({ command: 0x93cf, subCommand: 1, reserved: 0 })
+    expect(applyBody).toMatchObject({
+      totalFileCount: 1,
+      meta: { title: 'Reports', subtitle: 'Reports', totalFileSize: 3n, uploader: { nickname: 'Tester' } },
+      scene: 20,
+    })
+    expect(decodeFlashApplyFilesetResponse(oidb(Buffer.from(toBinary(
+      generated.FlashApplyFilesetResponseSchema,
+      create(generated.FlashApplyFilesetResponseSchema, {
+        filesetId: 'set', uploadKey: 'set', shareLink: 'https://qfile.qq.com/q/code', expireTime: 2_000_000_000n,
+      }),
+    ))))).toEqual({
+      fileSetId: 'set', uploadKey: 'set', shareLink: 'https://qfile.qq.com/q/code', expiresAt: 2_000_000_000_000,
+    })
+
+    const commit = encodeFlashCommitFilesRequest({ fileSetId: 'set', uploadKey: 'set' }, [file])
+    const commitEnvelope = fromBinary(generated.OidbEnvelopeSchema, commit.payload)
+    const commitBody = fromBinary(generated.FlashCommitFilesRequestSchema, commitEnvelope.body)
+    expect(commitBody.files[0]).toMatchObject({
+      filesetId: 'set', fileUuid: 'file-uuid', fileIndex: 1, formatCode: 9,
+      sha1: file.sha1, md5: file.md5,
+    })
+
+    const summary = Buffer.from(toBinary(generated.FlashUploadSummarySchema, create(
+      generated.FlashUploadSummarySchema,
+      { fileId: 'server-file-id', uploadTime: 123, expireLeftTime: 456 },
+    )))
+    const uploadResult = pb([
+      field(1, Buffer.from('slice-rkey')),
+      field(6, pb([field(1, pb([field(1, summary)]))])),
+      field(7, pb([u(2, 5), field(3, pb([
+        field(1, Buffer.from('set')), field(2, Buffer.from('set')),
+        field(3, Buffer.from('file-uuid')), u(4, 1), u(7, 9),
+        field(8, Buffer.from('server-node-id')), u(9, 1),
+      ]))])),
+    ])
+    expect(decodeFlashPrepareUploadResponse(oidb(pb([field(2, uploadResult)])))).toEqual({
+      rkey: 'slice-rkey', fileId: 'server-file-id', uploadTime: 123, expireLeftTime: 456,
+    })
+    expect(decodeFlashPrepareUploadResponse(oidb(pb([
+      field(2, pb([field(6, pb([field(1, pb([field(1, summary)]))]))])),
+    ])))).toEqual({ fileId: 'server-file-id', uploadTime: 123, expireLeftTime: 456 })
+
+    const slice = encodeFlashSliceUploadRequest({
+      rkey: 'slice-rkey', start: 0, chunk: Buffer.from('abc'),
+      chunkSha1: createHash('sha1').update('abc').digest(),
+      sha1State: [createHash('sha1').update('abc').digest()],
+    })
+    const sliceBody = fromBinary(generated.FlashSliceUploadRequestSchema, slice)
+    expect(sliceBody).toMatchObject({ appId: 14901, field3: 2, payload: { rkey: 'slice-rkey', start: 0n, end: 2n } })
+    expect(() => decodeFlashSliceUploadResponse(pb([field(5, Buffer.from('success'))]))).not.toThrow()
+    expect(() => decodeFlashSliceUploadResponse(pb([field(5, Buffer.from('denied'))]))).toThrow('denied')
+
+    const rejected = oidb(Buffer.from(toBinary(generated.FlashApplyUploadResponseSchema, create(
+      generated.FlashApplyUploadResponseSchema,
+      { result: { error: { code: 999, message: 'not found node' } } },
+    ))))
+    expect(() => decodeFlashApplyUploadResponse(rejected)).toThrow('not found node (999)')
+    const applied = oidb(pb([field(12, pb([field(1, pb([
+      field(1, Buffer.from('set')), field(2, Buffer.from('set')),
+      field(3, Buffer.from('file-uuid')), field(8, Buffer.from('server-node-id')),
+    ]))]))]))
+    expect(() => decodeFlashApplyUploadResponse(applied)).not.toThrow()
   })
 
   it('negotiates playable video with main and thumbnail rich-media uploads', () => {
@@ -491,6 +609,52 @@ describe('direct QQ upload protocol', () => {
     expect(heads.map((head) => head.base?.commandId)).toEqual([1005, 1006])
     expect(posted.map((frame) => frame.subarray(9 + frame.readUInt32BE(1), -1)))
       .toEqual([bytes, VIDEO_THUMBNAIL_BYTES])
+  })
+
+  it('uploads flash-transfer slices with exact offsets, cumulative SHA-1 state, and stream bounds', async () => {
+    const bytes = Buffer.alloc(FLASH_TRANSFER_BLOCK_SIZE + 3, 0x5a)
+    const sha1State = [
+      createHash('sha1').update(bytes.subarray(0, FLASH_TRANSFER_BLOCK_SIZE)).digest(),
+      createHash('sha1').update(bytes).digest(),
+    ]
+    const posted: Buffer[] = []
+    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      posted.push(Buffer.from(init?.body as Uint8Array))
+      return new Response(pb([field(5, Buffer.from('success'))]), { status: 200 })
+    })
+    const client = new QQPacketClient({} as KernelMsgService, { fetch: fetchMock as typeof globalThis.fetch })
+    const file = {
+      fileUuid: 'file', fileIndex: 1, name: 'large.bin', size: bytes.length,
+      md5: createHash('md5').update(bytes).digest('hex'),
+      sha1: createHash('sha1').update(bytes).digest('hex'), formatCode: 11,
+    }
+    await client.uploadFlashTransferFile(file, {
+      rkey: 'rkey', fileId: 'id', uploadTime: 1, expireLeftTime: 2,
+    }, (async function* () {
+      yield bytes.subarray(0, 17)
+      yield bytes.subarray(17)
+    })(), sha1State)
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    const decoded = posted.map((body) => fromBinary(generated.FlashSliceUploadRequestSchema, body))
+    expect(decoded.map((item) => ({
+      start: item.payload?.start, end: item.payload?.end, size: item.payload?.chunk.length,
+      state: item.payload?.state?.values.map(Buffer.from),
+    }))).toEqual([{
+      start: 0n, end: BigInt(FLASH_TRANSFER_BLOCK_SIZE - 1), size: FLASH_TRANSFER_BLOCK_SIZE, state: sha1State,
+    }, {
+      start: BigInt(FLASH_TRANSFER_BLOCK_SIZE), end: BigInt(bytes.length - 1), size: 3, state: sha1State,
+    }])
+    expect(Buffer.from(decoded[0]!.payload!.sha1)).toEqual(
+      createHash('sha1').update(bytes.subarray(0, FLASH_TRANSFER_BLOCK_SIZE)).digest(),
+    )
+    expect(Buffer.from(decoded[1]!.payload!.sha1)).toEqual(createHash('sha1').update(bytes.subarray(-3)).digest())
+
+    await expect(client.uploadFlashTransferFile(file, {
+      rkey: 'rkey', fileId: 'id', uploadTime: 1, expireLeftTime: 2,
+    }, (async function* () { yield Buffer.from('short') })(), sha1State)).rejects.toThrow(
+      `expected ${bytes.length} bytes, received 5`,
+    )
   })
 
   it('uses the stable Highway session request wire shape and rejects incomplete streams', async () => {

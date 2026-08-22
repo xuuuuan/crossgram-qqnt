@@ -10,7 +10,7 @@ import { promisify, types } from 'node:util'
 import { create, toBinary } from '@bufbuild/protobuf'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import WebSocket from 'ws'
-import { GroupMsgMask, type ContactMsgBoxInfo, type KernelBuddyService, type KernelFlashTransferService, type KernelGroupService, type KernelModule, type KernelMsgService, type KernelRichMediaService, type KernelSession, type MsgElement, type MsgRecord } from './kernel-types.js'
+import { GroupMsgMask, type ContactMsgBoxInfo, type KernelBuddyService, type KernelGroupService, type KernelModule, type KernelMsgService, type KernelRichMediaService, type KernelSession, type MsgElement, type MsgRecord } from './kernel-types.js'
 import type { PacketAddon } from './packet-addon.js'
 import { parseConversationId, type QQEvent, type QQStickerReference } from './protocol.js'
 import { QQKernelBridge } from './qq-kernel.js'
@@ -449,10 +449,25 @@ function fixture() {
       }))
       return { published: true }
     })
+  const flashApplyFileset = vi.spyOn(QQPacketClient.prototype, 'applyFlashTransferFileset')
+    .mockResolvedValue({
+      fileSetId: 'fileset-1', uploadKey: 'fileset-1',
+      shareLink: 'https://qfile.qq.com/q/share-code', expiresAt: 2_000_000_000_000,
+    })
+  const flashCommitFiles = vi.spyOn(QQPacketClient.prototype, 'commitFlashTransferFiles').mockResolvedValue()
+  const flashCompleteFileset = vi.spyOn(QQPacketClient.prototype, 'completeFlashTransferFileset').mockResolvedValue()
+  const flashPrepareUpload = vi.spyOn(QQPacketClient.prototype, 'prepareFlashTransferUpload')
+    .mockResolvedValue({ fileId: 'server-file-id', uploadTime: 1, expireLeftTime: 2 })
+  const flashUploadFile = vi.spyOn(QQPacketClient.prototype, 'uploadFlashTransferFile')
+    .mockImplementation(async (_file, _prepared, source) => { for await (const _chunk of source) {} })
+  const flashApplyUpload = vi.spyOn(QQPacketClient.prototype, 'applyFlashTransferUpload').mockResolvedValue()
+  const flashSetReady = vi.spyOn(QQPacketClient.prototype, 'setFlashTransferFilesetReady').mockResolvedValue()
   return {
     kernel, session, msg, recent, buddy, profile, group, search, avsdk, richMedia, uix, message, sentBodies,
     forceDownloadAvatar,
     imageUpload, fileUpload, protocolSend, groupFilePublish,
+    flashApplyFileset, flashCommitFiles, flashCompleteFileset, flashPrepareUpload,
+    flashUploadFile, flashApplyUpload, flashSetReady,
     emitMessages(records: MsgRecord[]) {
       return msgHandlers.onMsgInfoListUpdate?.(records)
     },
@@ -630,32 +645,20 @@ describe('QQKernelBridge', () => {
     const directory = await mkdtemp(join(tmpdir(), 'qqnt-flash-unit-'))
     tempPaths.push(directory)
     const f = fixture()
-    const createFlashTransferUploadTask = vi.fn<KernelFlashTransferService['createFlashTransferUploadTask']>()
-    ;(f.session as unknown as { getFlashTransferService: () => KernelFlashTransferService }).getFlashTransferService =
-      () => ({ createFlashTransferUploadTask })
-    const bridge = new QQKernelBridge({ tempPath: directory, flashTransferSupported: true })
+    const bridge = new QQKernelBridge({ tempPath: directory })
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: directory })
 
     await expect(bridge.createFlashTransfer({
       framing: 'length-prefixed-v1', files: [{ source: 'upload', name: 'short.txt', size: 5 }],
     }, Readable.from(framedUpload(Buffer.from('abc'))))).rejects.toThrow(/size mismatch/)
-    expect(createFlashTransferUploadTask).not.toHaveBeenCalled()
+    expect(f.flashApplyFileset).not.toHaveBeenCalled()
   })
 
-  it('rejects QQ flash-transfer reuse outside QQNT trusted media roots', async () => {
+  it('rejects QQ flash-transfer reuse without remote MD5 and SHA-1 identity', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'qqnt-flash-unit-'))
-    const outside = await mkdtemp(join(tmpdir(), 'qqnt-flash-outside-'))
-    tempPaths.push(directory, outside)
-    const path = join(outside, 'outside.bin')
-    await writeFile(path, Buffer.from('outside'))
+    tempPaths.push(directory)
     const f = fixture()
-    const createFlashTransferUploadTask = vi.fn<KernelFlashTransferService['createFlashTransferUploadTask']>()
-    ;(f.session as unknown as { getFlashTransferService: () => KernelFlashTransferService }).getFlashTransferService =
-      () => ({ createFlashTransferUploadTask })
-    const bridge = new QQKernelBridge({
-      tempPath: join(directory, 'bridge-cache'),
-      flashTransferSupported: true,
-    })
+    const bridge = new QQKernelBridge({ tempPath: join(directory, 'bridge-cache') })
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: directory })
 
     await expect(bridge.createFlashTransfer({
@@ -664,11 +667,45 @@ describe('QQKernelBridge', () => {
         source: 'qq-media', name: 'outside.bin', size: 7,
         locator: {
           messageId: 'm1', elementId: 'e1', chatType: 1, peerUid: 'friend',
-          kind: 'file', fileName: 'outside.bin', filePath: path,
+          kind: 'file', fileName: 'outside.bin', filePath: 'C:\\QQ\\cache\\outside.bin',
         },
       }],
-    }, Readable.from([]))).rejects.toThrow(/not trusted/)
-    expect(createFlashTransferUploadTask).not.toHaveBeenCalled()
+    }, Readable.from([]))).rejects.toThrow(/no reusable MD5\/SHA-1 identity/)
+    expect(f.flashApplyFileset).not.toHaveBeenCalled()
+  })
+
+  it('uses QQ little-endian intermediate SHA-1 states for multi-slice flash uploads', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'qqnt-flash-sha1-'))
+    tempPaths.push(directory)
+    const f = fixture()
+    f.flashPrepareUpload.mockResolvedValue({
+      rkey: 'slice-rkey', fileId: 'server-file-id', uploadTime: 1, expireLeftTime: 2,
+    })
+    let capturedState: Buffer[] = []
+    f.flashUploadFile.mockImplementation(async (_file, _prepared, source, state) => {
+      capturedState = state.map(Buffer.from)
+      for await (const _chunk of source) {}
+    })
+    const bridge = new QQKernelBridge({ tempPath: directory })
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: directory })
+    const content = Buffer.from('crossgram-pure-protocol-flash-'.repeat(60_000)).subarray(0, 1_468_006)
+    const first = content.subarray(0, 1024 * 1024)
+    const second = content.subarray(first.length)
+    const frame = (chunk: Buffer) => {
+      const header = Buffer.alloc(4)
+      header.writeUInt32BE(chunk.length)
+      return Buffer.concat([header, chunk])
+    }
+
+    await bridge.createFlashTransfer({
+      framing: 'length-prefixed-v1',
+      files: [{ source: 'upload', name: 'multi.bin', size: content.length }],
+    }, Readable.from(Buffer.concat([frame(first), frame(second), Buffer.alloc(4)])))
+
+    expect(capturedState.map((value) => value.toString('hex'))).toEqual([
+      'e78253d3828f255c741fdc97a9c929dd5ae0a724',
+      createHash('sha1').update(content).digest('hex'),
+    ])
   })
 
   it('leaves the static group-join wrapper probe off without reading native candidates', async () => {
@@ -5764,32 +5801,20 @@ describe('QQBridgeServer', () => {
     await Promise.all(tempPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })))
   })
 
-  it('reuses QQ cache paths and streams only new files into native flash transfer staging', async () => {
+  it('reuses QQ remote identities and streams only new files through the flash slice protocol', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'qqnt-flash-server-'))
     tempPaths.push(directory)
-    const reusedPath = join(directory, 'cached-qq.bin')
-    await writeFile(reusedPath, Uint8Array.of(9, 8, 7, 6))
     const f = fixture()
-    const staged: Array<{ paths: string[], names: string[], bodies: Buffer[] }> = []
-    const createFlashTransferUploadTask = vi.fn<KernelFlashTransferService['createFlashTransferUploadTask']>(
-      async (_timestamp, request) => {
-        staged.push({
-          paths: request.paths,
-          names: request.paths.map((path) => basename(path)),
-          bodies: await Promise.all(request.paths.map((path) => readFile(path))),
-        })
-        return {
-          result: 0, errMsg: '', seq: 1,
-          createFlashTransferResult: {
-            fileSetId: 'fileset-1', shareLink: 'https://qq.example/flash/share-code',
-            expireTime: '2000000000', expireLeftTime: '0',
-          },
-        }
-      },
-    )
-    ;(f.session as unknown as { getFlashTransferService: () => KernelFlashTransferService }).getFlashTransferService =
-      () => ({ createFlashTransferUploadTask })
-    const bridge = new QQKernelBridge({ tempPath: directory, flashTransferSupported: true })
+    f.flashPrepareUpload
+      .mockResolvedValueOnce({ fileId: 'remote-id', uploadTime: 1, expireLeftTime: 2 })
+      .mockResolvedValueOnce({ rkey: 'slice-rkey', fileId: 'upload-id', uploadTime: 3, expireLeftTime: 4 })
+    const uploaded: Array<{ name: string, body: Buffer, state: Buffer[] }> = []
+    f.flashUploadFile.mockImplementation(async (file, _prepared, source, state) => {
+      const chunks: Buffer[] = []
+      for await (const chunk of source) chunks.push(Buffer.from(chunk))
+      uploaded.push({ name: file.name, body: Buffer.concat(chunks), state: state.map(Buffer.from) })
+    })
+    const bridge = new QQKernelBridge({ tempPath: directory })
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: directory })
     server = new QQBridgeServer(bridge, { port: 0 })
     await server.start()
@@ -5799,7 +5824,9 @@ describe('QQBridgeServer', () => {
         source: 'qq-media', name: 'cached-qq.bin', size: 4,
         locator: {
           messageId: 'm1', elementId: 'e1', chatType: 1, peerUid: 'friend',
-          kind: 'file', fileName: 'cached-qq.bin', filePath: reusedPath,
+          kind: 'file', fileName: 'cached-qq.bin', fileSize: '4',
+          filePath: 'Z:\\QQ\\cache\\does-not-need-to-exist.bin',
+          md5: '11'.repeat(16), sha: '22'.repeat(20),
         },
       }, { source: 'upload', name: 'alpha.txt', size: 5 }],
     }
@@ -5814,55 +5841,74 @@ describe('QQBridgeServer', () => {
 
     expect(response.status).toBe(200)
     await expect(response.json()).resolves.toEqual({
-      fileSetId: 'fileset-1', shareLink: 'https://qq.example/flash/share-code', expiresAt: 2_000_000_000_000,
+      fileSetId: 'fileset-1', shareLink: 'https://qfile.qq.com/q/share-code', expiresAt: 2_000_000_000_000,
     })
-    expect(staged).toHaveLength(1)
-    expect(staged[0]!.paths[0]).toBe(reusedPath)
-    expect(staged[0]!.paths[1]).not.toBe(reusedPath)
-    expect(staged[0]).toMatchObject({
-      names: ['cached-qq.bin', 'alpha.txt'],
-      bodies: [Buffer.from([9, 8, 7, 6]), Buffer.from('alpha')],
-    })
-    expect(createFlashTransferUploadTask).toHaveBeenCalledWith(expect.any(Number), expect.objectContaining({
-      name: 'Telegram files', paths: expect.any(Array), uploaders: [{
-        uin: '10000', uid: 'self', nickname: 'Self', sendEntrance: '',
-      }], uploadSceneType: 10,
+    expect(f.flashApplyFileset).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'Telegram files',
+      uploader: { uin: '10000', uid: 'self', nickname: 'Self' },
+      files: [
+        expect.objectContaining({ name: 'cached-qq.bin', size: 4, md5: '11'.repeat(16), sha1: '22'.repeat(20) }),
+        expect.objectContaining({
+          name: 'alpha.txt', size: 5,
+          md5: createHash('md5').update('alpha').digest('hex'),
+          sha1: createHash('sha1').update('alpha').digest('hex'),
+        }),
+      ],
     }))
+    expect(f.flashCommitFiles).toHaveBeenCalledTimes(1)
+    expect(f.flashCompleteFileset).toHaveBeenCalledTimes(1)
+    expect(f.flashPrepareUpload).toHaveBeenCalledTimes(2)
+    expect(uploaded).toEqual([{
+      name: 'alpha.txt', body: Buffer.from('alpha'),
+      state: [createHash('sha1').update('alpha').digest()],
+    }])
+    expect(f.flashApplyUpload).toHaveBeenCalledTimes(2)
+    expect(f.flashSetReady).toHaveBeenCalledTimes(1)
+    expect(f.flashCommitFiles.mock.invocationCallOrder[0]).toBeLessThan(f.flashCompleteFileset.mock.invocationCallOrder[0]!)
+    expect(f.flashCompleteFileset.mock.invocationCallOrder[0]).toBeLessThan(f.flashPrepareUpload.mock.invocationCallOrder[0]!)
+    expect(f.flashApplyUpload.mock.invocationCallOrder.at(-1)).toBeLessThan(f.flashSetReady.mock.invocationCallOrder[0]!)
   })
 
-  it('advertises and rejects unsupported Linux QQ flash transfers without calling the native stub', async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'qqnt-flash-unsupported-'))
+  it('advertises protocol flash support and never downloads a QQ remote cache miss', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'qqnt-flash-protocol-'))
     tempPaths.push(directory)
     const f = fixture()
-    const createFlashTransferUploadTask = vi.fn<KernelFlashTransferService['createFlashTransferUploadTask']>()
-    ;(f.session as unknown as { getFlashTransferService: () => KernelFlashTransferService }).getFlashTransferService =
-      () => ({ createFlashTransferUploadTask })
-    const bridge = new QQKernelBridge({ tempPath: directory, flashTransferSupported: false })
+    f.flashPrepareUpload.mockResolvedValue({
+      rkey: 'remote-content-not-found', fileId: 'new-id', uploadTime: 1, expireLeftTime: 2,
+    })
+    const bridge = new QQKernelBridge({ tempPath: directory })
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: directory })
     server = new QQBridgeServer(bridge, { port: 0 })
     await server.start()
     const base = `http://127.0.0.1:${server.address().port}/v1`
 
     await expect(fetch(`${base}/status`).then((response) => response.json())).resolves.toMatchObject({
-      protocolVersion: 29, ready: true, flashTransferSupported: false,
+      protocolVersion: 29, ready: true, flashTransferSupported: true,
     })
     const manifest = {
-      name: 'unsupported', framing: 'length-prefixed-v1',
-      files: [{ source: 'upload', name: 'alpha.txt', size: 5 }],
+      name: 'remote reuse', framing: 'length-prefixed-v1',
+      files: [{
+        source: 'qq-media', name: 'remote.bin', size: 5,
+        locator: {
+          messageId: 'm1', elementId: 'e1', chatType: 1, peerUid: 'friend',
+          kind: 'file', fileName: 'remote.bin', fileSize: '5',
+          filePath: 'Z:\\QQ\\cache\\remote.bin', md5: '11'.repeat(16), sha: '22'.repeat(20),
+        },
+      }],
     }
     const response = await fetch(`${base}/flash-transfers`, {
       method: 'POST',
       headers: {
         'x-qqnt-flash-manifest': Buffer.from(JSON.stringify(manifest)).toString('base64url'),
       },
-      body: framedUpload(Buffer.from('alpha')),
+      body: Buffer.alloc(0),
     })
 
-    expect(response.status).toBe(503)
+    expect(response.status).toBe(502)
     await expect(response.json()).resolves.toEqual({
-      error: 'QQ Flash Transfer is not supported by Linux QQ',
+      error: 'QQ remote media cannot be reused without downloading it: remote.bin',
     })
-    expect(createFlashTransferUploadTask).not.toHaveBeenCalled()
+    expect(f.flashUploadFile).not.toHaveBeenCalled()
   })
 
   it.runIf(process.platform === 'linux')('requires a configured bearer token for the inert wrapper probe and redacts encoded targets', async () => {

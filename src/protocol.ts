@@ -491,7 +491,7 @@ export interface QQFlashTransferUploadFile {
   size: number
 }
 
-/** One existing QQ media file reused from QQNT's trusted local cache. */
+/** One existing QQ media file reused through QQ's remote MD5/SHA-1 identity. */
 export interface QQFlashTransferQQMediaFile {
   source: 'qq-media'
   name: string
@@ -505,8 +505,8 @@ export type QQFlashTransferFile = QQFlashTransferUploadFile | QQFlashTransferQQM
  * Hybrid reuse/upload contract for POST /v1/flash-transfers.
  *
  * Only `source: 'upload'` entries consume a length-prefixed body item. Existing
- * QQ media is passed by locator and reused from QQNT's cache without crossing
- * the HTTP boundary again.
+ * QQ media is passed by locator and reused through QQ's protocol-level fast
+ * upload identity without reading local cache bytes or crossing the HTTP body.
  */
 export interface QQFlashTransferManifest {
   name?: string

@@ -873,39 +873,6 @@ export interface KernelRichMediaService {
   }>
 }
 
-export interface KernelFlashTransferService {
-  createFlashTransferUploadTask(timestamp: number, request: {
-    screen: number
-    name: string
-    uploaders: Array<{ uin: string, uid: string, nickname: string, sendEntrance: string }>
-    coverPath: string
-    paths: string[]
-    excludePaths: string[]
-    expireLeftTime: number
-    isNeedDelDeviceInfo: boolean
-    isNeedDelLocation: boolean
-    coverOriginalInfos: Array<{ path: string, thumbnailPath: string }>
-    uploadSceneType: number
-    detectPrivacyInfoResult: { exists: boolean, allDetectResults: Map<string, unknown> }
-  }): Promise<{
-    result: number
-    errMsg: string
-    seq: number
-    createFlashTransferResult: {
-      fileSetId: string
-      shareLink: string
-      expireTime: string
-      expireLeftTime: string
-    }
-  }>
-  getShareLinkReq?(fileSetId: string): Promise<{
-    result: number
-    errMsg: string
-    shareLink: string
-    expireTimestamp: string
-  }>
-}
-
 export interface KernelAVSDKService {
   addKernelAVSDKListener(listener: unknown): string
   removeKernelAVSDKListener(listenerId: string): void
@@ -921,7 +888,6 @@ export interface KernelSession {
   getSearchService?(): KernelSearchService
   getAVSDKService?(): KernelAVSDKService
   getRichMediaService(): KernelRichMediaService
-  getFlashTransferService?(): KernelFlashTransferService
   getSettingService?(): KernelSettingService
   getAvatarService?(): {
     getAvatarPath(uid: string, size: number): string
