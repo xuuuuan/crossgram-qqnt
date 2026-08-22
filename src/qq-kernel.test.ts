@@ -633,7 +633,7 @@ describe('QQKernelBridge', () => {
     const createFlashTransferUploadTask = vi.fn<KernelFlashTransferService['createFlashTransferUploadTask']>()
     ;(f.session as unknown as { getFlashTransferService: () => KernelFlashTransferService }).getFlashTransferService =
       () => ({ createFlashTransferUploadTask })
-    const bridge = new QQKernelBridge({ tempPath: directory })
+    const bridge = new QQKernelBridge({ tempPath: directory, flashTransferSupported: true })
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: directory })
 
     await expect(bridge.createFlashTransfer({
@@ -5786,7 +5786,7 @@ describe('QQBridgeServer', () => {
     )
     ;(f.session as unknown as { getFlashTransferService: () => KernelFlashTransferService }).getFlashTransferService =
       () => ({ createFlashTransferUploadTask })
-    const bridge = new QQKernelBridge({ tempPath: directory })
+    const bridge = new QQKernelBridge({ tempPath: directory, flashTransferSupported: true })
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: directory })
     server = new QQBridgeServer(bridge, { port: 0 })
     await server.start()
@@ -5825,6 +5825,41 @@ describe('QQBridgeServer', () => {
         uin: '10000', uid: 'self', nickname: 'Self', sendEntrance: '',
       }], uploadSceneType: 10,
     }))
+  })
+
+  it('advertises and rejects unsupported Linux QQ flash transfers without calling the native stub', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'qqnt-flash-unsupported-'))
+    tempPaths.push(directory)
+    const f = fixture()
+    const createFlashTransferUploadTask = vi.fn<KernelFlashTransferService['createFlashTransferUploadTask']>()
+    ;(f.session as unknown as { getFlashTransferService: () => KernelFlashTransferService }).getFlashTransferService =
+      () => ({ createFlashTransferUploadTask })
+    const bridge = new QQKernelBridge({ tempPath: directory, flashTransferSupported: false })
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: directory })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const base = `http://127.0.0.1:${server.address().port}/v1`
+
+    await expect(fetch(`${base}/status`).then((response) => response.json())).resolves.toMatchObject({
+      protocolVersion: 29, ready: true, flashTransferSupported: false,
+    })
+    const manifest = {
+      name: 'unsupported', framing: 'length-prefixed-v1',
+      files: [{ source: 'upload', name: 'alpha.txt', size: 5 }],
+    }
+    const response = await fetch(`${base}/flash-transfers`, {
+      method: 'POST',
+      headers: {
+        'x-qqnt-flash-manifest': Buffer.from(JSON.stringify(manifest)).toString('base64url'),
+      },
+      body: framedUpload(Buffer.from('alpha')),
+    })
+
+    expect(response.status).toBe(503)
+    await expect(response.json()).resolves.toEqual({
+      error: 'QQ Flash Transfer is not supported by Linux QQ',
+    })
+    expect(createFlashTransferUploadTask).not.toHaveBeenCalled()
   })
 
   it.runIf(process.platform === 'linux')('requires a configured bearer token for the inert wrapper probe and redacts encoded targets', async () => {
@@ -6290,7 +6325,7 @@ describe('QQBridgeServer', () => {
     const { port } = server.address()
     const base = `http://127.0.0.1:${port}/v1`
     await expect(fetch(`${base}/status`).then((response) => response.json())).resolves.toMatchObject({
-      protocolVersion: 28, ready: true, selfUin: '10000',
+      protocolVersion: 29, ready: true, selfUin: '10000',
     })
     const dialogs = await fetch(`${base}/dialogs`)
     expect(dialogs.status).toBe(200)

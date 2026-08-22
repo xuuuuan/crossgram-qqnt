@@ -658,7 +658,10 @@ export class QQBridgeServer {
         log('info', `HTTP API flash transfer complete id=${requestId} fileSet=${result.fileSetId}`)
         json(response, 200, result)
       } catch (error) {
-        if (error instanceof QQFlashTransferUnavailableError) json(response, 503, { error: error.message })
+        if (error instanceof QQFlashTransferUnavailableError) {
+          request.resume()
+          json(response, 503, { error: error.message })
+        }
         else if (error instanceof QQFlashTransferError) json(response, 502, { error: error.message })
         else throw error
       }

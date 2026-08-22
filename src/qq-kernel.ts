@@ -126,6 +126,8 @@ export interface QQKernelOptions {
   voiceInputLimitBytes?: number
   mediaGateway?: QQMediaLeaseIssuer
   callController?: QQCallController
+  /** Test-only override; Linux QQ currently exposes a non-functional flash-transfer stub. */
+  flashTransferSupported?: boolean
 }
 
 export type QQCallOperation = 'accept' | 'reject' | 'hangup'
@@ -219,8 +221,8 @@ export class QQRequestSessionChangedError extends Error {
 }
 
 export class QQFlashTransferUnavailableError extends Error {
-  constructor() {
-    super('QQNT flash transfer API is unavailable')
+  constructor(message = 'QQNT flash transfer API is unavailable') {
+    super(message)
     this.name = 'QQFlashTransferUnavailableError'
   }
 }
@@ -454,6 +456,7 @@ export class QQKernelBridge {
   private readonly stickerMissingCacheTtlMs: number
   private readonly marketStickerMimeCacheDir?: string
   private readonly voiceInputLimitBytes: number
+  private readonly flashTransferSupported: boolean
 
   private readonly mediaGateway?: QQMediaLeaseIssuer
   private readonly groupJoinContractProbeEnabled: boolean
@@ -480,6 +483,7 @@ export class QQKernelBridge {
     if (!Number.isSafeInteger(this.voiceInputLimitBytes) || this.voiceInputLimitBytes <= 0) {
       throw new Error('voice input limit must be a positive integer')
     }
+    this.flashTransferSupported = options.flashTransferSupported ?? process.platform !== 'linux'
     this.marketStickerMimeCacheDir = options.marketStickerMimeCacheDir === false
       || (options.marketStickerMimeCacheDir === undefined && Boolean(process.env.VITEST))
       ? undefined
@@ -504,6 +508,7 @@ export class QQKernelBridge {
       ready: Boolean(this.session),
       selfUin: this.config?.selfUin,
       selfUid: this.config?.selfUid,
+      flashTransferSupported: this.flashTransferSupported,
     }
   }
 
@@ -6260,6 +6265,9 @@ export class QQKernelBridge {
   }
 
   private requireFlashTransferService(): KernelFlashTransferService {
+    if (!this.flashTransferSupported) {
+      throw new QQFlashTransferUnavailableError('QQ Flash Transfer is not supported by Linux QQ')
+    }
     const service = this.requireSession().getFlashTransferService?.()
     if (!service?.createFlashTransferUploadTask) throw new QQFlashTransferUnavailableError()
     return service
