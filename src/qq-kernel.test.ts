@@ -652,7 +652,10 @@ describe('QQKernelBridge', () => {
     const createFlashTransferUploadTask = vi.fn<KernelFlashTransferService['createFlashTransferUploadTask']>()
     ;(f.session as unknown as { getFlashTransferService: () => KernelFlashTransferService }).getFlashTransferService =
       () => ({ createFlashTransferUploadTask })
-    const bridge = new QQKernelBridge({ tempPath: join(directory, 'bridge-cache') })
+    const bridge = new QQKernelBridge({
+      tempPath: join(directory, 'bridge-cache'),
+      flashTransferSupported: true,
+    })
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: directory })
 
     await expect(bridge.createFlashTransfer({
