@@ -1,6 +1,6 @@
 {
   "name": "qqnt-bridge",
-  "version": "1.0.22",
+  "version": "1.0.23",
   "private": true,
   "description": "Local streaming bridge exposing the QQNT kernel to mtproto-relay",
   "type": "module",
