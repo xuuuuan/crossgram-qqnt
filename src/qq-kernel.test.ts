@@ -1456,6 +1456,39 @@ describe('QQKernelBridge', () => {
     expect(f.search.cancelSearchChatMsgs).toHaveBeenCalledWith(71, 2, 'search completed')
   })
 
+  it('accepts a cold native search callback that arrives after five seconds', async () => {
+    vi.useFakeTimers()
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    try {
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      const record = { ...f.message, msgId: 'slow-search', msgTime: '1700000030' }
+      f.search.searchChatMsgs.mockImplementation(() => {
+        setTimeout(() => f.emitSearch({
+          searchId: 72, hasMore: false,
+          resultItems: [{
+            msgId: record.msgId, msgSeq: record.msgSeq ?? '', msgTime: record.msgTime,
+            senderUid: record.senderUid, senderUin: record.senderUin,
+            senderNick: record.sendNickName, msgRecord: record,
+          }],
+        }), 6_000)
+        return 72
+      })
+
+      const search = bridge.searchMessages(bridge.getConversation('uid-1715311957'), {
+        query: 'gpt', limit: 20,
+      })
+      const result = expect(search).resolves.toMatchObject({
+        messages: [{ id: 'slow-search' }], nextCursor: undefined,
+      })
+      await vi.advanceTimersByTimeAsync(6_000)
+      await result
+    } finally {
+      bridge.detach()
+      vi.useRealTimers()
+    }
+  })
+
   it('continues native search until a requested media result is found', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
@@ -5800,6 +5833,32 @@ describe('QQBridgeServer', () => {
     vi.restoreAllMocks()
     await Promise.all(tempPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })))
   })
+
+  it('keeps the HTTP search request open for a cold native callback', async () => {
+    const f = fixture()
+    f.search.searchChatMsgs.mockImplementation(() => {
+      setTimeout(() => f.emitSearch({
+        searchId: 73, hasMore: false, resultItems: [{
+          msgId: 'http-slow-search', msgSeq: '8', msgTime: '1700000001', senderUid: 'self',
+          senderUin: '10000', senderNick: 'Self',
+          msgRecord: { ...f.message, msgId: 'http-slow-search' },
+        }],
+      }), 6_000)
+      return 73
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const base = `http://127.0.0.1:${server.address().port}/v1`
+
+    const response = await fetch(`${base}/conversations/uid-1715311957/search?q=gpt&limit=20`)
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toMatchObject({
+      messages: [{ id: 'http-slow-search' }],
+    })
+  }, 10_000)
 
   it('reuses QQ remote identities and streams only new files through the flash slice protocol', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'qqnt-flash-server-'))

@@ -85,6 +85,10 @@ const FAVORITE_STICKER_PACK_TITLE = 'QQ 收藏表情'
 const FAVORITE_STICKER_VERSION = 2
 const STICKER_METADATA_PROBE_BYTES = 256 * 1024
 const STICKER_METADATA_PROBE_TIMEOUT_MS = 5_000
+// Large local QQ indexes can take slightly longer than five seconds to emit
+// the first native search callback. Keep the request alive long enough for a
+// cold search without turning a genuinely missing callback into a long hang.
+const SEARCH_PAGE_TIMEOUT_MS = 15_000
 const REQUEST_PAGE_LIMIT = 100
 const GROUP_JOIN_CONTRACT_METHODS = [
   'getGroupInfoForJoinGroup', 'queryJoinGroupCanNoVerify', 'reqToJoinGroup', 'joinGroup',
@@ -1660,7 +1664,7 @@ export class QQKernelBridge {
     this.pendingSearchPages.set(searchId, pending)
     try {
       trigger?.()
-      return await withTimeout(pending.promise, 5_000, 'QQ search request timed out')
+      return await withTimeout(pending.promise, SEARCH_PAGE_TIMEOUT_MS, 'QQ search request timed out')
     } finally {
       if (this.pendingSearchPages.get(searchId) === pending) this.pendingSearchPages.delete(searchId)
     }
