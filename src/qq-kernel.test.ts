@@ -5807,6 +5807,7 @@ describe('QQBridgeServer', () => {
     const f = fixture()
     f.flashPrepareUpload
       .mockResolvedValueOnce({ fileId: 'remote-id', uploadTime: 1, expireLeftTime: 2 })
+      .mockResolvedValueOnce({ fileId: 'preflight-id', uploadTime: 2, expireLeftTime: 3 })
       .mockResolvedValueOnce({ rkey: 'slice-rkey', fileId: 'upload-id', uploadTime: 3, expireLeftTime: 4 })
     const uploaded: Array<{ name: string, body: Buffer, state: Buffer[] }> = []
     f.flashUploadFile.mockImplementation(async (file, _prepared, source, state) => {
@@ -5828,6 +5829,9 @@ describe('QQBridgeServer', () => {
           filePath: 'Z:\\QQ\\cache\\does-not-need-to-exist.bin',
           md5: '11'.repeat(16), sha: '22'.repeat(20),
         },
+      }, {
+        source: 'uploaded', name: 'preflight.bin', size: 6,
+        md5: '33'.repeat(16), sha1: '44'.repeat(20),
       }, { source: 'upload', name: 'alpha.txt', size: 5 }],
     }
 
@@ -5848,6 +5852,7 @@ describe('QQBridgeServer', () => {
       uploader: { uin: '10000', uid: 'self', nickname: 'Self' },
       files: [
         expect.objectContaining({ name: 'cached-qq.bin', size: 4, md5: '11'.repeat(16), sha1: '22'.repeat(20) }),
+        expect.objectContaining({ name: 'preflight.bin', size: 6, md5: '33'.repeat(16), sha1: '44'.repeat(20) }),
         expect.objectContaining({
           name: 'alpha.txt', size: 5,
           md5: createHash('md5').update('alpha').digest('hex'),
@@ -5857,12 +5862,12 @@ describe('QQBridgeServer', () => {
     }))
     expect(f.flashCommitFiles).toHaveBeenCalledTimes(1)
     expect(f.flashCompleteFileset).toHaveBeenCalledTimes(1)
-    expect(f.flashPrepareUpload).toHaveBeenCalledTimes(2)
+    expect(f.flashPrepareUpload).toHaveBeenCalledTimes(3)
     expect(uploaded).toEqual([{
       name: 'alpha.txt', body: Buffer.from('alpha'),
       state: [createHash('sha1').update('alpha').digest()],
     }])
-    expect(f.flashApplyUpload).toHaveBeenCalledTimes(2)
+    expect(f.flashApplyUpload).toHaveBeenCalledTimes(3)
     expect(f.flashSetReady).toHaveBeenCalledTimes(1)
     expect(f.flashCommitFiles.mock.invocationCallOrder[0]).toBeLessThan(f.flashCompleteFileset.mock.invocationCallOrder[0]!)
     expect(f.flashCompleteFileset.mock.invocationCallOrder[0]).toBeLessThan(f.flashPrepareUpload.mock.invocationCallOrder[0]!)
@@ -5883,7 +5888,7 @@ describe('QQBridgeServer', () => {
     const base = `http://127.0.0.1:${server.address().port}/v1`
 
     await expect(fetch(`${base}/status`).then((response) => response.json())).resolves.toMatchObject({
-      protocolVersion: 29, ready: true, flashTransferSupported: true,
+      protocolVersion: 30, ready: true, flashTransferSupported: true,
     })
     const manifest = {
       name: 'remote reuse', framing: 'length-prefixed-v1',
@@ -6374,7 +6379,7 @@ describe('QQBridgeServer', () => {
     const { port } = server.address()
     const base = `http://127.0.0.1:${port}/v1`
     await expect(fetch(`${base}/status`).then((response) => response.json())).resolves.toMatchObject({
-      protocolVersion: 29, ready: true, selfUin: '10000',
+      protocolVersion: 30, ready: true, selfUin: '10000',
     })
     const dialogs = await fetch(`${base}/dialogs`)
     expect(dialogs.status).toBe(200)

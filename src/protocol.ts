@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 29
+export const PROTOCOL_VERSION = 30
 
 /** Local Unix-socket PCM media protocol. Audio frames use a 1-byte type plus a 4-byte big-endian length. */
 export const PCM_MEDIA_PROTOCOL_VERSION = 1
@@ -491,6 +491,15 @@ export interface QQFlashTransferUploadFile {
   size: number
 }
 
+/** One file whose bytes were already streamed into QQ's file CDN. */
+export interface QQFlashTransferUploadedFile {
+  source: 'uploaded'
+  name: string
+  size: number
+  md5: string
+  sha1: string
+}
+
 /** One existing QQ media file reused through QQ's remote MD5/SHA-1 identity. */
 export interface QQFlashTransferQQMediaFile {
   source: 'qq-media'
@@ -499,14 +508,17 @@ export interface QQFlashTransferQQMediaFile {
   locator: QQMediaLocator
 }
 
-export type QQFlashTransferFile = QQFlashTransferUploadFile | QQFlashTransferQQMediaFile
+export type QQFlashTransferFile =
+  | QQFlashTransferUploadFile
+  | QQFlashTransferUploadedFile
+  | QQFlashTransferQQMediaFile
 
 /**
  * Hybrid reuse/upload contract for POST /v1/flash-transfers.
  *
  * Only `source: 'upload'` entries consume a length-prefixed body item. Existing
- * QQ media is passed by locator and reused through QQ's protocol-level fast
- * upload identity without reading local cache bytes or crossing the HTTP body.
+ * QQ media and preflight-uploaded bytes are reused through QQ's protocol-level
+ * fast-upload identity without reading local cache bytes or crossing the body.
  */
 export interface QQFlashTransferManifest {
   name?: string

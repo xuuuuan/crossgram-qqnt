@@ -1052,8 +1052,12 @@ function decodeFlashTransferManifest(value: string | string[] | undefined): QQFl
   for (const file of manifest.files) {
     if (!file || typeof file.name !== 'string' || !file.name || file.name.length > 255
       || !Number.isSafeInteger(file.size) || file.size < 0
-      || (file.source !== 'upload' && file.source !== 'qq-media')) {
+      || (file.source !== 'upload' && file.source !== 'uploaded' && file.source !== 'qq-media')) {
       throw new Error('invalid flash transfer file')
+    }
+    if (file.source === 'uploaded'
+      && (!/^[a-f0-9]{32}$/iu.test(file.md5) || !/^[a-f0-9]{40}$/iu.test(file.sha1))) {
+      throw new Error('invalid uploaded flash transfer hashes')
     }
     if (file.source === 'qq-media' && !validFlashTransferLocator(file.locator)) {
       throw new Error('invalid QQ flash transfer media locator')

@@ -525,7 +525,7 @@ export class QQKernelBridge {
     const reader = new FramedUploadReader(body)
     const staged: Array<{
       file: FlashTransferFileSpec
-      source: 'upload' | 'qq-media'
+      source: 'upload' | 'uploaded' | 'qq-media'
       path?: string
       sha1State?: Buffer[]
     }> = []
@@ -542,6 +542,17 @@ export class QQKernelBridge {
             file: {
               fileUuid: randomUUID(), fileIndex: index + 1, name, size: file.size,
               md5: hashes.md5, sha1: hashes.sha1, formatCode: flashTransferFormatCode(name),
+            },
+          })
+          continue
+        }
+        if (file.source === 'uploaded') {
+          staged.push({
+            source: 'uploaded',
+            file: {
+              fileUuid: randomUUID(), fileIndex: index + 1, name, size: file.size,
+              md5: file.md5.toLowerCase(), sha1: file.sha1.toLowerCase(),
+              formatCode: flashTransferFormatCode(name),
             },
           })
           continue
@@ -586,6 +597,11 @@ export class QQKernelBridge {
         if (item.source === 'qq-media' && prepared.rkey) {
           throw new QQFlashTransferError(
             `QQ remote media cannot be reused without downloading it: ${item.file.name}`,
+          )
+        }
+        if (item.source === 'uploaded' && prepared.rkey) {
+          throw new QQFlashTransferError(
+            `QQ preflight-uploaded media was not found by Flash Transfer: ${item.file.name}`,
           )
         }
         if (prepared.rkey) {
