@@ -390,7 +390,14 @@ export class QQKernelBridge {
   private readonly pendingMinimumStatuses = new Map<string, number>()
   private readonly messageOrigins = new Map<string, string>()
   private readonly resolvedReplyTargets = new Map<string, string>()
-  private readonly pendingMergedForwards: Array<{ conversationId: string, startedAt: number }> = []
+  private readonly pendingForwards: Array<{
+    conversationId: string
+    startedAt: number
+    merged: boolean
+    expectedCount: number
+    messageIds: Set<string>
+    originRequestId?: string
+  }> = []
   private readonly pendingUnassigned: Array<{
     conversationId: string
     pending: ReturnType<typeof deferred<MsgRecord>>
@@ -848,6 +855,7 @@ export class QQKernelBridge {
     this.pendingMessages.clear()
     this.pendingAcceptances.clear()
     this.pendingMinimumStatuses.clear()
+    this.pendingForwards.splice(0)
     this.pendingUnassigned.splice(0)
     this.pendingSearchPages.clear()
     this.earlySearchPages.clear()
@@ -3043,6 +3051,7 @@ export class QQKernelBridge {
     ids: string[],
     destination: QQConversation,
     merged = false,
+    originRequestId?: string,
   ): Promise<QQMessage[]> {
     if (!ids.length) return []
     const service = this.requireMsgService()
@@ -3050,8 +3059,15 @@ export class QQKernelBridge {
     const startedAt = Math.floor(Date.now() / 1000)
     const api = merged ? 'multiForwardMsg' : 'forwardMsg'
     log('info', `native API start name=${api} from=${source.id} to=${destination.id} messages=${ids.join(',')}`)
-    const pendingMerged = merged ? { conversationId: destination.id, startedAt } : undefined
-    if (pendingMerged) this.pendingMergedForwards.push(pendingMerged)
+    const pendingForward = {
+      conversationId: destination.id,
+      startedAt,
+      merged,
+      expectedCount: merged ? 1 : ids.length,
+      messageIds: new Set<string>(),
+      originRequestId,
+    }
+    this.pendingForwards.push(pendingForward)
     try {
       let result: { result: number, errMsg: string }
       if (merged) {
@@ -3082,13 +3098,12 @@ export class QQKernelBridge {
       const messages = await this.waitForForwardedMessages(
         destination, before, merged ? 1 : ids.length, startedAt, merged,
       )
+      for (const message of messages) this.rememberMessageOrigin(message.id, originRequestId)
       log('info', `native API complete name=${api} from=${source.id} to=${destination.id} result=${result.result} messages=${messages.map((item) => item.id).join(',')} err=${JSON.stringify(result.errMsg)}`)
-      return messages
+      return messages.map((message) => ({ ...message, originRequestId: originRequestId ?? message.originRequestId }))
     } finally {
-      if (pendingMerged) {
-        const index = this.pendingMergedForwards.indexOf(pendingMerged)
-        if (index >= 0) this.pendingMergedForwards.splice(index, 1)
-      }
+      const index = this.pendingForwards.indexOf(pendingForward)
+      if (index >= 0) this.pendingForwards.splice(index, 1)
     }
   }
 
@@ -5052,8 +5067,21 @@ export class QQKernelBridge {
       }
       let message = await this.mapMessagePrepared(record)
       const conversation = this.conversationFromRecord(record, message)
-      const pendingMerged = outgoing && this.pendingMergedForwards.some((item) =>
-        item.conversationId === conversation.id
+      const pendingForward = outgoing
+        ? this.pendingForwards.find((item) =>
+            item.conversationId === conversation.id
+            && Number(record.msgTime) >= item.startedAt - 1
+            && (item.messageIds.has(record.msgId)
+              || (source === 'onAddSendMsg' && item.messageIds.size < item.expectedCount)))
+        : undefined
+      if (pendingForward) {
+        pendingForward.messageIds.add(record.msgId)
+        this.rememberMessageOrigin(record.msgId, pendingForward.originRequestId)
+        message = await this.mapMessagePrepared(record)
+      }
+      const pendingMerged = pendingForward?.merged || outgoing && this.pendingForwards.some((item) =>
+        item.merged
+        && item.conversationId === conversation.id
         && Number(record.msgTime) >= item.startedAt - 1)
       if (pendingMerged && !isMultiForwardRecord(record)) {
         log('info', `native merged-forward placeholder deferred source=${source} id=${record.msgId} peer=${record.peerUid} status=${record.sendStatus}`)

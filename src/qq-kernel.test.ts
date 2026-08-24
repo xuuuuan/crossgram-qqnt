@@ -2558,12 +2558,24 @@ describe('QQKernelBridge', () => {
       .mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [f.message] })
       .mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [optimisticForward, f.message] })
       .mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [forwarded, f.message] })
-    await expect(bridge.forwardMessages(conversation, ['m1'], conversation)).resolves.toMatchObject([
+    f.msg.forwardMsg.mockImplementationOnce(async () => {
+      await f.emitSent(optimisticForward)
+      return { result: 0, errMsg: '', detailErr: new Map() }
+    })
+    const singleEvents = bridge.subscribe()[Symbol.asyncIterator]()
+    await expect(bridge.forwardMessages(
+      conversation, ['m1'], conversation, false, 'relay-forward-1',
+    )).resolves.toMatchObject([
       {
         id: 'forwarded-1', msgSeq: '463084',
+        originRequestId: 'relay-forward-1',
         parts: [{ type: 'text', text: 'forwarded' }],
       },
     ])
+    await expect(singleEvents.next()).resolves.toMatchObject({ value: {
+      type: 'message',
+      message: { id: 'forwarded-1', originRequestId: 'relay-forward-1', outgoing: true },
+    } })
     expect(f.msg.forwardMsg).toHaveBeenCalledWith(['m1'], expect.anything(), [expect.anything()], expect.any(Map))
 
     const merged = {
@@ -5853,6 +5865,46 @@ describe('QQBridgeServer', () => {
     await Promise.all(tempPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })))
   })
 
+  it('preserves a forward origin through HTTP and the native observer callback', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    await bridge.getDialogs()
+    const optimistic = {
+      ...f.message, msgId: 'http-forwarded', msgTime: String(Math.floor(Date.now() / 1000)),
+      msgSeq: '463083', sendStatus: 1,
+      elements: [{ elementType: 1, elementId: 'forwarded-text', textElement: { content: 'forwarded' } }],
+    }
+    const confirmed = { ...optimistic, msgSeq: '463084', sendStatus: 2 }
+    f.msg.getLatestDbMsgs
+      .mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [f.message] })
+      .mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [optimistic, f.message] })
+      .mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [confirmed, f.message] })
+    f.msg.forwardMsg.mockImplementationOnce(async () => {
+      await f.emitSent(optimistic)
+      return { result: 0, errMsg: '', detailErr: new Map() }
+    })
+    const event = bridge.subscribe()[Symbol.asyncIterator]().next()
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/v1/messages/forward`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        from: 'uid-1715311957', to: 'uid-1715311957', messageIds: ['m1'], merged: false,
+        originRequestId: 'http-forward-origin',
+      }),
+    })
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toMatchObject({
+      messages: [{ id: 'http-forwarded', originRequestId: 'http-forward-origin' }],
+    })
+    await expect(event).resolves.toMatchObject({ value: {
+      type: 'message', message: { id: 'http-forwarded', originRequestId: 'http-forward-origin' },
+    } })
+  })
+
   it('keeps the HTTP search request open for a cold native callback', async () => {
     const f = fixture()
     f.search.searchChatMsgs.mockImplementation(() => {
@@ -5966,7 +6018,7 @@ describe('QQBridgeServer', () => {
     const base = `http://127.0.0.1:${server.address().port}/v1`
 
     await expect(fetch(`${base}/status`).then((response) => response.json())).resolves.toMatchObject({
-      protocolVersion: 30, ready: true, flashTransferSupported: true,
+      protocolVersion: 31, ready: true, flashTransferSupported: true,
     })
     const manifest = {
       name: 'remote reuse', framing: 'length-prefixed-v1',
@@ -6457,7 +6509,7 @@ describe('QQBridgeServer', () => {
     const { port } = server.address()
     const base = `http://127.0.0.1:${port}/v1`
     await expect(fetch(`${base}/status`).then((response) => response.json())).resolves.toMatchObject({
-      protocolVersion: 30, ready: true, selfUin: '10000',
+      protocolVersion: 31, ready: true, selfUin: '10000',
     })
     const dialogs = await fetch(`${base}/dialogs`)
     expect(dialogs.status).toBe(200)

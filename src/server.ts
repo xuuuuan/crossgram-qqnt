@@ -764,12 +764,19 @@ export class QQBridgeServer {
       return
     }
     if (request.method === 'POST' && path === '/v1/messages/forward') {
-      const body = await readJson<{ from: string, to: string, messageIds: string[], merged?: boolean }>(request)
+      const body = await readJson<{
+        from: string
+        to: string
+        messageIds: string[]
+        merged?: boolean
+        originRequestId?: string
+      }>(request)
       const messages = await this.bridge.forwardMessages(
         this.bridge.getConversation(body.from),
         body.messageIds,
         this.bridge.getConversation(body.to),
         body.merged,
+        body.originRequestId,
       )
       log('info', `HTTP API forward messages id=${requestId} from=${body.from} to=${body.to} merged=${Boolean(body.merged)} messages=${body.messageIds.join(',')} outputs=${messages.map((item) => item.id).join(',')}`)
       json(response, 200, { messages })
