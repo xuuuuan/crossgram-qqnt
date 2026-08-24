@@ -5999,8 +5999,15 @@ export class QQKernelBridge {
       const filePath = join(facePath, 'static', `s${item.QSid}.png`)
       if (!existsSync(filePath)) continue
       const animatedPath = join(facePath, 'apng', `s${item.QSid}.png`)
+      // QQ ships some plain PNG fallbacks inside sysface_res/apng. Treating
+      // directory membership as proof of animation makes desktop clients
+      // route those files through FFmpeg, where the APNG-only demuxer option
+      // rejects them and leaves empty reaction cells. Trust the PNG acTL
+      // chunk instead and fall back to the authoritative static asset.
       const animated = existsSync(animatedPath)
-      const info = await stat(animated ? animatedPath : filePath)
+        && sniffStickerFileMimeType(animatedPath, false, true) === 'image/apng'
+      const resourcePath = animated ? animatedPath : filePath
+      const info = await stat(resourcePath)
       const dimensions = pngDimensions(await readFile(filePath))
       const key = reactionKey('1', item.QSid)
       definitions.push({
@@ -6027,7 +6034,7 @@ export class QQKernelBridge {
         },
       })
       assets.set(key, {
-        path: animated ? animatedPath : filePath,
+        path: resourcePath,
         mimeType: animated ? 'image/apng' : 'image/png',
       })
     }

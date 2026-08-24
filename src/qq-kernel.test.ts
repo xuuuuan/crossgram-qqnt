@@ -5112,7 +5112,7 @@ describe('QQKernelBridge', () => {
     })
   })
 
-  it('loads animated sysfaces and non-Telegram QQ emoji as custom reaction resources', async () => {
+  it('sniffs sysface animation bytes and falls back from plain PNG files in the APNG directory', async () => {
     const root = await mkdtemp(join(tmpdir(), 'qqnt-reactions-'))
     tempPaths.push(root)
     const resourceRoot = join(root, 'global', 'nt_data', 'Emoji', 'emoji-resource')
@@ -5128,13 +5128,19 @@ describe('QQKernelBridge', () => {
       'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M/wHwAF/gL+X1n0WQAAAABJRU5ErkJggg==',
       'base64',
     )
+    const apng = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAACXBIWXMAAAABAAAAAQBPJcTWAAAACGFjVEwAAAACAAAAAPONk3AAAAAaZmNUTAAAAAAAAAAQAAAAEAAAAAAAAAAAAAEABQAAaBqIGAAAACVJREFUeJxj/MvA0MBAAWChRPOoARDAwkAhYBk1gGE0DBgoDwMAiy0Bu3X5t4YAAAAaZmNUTAAAAAEAAAAQAAAAEAAAAAAAAAAAAAEABQAA82lizAAAAClmZEFUAAAAAnicY2Rg+OfAQAFgoUTzqAEQwMJAIWAZNYBhNAwYKA8DAIoxAXwWfDc6AAAAAElFTkSuQmCC',
+      'base64',
+    )
     await Promise.all([
       writeFile(join(resourceRoot, 'face_config.json'), JSON.stringify({
         emoji: [{ QSid: '😊', QCid: '128522', AQLid: '0', QDes: '/嘿嘿' }],
-        sysface: [{ QSid: '14', QDes: '/微笑' }],
+        sysface: [{ QSid: '14', QDes: '/微笑' }, { QSid: '66', QDes: '/爱心' }],
       })),
       writeFile(join(staticPath, 's14.png'), png),
+      writeFile(join(staticPath, 's66.png'), png),
       writeFile(join(animatedPath, 's14.png'), png),
+      writeFile(join(animatedPath, 's66.png'), apng),
       writeFile(join(emojiPath, 'emoji_000.png'), png),
     ])
     const f = fixture()
@@ -5142,7 +5148,7 @@ describe('QQKernelBridge', () => {
     bridge.attach(f.kernel, f.session, {
       selfUin: '10000', selfUid: 'self', userPath: join(root, 'account'),
     })
-    await vi.waitFor(async () => expect((await bridge.getReactionCatalog()).available).toHaveLength(2))
+    await vi.waitFor(async () => expect((await bridge.getReactionCatalog()).available).toHaveLength(3))
 
     const catalog = await bridge.getReactionCatalog()
     expect(catalog.available).toEqual(expect.arrayContaining([
@@ -5158,16 +5164,29 @@ describe('QQKernelBridge', () => {
         presentation: expect.objectContaining({
           type: 'custom', alt: '🙂',
           resource: expect.objectContaining({
-            format: 'video', mimeType: 'video/webm', size: png.length,
+            format: 'static', mimeType: 'image/png', size: png.length,
             locator: { reactionKey: '1:14' },
+          }),
+        }),
+      }),
+      expect.objectContaining({
+        key: '1:66',
+        presentation: expect.objectContaining({
+          type: 'custom', alt: '🙂',
+          resource: expect.objectContaining({
+            format: 'video', mimeType: 'video/webm', size: apng.length,
+            locator: { reactionKey: '1:66' },
           }),
         }),
       }),
     ]))
     expect(JSON.stringify(catalog)).not.toContain(root)
     const resource = await bridge.openReactionResource('1:14', { offset: 1, limit: 3 })
-    expect(resource).toMatchObject({ mimeType: 'image/apng', size: png.length, offset: 1, length: 3 })
+    expect(resource).toMatchObject({ mimeType: 'image/png', size: png.length, offset: 1, length: 3 })
     expect(await readStream(resource!.stream)).toEqual(png.subarray(1, 4))
+    const animatedResource = await bridge.openReactionResource('1:66')
+    expect(animatedResource).toMatchObject({ mimeType: 'image/apng', size: apng.length })
+    expect(await readStream(animatedResource!.stream)).toEqual(apng)
     await expect(bridge.openReactionResource('unknown')).resolves.toBeUndefined()
   })
 
