@@ -46,7 +46,7 @@ curl -fsSL https://raw.githubusercontent.com/xuuuuan/crossgram-qqnt/master/deplo
 
 更多部署细节见 [`deploy/README.md`](deploy/README.md)。
 
-### Nix：本地源码构建与两个 QQ 实例
+### Nix 一键启动
 
 仓库根目录的 `flake.nix` 使用锁定的公开 Nixpkgs，从当前源码构建注入资源，并沿用
 生产 Flake 的 Bubblewrap、Runit、D-Bus、Xvfb、VNC 和 PulseAudio runtime。
@@ -64,9 +64,6 @@ nix build .#qqnt-bridge-assets
 nix run .#qqnt -- /srv/qqnt/primary 99 5900 6080 /run/qqnt-media/primary/qqnt-media.sock
 nix run .#qqnt -- /srv/qqnt/secondary 100 5901 6081
 ```
-
-`data/`、`backups/`、`result` 与 `result-*` 均被 Git 忽略。回滚时停止对应实例并保留
-data 目录，然后以先前的 Git revision 运行同一 Flake。
 
 ### Windows
 
