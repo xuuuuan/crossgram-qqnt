@@ -48,36 +48,25 @@ curl -fsSL https://raw.githubusercontent.com/xuuuuan/crossgram-qqnt/master/deplo
 
 ### Nix：本地源码构建与两个 QQ 实例
 
-仓库根目录的 `flake.nix` 使用锁定的公开 Nixpkgs、Node 24 和 pnpm 10，从当前
-源码及 `pnpm-lock.yaml` 构建注入资源；Rust N-API addon 由 `Cargo.lock` 的固定
-vendor 依赖离线编译。不会下载或提交预构建的 `app.asar` 或 `.node`。
+仓库根目录的 `flake.nix` 使用锁定的公开 Nixpkgs，从当前源码构建注入资源，并沿用
+生产 Flake 的 Bubblewrap、Runit、D-Bus、Xvfb、VNC 和 PulseAudio runtime。
+
+```text
+qqnt [DATA_DIR] [DISPLAY] [VNC_PORT] [NOVNC_PORT] [MEDIA_SOCKET] [BRIDGE_ENV]
+```
+
+参数均为 positional；默认值依次为 `$PWD/data`、`99`、`5900`、`6080`、不启用
+media 和 data 目录内的 `qqnt-bridge.env`。`DATA_DIR` 会原样 bind 到 sandbox 的
+`/root`，因此已有 QQ 数据目录无需复制或转换。
 
 ```sh
 nix build .#qqnt-bridge-assets
-nix run .#qqnt -- --data-dir /srv/qqnt-primary --display :99 --vnc-port 5900 --novnc-port 6080
-nix run .#qqnt -- --data-dir /srv/qqnt-secondary --display :100 --vnc-port 5901 --novnc-port 6081
+nix run .#qqnt -- /srv/qqnt/primary 99 5900 6080 /run/qqnt-media/primary/qqnt-media.sock
+nix run .#qqnt -- /srv/qqnt/secondary 100 5901 6081
 ```
 
-通用 launcher 支持 `--data-dir`、`--display`、`--vnc-port`、`--novnc-port` 和
-`--help`。Nix store 中的 launcher 无法可靠推断 checkout 路径，因此默认 data
-目录为 `/root/qqnt-bridge/data/default`；在其他 checkout 或用户目录中必须显式传入
-`--data-dir`。运行时由 Bubblewrap、Runit、Xvfb、x11vnc、noVNC、D-Bus 和中文字体
-组成，Nixpkgs 的 QQ package 以只读 overlay 使用上述源码构建的 assets。
-
-要交给 PM2 管理时，由 PM2 在外层指定实例名称，helper 本身只运行离线的
-`.#qqnt`（参数以独立 argv 传递）：
-
-```sh
-repo=/root/qqnt-bridge
-pm2 start "$repo/nix/run-qqnt-pm2" --name qqnt-primary --interpreter /bin/sh -- \
-  /srv/qqnt/primary :99 5900 6080
-pm2 start "$repo/nix/run-qqnt-pm2" --name qqnt-secondary --interpreter /bin/sh -- \
-  /srv/qqnt/secondary :100 5901 6081
-```
-
-`data/`、`backups/`、`result` 与 `result-*` 均被 Git 忽略。回滚时停止对应 PM2
-process（或 `nix run` 实例），保留 data 目录，然后以先前的 Git revision 运行同一
-flake；不要把运行时 data、Nix build result 或二进制 assets 加入版本控制。
+`data/`、`backups/`、`result` 与 `result-*` 均被 Git 忽略。回滚时停止对应实例并保留
+data 目录，然后以先前的 Git revision 运行同一 Flake。
 
 ### Windows
 

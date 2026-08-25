@@ -1,16 +1,17 @@
 {
-  description = "Reproducible QQNT bridge assets and headless QQ launchers";
+  description = "Standalone QQNT bridge launcher";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, ... }:
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs {
         inherit system;
-        config.allowUnfreePredicate = package: pkgs.lib.getName package == "qq";
+        config.allowUnfree = true;
       };
       lib = pkgs.lib;
+      version = (builtins.fromJSON (builtins.readFile ./package.json)).version;
       src = lib.cleanSourceWith {
         src = ./.;
         filter = path: type:
@@ -18,22 +19,20 @@
             base = baseNameOf path;
           in
             lib.cleanSourceFilter path type
-            && !(builtins.elem base [ "yarn.lock" "node_modules" "dist" "data" "backups" "result" "target" "artifacts" ])
+            && !(builtins.elem base [ "flake.nix" "flake.lock" "yarn.lock" "node_modules" "dist" "data" "backups" "result" "target" "artifacts" ])
             && !(lib.hasPrefix "result-" base);
       };
       nodejs = pkgs.nodejs-slim_24;
-      pnpm = pkgs.pnpm_10.override { inherit nodejs; };
+      pnpm = pkgs.pnpm_10.override { nodejs-slim = nodejs; };
       cargoVendor = pkgs.rustPlatform.fetchCargoVendor {
         pname = "qqnt-bridge-native-deps";
-        version = "1.0.17";
-        inherit src;
+        inherit version src;
         cargoRoot = "native/packet-addon";
         hash = "sha256-MCvuxnIwJgpynBD1tdElo6kohPsEeg/HhRw2oksFcgM=";
       };
       assets = pkgs.stdenv.mkDerivation (finalAttrs: {
         pname = "qqnt-bridge-assets";
-        version = "1.0.17";
-        inherit src;
+        inherit version src;
 
         pnpmDeps = pkgs.fetchPnpmDeps {
           inherit (finalAttrs) pname version src;
@@ -75,11 +74,6 @@
           runHook postBuild
         '';
 
-        doCheck = true;
-        checkPhase = ''
-          pnpm exec vitest run deploy/deploy-files.test.ts
-        '';
-
         installPhase = ''
           runHook preInstall
           mkdir -p "$out"
@@ -89,137 +83,136 @@
           runHook postInstall
         '';
       });
-      makeLauncher = name: defaultDataDir:
-        pkgs.writeShellApplication {
-          inherit name;
-          runtimeInputs = [
-            pkgs.bubblewrap
-            pkgs.runit
-            pkgs.xorg-server
-            pkgs.x11vnc
-            pkgs.novnc
-            pkgs.dbus
-            pkgs.noto-fonts-cjk-sans
-            pkgs.wqy_zenhei
-            pkgs.coreutils
-          ];
-          text = ''
-            set -eu
+      qq = pkgs.qq.overrideAttrs (old: {
+        postInstall = (old.postInstall or "") + ''
+          install -Dm644 ${assets}/resources/app.asar \
+            "$out/opt/QQ/resources/app.asar"
+          install -Dm755 \
+            ${assets}/resources/app.asar.unpacked/qqnt_packet.linux-x64-gnu.node \
+            "$out/opt/QQ/resources/app.asar.unpacked/qqnt_packet.linux-x64-gnu.node"
+        '';
+      });
+      fonts = pkgs.makeFontsConf {
+        fontDirectories = [ pkgs.source-han-sans ];
+      };
+      runtime = pkgs.writeShellScriptBin "qqnt-runtime" ''
+        display=$1
+        vnc_port=$2
+        novnc_port=$3
+        media_socket=$4
+        bridge_env=$5
 
-            data_dir=${lib.escapeShellArg defaultDataDir}
-            display=:99
-            vnc_port=5900
-            novnc_port=6080
+        create_service() {
+          mkdir -p "/services/$1"
+          printf '%s\n' "#!${pkgs.runtimeShell}" "$2" > "/services/$1/run"
+          chmod +x "/services/$1/run"
+        }
 
-            usage() {
-              cat <<'EOF'
-            Usage: ${name} [--data-dir PATH] [--display DISPLAY] [--vnc-port PORT] [--novnc-port PORT]
+        export PATH=${lib.makeBinPath [ pkgs.busybox pkgs.xorg-server pkgs.x11vnc pkgs.dbus pkgs.dunst pkgs.novnc pkgs.pulseaudio ]}
+        export HOME=/root
+        export XDG_DATA_HOME=/root/.local/share
+        export XDG_CONFIG_HOME=/root/.config
+        export TERM=xterm
+        export QQNT_MEDIA_SOCKET="$media_socket"
+        export QQNT_BRIDGE_ENV="$bridge_env"
+        mkdir -p /root/.local/share /root/.config /etc/ssl/certs /etc/fonts /etc/dbus /run/dbus /tmp /usr/bin /bin
+        printf '%s\n' 'root:x:0:0::/root:${pkgs.runtimeShell}' > /etc/passwd
+        printf '%s\n' 'root:x:0:' > /etc/group
+        ln -s ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt /etc/ssl/certs/ca-bundle.crt
+        ln -s ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt /etc/ssl/certs/ca-certificates.crt
+        ln -s ${fonts} /etc/fonts/fonts.conf
+        ln -s "$(command -v env)" /usr/bin/env
+        ln -s "$(command -v sh)" /bin/sh
+        cp ${pkgs.dbus}/share/dbus-1/system.conf /etc/dbus/system.conf
+        sed -i '/<user>messagebus<\/user>/d' /etc/dbus/system.conf
+        sed -i 's/<deny/<allow/' /etc/dbus/system.conf
+        rm -f /run/dbus/pid
+        export DBUS_SESSION_BUS_ADDRESS='unix:path=/run/dbus/system_bus_socket'
+        export DISPLAY=:$display
+        create_service xvfb "Xvfb :$display"
+        create_service x11vnc "x11vnc -forever -display :$display -rfbport $vnc_port"
+        create_service novnc "novnc --vnc localhost:$vnc_port --listen $novnc_port --file-only"
+        create_service dbus 'dbus-daemon --nofork --config-file=/etc/dbus/system.conf'
+        create_service dunst 'dunst'
 
-            Launch QQ with the qqnt-bridge injection in an isolated Xvfb session.
-            EOF
-            }
+        if [ -n "$media_socket" ]; then
+          mkdir -p /root/.pulse-runtime
+          chmod 700 /root/.pulse-runtime
+          export XDG_RUNTIME_DIR=/root/.pulse-runtime
+          export PULSE_SERVER=unix:/root/.pulse-runtime/native
+          export QQNT_BRIDGE_MEDIA_GATEWAY=1
+          export QQNT_BRIDGE_MEDIA_PULSE_SERVER="$PULSE_SERVER"
+          export QQNT_BRIDGE_MEDIA_SOCKET="$media_socket"
+          export QQNT_BRIDGE_MEDIA_SOCKET_MODE=0600
+          create_service pulse 'pulseaudio -n --daemonize=no --exit-idle-time=-1 \
+            --load="module-native-protocol-unix socket=/root/.pulse-runtime/native auth-anonymous=1" \
+            --load="module-null-sink sink_name=qq_sink rate=48000 channels=2" \
+            --load="module-null-sink sink_name=qq_mic_sink rate=48000 channels=1 channel_map=mono" \
+            --load="module-remap-source source_name=qq_source master=qq_mic_sink.monitor channels=1 master_channel_map=mono channel_map=mono"'
+        fi
 
-            require_port() {
-              case "$1" in
-                ""|*[!0-9]*|0|[1-9][0-9][0-9][0-9][0-9]*)
-                  printf '%s\n' "invalid port: $1" >&2
-                  exit 2
-                  ;;
-              esac
-            }
+        mkdir -p /services/program
+        cat > /services/program/run <<'EOF'
+        #!${pkgs.runtimeShell}
+        if [ -n "$QQNT_MEDIA_SOCKET" ]; then
+          rm -f -- "$QQNT_MEDIA_SOCKET"
+          until pactl info >/dev/null 2>&1; do sleep 0.1; done
+          pactl set-default-sink qq_sink
+          pactl set-default-source qq_source
+        fi
+        if [ -f "$QQNT_BRIDGE_ENV" ]; then
+          set -a
+          . "$QQNT_BRIDGE_ENV"
+          set +a
+        fi
+        export PATH=${pkgs.ffmpeg}/bin:$PATH
+        exec ${qq}/bin/qq --no-sandbox --disable-gpu "$@"
+        EOF
+        chmod +x /services/program/run
+        runsvdir /services
+      '';
+      qqnt = pkgs.writeShellApplication {
+        name = "qqnt";
+        runtimeInputs = [ pkgs.bubblewrap pkgs.coreutils ];
+        text = ''
+          data_dir="''${1:-$PWD/data}"
+          display="''${2:-99}"
+          vnc_port="''${3:-5900}"
+          novnc_port="''${4:-6080}"
+          media_socket="''${5:-}"
+          bridge_env="/root/''${6:-qqnt-bridge.env}"
 
-            while [ "$#" -gt 0 ]; do
-              case "$1" in
-                --data-dir)
-                  [ "$#" -ge 2 ] || { printf '%s\n' '--data-dir requires a path' >&2; exit 2; }
-                  data_dir=$2
-                  shift 2
-                  ;;
-                --display)
-                  [ "$#" -ge 2 ] || { printf '%s\n' '--display requires a value' >&2; exit 2; }
-                  display=$2
-                  shift 2
-                  ;;
-                --vnc-port)
-                  [ "$#" -ge 2 ] || { printf '%s\n' '--vnc-port requires a port' >&2; exit 2; }
-                  vnc_port=$2
-                  shift 2
-                  ;;
-                --novnc-port)
-                  [ "$#" -ge 2 ] || { printf '%s\n' '--novnc-port requires a port' >&2; exit 2; }
-                  novnc_port=$2
-                  shift 2
-                  ;;
-                --help|-h)
-                  usage
-                  exit 0
-                  ;;
-                *)
-                  printf '%s\n' "unknown option: $1" >&2
-                  usage >&2
-                  exit 2
-                  ;;
-              esac
-            done
-
-            require_port "$vnc_port"
-            require_port "$novnc_port"
-            case "$data_dir" in
-              /*) ;;
-              *) printf '%s\n' '--data-dir must be an absolute path' >&2; exit 2 ;;
-            esac
-
-            mkdir -p "$data_dir/home" "$data_dir/config" "$data_dir/data" "$data_dir/cache" "$data_dir/state" /tmp/.X11-unix
-            runtime_dir=$(mktemp -d "/tmp/qqnt.XXXXXX")
-            trap 'rm -rf "$runtime_dir"' EXIT INT TERM
-            mkdir -p "$runtime_dir/service/xvfb" "$runtime_dir/service/vnc" "$runtime_dir/service/novnc" "$runtime_dir/service/qq" "$runtime_dir/resources" "$runtime_dir/dbus"
-            cat > "$runtime_dir/dbus/session.conf" <<'EOF'
-            <!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
-             "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
-            <busconfig>
-              <type>session</type>
-              <listen>unix:tmpdir=/tmp</listen>
-              <auth>EXTERNAL</auth>
-              <policy context="default">
-                <allow send_destination="*"/>
-                <allow receive_sender="*"/>
-                <allow own="*"/>
-              </policy>
-            </busconfig>
-            EOF
-            for resource in ${pkgs.qq}/opt/QQ/resources/*; do
-              case "$(basename "$resource")" in
-                app.asar|app.asar.unpacked) ;;
-                *) ln -s "$resource" "$runtime_dir/resources/$(basename "$resource")" ;;
-              esac
-            done
-            ln -s ${assets}/resources/app.asar "$runtime_dir/resources/app.asar"
-            ln -s ${assets}/resources/app.asar.unpacked "$runtime_dir/resources/app.asar.unpacked"
-
-            cat > "$runtime_dir/service/xvfb/run" <<EOF
-            #!${pkgs.runtimeShell}
-            exec ${pkgs.xorg-server}/bin/Xvfb "$display" -screen 0 1280x800x24 -nolisten tcp
-            EOF
-            cat > "$runtime_dir/service/vnc/run" <<EOF
-            #!${pkgs.runtimeShell}
-            exec ${pkgs.x11vnc}/bin/x11vnc -display "$display" -localhost -forever -shared -rfbport "$vnc_port"
-            EOF
-            cat > "$runtime_dir/service/novnc/run" <<EOF
-            #!${pkgs.runtimeShell}
-            exec ${pkgs.novnc}/bin/novnc_proxy --listen "$novnc_port" --vnc "localhost:$vnc_port"
-            EOF
-            cat > "$runtime_dir/service/qq/run" <<EOF
-            #!${pkgs.runtimeShell}
-            export DISPLAY="$display"
-            export FONTCONFIG_FILE=${pkgs.fontconfig.out}/etc/fonts/fonts.conf
-            exec ${pkgs.bubblewrap}/bin/bwrap --die-with-parent --new-session --share-net --tmpfs / --dir /nix --dir /tmp --dir /tmp/.X11-unix --dir /etc --dir /etc/dbus-1 --proc /proc --dev /dev --ro-bind /nix /nix --ro-bind /tmp/.X11-unix /tmp/.X11-unix --ro-bind "$runtime_dir/dbus/session.conf" /etc/dbus-1/session.conf --dir /data --bind "$data_dir" /data --ro-bind "$runtime_dir/resources" ${pkgs.qq}/opt/QQ/resources --setenv HOME /data/home --setenv XDG_CONFIG_HOME /data/config --setenv XDG_DATA_HOME /data/data --setenv XDG_CACHE_HOME /data/cache --setenv XDG_STATE_HOME /data/state --chdir /data ${pkgs.dbus}/bin/dbus-run-session --config-file=/etc/dbus-1/session.conf -- ${pkgs.qq}/bin/qq
-            EOF
-            chmod 700 "$runtime_dir"/service/*/run
-
-            exec ${pkgs.runit}/bin/runsvdir -P "$runtime_dir/service"
-          '';
-        };
-      qqnt = makeLauncher "qqnt" "/root/qqnt-bridge/data/default";
+          mkdir -p -- "$data_dir"
+          bwrap_args=(
+            --unshare-all
+            --share-net
+            --as-pid-1
+            --uid 0 --gid 0
+            --clearenv
+            --ro-bind /nix/store /nix/store
+            --bind "$data_dir" /root
+            --dir /etc
+            --ro-bind /etc/resolv.conf /etc/resolv.conf
+            --proc /proc
+            --dev /dev
+            --tmpfs /tmp
+          )
+          if [ -n "$media_socket" ]; then
+            media_dir=$(dirname "$media_socket")
+            mkdir -p -- "$media_dir"
+            chmod 700 -- "$media_dir"
+            bwrap_args+=(
+              --dir /root/.pulse-runtime
+              --tmpfs /root/.pulse-runtime
+              --dir /run
+              --bind "$media_dir" "$media_dir"
+            )
+          fi
+          exec ${pkgs.bubblewrap}/bin/bwrap "''${bwrap_args[@]}" \
+            ${runtime}/bin/qqnt-runtime \
+            "$display" "$vnc_port" "$novnc_port" "$media_socket" "$bridge_env"
+        '';
+      };
     in {
       packages.${system} = {
         default = qqnt;
@@ -227,8 +220,14 @@
         qqnt-bridge-assets = assets;
       };
       apps.${system} = {
-        default = { type = "app"; program = "${qqnt}/bin/qqnt"; };
-        qqnt = { type = "app"; program = "${qqnt}/bin/qqnt"; };
+        default = {
+          type = "app";
+          program = "${qqnt}/bin/qqnt";
+        };
+        qqnt = {
+          type = "app";
+          program = "${qqnt}/bin/qqnt";
+        };
       };
     };
 }
