@@ -574,32 +574,6 @@ export interface MemberPage {
   nextCursor?: string
 }
 
-export interface QQGroupJoinContractProbeMethod {
-  name: 'getGroupInfoForJoinGroup' | 'queryJoinGroupCanNoVerify' | 'reqToJoinGroup' | 'joinGroup'
-  present: boolean
-  argumentCount?: number
-}
-
-/** Fixed, allowlisted metadata from an opt-in, non-invoking QQNT contract probe. */
-export interface QQGroupJoinContractProbe {
-  enabled: boolean
-  /** Whether every allowlisted descriptor and arity was observed safely; not a contract validation. */
-  surfaceComplete: boolean
-  /** This presence-only observation never validates a native call contract. */
-  contractVerified: false
-  /** This probe never enables group-join writes. */
-  writeEnabled: false
-  methods: QQGroupJoinContractProbeMethod[]
-  /** Digest and byte size of the inert wrapper file; its path is never exposed. */
-  wrapperIdentity?: { sha256: string, size: number }
-  /** Versions of the host runtime only; they do not identify or verify a QQ build. */
-  hostRuntime?: {
-    node?: string
-    electron?: string
-    chrome?: string
-  }
-}
-
 export interface BridgeStatus {
   protocolVersion: number
   ready: boolean

@@ -128,7 +128,6 @@ function installKernelRequireHook(bridge: QQKernelBridge, login: QQLoginControll
     const result = originalDlopen.apply(this, arguments as unknown as Parameters<typeof originalDlopen>)
     const nativeModule = module as { exports: unknown }
     if (isKernelModule(nativeModule.exports)) {
-      observeAvsdkLoaderProbe()
       probeLinuxPacketBinding()
       const raw = nativeModule.exports
       let wrapped = wrappedModules.get(raw)
@@ -140,15 +139,6 @@ function installKernelRequireHook(bridge: QQKernelBridge, login: QQLoginControll
       log('info', `wrapped QQNT kernel through process.dlopen: ${filename}`)
     }
     return result
-  }
-
-  function observeAvsdkLoaderProbe(): void {
-    if (process.platform !== 'linux') return
-    try {
-      void loadPacketAddon().avsdkLoaderProbeStatus?.()
-    } catch {
-      // Loader-identity evidence is diagnostic only and always fails closed.
-    }
   }
 
   function probeLinuxPacketBinding(): void {

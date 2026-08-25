@@ -122,8 +122,6 @@ pnpm test:e2e                    # 针对运行中 bridge 的端到端测试
 | `QQNT_BRIDGE_MEDIA_GATEWAY` | 空 | 设为 `1` 启用本地 PCM 媒体网关。 |
 | `QQNT_BRIDGE_MEDIA_SOCKET` | `/run/qq-pulse/qqnt-media.sock` | PCM 媒体网关 Unix socket 路径。 |
 | `QQNT_BRIDGE_MEDIA_MIC_SINK` | `qq_mic_sink` | PCM 媒体网关 PulseAudio 麦克风 sink。 |
-| `QQNT_BRIDGE_GROUP_JOIN_CONTRACT_PROBE` | 空 | 设为 `1` 启用加群契约探测。 |
-| `QQNT_BRIDGE_GROUP_JOIN_WRAPPER_PATH` | `/opt/QQ/resources/app/wrapper.node` | 加群契约探测使用的 `wrapper.node` 路径。 |
 
 ### E2E 测试
 
@@ -187,5 +185,4 @@ Authorization: Bearer <QQNT_BRIDGE_TOKEN>
 | `POST` | `/v1/files/direct-url` | 图片/文件直链（自动刷新 RKey）。 |
 | `POST` | `/v1/files/asset` | 媒体资产流式下载（支持 Range）。 |
 | `POST` | `/v1/reactions/asset` | 回应图标资产。 |
-| `GET` | `/v1/group-join/probe` | 加群契约探测状态（要求 token）。 |
 

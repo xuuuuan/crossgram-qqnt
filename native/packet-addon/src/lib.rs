@@ -1,10 +1,8 @@
-mod avsdk_probe;
 mod elf;
 mod hook;
 mod locator;
 mod pe;
 mod proto;
-mod qrtc;
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -80,30 +78,6 @@ pub struct PacketBindingProbe {
     pub dispatch_helper_rva: String,
     pub resolver_thunk_rva: String,
     pub resolve_action_rva: String,
-}
-
-/// Fixed, identifier-free QRTC lifecycle metadata for one authorized future
-/// observation. No native object, call, module, payload, or token is exposed.
-#[napi(object)]
-pub struct QrtcMetadataSnapshot {
-    pub lifecycle: String,
-    pub same_thread: bool,
-    pub in_flight: u32,
-    pub shutdown_was_idle: bool,
-}
-
-/// Fixed, identifier-free result of the compile-time AVSDK loader probe.
-/// Production builds return the inert all-false status without loading AVSDK.
-#[napi(object)]
-pub struct AvsdkLoaderProbeStatus {
-    pub prepared: bool,
-    pub observed: bool,
-    pub unique: bool,
-    pub same_object: bool,
-    pub same_namespace: bool,
-    pub build_match: bool,
-    pub flags_compatible: bool,
-    pub observation_count: u32,
 }
 
 /// Calls QQNT's bound sendSsoCmdReqByContend function from the addon so the
@@ -236,33 +210,6 @@ pub fn decode_private_file_download_response(payload: Buffer) -> Result<DirectUr
         proto::decode_private_file_download(payload.as_ref()),
         "private file download",
     )
-}
-
-#[napi]
-pub fn qrtc_metadata_status() -> QrtcMetadataSnapshot {
-    let snapshot = qrtc::addon_metadata_snapshot();
-    QrtcMetadataSnapshot {
-        lifecycle: snapshot.lifecycle.as_str().into(),
-        same_thread: snapshot.same_thread,
-        in_flight: snapshot.in_flight,
-        shutdown_was_idle: snapshot.shutdown_was_idle,
-    }
-}
-
-#[napi]
-pub fn avsdk_loader_probe_status(env: Env) -> AvsdkLoaderProbeStatus {
-    avsdk_probe::register_napi_cleanup(env.raw());
-    let snapshot = avsdk_probe::snapshot();
-    AvsdkLoaderProbeStatus {
-        prepared: snapshot.prepared,
-        observed: snapshot.observed,
-        unique: snapshot.unique,
-        same_object: snapshot.same_object,
-        same_namespace: snapshot.same_namespace,
-        build_match: snapshot.build_match,
-        flags_compatible: snapshot.flags_compatible,
-        observation_count: snapshot.observation_count,
-    }
 }
 
 #[napi]

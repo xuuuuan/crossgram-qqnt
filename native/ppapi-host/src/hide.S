@@ -1,1 +1,0 @@
-.hidden ppapi_dlopen_dispatch

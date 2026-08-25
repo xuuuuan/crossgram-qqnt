@@ -1,5 +1,5 @@
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
-import { closeSync, constants as fsConstants, createReadStream, createWriteStream, existsSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { closeSync, createReadStream, createWriteStream, existsSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { copyFile, mkdir, mkdtemp, open as openFile, readFile, readdir, rename, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
@@ -27,7 +27,7 @@ import {
 } from './kernel-types.js'
 import {
   conversationId, parseConversationId, type HistoryQuery, type MemberPage, type QQCallSignalEvent, type QQCard, type QQConversation, type QQEvent, type QQGroupFilePage, type QQMedia, type QQMediaLocator, type QQMediaUploadPlan, type QQMessage, type QQMultiForwardLocator, type QQReactionActorPage, type QQReactionContext, type QQReactionDefinition, type QQReactionState,
-  type QQFlashTransferManifest, type QQFlashTransferResult, type QQGroupJoinContractProbe, type QQGroupJoinContractProbeMethod, type QQRequest, type QQRequestKind, type QQRequestPage, type QQRequestStatus, type QQSendMediaSpec, type QQSticker, type QQStickerPack, type QQStickerPackSummary, type QQStickerReference, type QQTextPart, type SearchPage, type SearchQuery, type SendManifest,
+  type QQFlashTransferManifest, type QQFlashTransferResult, type QQRequest, type QQRequestKind, type QQRequestPage, type QQRequestStatus, type QQSendMediaSpec, type QQSticker, type QQStickerPack, type QQStickerPackSummary, type QQStickerReference, type QQTextPart, type SearchPage, type SearchQuery, type SendManifest,
 } from './protocol.js'
 
 const CHAT_C2C = 1
@@ -90,19 +90,6 @@ const STICKER_METADATA_PROBE_TIMEOUT_MS = 5_000
 // cold search without turning a genuinely missing callback into a long hang.
 const SEARCH_PAGE_TIMEOUT_MS = 15_000
 const REQUEST_PAGE_LIMIT = 100
-const GROUP_JOIN_CONTRACT_METHODS = [
-  'getGroupInfoForJoinGroup', 'queryJoinGroupCanNoVerify', 'reqToJoinGroup', 'joinGroup',
-] as const
-const GROUP_JOIN_WRAPPER_MAX_BYTES = 32 * 1024 * 1024
-const DEFAULT_GROUP_JOIN_WRAPPER_PATH = '/opt/QQ/resources/app/wrapper.node'
-const groupJoinWrapperProbeCache = new Map<string, Promise<QQGroupJoinContractProbe>>()
-const DISABLED_GROUP_JOIN_CONTRACT_PROBE = Object.freeze({
-  enabled: false,
-  surfaceComplete: false,
-  contractVerified: false as const,
-  writeEnabled: false as const,
-  methods: Object.freeze([]) as unknown as QQGroupJoinContractProbeMethod[],
-}) as QQGroupJoinContractProbe
 // Keep this in sync with Telegram's account-level reaction catalog. QQ emoji
 // outside this set are exposed as custom reactions backed by QQ's own icon.
 const TELEGRAM_STANDARD_REACTIONS = new Set([
@@ -461,18 +448,9 @@ export class QQKernelBridge {
   private readonly voiceInputLimitBytes: number
 
   private readonly mediaGateway?: QQMediaLeaseIssuer
-  private readonly groupJoinContractProbeEnabled: boolean
-  private readonly groupJoinWrapperPath?: string
-  private groupJoinContractProbe: QQGroupJoinContractProbe = DISABLED_GROUP_JOIN_CONTRACT_PROBE
   private readonly callController?: QQCallController
 
   constructor(options: QQKernelOptions = {}) {
-    this.groupJoinContractProbeEnabled = process.env.QQNT_BRIDGE_GROUP_JOIN_CONTRACT_PROBE === '1'
-    this.groupJoinWrapperPath = process.env.QQNT_BRIDGE_GROUP_JOIN_WRAPPER_PATH
-      ?? (process.platform === 'linux' ? DEFAULT_GROUP_JOIN_WRAPPER_PATH : undefined)
-    if (this.groupJoinContractProbeEnabled) {
-      this.groupJoinContractProbe = unavailableGroupJoinContractProbe(true)
-    }
     this.tempPath = options.tempPath ?? join(process.env.TMPDIR ?? '/tmp', 'qqnt-mtproto-bridge')
     this.voiceCachePath = join(this.tempPath, 'voice-cache')
     this.flashTransferPath = join(this.tempPath, 'flash-transfer')
@@ -510,17 +488,6 @@ export class QQKernelBridge {
       selfUin: this.config?.selfUin,
       selfUid: this.config?.selfUid,
       flashTransferSupported: true,
-    }
-  }
-
-  async getGroupJoinContractProbe(): Promise<QQGroupJoinContractProbe> {
-    if (this.groupJoinContractProbeEnabled) await this.probeGroupJoinWrapper()
-    const probe = this.groupJoinContractProbe
-    return {
-      ...probe,
-      methods: probe.methods.map((method) => ({ ...method })),
-      ...(probe.wrapperIdentity ? { wrapperIdentity: { ...probe.wrapperIdentity } } : {}),
-      ...(probe.hostRuntime ? { hostRuntime: { ...probe.hostRuntime } } : {}),
     }
   }
 
@@ -775,9 +742,6 @@ export class QQKernelBridge {
   }
 
   detach(): void {
-    this.groupJoinContractProbe = this.groupJoinContractProbeEnabled
-      ? unavailableGroupJoinContractProbe(true)
-      : DISABLED_GROUP_JOIN_CONTRACT_PROBE
     this.callSignalGeneration++
     this.callSignalJobs.splice(0)
     this.pendingCallSignalKinds.clear()
@@ -3821,20 +3785,6 @@ export class QQKernelBridge {
     }
   }
 
-  private async probeGroupJoinWrapper(): Promise<void> {
-    const path = this.groupJoinWrapperPath
-    if (process.platform !== 'linux' || !path) {
-      this.groupJoinContractProbe = unavailableGroupJoinContractProbe(true)
-      return
-    }
-    let probe = groupJoinWrapperProbeCache.get(path)
-    if (!probe) {
-      probe = inspectGroupJoinWrapper(path)
-      groupJoinWrapperProbeCache.set(path, probe)
-    }
-    this.groupJoinContractProbe = await probe
-  }
-
   private registerListeners(): void {
     const session = this.requireSession()
     const kernel = this.kernel!
@@ -6840,88 +6790,6 @@ function reactionStateRevision(state: QQReactionState | undefined): string {
       recentActors: (reaction.recentActors ?? []).map((actor) => actor.userId),
     }))
     .sort((left, right) => left.key.localeCompare(right.key)))
-}
-
-function unavailableGroupJoinContractProbe(enabled: boolean): QQGroupJoinContractProbe {
-  return {
-    enabled,
-    surfaceComplete: false,
-    contractVerified: false,
-    writeEnabled: false,
-    methods: [],
-  }
-}
-
-async function inspectGroupJoinWrapper(path: string): Promise<QQGroupJoinContractProbe> {
-  try {
-    const handle = await openFile(
-      path,
-      fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
-    )
-    try {
-      const info = await handle.stat()
-      if (!info.isFile() || !Number.isSafeInteger(info.size) || info.size < 0 || info.size > GROUP_JOIN_WRAPPER_MAX_BYTES) {
-        return unavailableGroupJoinContractProbe(true)
-      }
-      const bytes = Buffer.allocUnsafe(info.size)
-      for (let offset = 0; offset < bytes.length;) {
-        const { bytesRead } = await handle.read(bytes, offset, bytes.length - offset, offset)
-        if (!bytesRead) throw new Error('wrapper changed during inspection')
-        offset += bytesRead
-      }
-      if ((await handle.stat()).size !== info.size) throw new Error('wrapper changed during inspection')
-      const methods = GROUP_JOIN_CONTRACT_METHODS.map((name) => groupJoinWrapperMethod(bytes, name))
-      return {
-        enabled: true,
-        surfaceComplete: methods.every((method) => method.present && method.argumentCount !== undefined),
-        contractVerified: false,
-        writeEnabled: false,
-        methods,
-        wrapperIdentity: {
-          sha256: createHash('sha256').update(bytes).digest('hex'),
-          size: bytes.length,
-        },
-        hostRuntime: fixedHostRuntimeIdentity(),
-      }
-    } finally {
-      await handle.close()
-    }
-  } catch {
-    // Opening is Linux-only, no-follow, and nonblocking. Inspection is diagnostic only.
-    return unavailableGroupJoinContractProbe(true)
-  }
-}
-
-function groupJoinWrapperMethod(
-  bytes: Buffer,
-  name: typeof GROUP_JOIN_CONTRACT_METHODS[number],
-): QQGroupJoinContractProbeMethod {
-  const nameBytes = Buffer.from(name, 'ascii')
-  const marker = Buffer.from(`${name} needs `, 'ascii')
-  const suffix = Buffer.from(' arguments', 'ascii')
-  let offset = 0
-  while ((offset = bytes.indexOf(marker, offset)) >= 0) {
-    const start = offset + marker.length
-    let end = start
-    while (end < bytes.length && bytes[end] >= 0x30 && bytes[end] <= 0x39) end++
-    if (end > start && end - start <= 10 && bytes.subarray(end, end + suffix.length).equals(suffix)) {
-      const argumentCount = Number(bytes.subarray(start, end).toString('ascii'))
-      if (Number.isSafeInteger(argumentCount)) return { name, present: true, argumentCount }
-    }
-    offset = start
-  }
-  return { name, present: bytes.indexOf(nameBytes) >= 0 }
-}
-
-function fixedHostRuntimeIdentity(): QQGroupJoinContractProbe['hostRuntime'] {
-  const identity: NonNullable<QQGroupJoinContractProbe['hostRuntime']> = {}
-  for (const key of ['node', 'electron', 'chrome'] as const) {
-    const value = process.versions[key]
-    if (typeof value === 'string' && value.length <= 128 && /^[0-9A-Za-z._+-]+$/.test(value)) {
-      identity[key] = value
-    }
-  }
-  return identity
 }
 
 function contact(conversation: QQConversation) {

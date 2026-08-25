@@ -65,33 +65,6 @@ export interface PacketBindingProbe {
   resolveActionFingerprint: string
 }
 
-export type QrtcLifecycle = 'active' | 'closing' | 'destroyed'
-
-/** Fixed, identifier-free status for the compile-time AVSDK loader identity probe. */
-export interface AvsdkLoaderProbeStatus {
-  prepared: boolean
-  observed: boolean
-  unique: boolean
-  sameObject: boolean
-  sameNamespace: boolean
-  buildMatch: boolean
-  flagsCompatible: boolean
-  observationCount: number
-}
-
-/** Fixed, identifier-free QRTC lifecycle metadata for one authorized future observation. */
-export interface QrtcMetadataSnapshot {
-  lifecycle: QrtcLifecycle
-  sameThread: boolean
-  inFlight: number
-  shutdownWasIdle: boolean
-}
-
-/** Deliberately a fixed snapshot surface, not an invocation or hook API. */
-export interface QrtcMetadataAddon {
-  qrtcMetadataStatus(): QrtcMetadataSnapshot
-}
-
 export interface PacketAddon {
   sendPacket(
     send: (command: string, payload: Buffer) => unknown,
@@ -112,7 +85,6 @@ export interface PacketAddon {
   probePacketBinding(): PacketBindingProbe
   locateSendBinding(): NativeSendBindingLocation
   installSendHook(): NativeSendBindingLocation
-  avsdkLoaderProbeStatus?(): AvsdkLoaderProbeStatus
 }
 
 let loadedAddon: PacketAddon | undefined
@@ -143,20 +115,7 @@ export function validatePacketAddon(required: Partial<PacketAddon>): PacketAddon
   ] satisfies Array<keyof PacketAddon>) {
     if (typeof required[name] !== 'function') throw new Error(`QQNT packet addon is missing ${name}`)
   }
-  // AVSDK loader probing is diagnostic-only. Older production packet addons
-  // legitimately omit it and must remain usable for ordinary message/media
-  // packet operations.
   return required as PacketAddon
-}
-
-export function loadQrtcMetadataAddon(
-  loadAddon: () => Partial<QrtcMetadataAddon> = () => loadPacketAddon() as PacketAddon & Partial<QrtcMetadataAddon>,
-): QrtcMetadataAddon {
-  const addon = loadAddon()
-  if (typeof addon.qrtcMetadataStatus !== 'function') {
-    throw new Error('QQNT packet addon is missing qrtcMetadataStatus')
-  }
-  return addon as QrtcMetadataAddon
 }
 
 export function packetAddonCandidates(

@@ -208,16 +208,6 @@ export class QQBridgeServer {
   ): Promise<void> {
     const url = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`)
     const path = url.pathname
-    if (request.method === 'GET' && path === '/v1/group-join/probe') {
-      if (!this.tokenDigest) {
-        json(response, 503, { error: 'group-join probe requires bridge token' })
-      } else if (!this.authorize(request)) {
-        json(response, 401, { error: 'unauthorized' })
-      } else {
-        json(response, 200, await this.bridge.getGroupJoinContractProbe())
-      }
-      return
-    }
     if (!this.authorize(request)) {
       json(response, 401, { error: 'unauthorized' })
       return
