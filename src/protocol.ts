@@ -409,6 +409,8 @@ export interface QQSendMediaSpec {
   /** Full-file hashes supplied by the relay so protocol upload needs no local staging pass. */
   md5?: string
   sha1?: string
+  /** QQ cumulative SHA-1 states for each 1 MiB boundary, followed by the final digest. */
+  sha1Checkpoints?: string[]
   /** MD5 of the first min(10 MiB, file size), used by private-file upload. */
   file10MMd5?: string
   width?: number

@@ -280,7 +280,9 @@ export class QQPacketClient {
       thumbnail,
       ...(upload.videoUkey ? { highway: {
         session,
-        extendInfo: encodeVideoHighwayExt(upload, 'video', spec.sha1),
+        extendInfo: encodeVideoHighwayExt(
+          upload, 'video', spec.sha1, spec.sha1Checkpoints, spec.size,
+        ),
         commandId: chatType === 2 ? 1005 : 1001,
         sequenceStart: this.reserveHighwaySequences(spec.size),
       } } : {}),

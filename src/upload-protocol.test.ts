@@ -267,15 +267,25 @@ describe('direct QQ upload protocol', () => {
     })
     const mainExt = fromBinary(
       generated.ImageHighwayExtSchema,
-      encodeVideoHighwayExt(upload, 'video', spec.sha1),
+      encodeVideoHighwayExt(upload, 'video', spec.sha1, [spec.sha1], spec.size),
     )
     const thumbnailExt = fromBinary(
       generated.ImageHighwayExtSchema,
       encodeVideoHighwayExt(upload, 'thumbnail', VIDEO_THUMBNAIL_SHA1),
     )
     expect(mainExt).toMatchObject({ fileUuid: 'video-uuid', ukey: 'video-ukey' })
+    expect(mainExt.hash?.sha1.map(Buffer.from)).toEqual([Buffer.from(spec.sha1, 'hex')])
     expect(thumbnailExt).toMatchObject({ fileUuid: 'thumbnail-uuid', ukey: 'thumbnail-ukey' })
     expect(mainExt.msgInfoBodies.map(Buffer.from)).toEqual([videoBody, thumbnailBody])
+    const checkpoints = [spec.sha1, 'ffeeddccbbaa9988776655443322110000112233']
+    const checkpointExt = fromBinary(
+      generated.ImageHighwayExtSchema,
+      encodeVideoHighwayExt(
+        upload, 'video', spec.sha1, checkpoints, 2 * HIGHWAY_BLOCK_SIZE,
+      ),
+    )
+    expect(checkpointExt.hash?.sha1.map((value) => Buffer.from(value).toString('hex')))
+      .toEqual(checkpoints)
   })
 
   it('frames exact Highway metadata and validates server responses', () => {
@@ -597,6 +607,7 @@ describe('direct QQ upload protocol', () => {
 
     const uploaded = await client.uploadVideo(2, '1002974327', '1715311957', {
       name: 'clip.mp4', mimeType: 'video/mp4', size: bytes.length, md5, sha1,
+      sha1Checkpoints: [sha1],
       width: 320, height: 180, duration: 4,
     }, (async function* () { yield bytes })())
 

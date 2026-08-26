@@ -2160,6 +2160,7 @@ export class QQKernelBridge {
     if (spec.kind === 'video') {
       const plan = await packet.prepareVideoUpload(conversation.chatType as 1 | 2, conversation.peerUid, {
         name: spec.name, mimeType: spec.mimeType, size, md5, sha1,
+        sha1Checkpoints: spec.sha1Checkpoints,
         width: spec.width, height: spec.height, duration: spec.duration,
         thumbnail: spec.thumbnail,
       })
@@ -2371,6 +2372,7 @@ export class QQKernelBridge {
           let size = spec.size
           let md5 = spec.md5
           let sha1 = spec.sha1
+          let sha1Checkpoints = spec.kind === 'video' ? spec.sha1Checkpoints : undefined
           let file10MMd5 = spec.file10MMd5
           let dimensions = spec.width && spec.height
             ? { width: spec.width, height: spec.height }
@@ -2378,6 +2380,8 @@ export class QQKernelBridge {
           let uploadBody: AsyncIterable<Uint8Array> = mediaBody
           const requiresStaging = size === undefined || !md5 || !sha1
             || (spec.kind === 'file' && !file10MMd5)
+            || (spec.kind === 'video'
+              && sha1Checkpoints?.length !== Math.ceil((size ?? 0) / HIGHWAY_BLOCK_SIZE))
           if (requiresStaging) {
             const stagingRoot = this.stagingPath(spec.kind)
             mkdirSync(stagingRoot, { recursive: true })
@@ -2394,8 +2398,11 @@ export class QQKernelBridge {
               sha1 ? Promise.resolve(sha1) : hashFile(path, 'sha1'),
               spec.kind === 'file' && !file10MMd5 ? hashFilePrefix(path, 'md5', 10 * 1024 * 1024) : Promise.resolve(file10MMd5),
               spec.kind === 'image' && !dimensions ? imageFileDimensions(path) : Promise.resolve(dimensions),
+              spec.kind === 'video'
+                ? hashHighwaySha1Checkpoints(path, actualSize)
+                : Promise.resolve(sha1Checkpoints),
             ])
-            ;[md5, sha1, file10MMd5, dimensions] = hashes
+            ;[md5, sha1, file10MMd5, dimensions, sha1Checkpoints] = hashes
             uploadBody = createReadStream(path)
           }
           if (size === undefined || !md5 || !sha1) throw new Error(`media ${index} metadata is incomplete`)
@@ -2420,7 +2427,7 @@ export class QQKernelBridge {
               conversation.peerUid,
               this.requireConfig().selfUin,
               {
-                name: spec.name, mimeType: spec.mimeType, size, md5, sha1,
+                name: spec.name, mimeType: spec.mimeType, size, md5, sha1, sha1Checkpoints,
                 width: spec.width, height: spec.height, duration: spec.duration,
               },
               uploadBody,
@@ -6925,6 +6932,11 @@ async function hashFlashTransferPath(
   if (expectedSize % FLASH_TRANSFER_BLOCK_SIZE === 0) sha1State[sha1State.length - 1] = finalSha1
   else sha1State.push(finalSha1)
   return { md5: md5.digest('hex'), sha1: sha1Hex, sha1State }
+}
+
+async function hashHighwaySha1Checkpoints(path: string, expectedSize: number): Promise<string[]> {
+  const { sha1State } = await hashFlashTransferPath(path, expectedSize)
+  return sha1State.map((value) => value.toString('hex'))
 }
 
 class FlashSha1IntermediateState {

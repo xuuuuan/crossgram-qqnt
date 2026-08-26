@@ -484,7 +484,7 @@ message ImageHighwayHost {
 }
 
 message ImageHighwayHash {
-  bytes sha1 = 1;
+  repeated bytes sha1 = 1;
 }
 
 message FileHighwayExt {

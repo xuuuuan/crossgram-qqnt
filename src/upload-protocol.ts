@@ -67,6 +67,7 @@ export interface DirectVideoSpec {
   size: number
   md5: string
   sha1: string
+  sha1Checkpoints?: string[]
   width?: number
   height?: number
   duration?: number
@@ -818,7 +819,7 @@ export function encodeImageHighwayExt(upload: PreparedImageUpload, sha1Hex: stri
     })) },
     msgInfoBodies: upload.msgInfoBodies,
     blockSize: HIGHWAY_BLOCK_SIZE,
-    hash: { sha1: hex(sha1Hex) },
+    hash: { sha1: [hex(sha1Hex)] },
   })
 }
 
@@ -826,6 +827,8 @@ export function encodeVideoHighwayExt(
   upload: PreparedVideoUpload,
   role: 'video' | 'thumbnail',
   sha1Hex: string,
+  sha1Checkpoints?: string[],
+  expectedSize?: number,
 ): Buffer {
   assertHash(sha1Hex, 'SHA-1', 40)
   const thumbnail = role === 'thumbnail'
@@ -840,7 +843,8 @@ export function encodeVideoHighwayExt(
     })) },
     msgInfoBodies: upload.msgInfoBodies,
     blockSize: HIGHWAY_BLOCK_SIZE,
-    hash: { sha1: hex(sha1Hex) },
+    hash: { sha1: (thumbnail ? [sha1Hex] : requiredSha1Checkpoints(sha1Checkpoints, expectedSize))
+      .map((value) => hex(value)) },
   })
 }
 
@@ -1245,6 +1249,16 @@ function assertVideoSpec(spec: DirectVideoSpec): void {
   roundedUint32(spec.height)
   roundedUint32(spec.duration)
   if (spec.thumbnail) assertVideoThumbnailSpec(spec.thumbnail)
+}
+
+function requiredSha1Checkpoints(values: string[] | undefined, expectedSize?: number): string[] {
+  if (!values?.length || values.some((value) => !/^[a-f0-9]{40}$/iu.test(value))) {
+    throw new Error('video upload requires valid cumulative SHA-1 checkpoints')
+  }
+  if (expectedSize !== undefined && values.length !== Math.ceil(expectedSize / HIGHWAY_BLOCK_SIZE)) {
+    throw new Error('video upload cumulative SHA-1 checkpoint count does not match its size')
+  }
+  return values
 }
 
 export function videoThumbnailSpec(spec: DirectVideoSpec): DirectVideoThumbnailSpec {
