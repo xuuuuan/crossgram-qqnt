@@ -130,7 +130,10 @@
         export DBUS_SESSION_BUS_ADDRESS='unix:path=/run/dbus/system_bus_socket'
         export DISPLAY=:$display
         create_service xvfb "Xvfb :$display"
-        create_service x11vnc "x11vnc -forever -display :$display -rfbport $vnc_port"
+        # LibVNCServer counts free descriptors by walking 0..RLIMIT_NOFILE with
+        # fcntl() on every incoming connection, so an inherited "infinity" soft
+        # limit (pm2, systemd) wedges the accept path at 100% CPU. Cap it.
+        create_service x11vnc "ulimit -Sn 1024; exec x11vnc -forever -display :$display -rfbport $vnc_port"
         create_service novnc "novnc --vnc localhost:$vnc_port --listen $novnc_port --file-only"
         create_service dbus 'dbus-daemon --nofork --config-file=/etc/dbus/system.conf'
         create_service dunst 'dunst'
