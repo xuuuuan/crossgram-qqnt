@@ -120,6 +120,10 @@ pnpm test:e2e                    # 针对运行中 bridge 的端到端测试
 | `QQNT_BRIDGE_MEDIA_SOCKET` | `/run/qq-pulse/qqnt-media.sock` | PCM 媒体网关 Unix socket 路径。 |
 | `QQNT_BRIDGE_MEDIA_MIC_SINK` | `qq_mic_sink` | PCM 媒体网关 PulseAudio 麦克风 sink。 |
 
+Release 构建会将当前平台的 packet addon 以 Base64 嵌入 esbuild 输出。运行时会先校验
+SHA-256，再释放到仅当前用户可访问的临时目录供系统 `dlopen()`；因此部署包不再依赖
+`app.asar.unpacked`。`QQNT_BRIDGE_PACKET_ADDON` 仍可用于显式覆盖内嵌版本。
+
 ### E2E 测试
 
 | 变量 | 说明 |

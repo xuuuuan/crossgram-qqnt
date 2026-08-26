@@ -79,7 +79,6 @@
           mkdir -p "$out"
           tar -xzf dist/packages/qqnt-bridge-linux-x64-release.tar.gz -C "$out"
           test -f "$out/resources/app.asar"
-          test -f "$out/resources/app.asar.unpacked/qqnt_packet.linux-x64-gnu.node"
           runHook postInstall
         '';
       });
@@ -87,9 +86,6 @@
         postInstall = (old.postInstall or "") + ''
           install -Dm644 ${assets}/resources/app.asar \
             "$out/opt/QQ/resources/app.asar"
-          install -Dm755 \
-            ${assets}/resources/app.asar.unpacked/qqnt_packet.linux-x64-gnu.node \
-            "$out/opt/QQ/resources/app.asar.unpacked/qqnt_packet.linux-x64-gnu.node"
         '';
       });
       fonts = pkgs.makeFontsConf {

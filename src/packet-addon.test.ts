@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { createHash } from 'node:crypto'
+import { mkdtemp, readFile, readdir, rm, stat } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { createPacketBindingProber, createPacketHookInstaller, loadPacketAddon, packetAddonCandidates, type NativeSendBindingLocation, type PacketBindingProbe } from './packet-addon.js'
+import { createPacketBindingProber, createPacketHookInstaller, loadPacketAddon, materializeEmbeddedPacketAddon, packetAddonCandidates, type NativeSendBindingLocation, type PacketBindingProbe } from './packet-addon.js'
 
 describe('native packet addon', () => {
   afterEach(() => {
@@ -50,6 +53,40 @@ describe('native packet addon', () => {
     )
     expect(candidates[0]).toBe(join(dirname(filename), `qqnt_packet.${suffix}.node`))
     expect(candidates).toContain(join(dist, `qqnt_packet.${suffix}.node`))
+  })
+
+  it('materializes an embedded addon into a private verified temporary file', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'qqnt-embedded-addon-test-'))
+    try {
+      const bytes = Buffer.from('native-addon-fixture')
+      const sha256 = createHash('sha256').update(bytes).digest('hex')
+      const path = materializeEmbeddedPacketAddon({
+        base64: bytes.toString('base64'), filename: 'qqnt_packet.test.node', sha256,
+      }, root)
+
+      expect(dirname(path)).toMatch(new RegExp(`^${escapeRegExp(root)}`))
+      await expect(readFile(path)).resolves.toEqual(bytes)
+      if (process.platform !== 'win32') expect((await stat(path)).mode & 0o777).toBe(0o500)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects corrupted or path-traversing embedded addons without leaving payload files', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'qqnt-embedded-addon-reject-'))
+    const bytes = Buffer.from('native-addon-fixture')
+    const sha256 = createHash('sha256').update(bytes).digest('hex')
+    try {
+      expect(() => materializeEmbeddedPacketAddon({
+        base64: Buffer.from('corrupted').toString('base64'), filename: 'qqnt_packet.test.node', sha256,
+      }, root)).toThrow(/SHA-256 mismatch/u)
+      expect(() => materializeEmbeddedPacketAddon({
+        base64: bytes.toString('base64'), filename: '../qqnt_packet.test.node', sha256,
+      }, root)).toThrow(/filename is invalid/u)
+      await expect(readdir(root)).resolves.toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('prevents synchronous recursive probes and restores the prober state', () => {
@@ -123,3 +160,7 @@ describe('native packet addon', () => {
   })
 
 })
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
+}

@@ -1,6 +1,8 @@
-import { existsSync, readdirSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
-import { dirname, join } from 'node:path'
+import { tmpdir } from 'node:os'
+import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 export interface NativePacketRequest {
@@ -88,17 +90,22 @@ export interface PacketAddon {
 }
 
 let loadedAddon: PacketAddon | undefined
+let materializedAddonPath: string | undefined
 const moduleFilename = typeof __filename === 'string' ? __filename : fileURLToPath(import.meta.url)
 declare const __QQNT_BRIDGE_BUILD_DIST_DIR__: string | undefined
+declare const __QQNT_BRIDGE_EMBEDDED_PACKET_ADDON_BASE64__: string | undefined
+declare const __QQNT_BRIDGE_EMBEDDED_PACKET_ADDON_FILENAME__: string | undefined
+declare const __QQNT_BRIDGE_EMBEDDED_PACKET_ADDON_SHA256__: string | undefined
 const buildDistDir = typeof __QQNT_BRIDGE_BUILD_DIST_DIR__ === 'string'
   ? __QQNT_BRIDGE_BUILD_DIST_DIR__
   : undefined
 
 export function loadPacketAddon(): PacketAddon {
   if (loadedAddon) return loadedAddon
-  const candidate = packetAddonCandidates().find(existsSync)
+  const candidates = packetAddonCandidates()
+  const candidate = candidates.find(existsSync)
   if (!candidate) {
-    throw new Error(`QQNT packet addon was not found; tried: ${packetAddonCandidates().join(', ')}`)
+    throw new Error(`QQNT packet addon was not found; tried: ${candidates.join(', ')}`)
   }
   const required = createRequire(moduleFilename)(candidate) as Partial<PacketAddon>
   return loadedAddon = validatePacketAddon(required)
@@ -132,11 +139,68 @@ export function packetAddonCandidates(
     : `${process.platform}-${process.arch}-gnu`
   return [
     process.env.QQNT_BRIDGE_PACKET_ADDON,
+    materializeBundledPacketAddon(),
     join(sourceDir, `qqnt_packet.${platformSuffix}.node`),
     bundledDistDir ? join(bundledDistDir, `qqnt_packet.${platformSuffix}.node`) : undefined,
     artifact ? join(artifactDir, artifact) : undefined,
   ].filter((candidate, index, candidates): candidate is string =>
     Boolean(candidate) && candidates.indexOf(candidate) === index)
+}
+
+export interface EmbeddedPacketAddon {
+  base64: string
+  filename: string
+  sha256: string
+}
+
+/** Decode an esbuild-embedded native addon into a private real file for dlopen(). */
+export function materializeEmbeddedPacketAddon(
+  embedded: EmbeddedPacketAddon,
+  temporaryRoot = tmpdir(),
+): string {
+  if (!embedded.filename.endsWith('.node') || basename(embedded.filename) !== embedded.filename) {
+    throw new Error('embedded packet addon filename is invalid')
+  }
+  if (!/^[a-f0-9]{64}$/u.test(embedded.sha256)) {
+    throw new Error('embedded packet addon SHA-256 is invalid')
+  }
+  const bytes = Buffer.from(embedded.base64, 'base64')
+  const actualSha256 = createHash('sha256').update(bytes).digest('hex')
+  if (actualSha256 !== embedded.sha256) {
+    throw new Error(`embedded packet addon SHA-256 mismatch: expected ${embedded.sha256}, received ${actualSha256}`)
+  }
+  const directory = join(temporaryRoot, 'qqnt-bridge-packet-addons', embedded.sha256)
+  const path = join(directory, embedded.filename)
+  if (existsSync(path)
+    && createHash('sha256').update(readFileSync(path)).digest('hex') === embedded.sha256) return path
+  mkdirSync(directory, { recursive: true, mode: 0o700 })
+  try {
+    rmSync(path, { force: true })
+    writeFileSync(path, bytes, { flag: 'wx', mode: 0o500 })
+    if (createHash('sha256').update(readFileSync(path)).digest('hex') !== embedded.sha256) {
+      throw new Error('materialized packet addon failed SHA-256 verification')
+    }
+    return path
+  } catch (error) {
+    rmSync(path, { force: true })
+    throw error
+  }
+}
+
+function materializeBundledPacketAddon(): string | undefined {
+  if (materializedAddonPath) return materializedAddonPath
+  const base64 = typeof __QQNT_BRIDGE_EMBEDDED_PACKET_ADDON_BASE64__ === 'string'
+    ? __QQNT_BRIDGE_EMBEDDED_PACKET_ADDON_BASE64__
+    : undefined
+  const filename = typeof __QQNT_BRIDGE_EMBEDDED_PACKET_ADDON_FILENAME__ === 'string'
+    ? __QQNT_BRIDGE_EMBEDDED_PACKET_ADDON_FILENAME__
+    : undefined
+  const sha256 = typeof __QQNT_BRIDGE_EMBEDDED_PACKET_ADDON_SHA256__ === 'string'
+    ? __QQNT_BRIDGE_EMBEDDED_PACKET_ADDON_SHA256__
+    : undefined
+  if (!base64 || !filename || !sha256) return
+  materializedAddonPath = materializeEmbeddedPacketAddon({ base64, filename, sha256 })
+  return materializedAddonPath
 }
 
 export function createPacketBindingProber(

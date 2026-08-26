@@ -7,6 +7,8 @@ import { dirname, join } from 'node:path'
 import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
 
+import { embeddedPacketAddonDefines } from './embedded-packet-addon.mjs'
+
 const execFileAsync = promisify(execFile)
 const root = dirname(dirname(fileURLToPath(import.meta.url)))
 const require = createRequire(import.meta.url)
@@ -18,6 +20,7 @@ const arch = process.arch === 'x64' ? 'x64' : process.arch
 const artifactDir = join(root, 'native', 'packet-addon', 'artifacts')
 const addon = (await readdir(artifactDir).catch(() => [])).find((name) => name.endsWith('.node'))
 if (!addon) throw new Error('native addon is missing; run pnpm build:native first')
+const addonPath = join(artifactDir, addon)
 
 const dist = join(root, 'dist')
 const staging = join(dist, `.package-${platform}-${arch}-${mode}`)
@@ -49,10 +52,10 @@ await build({
     'import.meta.url': '__filename',
     __QQNT_BRIDGE_BUILD_DIST_DIR__: 'undefined',
     __QQNT_BRIDGE_BUILD_MODE__: JSON.stringify(mode),
+    ...await embeddedPacketAddonDefines(addonPath),
   },
 })
 
-await cp(join(artifactDir, addon), join(app, addon))
 await cp(require.resolve('silk-wasm/lib/silk.wasm'), join(app, 'silk.wasm'))
 await writeFile(join(app, 'package.json'), `${JSON.stringify({
   name: 'qqnt-bridge-injection',
@@ -63,7 +66,7 @@ await writeFile(join(app, 'package.json'), `${JSON.stringify({
 await cp(join(root, 'deploy', 'loader.cjs'), join(app, 'loader.js'))
 
 const asarPath = join(payload, 'resources', 'app.asar')
-await createPackageWithOptions(app, asarPath, { unpack: '*.node' })
+await createPackageWithOptions(app, asarPath, {})
 await cp(join(root, 'deploy', 'qqntctl'), join(payload, 'bin', 'qqntctl'))
 await cp(join(root, 'deploy', 'install.sh'), join(payload, 'bin', 'install.sh'))
 await cp(join(root, 'deploy', 'run-headless.sh'), join(payload, 'bin', 'run-headless.sh'))
