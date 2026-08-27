@@ -360,12 +360,12 @@ function fixture() {
     removeKernelAVSDKListener: vi.fn(),
   }
   const richMedia = {
-    getGroupFileList: vi.fn<NonNullable<KernelRichMediaService['getGroupFileList']>>(async () => {
+    getGroupFileList: vi.fn<NonNullable<KernelRichMediaService['getGroupFileList']>>(() => {
       queueMicrotask(() => msgHandlers.onGroupFileInfoUpdate?.({
         retCode: 0, retMsg: '', clientWording: '', isEnd: true,
         item: [], allFileCount: 0, nextIndex: 0, reqId: 1,
       }))
-      return { result: 0, errMsg: '' }
+      return 1
     }),
   }
   const uix = {
@@ -1339,7 +1339,7 @@ describe('QQKernelBridge', () => {
 
   it('lists native QQ group folders and files with downloadable media locators', async () => {
     const f = fixture()
-    f.richMedia.getGroupFileList.mockImplementation(async (_groupCode, params) => {
+    f.richMedia.getGroupFileList.mockImplementation((_groupCode, params) => {
       queueMicrotask(() => f.emitGroupFiles({
         retCode: 0, retMsg: '', clientWording: '', isEnd: false,
         allFileCount: 3, nextIndex: 2, reqId: 7,
@@ -1362,7 +1362,7 @@ describe('QQKernelBridge', () => {
         }],
       }))
       expect(params).toMatchObject({ startIndex: 0, fileCount: 2, sortType: 1, sortOrder: 2 })
-      return { result: 0, errMsg: '' }
+      return 7
     })
     const bridge = new QQKernelBridge()
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
@@ -1379,6 +1379,38 @@ describe('QQKernelBridge', () => {
         } },
       }],
     })
+  })
+
+  it('treats the native group-file numeric return as a request token and waits for the callback', async () => {
+    const f = fixture()
+    f.richMedia.getGroupFileList.mockImplementation(() => {
+      setTimeout(() => f.emitGroupFiles({
+        retCode: 0, retMsg: '', clientWording: '', isEnd: true,
+        item: [], allFileCount: 0, nextIndex: 0, reqId: 734,
+      }), 5)
+      return 734
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.getGroupFiles(bridge.getConversation('2:1058754719')))
+      .resolves.toEqual({ items: [], total: 0 })
+  })
+
+  it('reports the callback error instead of interpreting the native request token as a status', async () => {
+    const f = fixture()
+    f.richMedia.getGroupFileList.mockImplementation(() => {
+      queueMicrotask(() => f.emitGroupFiles({
+        retCode: 120, retMsg: 'denied', clientWording: '群文件访问被拒绝', isEnd: true,
+        item: [], allFileCount: 0, nextIndex: 0, reqId: 735,
+      }))
+      return 735
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.getGroupFiles(bridge.getConversation('2:1058754719')))
+      .rejects.toThrow('QQNT group file listing failed: 群文件访问被拒绝')
   })
 
   it('paginates the complete ordered recent-contact snapshot instead of the small infos cache', async () => {
@@ -6306,6 +6338,30 @@ describe('QQBridgeServer', () => {
       parts: [{ type: 'text', text: 'saved over HTTP' }],
     })
     expect(f.protocolSend).not.toHaveBeenCalled()
+  })
+
+  it('E2E: keeps the group-files HTTP request open until the native callback after a numeric dispatch token', async () => {
+    const f = fixture()
+    f.richMedia.getGroupFileList.mockImplementation((_groupCode, params) => {
+      setTimeout(() => f.emitGroupFiles({
+        retCode: 0, retMsg: '', clientWording: '', isEnd: true,
+        item: [], allFileCount: 0, nextIndex: params.startIndex, reqId: 912,
+      }), 10)
+      return 912
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const base = `http://127.0.0.1:${server.address().port}/v1`
+
+    const response = await fetch(
+      `${base}/conversations/${encodeURIComponent('2:1058754719')}/group-files?limit=20`,
+    )
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toEqual({ items: [], total: 0 })
+    expect(f.richMedia.getGroupFileList).toHaveReturnedWith(912)
   })
 
   it('serves status, dialogs, and a chunked send endpoint', async () => {

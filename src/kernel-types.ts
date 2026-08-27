@@ -859,18 +859,7 @@ export interface KernelGroupService {
 
 export interface KernelRichMediaService {
   getRichMediaFileDir?(elementType: number, downType: number, isTemp: boolean): string
-  getGroupFileList?(groupCode: string, params: GroupFileListParams): Promise<{
-    result: number
-    errMsg: string
-    groupSpaceResult?: {
-      retCode: number
-      retMsg: string
-      clientWording: string
-      totalSpace: number
-      usedSpace: number
-      allUpload: boolean
-    }
-  }>
+  getGroupFileList?(groupCode: string, params: GroupFileListParams): number
 }
 
 export interface KernelAVSDKService {

@@ -1269,7 +1269,8 @@ export class QQKernelBridge {
       const pendingPage = { groupCode, result: pending }
       this.pendingGroupFilePage = pendingPage
       try {
-        const accepted = await service.getGroupFileList!(conversation.peerUin || conversation.peerUid, {
+        // QQNT returns only a numeric dispatch token here. The listener callback below is authoritative.
+        service.getGroupFileList!(conversation.peerUin || conversation.peerUid, {
           sortType: 1,
           fileCount: limit,
           startIndex,
@@ -1277,9 +1278,6 @@ export class QQKernelBridge {
           showOnlinedocFolder: 0,
           ...(query.folderId ? { folderId: query.folderId } : {}),
         })
-        if (accepted.result !== 0) {
-          throw new Error(`QQNT group file listing failed: ${accepted.errMsg || accepted.result}`)
-        }
         const result = await withTimeout(
           pending.promise,
           5_000,
