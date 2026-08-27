@@ -1699,12 +1699,90 @@ describe('QQKernelBridge', () => {
 
     await expect(bridge.getHistory(bridge.getConversation('1058754719'))).resolves.toMatchObject({
       messages: [
-        { id: 'reply', telegramMessageId: 5850634, telegramReplyToMessageId: 5850632 },
+        {
+          id: 'reply', replyToId: 'real-source',
+          telegramMessageId: 5850634, telegramReplyToMessageId: 5850632,
+        },
         { id: 'real-source', telegramMessageId: 5850632 },
       ],
     })
     expect(f.msg.getMsgsBySeqAndCount).not.toHaveBeenCalled()
     expect(f.msg.getSourceOfReplyMsg).not.toHaveBeenCalled()
+  })
+
+  it('resolves a group reply to the content msgId when a gray service sidecar reuses its sequence', async () => {
+    const f = fixture()
+    const original = {
+      ...f.message, chatType: 2, peerUid: '1058754719', peerUin: '1058754719',
+      msgId: 'real-source', msgSeq: '490124',
+    } satisfies MsgRecord
+    const grayTip = {
+      ...original, msgId: 'gray-sidecar', elements: [{
+        elementType: 6, elementId: 'poke', faceElement: {
+          faceIndex: 0, faceType: 5, spokeSummary: 'Alice poked Bob',
+        },
+      }],
+    } satisfies MsgRecord
+    const reply = {
+      ...original, msgId: 'reply', msgSeq: '490125', elements: [{
+        elementType: 7, elementId: 'reply-element', replyElement: {
+          replayMsgId: '0', replayMsgSeq: '490124', sourceMsgIdInRecords: '0',
+          sourceMsgTextElems: [], replyMsgRevokeType: 0,
+          sourceMsgIsIncPic: false, sourceMsgExpired: false,
+        },
+      }, { elementType: 1, elementId: 'text', textElement: { content: 'reply' } }],
+    } satisfies MsgRecord
+    f.msg.getLatestDbMsgs.mockResolvedValueOnce({
+      result: 0, errMsg: '', msgList: [reply, grayTip, original],
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.getHistory(bridge.getConversation('1058754719'))).resolves.toMatchObject({
+      messages: [
+        { id: 'reply', replyToId: 'real-source', telegramReplyToMessageId: 490124 },
+        { id: 'gray-sidecar', serviceAction: { type: 'custom' } },
+        { id: 'real-source' },
+      ],
+    })
+    expect(f.msg.getMsgsBySeqAndCount).not.toHaveBeenCalled()
+  })
+
+  it('loads enough group sequence candidates to recover an exact content msgId', async () => {
+    const f = fixture()
+    const original = {
+      ...f.message, chatType: 2, peerUid: '1058754719', peerUin: '1058754719',
+      msgId: 'real-source', msgSeq: '490124',
+    } satisfies MsgRecord
+    const grayTip = {
+      ...original, msgId: 'gray-sidecar', elements: [{
+        elementType: 6, elementId: 'poke', faceElement: {
+          faceIndex: 0, faceType: 5, spokeSummary: 'Alice poked Bob',
+        },
+      }],
+    } satisfies MsgRecord
+    const reply = {
+      ...original, msgId: 'reply', msgSeq: '490125', elements: [{
+        elementType: 7, elementId: 'reply-element', replyElement: {
+          replayMsgId: '0', replayMsgSeq: '490124', sourceMsgIdInRecords: '0',
+          sourceMsgTextElems: [], replyMsgRevokeType: 0,
+          sourceMsgIsIncPic: false, sourceMsgExpired: false,
+        },
+      }],
+    } satisfies MsgRecord
+    f.msg.getMsgsByMsgId.mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [reply] })
+    f.msg.getMsgsBySeqAndCount.mockResolvedValueOnce({
+      result: 0, errMsg: '', msgList: [grayTip, original],
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.getMessage(bridge.getConversation('1058754719'), 'reply')).resolves.toMatchObject({
+      id: 'reply', replyToId: 'real-source', telegramReplyToMessageId: 490124,
+    })
+    expect(f.msg.getMsgsBySeqAndCount).toHaveBeenCalledWith(
+      expect.objectContaining({ peerUid: '1058754719' }), '490124', 8, true, true,
+    )
   })
 
   it('resolves an adjacent direct reply from the same batch without loading its target', async () => {

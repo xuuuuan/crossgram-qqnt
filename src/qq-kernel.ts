@@ -5835,27 +5835,32 @@ export class QQKernelBridge {
   }
 
   private async resolveReplyTargets(records: MsgRecord[]): Promise<void> {
-    const batchBySeq = new Map(records.flatMap((record) => {
-      if (!record.msgSeq || !isMessageChatType(record.chatType)) return []
+    const batchBySeq = replyTargetsBySequence(records)
+    const cachedCandidates = new Map<string, { id: string, service: boolean }>()
+    for (const record of records) {
+      if (!isMessageChatType(record.chatType)) continue
       const conversation = conversationId(record.chatType, record.peerUid)
-      return [[`${conversation}\u0000${record.msgSeq}`, record.msgId] as const]
-    }))
-    const cachedBySeq = new Map(records.flatMap((record) => {
-      if (!isMessageChatType(record.chatType)) return []
-      const conversation = conversationId(record.chatType, record.peerUid)
-      return (this.messages.get(conversation) ?? []).flatMap((message) =>
-        message.msgSeq ? [[`${conversation}\u0000${message.msgSeq}`, message.id] as const] : [])
-    }))
+      for (const message of this.messages.get(conversation) ?? []) {
+        if (!message.msgSeq) continue
+        const key = `${conversation}\u0000${message.msgSeq}`
+        const existing = cachedCandidates.get(key)
+        const service = Boolean(message.serviceAction)
+        if (!existing || (existing.service && !service)) cachedCandidates.set(key, { id: message.id, service })
+      }
+    }
+    const cachedBySeq = new Map([...cachedCandidates].map(([key, value]) => [key, value.id]))
     await Promise.all(
       records.map(async (record) => {
       if (!isMessageChatType(record.chatType)) return
-      // QQ group msgSeq is the Telegram megagroup message ID, so group replies
-      // never need a target msgId lookup.
-      if (record.chatType === CHAT_GROUP) return
       if (this.resolvedReplyTargets.has(record.msgId)) return
       const reply = record.elements?.find((element) => element.replyElement)?.replyElement
       if (!reply) return
       const conversation = conversationId(record.chatType, record.peerUid)
+      const direct = directReplyTargetId(reply)
+      if (direct) {
+        this.resolvedReplyTargets.set(record.msgId, direct)
+        return
+      }
       const local = reply.replayMsgSeq
         ? (batchBySeq.get(`${conversation}\u0000${reply.replayMsgSeq}`)
           ??
@@ -5865,9 +5870,9 @@ export class QQKernelBridge {
         this.resolvedReplyTargets.set(record.msgId, local)
         return
       }
-      const direct = replyTargetId(record, reply)
-      if (direct) {
-        this.resolvedReplyTargets.set(record.msgId, direct)
+      const legacy = replyTargetId(record, reply)
+      if (legacy) {
+        this.resolvedReplyTargets.set(record.msgId, legacy)
         return
       }
       if (reply.sourceMsgExpired) return
@@ -5876,7 +5881,9 @@ export class QQKernelBridge {
       try {
         const response = reply.replayMsgSeq && reply.replayMsgSeq !== '0' && service.getMsgsBySeqAndCount
           ? await withTimeout(
-            retryHistoryCall(() => service.getMsgsBySeqAndCount!(peer, reply.replayMsgSeq!, 1, true, true)),
+            retryHistoryCall(() => service.getMsgsBySeqAndCount!(
+              peer, reply.replayMsgSeq!, record.chatType === CHAT_GROUP ? 8 : 1, true, true,
+            )),
             2_000,
             'QQ reply source request timed out',
           )
@@ -5890,7 +5897,7 @@ export class QQKernelBridge {
             )
             : undefined
         const target = response?.result === 0
-          ? response.msgList.find((item) => !reply.replayMsgSeq || item.msgSeq === reply.replayMsgSeq)?.msgId
+          ? selectReplySequenceTarget(response.msgList, reply.replayMsgSeq)?.msgId
           : undefined
         if (target && target !== '0') this.resolvedReplyTargets.set(record.msgId, target)
       } catch (error) {
@@ -8963,9 +8970,8 @@ function replyTargetId(
   record: MsgRecord,
   reply: NonNullable<MsgElement['replyElement']>,
 ): string | undefined {
-  for (const id of [reply.replayMsgId, reply.replayMsgRootMsgId]) {
-    if (id && id !== '0') return id
-  }
+  const direct = directReplyTargetId(reply)
+  if (direct) return direct
   // sourceMsgIdInRecords identifies QQNT's nested snapshot, which can have a
   // different msgId from the real top-level source. Keep it only as a legacy
   // fallback when the corresponding nested record was not actually supplied.
@@ -8974,6 +8980,42 @@ function replyTargetId(
     return reply.sourceMsgIdInRecords
   }
   return undefined
+}
+
+function directReplyTargetId(
+  reply: NonNullable<MsgElement['replyElement']>,
+): string | undefined {
+  for (const id of [reply.replayMsgId, reply.replayMsgRootMsgId]) {
+    if (id && id !== '0') return id
+  }
+}
+
+function replyTargetsBySequence(records: readonly MsgRecord[]): Map<string, string> {
+  const targets = new Map<string, MsgRecord>()
+  for (const record of records) {
+    if (!record.msgSeq || !isMessageChatType(record.chatType)) continue
+    const key = `${conversationId(record.chatType, record.peerUid)}\u0000${record.msgSeq}`
+    const existing = targets.get(key)
+    if (!existing || (isServiceMessageRecord(existing) && !isServiceMessageRecord(record))) {
+      targets.set(key, record)
+    }
+  }
+  return new Map([...targets].map(([key, record]) => [key, record.msgId]))
+}
+
+function selectReplySequenceTarget(
+  records: readonly MsgRecord[],
+  sequence?: string,
+): MsgRecord | undefined {
+  const matching = sequence ? records.filter((record) => record.msgSeq === sequence) : [...records]
+  return matching.find((record) => !isServiceMessageRecord(record)) ?? matching[0]
+}
+
+function isServiceMessageRecord(record: MsgRecord): boolean {
+  return record.elements.some((element) =>
+    Boolean(element.grayTipElement)
+    || element.faceElement?.faceType === 5
+    || element.elementType === ELEMENT_AV_RECORD)
 }
 
 function telegramMessageId(value?: string): number | undefined {

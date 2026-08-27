@@ -215,7 +215,7 @@ export interface QQMessage {
   msgSeq?: string
   /** Telegram megagroup message ID; QQ group msgSeq is conversation-scoped and monotonic. */
   telegramMessageId?: number
-  /** Telegram megagroup reply target taken directly from QQ replayMsgSeq. */
+  /** Telegram megagroup reply fallback taken directly from QQ replayMsgSeq. */
   telegramReplyToMessageId?: number
   /** Adapter-generated correlation token used to suppress only its own listener echo. */
   originRequestId?: string
