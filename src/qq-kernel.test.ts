@@ -2293,6 +2293,7 @@ describe('QQKernelBridge', () => {
           { elementType: 5, elementId: 'video', videoElement: {
             filePath: '/missing/clip.mp4', fileName: 'clip.mp4', fileTime: 4,
             fileFormat: 2, fileSize: '1048576', thumbWidth: 1280, thumbHeight: 720,
+            fileWidth: 1920, fileHeight: 1080,
             thumbSize: 4, thumbMd5: 'thumb-md5', thumbPath: new Map([[0, videoThumbnailPath]]),
             videoMd5: 'video-md5', fileUuid: 'video-uuid', fileSubId: 'video-sub-id', fileBizId: 4601,
             sourceVideoCodecFormat: 1,
@@ -2313,7 +2314,7 @@ describe('QQKernelBridge', () => {
       { type: 'text', text: '[语音] 转写内容' },
       { type: 'media', media: {
         id: 'video', kind: 'file', name: 'clip.mp4', mimeType: 'video/mp4',
-        size: 1048576, width: 1280, height: 720, duration: 4,
+        size: 1048576, width: 1920, height: 1080, duration: 4,
         preview: {
           mimeType: 'image/jpeg', size: 4, width: 1280, height: 720,
           locator: {

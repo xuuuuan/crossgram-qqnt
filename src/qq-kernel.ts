@@ -7253,8 +7253,11 @@ function mapMedia(record: MsgRecord, element: MsgElement): QQMedia | undefined {
       name: video.fileName,
       mimeType: videoMimeType(video.fileName, video.fileFormat),
       size: numberOrUndefined(video.fileSize),
-      width: video.thumbWidth || undefined,
-      height: video.thumbHeight || undefined,
+      // QQ exposes both original video dimensions and thumbnail dimensions.
+      // Use the original dimensions for Telegram's layout; thumbnail sizes
+      // can be tiny/letterboxed and make the message bubble collapse.
+      width: video.fileWidth || video.thumbWidth || undefined,
+      height: video.fileHeight || video.thumbHeight || undefined,
       duration: Number.isFinite(video.fileTime) && video.fileTime >= 0 ? video.fileTime : undefined,
       preview: thumbnailPath && thumbnailWidth && thumbnailHeight ? {
         mimeType: imageMimeType(thumbnailPath, false),

@@ -227,6 +227,9 @@ export interface MsgElement {
     thumbMd5?: string
     /** Duration in seconds. */
     fileTime: number
+    /** Original video dimensions (thumbnail dimensions may differ). */
+    fileWidth?: number
+    fileHeight?: number
     thumbSize?: number
     /** 1 avi, 2 mp4, 3 wmv, 4 mkv, 5 rmvb, 6 rm, 7 asf, 8 mov, 9 mod, 10 ts, 11 mts. */
     fileFormat?: number
