@@ -4929,6 +4929,35 @@ describe('QQKernelBridge', () => {
     })
   })
 
+  it('hydrates small reaction actor previews in history responses', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const conversation = await bridge.resolveConversation(2, '1058754719')
+    const groupMessage = {
+      ...f.message,
+      chatType: 2 as const,
+      peerUid: '1058754719',
+      peerUin: '1058754719',
+      emojiLikesList: [{ emojiType: '2', emojiId: '128522', likesCnt: '2', isClicked: false }],
+    }
+    f.msg.getLatestDbMsgs.mockResolvedValue({ result: 0, errMsg: '', msgList: [groupMessage] })
+    f.msg.getMsgEmojiLikesList.mockResolvedValue({
+      result: 0, errMsg: '', cookie: '', isFirstPage: true, isLastPage: true,
+      emojiLikesList: [
+        { tinyId: 'actor-a', nickName: 'Alice', headUrl: '' },
+        { tinyId: 'actor-b', nickName: 'Bob', headUrl: '' },
+      ],
+    })
+
+    await expect(bridge.getHistory(conversation)).resolves.toMatchObject({
+      messages: [{ reactionContext: { reactions: [{ key: '2:128522', count: 2, recentActors: [
+        { userId: 'actor-a' }, { userId: 'actor-b' },
+      ] }] } }],
+    })
+    expect(f.msg.getMsgEmojiLikesList).toHaveBeenCalledOnce()
+  })
+
   it('falls back to the persisted group sequence when QQNT no longer resolves a message id', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()

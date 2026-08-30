@@ -1244,7 +1244,21 @@ export class QQKernelBridge {
     const visibleRecords = response.msgList.filter((record) => !isRecalledRecord(record))
     await this.resolveReplyTargets(visibleRecords)
     await this.resolveGrayTipUsers(visibleRecords)
-    const messages = await Promise.all(visibleRecords.map((record) => this.mapMessagePrepared(record)))
+    const messages = await mapConcurrent(visibleRecords, 8, async (record) => {
+      const message = await this.mapMessagePrepared(record)
+      // Telegram shows the actor preview directly from the history payload.
+      // QQ's message record only contains counts, so hydrate the small
+      // reaction sets while building history (the same three-actor preview
+      // used by getMessageReactions).  Larger sets are left to the explicit
+      // actor-list RPC to avoid multiplying native calls for busy chats.
+      const total = message.reactionContext?.reactions.reduce((sum, reaction) => sum + reaction.count, 0) ?? 0
+      if (record.chatType === CHAT_GROUP && message.reactionContext && total > 0 && total <= 3) {
+        message.reactionContext = await this.withReactionActors(
+          conversation, record, message.reactionContext, 3,
+        )
+      }
+      return message
+    })
     for (const message of messages) this.rememberMessage(message)
     if (!messages.length && !query.beforeId && !query.afterId && !query.cursor) {
       const cached = this.messages.get(conversation.id) ?? []
