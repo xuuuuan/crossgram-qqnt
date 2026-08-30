@@ -4807,6 +4807,39 @@ describe('QQKernelBridge', () => {
     } })
   })
 
+  it('hydrates the complete small actor preview after a native reaction push', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    vi.spyOn(bridge as unknown as { initializePlatformData(): Promise<void> }, 'initializePlatformData').mockResolvedValue()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const conversation = bridge.getConversation('1058754719')
+    const target = {
+      ...f.message,
+      msgId: 'hydrated-pushed-reaction', msgSeq: '799177', chatType: 2 as const,
+      peerUid: '1058754719', peerUin: '1058754719', sendType: 0,
+      senderUid: 'member-a', senderUin: '42', emojiLikesList: [],
+    }
+    f.msg.getLatestDbMsgs.mockResolvedValue({ result: 0, errMsg: '', msgList: [target] })
+    f.msg.getMsgEmojiLikesList.mockResolvedValue({
+      result: 0, errMsg: '', cookie: '', isLastPage: true, isFirstPage: true,
+      emojiLikesList: [
+        { tinyId: 'actor-a', nickName: 'A', headUrl: '' },
+        { tinyId: 'actor-b', nickName: 'B', headUrl: '' },
+      ],
+    })
+    await bridge.getHistory(conversation)
+    const events = bridge.subscribe()[Symbol.asyncIterator]()
+
+    f.emitS2C(groupReactionPushBytes({ currentCount: 2 }))
+    await expect(events.next()).resolves.toMatchObject({ value: {
+      type: 'message-reactions',
+      context: { reactions: [{ recentActors: [{ userId: 'actor-a' }, { userId: 'actor-b' }] }] },
+    } })
+    expect(f.msg.getMsgEmojiLikesList).toHaveBeenCalledWith(
+      expect.objectContaining({ peerUid: '1058754719' }), '799177', '10068', '2', '', false, 3,
+    )
+  })
+
   it('resolves an uncached reaction-push target by its group sequence', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()

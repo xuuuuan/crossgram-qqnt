@@ -399,6 +399,10 @@ export class QQKernelBridge {
     assignedMessageId?: string
   }> = []
   private readonly pendingReactions = new Map<string, ReturnType<typeof deferred<QQReactionState>>>()
+  // QQNT may publish an intermediate info snapshot before the reaction write
+  // reaches its local message cache. Keep the requested selection briefly so
+  // that snapshot cannot make an optimistic reaction disappear.
+  private readonly pendingReactionDesired = new Map<string, { keys: Set<string>, expiresAt: number }>()
   private readonly pendingGroupProfiles = new Map<string, ReturnType<typeof deferred<void>>>()
   private pendingGroupFilePage?: {
     groupCode: string
@@ -828,6 +832,7 @@ export class QQKernelBridge {
     this.searchContexts.clear()
     for (const pending of this.pendingReactions.values()) pending.reject(new Error('QQNT session detached'))
     this.pendingReactions.clear()
+    this.pendingReactionDesired.clear()
     for (const pending of this.pendingGroupProfiles.values()) pending.reject(new Error('QQNT session detached'))
     this.pendingGroupProfiles.clear()
     this.pendingGroupFilePage?.result.reject(new Error('QQNT session detached'))
@@ -3429,6 +3434,15 @@ export class QQKernelBridge {
     const desired = new Set(reactionKeys)
     const stateChanged = current.size !== desired.size || [...current].some((key) => !desired.has(key))
     const pendingKey = `${conversation.id}\u0000${message.id}`
+    if (stateChanged) {
+      const expiresAt = Date.now() + 10_000
+      this.pendingReactionDesired.set(pendingKey, { keys: desired, expiresAt })
+      const timer = setTimeout(() => {
+        const pending = this.pendingReactionDesired.get(pendingKey)
+        if (pending?.expiresAt === expiresAt) this.pendingReactionDesired.delete(pendingKey)
+      }, 10_000)
+      timer.unref?.()
+    }
     try {
       for (const key of new Set([...current, ...desired])) {
         if (current.has(key) === desired.has(key)) continue
@@ -3460,7 +3474,10 @@ export class QQKernelBridge {
             if (attempt < 4) await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)))
           }
         }
-        if (!completed) throw lastError
+        if (!completed) {
+          this.pendingReactionDesired.delete(pendingKey)
+          throw lastError
+        }
         this.pendingReactions.delete(pendingKey)
       }
       const previous = new Map((message.reactionContext?.reactions ?? []).map((item) => [item.key, item]))
@@ -5145,6 +5162,15 @@ export class QQKernelBridge {
         log('info', receivedMessageSummary(conversation, message))
       }
       const previous = (this.messages.get(message.conversationId) ?? []).find((item) => item.id === message.id)
+      const pendingIntent = this.pendingReactionDesired.get(`${conversation.id}\u0000${message.id}`)
+      if (pendingIntent && pendingIntent.expiresAt > Date.now()
+        && (record.emojiLikesList === undefined || record.emojiLikesList.length === 0)) {
+        message.reactionContext = this.mergePendingReactionIntent(
+          previous?.reactionContext,
+          message.reactionContext,
+          pendingIntent.keys,
+        )
+      }
       // Some info updates only mutate delivery/media metadata and omit the
       // reaction field altogether. Absence is not an authoritative clear.
       if (record.emojiLikesList === undefined && previous?.reactionContext) {
@@ -5237,7 +5263,10 @@ export class QQKernelBridge {
     }
 
     const previous = message.reactionContext
-    const context = this.applyReactionPush(previous, push)
+    let context = this.applyReactionPush(previous, push)
+    if (push.currentCount > 0 && push.currentCount <= 3) {
+      context = await this.hydrateReactionPushActors(conversation, message, context, push)
+    }
     this.rememberMessage({
       ...message,
       reactionContext: context.reactions.length ? context : undefined,
@@ -5760,6 +5789,58 @@ export class QQKernelBridge {
         .catch(() => current.resolve(undefined))
     }
     await pending.promise.catch(() => undefined)
+  }
+
+  private async hydrateReactionPushActors(
+    conversation: QQConversation,
+    message: QQMessage,
+    context: QQReactionState,
+    push: QQGroupReactionPush,
+  ): Promise<QQReactionState> {
+    const service = this.requireMsgService()
+    if (!service.getMsgEmojiLikesList || !message.msgSeq) return context
+    const resolved = this.reactionPushKey(push.code)
+    const [emojiType, emojiId] = splitReactionKey(resolved.key)
+    try {
+      const actors = await this.getReactionActors(conversation, message.msgSeq, emojiId, emojiType, 3)
+      if (!actors.length) return context
+      const recentActors = actors.map((actor) => ({ userId: actor.tinyId }))
+      return {
+        ...context,
+        reactions: context.reactions.map((reaction) => reaction.key === resolved.key
+          ? { ...reaction, recentActors }
+          : reaction),
+      }
+    } catch (error) {
+      log('warn', `reaction actor push hydration failed conversation=${conversation.id} seq=${message.msgSeq} code=${push.code}`, error)
+      return context
+    }
+  }
+
+  private mergePendingReactionIntent(
+    previous: QQReactionState | undefined,
+    incoming: QQReactionState | undefined,
+    desired: Set<string>,
+  ): QQReactionState {
+    const previousByKey = new Map((previous?.reactions ?? []).map((reaction) => [reaction.key, reaction]))
+    const incomingByKey = new Map((incoming?.reactions ?? []).map((reaction) => [reaction.key, reaction]))
+    const keys = new Set([...previousByKey.keys(), ...incomingByKey.keys(), ...desired])
+    const reactions = [...keys].flatMap((key) => {
+      const prior = previousByKey.get(key)
+      const current = incomingByKey.get(key)
+      const selected = desired.has(key)
+      const count = selected
+        ? Math.max(1, current?.count ?? 0, prior?.count ?? 0)
+        : Math.max(0, current?.count ?? 0, prior?.count ?? 0) - (prior?.selected ? 1 : 0)
+      if (!count && !selected) return []
+      return [{
+        ...(current ?? prior ?? { key, count }),
+        key,
+        count,
+        ...(selected ? { selected: true } : { selected: undefined }),
+      }]
+    })
+    return { reactions, maxSelected: incoming?.maxSelected ?? previous?.maxSelected ?? 20 }
   }
 
   /** Consume a packet captured by the native receive hook. */
