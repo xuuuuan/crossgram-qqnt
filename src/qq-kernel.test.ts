@@ -2373,13 +2373,13 @@ describe('QQKernelBridge', () => {
           locator: {
             messageId: 'fallbacks', elementId: 'video', chatType: 1, peerUid: 'uid-1715311957',
             kind: 'image', fileName: 'preview.jpg',
-            fileSize: '4', filePath: videoThumbnailPath, md5: 'thumb-md5',
+            fileSize: '4', filePath: videoThumbnailPath, md5: '7468756d622d6d6435',
           },
         },
         locator: {
           messageId: 'fallbacks', elementId: 'video', chatType: 1, peerUid: 'uid-1715311957',
           kind: 'file', fileName: 'clip.mp4', fileSize: '1048576', filePath: '/missing/clip.mp4',
-          fileUuid: 'video-uuid', fileSubId: 'video-sub-id', fileBizId: 4601, md5: 'video-md5',
+          fileUuid: 'video-uuid', fileSubId: 'video-sub-id', fileBizId: 4601, md5: '766964656f2d6d6435',
           videoCodecFormat: 1,
         },
       } },
