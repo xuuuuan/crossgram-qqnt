@@ -592,7 +592,7 @@ mod linux {
         copied == destination.len() as isize
     }
 
-    fn read_qq_string_bytes(record: &[u8; 64], offset: usize) -> Option<Vec<u8>> {
+    fn read_qq_string_bytes(record: &[u8], offset: usize) -> Option<Vec<u8>> {
         let end = offset.checked_add(24)?;
         if end > record.len() {
             return None;
