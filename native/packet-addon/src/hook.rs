@@ -1063,9 +1063,10 @@ mod linux {
             record[0] = (uin.len() * 2) as u8;
             record[1..1 + uin.len()].copy_from_slice(uin);
             record[24..28].copy_from_slice(&42u32.to_ne_bytes());
-            let command = b"trpc.msg.olpush.OlPushService.MsgPush";
-            record[32] = (command.len() * 2) as u8;
-            record[33..33 + command.len()].copy_from_slice(command);
+            let command = b"trpc.msg.olpush.OlPushService.MsgPush".to_vec();
+            record[32] = 1;
+            record[40..48].copy_from_slice(&command.len().to_ne_bytes());
+            record[48..56].copy_from_slice(&(command.as_ptr() as usize).to_ne_bytes());
             record[56..64].copy_from_slice(&(buffer.as_mut_ptr() as usize).to_ne_bytes());
 
             let packet = unsafe { parse_receive_packet(record.as_mut_ptr()) }.expect("packet");
