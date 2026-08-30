@@ -14,6 +14,14 @@ pub enum HookError {
     Enable(String),
 }
 
+#[derive(Debug, Clone)]
+pub struct ReceivePacket {
+    pub uin: String,
+    pub command: String,
+    pub sequence: u64,
+    pub payload: Vec<u8>,
+}
+
 #[cfg(windows)]
 mod windows {
     use super::*;
@@ -331,6 +339,27 @@ mod windows {
                 Some((heap_data.as_ptr(), 32)),
             );
         }
+
+        #[test]
+        fn parses_msf_receive_record_layout() {
+            let payload = b"abc123".to_vec();
+            let mut buffer = vec![payload.as_ptr() as usize, unsafe { payload.as_ptr().add(payload.len()) as usize }];
+            let mut record = vec![0u8; 64];
+            let uin = b"1715311957";
+            record[0] = (uin.len() * 2) as u8;
+            record[1..1 + uin.len()].copy_from_slice(uin);
+            record[24..28].copy_from_slice(&42u32.to_ne_bytes());
+            let command = b"trpc.msg.olpush.OlPushService.MsgPush";
+            record[32] = (command.len() * 2) as u8;
+            record[33..33 + command.len()].copy_from_slice(command);
+            record[56..64].copy_from_slice(&(buffer.as_mut_ptr() as usize).to_ne_bytes());
+
+            let packet = unsafe { parse_receive_packet(record.as_mut_ptr()) }.expect("packet");
+            assert_eq!(packet.uin, "1715311957");
+            assert_eq!(packet.command, "trpc.msg.olpush.OlPushService.MsgPush");
+            assert_eq!(packet.sequence, 42);
+            assert_eq!(packet.payload, payload);
+        }
     }
 }
 
@@ -364,6 +393,7 @@ mod linux {
     };
     use std::ffi::c_void;
     use std::sync::Mutex;
+    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     type Converter = unsafe extern "C" fn(*mut u8, napi_env, napi_value);
@@ -381,6 +411,140 @@ mod linux {
     static ORIGINAL_CONVERTER: AtomicUsize = AtomicUsize::new(0);
     static CONVERTER_TARGET: AtomicUsize = AtomicUsize::new(0);
     static RESOLVER_TARGET: AtomicUsize = AtomicUsize::new(0);
+    static RECEIVE_TARGET: AtomicUsize = AtomicUsize::new(0);
+    static ORIGINAL_RECEIVE: AtomicUsize = AtomicUsize::new(0);
+    static RECEIVE_PAGE: AtomicUsize = AtomicUsize::new(0);
+    static RECEIVE_QUEUE: Mutex<VecDeque<super::ReceivePacket>> = Mutex::new(VecDeque::new());
+    const RECEIVE_PROLOGUE: [u8; 5] = [0x55, 0x41, 0x57, 0x41, 0x56];
+    const RECEIVE_STUB_OFFSET: usize = 64;
+    const MAX_RECEIVE_PAYLOAD: usize = 1024 * 1024;
+    const MAX_RECEIVE_STRING: usize = 4096;
+
+    pub fn drain_receive_packets() -> Vec<super::ReceivePacket> {
+        let mut queue = RECEIVE_QUEUE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        queue.drain(..).collect()
+    }
+
+    pub fn install_receive(probe: &PacketBindingProbe) -> Result<u64, HookError> {
+        let receive_rva = probe.receive_rva as usize;
+        if receive_rva == 0 {
+            return Err(HookError::Create("MSF receive handler xref was not found".into()));
+        }
+
+        let target = probe
+            .module_base
+            .checked_add(receive_rva)
+            .ok_or_else(|| HookError::Create("receive address overflow".into()))?;
+        if RECEIVE_TARGET.load(Ordering::Acquire) == target {
+            return Ok(probe.receive_rva);
+        }
+        if RECEIVE_TARGET.load(Ordering::Acquire) != 0 {
+            return Err(HookError::DifferentTarget);
+        }
+        let _guard = INSTALL_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if RECEIVE_TARGET.load(Ordering::Acquire) == target {
+            return Ok(probe.receive_rva);
+        }
+        if RECEIVE_TARGET.load(Ordering::Acquire) != 0 {
+            return Err(HookError::DifferentTarget);
+        }
+        let prologue = unsafe { std::ptr::read_unaligned(target as *const [u8; 5]) };
+        if prologue != RECEIVE_PROLOGUE {
+            return Err(HookError::Create(format!(
+                "receive target prologue {prologue:02x?} does not match expected {:02x?}",
+                RECEIVE_PROLOGUE,
+            )));
+        }
+        let near = alloc_near(target, PAGE_SIZE)?;
+        let page = near as *mut u8;
+        unsafe {
+            std::ptr::copy_nonoverlapping(target as *const u8, page, 5);
+            let jmp_at = page.add(5);
+            *jmp_at = 0xE9;
+            let rel = (target as isize)
+                .wrapping_add(5)
+                .wrapping_sub((near + 10) as isize);
+            write_i32(jmp_at.add(1), rel as i32);
+            write_abs_jmp(page.add(RECEIVE_STUB_OFFSET), shim_receive as *const () as usize);
+        }
+        mprotect_rw(near, PAGE_SIZE)
+            .and_then(|()| mprotect_rx(near, PAGE_SIZE))
+            .map_err(|error| {
+                unsafe { libc::munmap(near as *mut c_void, PAGE_SIZE) };
+                error
+            })?;
+        ORIGINAL_RECEIVE.store(near, Ordering::Release);
+        if let Err(error) = patch_rel32_jmp(target, near + RECEIVE_STUB_OFFSET) {
+            ORIGINAL_RECEIVE.store(0, Ordering::Release);
+            unsafe { libc::munmap(near as *mut c_void, PAGE_SIZE) };
+            return Err(error);
+        }
+        RECEIVE_PAGE.store(near, Ordering::Release);
+        RECEIVE_TARGET.store(target, Ordering::Release);
+        Ok(probe.receive_rva)
+    }
+
+    unsafe extern "C" fn shim_receive(arg1: *mut u8, rec: *mut u8, arg3: *mut u8) -> i64 {
+        if let Some(packet) = unsafe { parse_receive_packet(rec) } {
+            let mut queue = RECEIVE_QUEUE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if queue.len() >= 2048 {
+                queue.pop_front();
+            }
+            queue.push_back(packet);
+        }
+        let trampoline = ORIGINAL_RECEIVE.load(Ordering::Acquire);
+        if trampoline == 0 {
+            return 0;
+        }
+        let original: unsafe extern "C" fn(*mut u8, *mut u8, *mut u8) -> i64 =
+            unsafe { std::mem::transmute(trampoline) };
+        unsafe { original(arg1, rec, arg3) }
+    }
+
+    unsafe fn parse_receive_packet(rec: *mut u8) -> Option<super::ReceivePacket> {
+        if rec.is_null() {
+            return None;
+        }
+        let uin = unsafe { read_qq_string(rec, 0)? };
+        let command = unsafe { read_qq_string(rec, 32)? };
+        let sequence = unsafe { rec.add(24).cast::<u32>().read_unaligned() as u64 };
+        let buffer = unsafe { rec.add(56).cast::<*const u8>().read_unaligned() };
+        if buffer.is_null() {
+            return None;
+        }
+        let start = unsafe { buffer.cast::<*const u8>().read_unaligned() };
+        let end = unsafe { buffer.add(8).cast::<*const u8>().read_unaligned() };
+        if start.is_null() || end.is_null() || end < start {
+            return None;
+        }
+        let length = (end as usize).checked_sub(start as usize)?;
+        if length == 0 || length > MAX_RECEIVE_PAYLOAD {
+            return None;
+        }
+        let payload = unsafe { std::slice::from_raw_parts(start, length).to_vec() };
+        Some(super::ReceivePacket {
+            uin: String::from_utf8_lossy(&uin).into_owned(),
+            command: String::from_utf8_lossy(&command).into_owned(),
+            sequence,
+            payload,
+        })
+    }
+
+    unsafe fn read_qq_string(rec: *mut u8, offset: usize) -> Option<Vec<u8>> {
+        let value = unsafe { rec.add(offset) };
+        let tag = unsafe { *value };
+        let (data, length) = if tag & 1 == 0 {
+            (unsafe { value.add(1).cast_const() }, (tag as usize) >> 1)
+        } else {
+            let length = unsafe { value.add(8).cast::<usize>().read_unaligned() };
+            let data = unsafe { value.add(16).cast::<*const u8>().read_unaligned() };
+            (data, length)
+        };
+        if length > MAX_RECEIVE_STRING || (length != 0 && data.is_null()) {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts(data, length).to_vec() })
+    }
 
     pub fn install(probe: &PacketBindingProbe) -> Result<(), HookError> {
         let base = probe.module_base;
@@ -978,7 +1142,17 @@ mod linux {
 pub use windows::install;
 
 #[cfg(target_os = "linux")]
-pub use linux::install;
+pub use linux::{drain_receive_packets, install, install_receive};
+
+#[cfg(not(target_os = "linux"))]
+pub fn drain_receive_packets() -> Vec<ReceivePacket> {
+    Vec::new()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn install_receive(_probe: &crate::elf::PacketBindingProbe) -> Result<u64, HookError> {
+    Err(HookError::Create("native receive hook is not implemented on this platform".into()))
+}
 
 #[cfg(not(any(windows, target_os = "linux")))]
 pub fn install(_probe: &crate::elf::PacketBindingProbe) -> Result<(), HookError> {

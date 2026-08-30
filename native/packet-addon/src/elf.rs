@@ -1373,6 +1373,7 @@ mod tests {
         assert_eq!(
             locate_packet_binding(&elf, SEND_ANCHOR).unwrap(),
             LocatedPacketBinding {
+                receive_rva: 0,
                 anchor_rva: ANCHOR_RVA,
                 anchor_xref_rva: CALLBACK + 0x30,
                 napi_callback_rva: CALLBACK,

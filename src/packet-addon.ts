@@ -88,6 +88,13 @@ export interface PacketAddon {
   probePacketBinding(): PacketBindingProbe
   locateSendBinding(): NativeSendBindingLocation
   installSendHook(): NativeSendBindingLocation
+  installReceiveHook?(): string
+  drainReceivePackets?(): Array<{
+    uin: string
+    command: string
+    sequence: string
+    payload: Buffer
+  }>
 }
 
 let loadedAddon: PacketAddon | undefined

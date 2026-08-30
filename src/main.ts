@@ -109,6 +109,7 @@ function installKernelRequireHook(bridge: QQKernelBridge, login: QQLoginControll
   const originalDlopen = process.dlopen
   const probePacketBinding = createPacketBindingProber()
   const installPacketHook = createPacketHookInstaller()
+  let receivePollStarted = false
 
   moduleWithLoad._load = function qqntBridgeLoad(request, parent, isMain) {
     const loaded = originalLoad.call(this, request, parent, isMain)
@@ -148,6 +149,7 @@ function installKernelRequireHook(bridge: QQKernelBridge, login: QQLoginControll
       if (!probe) return
       logLinuxPacketProbe(probe)
       installLinuxPacketHook()
+      installLinuxReceiveHook()
     } catch (error) {
       log('warn', 'QQNT Linux packet binding probe unavailable', error)
     }
@@ -162,10 +164,39 @@ function installKernelRequireHook(bridge: QQKernelBridge, login: QQLoginControll
       log('error', 'QQNT Linux packet hook install failed; packet media URLs will be unavailable', error)
     }
   }
+
+  function installLinuxReceiveHook(): void {
+    if (receivePollStarted || process.platform !== 'linux') return
+    const addon = loadPacketAddon()
+    if (!addon.installReceiveHook || !addon.drainReceivePackets) {
+      log('warn', 'QQNT Linux receive packet hook unavailable in native addon')
+      return
+    }
+    try {
+      const rva = addon.installReceiveHook()
+      receivePollStarted = true
+      log('info', `QQNT Linux receive packet hook installed receiveRva=${rva}`)
+      const poll = () => {
+        try {
+          for (const packet of addon.drainReceivePackets!()) {
+            if (packet.command === 'trpc.msg.olpush.OlPushService.MsgPush') {
+              bridge.handleNativeReceivePacket(packet.payload)
+            }
+          }
+        } catch (error) {
+          log('error', 'QQNT Linux receive packet drain failed', error)
+        }
+      }
+      const timer = setInterval(poll, 50)
+      timer.unref?.()
+    } catch (error) {
+      log('error', 'QQNT Linux receive packet hook install failed', error)
+    }
+  }
 }
 
 function logLinuxPacketProbe(probe: PacketBindingProbe): void {
-  log('info', `QQNT Linux packet profile verified profile=${probe.profile} buildIdPrefix=${probe.buildId.slice(0, 16)} sha256Prefix=${probe.sha256.slice(0, 16)} nameSlotRva=${probe.nameSlotRva} bindingNameRva=${probe.bindingNameRva} napiCallbackSlotRva=${probe.napiCallbackSlotRva} napiCallbackRva=${probe.napiCallbackRva} responseActionSlotRva=${probe.responseActionSlotRva} responseActionRva=${probe.responseActionRva} converterRva=${probe.converterRva} resolveActionRva=${probe.resolveActionRva}`)
+  log('info', `QQNT Linux packet profile verified profile=${probe.profile} buildIdPrefix=${probe.buildId.slice(0, 16)} sha256Prefix=${probe.sha256.slice(0, 16)} nameSlotRva=${probe.nameSlotRva} bindingNameRva=${probe.bindingNameRva} napiCallbackSlotRva=${probe.napiCallbackSlotRva} napiCallbackRva=${probe.napiCallbackRva} responseActionSlotRva=${probe.responseActionSlotRva} responseActionRva=${probe.responseActionRva} converterRva=${probe.converterRva} resolveActionRva=${probe.resolveActionRva} receiveRva=${probe.receiveRva ?? '<none>'}`)
 }
 
 function isKernelModule(value: unknown): value is KernelModule & object {

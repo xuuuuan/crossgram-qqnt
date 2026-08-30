@@ -3916,9 +3916,7 @@ export class QQKernelBridge {
       onMsgInfoListUpdate: (value: MsgRecord[] | { msgList: MsgRecord[] }) =>
         void this.onMessages(normalizeMessageRecords(value), 'onMsgInfoListUpdate'),
       onRecvS2CMsg: (value: unknown) => {
-        const reaction = decodeGroupReactionPush(value)
-        if (reaction) void this.onReactionPush(reaction).catch((error) =>
-          log('error', `native reaction push failed group=${reaction.groupUin} seq=${reaction.messageSequence}`, error))
+        this.handleNativeReceivePacket(value)
       },
       onMsgRecall: (
         value: number | { chatType: number, peerUid: string, seq: string },
@@ -5762,6 +5760,13 @@ export class QQKernelBridge {
         .catch(() => current.resolve(undefined))
     }
     await pending.promise.catch(() => undefined)
+  }
+
+  /** Consume a packet captured by the native receive hook. */
+  handleNativeReceivePacket(value: unknown): void {
+    const reaction = decodeGroupReactionPush(value)
+    if (reaction) void this.onReactionPush(reaction).catch((error) =>
+      log('error', `native reaction push failed group=${reaction.groupUin} seq=${reaction.messageSequence}`, error))
   }
 
   private rememberRecordSender(record: MsgRecord): void {

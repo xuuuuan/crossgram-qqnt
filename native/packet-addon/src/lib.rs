@@ -81,6 +81,14 @@ pub struct PacketBindingProbe {
     pub resolve_action_rva: String,
 }
 
+#[napi(object)]
+pub struct ReceivedPacket {
+    pub uin: String,
+    pub command: String,
+    pub sequence: String,
+    pub payload: Buffer,
+}
+
 /// Calls QQNT's bound sendSsoCmdReqByContend function from the addon so the
 /// TypeScript layer never needs to know its native implementation details.
 #[napi]
@@ -287,6 +295,42 @@ pub fn locate_send_binding() -> Result<SendBindingLocation> {
 #[napi]
 pub fn install_send_hook() -> Result<SendBindingLocation> {
     install_send_hook_impl()
+}
+
+#[napi]
+pub fn install_receive_hook() -> Result<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut cache = CACHED_PROBE
+            .lock()
+            .map_err(|_| Error::from_reason("QQNT packet probe cache poisoned"))?;
+        if cache.is_none() {
+            let probe = locator::probe_packet_binding().map_err(|error| {
+                Error::from_reason(format!("failed to probe QQNT packet binding: {error}"))
+            })?;
+            *cache = Some(probe);
+        }
+        let probe = cache.as_ref().expect("probe cached");
+        let rva = hook::install_receive(probe).map_err(|error| {
+            Error::from_reason(format!("failed to install QQNT receive hook: {error}"))
+        })?;
+        return Ok(format!("0x{rva:x}"));
+    }
+    #[allow(unreachable_code)]
+    Err(Error::from_reason("QQNT receive hook is only supported on Linux"))
+}
+
+#[napi]
+pub fn drain_receive_packets() -> Vec<ReceivedPacket> {
+    hook::drain_receive_packets()
+        .into_iter()
+        .map(|packet| ReceivedPacket {
+            uin: packet.uin,
+            command: packet.command,
+            sequence: packet.sequence.to_string(),
+            payload: packet.payload.into(),
+        })
+        .collect()
 }
 
 #[cfg(windows)]
