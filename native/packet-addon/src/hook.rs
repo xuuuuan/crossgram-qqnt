@@ -517,10 +517,42 @@ mod linux {
         if !read_process_memory(rec.cast_const(), &mut record) {
             return None;
         }
+        // Current QQNT wraps the receive record in an outer pointer.  The
+        // pointed-to object stores command at +0x20 and the byte range at
+        // +0x38.  Keep the older direct layout as a fallback for other builds.
+        let inner = usize::from_ne_bytes(record[0..8].try_into().ok()?) as *const u8;
+        if !inner.is_null() {
+            let mut inner_record = [0u8; 0x48];
+            if read_process_memory(inner, &mut inner_record) {
+                if let Some(command) = read_qq_string_bytes(&inner_record, 0x20) {
+                    let buffer = usize::from_ne_bytes(inner_record[0x38..0x40].try_into().ok()?)
+                        as *const u8;
+                    if let Some(payload) = read_receive_payload(buffer) {
+                        return Some(super::ReceivePacket {
+                            uin: String::new(),
+                            command: String::from_utf8_lossy(&command).into_owned(),
+                            sequence: 0,
+                            payload,
+                        });
+                    }
+                }
+            }
+        }
+
         let uin = read_qq_string_bytes(&record, 0)?;
         let command = read_qq_string_bytes(&record, 32)?;
         let sequence = u32::from_ne_bytes(record[24..28].try_into().ok()?) as u64;
         let buffer = usize::from_ne_bytes(record[56..64].try_into().ok()?) as *const u8;
+        let payload = read_receive_payload(buffer)?;
+        Some(super::ReceivePacket {
+            uin: String::from_utf8_lossy(&uin).into_owned(),
+            command: String::from_utf8_lossy(&command).into_owned(),
+            sequence,
+            payload,
+        })
+    }
+
+    fn read_receive_payload(buffer: *const u8) -> Option<Vec<u8>> {
         if buffer.is_null() {
             return None;
         }
@@ -538,15 +570,7 @@ mod linux {
             return None;
         }
         let mut payload = vec![0u8; length];
-        if !read_process_memory(start, &mut payload) {
-            return None;
-        }
-        Some(super::ReceivePacket {
-            uin: String::from_utf8_lossy(&uin).into_owned(),
-            command: String::from_utf8_lossy(&command).into_owned(),
-            sequence,
-            payload,
-        })
+        read_process_memory(start, &mut payload).then_some(payload)
     }
 
     fn read_process_memory(address: *const u8, destination: &mut [u8]) -> bool {
@@ -1138,6 +1162,27 @@ mod linux {
             record[32] = 0;
             record[56..64].copy_from_slice(&1usize.to_ne_bytes());
             assert!(unsafe { parse_receive_packet(record.as_mut_ptr()) }.is_none());
+        }
+
+        #[test]
+        fn parses_wrapped_receive_record_layout() {
+            let payload = b"wrapped".to_vec();
+            let mut buffer = vec![payload.as_ptr() as usize, unsafe {
+                payload.as_ptr().add(payload.len()) as usize
+            }];
+            let command = b"trpc.msg.olpush.OlPushService.MsgPush".to_vec();
+            let mut inner = vec![0u8; 0x48];
+            inner[0x20] = 1;
+            inner[0x28..0x30].copy_from_slice(&command.len().to_ne_bytes());
+            inner[0x30..0x38].copy_from_slice(&(command.as_ptr() as usize).to_ne_bytes());
+            inner[0x38..0x40].copy_from_slice(&(buffer.as_mut_ptr() as usize).to_ne_bytes());
+            let mut record = vec![0u8; 64];
+            record[0..8].copy_from_slice(&(inner.as_mut_ptr() as usize).to_ne_bytes());
+
+            let packet = unsafe { parse_receive_packet(record.as_mut_ptr()) }.expect("packet");
+            assert_eq!(packet.uin, "");
+            assert_eq!(packet.command, "trpc.msg.olpush.OlPushService.MsgPush");
+            assert_eq!(packet.payload, payload);
         }
 
         // End-to-end mechanism check without QQNT: synthesize an executable
