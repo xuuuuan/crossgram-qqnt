@@ -110,6 +110,8 @@ function installKernelRequireHook(bridge: QQKernelBridge, login: QQLoginControll
   const probePacketBinding = createPacketBindingProber()
   const installPacketHook = createPacketHookInstaller()
   let receivePollStarted = false
+  let nativeReceiveLogCount = 0
+  const logNativeReceive = process.env.QQNT_BRIDGE_LOG_NATIVE_RECEIVE === '1'
 
   moduleWithLoad._load = function qqntBridgeLoad(request, parent, isMain) {
     const loaded = originalLoad.call(this, request, parent, isMain)
@@ -179,6 +181,10 @@ function installKernelRequireHook(bridge: QQKernelBridge, login: QQLoginControll
       const poll = () => {
         try {
           for (const packet of addon.drainReceivePackets!()) {
+            if (logNativeReceive && nativeReceiveLogCount < 100) {
+              nativeReceiveLogCount++
+              log('info', `native receive packet command=${packet.command} sequence=${packet.sequence} bytes=${packet.payload.length}`)
+            }
             if (packet.command === 'trpc.msg.olpush.OlPushService.MsgPush') {
               bridge.handleNativeReceivePacket(packet.payload)
             }
