@@ -5251,7 +5251,8 @@ export class QQKernelBridge {
     const id = conversationId(CHAT_GROUP, push.groupUin)
     let conversation = this.contacts.get(id) ?? this.getConversation(id)
     let message = (this.messages.get(id) ?? [])
-      .find((item) => item.msgSeq === push.messageSequence && !item.serviceAction)
+      .find((item) => item.msgSeq === push.messageSequence
+        && !item.serviceAction && item.parts.length > 0)
     if (!message) {
       const record = await this.reactionPushTarget(conversation, push.messageSequence)
       if (!record) {
@@ -5300,7 +5301,7 @@ export class QQKernelBridge {
       retryHistoryCall(() => service.getMsgsBySeqAndCount!(peer, messageSequence, 4, queryOrder, true))))
     return responses.flatMap((response) => response.msgList)
       .find((record) => record.msgSeq === messageSequence
-        && !isGrayTipRecord(record)
+        && !isServiceMessageRecord(record)
         && !isRecalledRecord(record))
   }
 
@@ -9274,7 +9275,7 @@ function selectReplySequenceTarget(
 }
 
 function isServiceMessageRecord(record: MsgRecord): boolean {
-  return record.elements.some((element) =>
+  return record.elements.length === 0 || record.elements.some((element) =>
     Boolean(element.grayTipElement)
     || element.faceElement?.faceType === 5
     || element.elementType === ELEMENT_AV_RECORD)
