@@ -509,15 +509,27 @@ mod linux {
         if rec.is_null() {
             return None;
         }
-        let uin = unsafe { read_qq_string(rec, 0)? };
-        let command = unsafe { read_qq_string(rec, 32)? };
-        let sequence = unsafe { rec.add(24).cast::<u32>().read_unaligned() as u64 };
-        let buffer = unsafe { rec.add(56).cast::<*const u8>().read_unaligned() };
+        // The receive callback runs on QQ's networking threads.  A malformed
+        // or already-released packet must not turn into a process crash, so all
+        // memory originating from QQ is copied through process_vm_readv.  The
+        // syscall returns EFAULT for an invalid range instead of faulting us.
+        let mut record = [0u8; 64];
+        if !read_process_memory(rec.cast_const(), &mut record) {
+            return None;
+        }
+        let uin = read_qq_string_bytes(&record, 0)?;
+        let command = read_qq_string_bytes(&record, 32)?;
+        let sequence = u32::from_ne_bytes(record[24..28].try_into().ok()?) as u64;
+        let buffer = usize::from_ne_bytes(record[56..64].try_into().ok()?) as *const u8;
         if buffer.is_null() {
             return None;
         }
-        let start = unsafe { buffer.cast::<*const u8>().read_unaligned() };
-        let end = unsafe { buffer.add(8).cast::<*const u8>().read_unaligned() };
+        let mut buffer_range = [0u8; 16];
+        if !read_process_memory(buffer, &mut buffer_range) {
+            return None;
+        }
+        let start = usize::from_ne_bytes(buffer_range[0..8].try_into().ok()?) as *const u8;
+        let end = usize::from_ne_bytes(buffer_range[8..16].try_into().ok()?) as *const u8;
         if start.is_null() || end.is_null() || end < start {
             return None;
         }
@@ -525,13 +537,56 @@ mod linux {
         if length == 0 || length > MAX_RECEIVE_PAYLOAD {
             return None;
         }
-        let payload = unsafe { std::slice::from_raw_parts(start, length).to_vec() };
+        let mut payload = vec![0u8; length];
+        if !read_process_memory(start, &mut payload) {
+            return None;
+        }
         Some(super::ReceivePacket {
             uin: String::from_utf8_lossy(&uin).into_owned(),
             command: String::from_utf8_lossy(&command).into_owned(),
             sequence,
             payload,
         })
+    }
+
+    fn read_process_memory(address: *const u8, destination: &mut [u8]) -> bool {
+        if address.is_null() {
+            return false;
+        }
+        if destination.is_empty() {
+            return true;
+        }
+        let local = libc::iovec {
+            iov_base: destination.as_mut_ptr().cast(),
+            iov_len: destination.len(),
+        };
+        let remote = libc::iovec {
+            iov_base: address.cast_mut().cast(),
+            iov_len: destination.len(),
+        };
+        let copied = unsafe { libc::process_vm_readv(libc::getpid(), &local, 1, &remote, 1, 0) };
+        copied == destination.len() as isize
+    }
+
+    fn read_qq_string_bytes(record: &[u8; 64], offset: usize) -> Option<Vec<u8>> {
+        let end = offset.checked_add(24)?;
+        if end > record.len() {
+            return None;
+        }
+        let tag = record[offset];
+        if tag & 1 == 0 {
+            let length = (tag as usize) >> 1;
+            let data_end = offset.checked_add(1)?.checked_add(length)?;
+            return (data_end <= record.len()).then(|| record[offset + 1..data_end].to_vec());
+        }
+        let length = usize::from_ne_bytes(record[offset + 8..offset + 16].try_into().ok()?);
+        if length > MAX_RECEIVE_STRING {
+            return None;
+        }
+        let data =
+            usize::from_ne_bytes(record[offset + 16..offset + 24].try_into().ok()?) as *const u8;
+        let mut bytes = vec![0u8; length];
+        (length == 0 || read_process_memory(data, &mut bytes)).then_some(bytes)
     }
 
     unsafe fn read_qq_string(rec: *mut u8, offset: usize) -> Option<Vec<u8>> {
