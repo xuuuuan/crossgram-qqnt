@@ -8350,10 +8350,19 @@ function makeListener(
 ): unknown {
   // QQNT 6.9.96 exports listener wrapper constructors. QQNT 6.9.98 accepts a
   // plain callback object directly and no longer exports those constructors.
+  const rawPushDiagnostics = process.env.QQNT_BRIDGE_LOG_RAW_PUSH === '1'
+  let rawPushCount = 0
   const protectedHandlers = Object.fromEntries(Object.entries(handlers).map(([event, handler]) => [event, (...args: unknown[]) => {
-    // onRecvS2CMsg is the raw online-push stream and can fire for every packet.
-    // Its decoded handlers log the small subset that the bridge consumes.
-    if (event !== 'onRecvS2CMsg') {
+    // QQNT's onRecvS2CMsg is expected to be the raw online-push stream, but
+    // that has to be verified against the running client.  Keep an opt-in,
+    // rate-limited counter so production diagnostics can prove whether this
+    // callback is firing without dumping packet contents or user data.
+    if (event === 'onRecvS2CMsg') {
+      rawPushCount++
+      if (rawPushDiagnostics && (rawPushCount <= 3 || rawPushCount % 1000 === 0)) {
+        log('info', `native raw push callback count=${rawPushCount} argc=${args.length} ${summarizeCallbackArgs(args)}`)
+      }
+    } else {
       log('info', `native callback listener=${name} event=${event} ${summarizeCallbackArgs(args)}`)
     }
     try {
