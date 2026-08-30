@@ -1131,6 +1131,15 @@ mod linux {
             assert_eq!(packet.payload, payload);
         }
 
+        #[test]
+        fn rejects_unreadable_receive_buffer_without_faulting() {
+            let mut record = [0u8; 64];
+            record[0] = 0;
+            record[32] = 0;
+            record[56..64].copy_from_slice(&1usize.to_ne_bytes());
+            assert!(unsafe { parse_receive_packet(record.as_mut_ptr()) }.is_none());
+        }
+
         // End-to-end mechanism check without QQNT: synthesize an executable
         // page whose function has the validated prologue, hook it through a
         // test shim, and confirm the shim runs and the trampoline reaches the
