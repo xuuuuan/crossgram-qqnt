@@ -56,6 +56,7 @@ pub struct SendBindingLocation {
 
 #[napi(object)]
 pub struct PacketBindingProbe {
+    pub receive_rva: String,
     pub module_base: String,
     pub module_path: String,
     pub locator: String,
@@ -244,6 +245,7 @@ pub fn probe_packet_binding() -> Result<PacketBindingProbe> {
         Error::from_reason(format!("failed to probe QQNT packet binding: {error}"))
     })?;
     Ok(PacketBindingProbe {
+        receive_rva: format!("0x{:x}", probe.receive_rva),
         module_base: format!("0x{:x}", probe.module_base),
         module_path: probe.module_path,
         locator: probe.locator.into(),

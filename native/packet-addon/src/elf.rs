@@ -51,6 +51,7 @@ const RESPONSE_ANCHORS: [(&str, &[u8]); 3] = [
     ("errMsg", b"errMsg\0"),
     ("rsp", b"rsp\0"),
 ];
+const RECEIVE_ANCHOR: &[u8] = b"MSF recv seq:{} cmd:{} data_size:{}, error_code:{}\0";
 
 #[derive(Debug, Error)]
 pub enum ElfError {
@@ -563,6 +564,7 @@ impl<'a> ElfImage<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LocatedPacketBinding {
+    receive_rva: u64,
     anchor_rva: u64,
     anchor_xref_rva: u64,
     napi_callback_rva: u64,
@@ -584,6 +586,7 @@ struct LocatedPacketBinding {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PacketBindingProbe {
+    pub receive_rva: u64,
     pub module_base: usize,
     pub module_path: String,
     pub locator: &'static str,
@@ -691,6 +694,7 @@ fn locate_packet_binding(
         .collect::<Result<_, _>>()?;
 
     let located = LocatedPacketBinding {
+        receive_rva: locate_receive_function(image, &functions),
         anchor_rva,
         anchor_xref_rva,
         napi_callback_rva: napi_callback.begin,
@@ -711,6 +715,17 @@ fn locate_packet_binding(
     };
     verify_locator_permissions(image, &located, send_anchor)?;
     Ok(located)
+}
+
+fn locate_receive_function(image: &ElfImage<'_>, functions: &[FunctionRange]) -> u64 {
+    let Some(anchor_rva) = unique(image.non_executable_matches(RECEIVE_ANCHOR)) else {
+        return 0;
+    };
+    let xrefs = image.rip_relative_xrefs_for_targets(&BTreeSet::from([anchor_rva]));
+    let Some(xref_rva) = unique(xrefs.get(&anchor_rva).cloned().unwrap_or_default()) else {
+        return 0;
+    };
+    function_containing(functions, xref_rva).map(|function| function.begin).unwrap_or(0)
 }
 
 fn locate_response_chain(
@@ -789,6 +804,16 @@ fn verify_locator_permissions(
             .is_none_or(|header| header.flags & PF_R == 0 || header.flags & PF_X != 0)
         {
             return Err(ElfError::LocatorPermissions);
+        }
+    }
+    if located.receive_rva != 0 {
+        for (address, length) in [(located.receive_rva, 1usize)] {
+            if image
+                .load_for_range(address, length as u64)
+                .is_none_or(|header| header.flags & (PF_R | PF_W | PF_X) != (PF_R | PF_X))
+            {
+                return Err(ElfError::LocatorPermissions);
+            }
         }
     }
     for address in [
@@ -898,6 +923,7 @@ pub fn probe_packet_binding(send_anchor: &[u8]) -> Result<PacketBindingProbe, El
         dispatch_helper_rva: located.dispatch_helper_rva,
         resolver_thunk_rva: located.resolver_thunk_rva,
         resolve_action_rva: located.resolve_action_rva,
+        receive_rva: located.receive_rva,
     })
 }
 

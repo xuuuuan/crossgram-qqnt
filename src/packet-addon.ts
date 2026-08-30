@@ -47,6 +47,7 @@ export interface NativeSendBindingLocation {
 }
 
 export interface PacketBindingProbe {
+  receiveRva?: string
   moduleBase: string
   modulePath: string
   profile: string
