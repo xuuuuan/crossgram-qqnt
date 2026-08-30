@@ -1058,7 +1058,7 @@ mod linux {
             let mut buffer = vec![payload.as_ptr() as usize, unsafe {
                 payload.as_ptr().add(payload.len()) as usize
             }];
-            let mut record = vec![0u8; 64];
+            let mut record = vec![0u8; 128];
             let uin = b"1715311957";
             record[0] = (uin.len() * 2) as u8;
             record[1..1 + uin.len()].copy_from_slice(uin);
