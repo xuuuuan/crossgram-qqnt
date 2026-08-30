@@ -7301,7 +7301,7 @@ function mapMedia(record: MsgRecord, element: MsgElement): QQMedia | undefined {
       duration: duration !== undefined && duration >= 0 ? duration : undefined,
       locator: {
         ...base, kind: 'voice', fileName: ptt.fileName || basename(filePath), fileSize: ptt.fileSize === undefined ? undefined : String(ptt.fileSize),
-        filePath, fileUuid: ptt.fileUuid, md5: ptt.md5HexStr,
+        filePath, fileUuid: ptt.fileUuid, md5: normalizeNativeHash(ptt.md5HexStr),
       },
     }
   }
@@ -7314,7 +7314,7 @@ function mapMedia(record: MsgRecord, element: MsgElement): QQMedia | undefined {
       // CDN locator exists, every image tier must stay on the direct-link path.
       filePath: picture.originImageUrl ? undefined : picture.sourcePath,
       fileUuid: picture.fileUuid, fileSubId: picture.fileSubId,
-      fileBizId: picture.fileBizId, md5: picture.md5HexStr,
+      fileBizId: picture.fileBizId, md5: normalizeNativeHash(picture.md5HexStr),
       originImageUrl: picture.originImageUrl, imageSpec: 0,
     }
     const preview = animated ? undefined : nativeImagePreview(locator, picture)
@@ -7361,13 +7361,13 @@ function mapMedia(record: MsgRecord, element: MsgElement): QQMedia | undefined {
           fileName: basename(thumbnailPath),
           fileSize: String(thumbnailSize),
           filePath: thumbnailPath,
-          md5: video.thumbMd5,
+          md5: normalizeNativeHash(video.thumbMd5),
         },
       } : undefined,
       locator: {
         ...base, kind: 'file', fileName: video.fileName, fileSize: video.fileSize,
         filePath: video.filePath, fileUuid: video.fileUuid, fileSubId: video.fileSubId,
-        fileBizId: video.fileBizId, md5: video.videoMd5 || video.originVideoMd5,
+        fileBizId: video.fileBizId, md5: normalizeNativeHash(video.videoMd5 || video.originVideoMd5),
         videoCodecFormat: video.sourceVideoCodecFormat ?? 0,
       },
     }
@@ -7382,8 +7382,9 @@ function mapMedia(record: MsgRecord, element: MsgElement): QQMedia | undefined {
       locator: {
         ...base, kind: 'file', fileName: file.fileName, fileSize: file.fileSize,
         filePath: file.filePath, fileUuid: file.fileUuid, fileSubId: file.fileSubId,
-        fileBizId: file.fileBizId, md5: file.fileMd5, sha: file.fileSha, sha3: file.fileSha3,
-        file10MMd5: file.file10MMd5,
+        fileBizId: file.fileBizId, md5: normalizeNativeHash(file.fileMd5),
+        sha: normalizeNativeHash(file.fileSha), sha3: normalizeNativeHash(file.fileSha3),
+        file10MMd5: normalizeNativeHash(file.file10MMd5),
       },
     }
   }

@@ -1355,6 +1355,34 @@ describe('QQKernelBridge', () => {
     expect(f.search.searchMoreChatMsgs).toHaveBeenCalledWith(71)
   })
 
+  it('normalizes hashes on generic searched file messages before persistence', async () => {
+    const f = fixture()
+    const record = { ...f.message, msgId: 'binary-file-search', elements: [{
+      elementType: 3, elementId: 'binary-file-element', fileElement: {
+        fileName: 'binary.bin', fileSize: '3', filePath: '', fileUuid: 'binary-file', fileSubId: '',
+        fileMd5: '\u0000\u0014\ud800', fileSha: 'A0b1', fileSha3: '', file10MMd5: '',
+      },
+    }] }
+    f.search.searchChatMsgs.mockImplementation(() => {
+      queueMicrotask(() => f.emitSearch({
+        searchId: 74, hasMore: false,
+        resultItems: [{ msgId: record.msgId, msgSeq: '1', msgTime: '10',
+          senderUid: record.senderUid, senderUin: record.senderUin, senderNick: record.sendNickName,
+          msgRecord: record }],
+      }))
+      return 74
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    const page = await bridge.searchMessages(bridge.getConversation('uid-1715311957'), {
+      query: '的', limit: 1,
+    })
+    expect(page.messages[0]?.parts[0]).toMatchObject({
+      type: 'media', media: { locator: { md5: '0014efbfbd', sha: 'a0b1' } },
+    })
+  })
+
   it('lists native QQ group folders and files with downloadable media locators', async () => {
     const f = fixture()
     f.richMedia.getGroupFileList.mockImplementation((_groupCode, params) => {
