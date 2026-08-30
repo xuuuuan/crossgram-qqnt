@@ -52,6 +52,7 @@ const RESPONSE_ANCHORS: [(&str, &[u8]); 3] = [
     ("rsp", b"rsp\0"),
 ];
 const RECEIVE_ANCHOR: &[u8] = b"MSF recv seq:{} cmd:{} data_size:{}, error_code:{}\0";
+const RECEIVE_PROLOGUE: &[u8] = b"\x55\x41\x57\x41\x56";
 
 #[derive(Debug, Error)]
 pub enum ElfError {
@@ -725,7 +726,10 @@ fn locate_receive_function(image: &ElfImage<'_>, functions: &[FunctionRange]) ->
     let Some(xref_rva) = unique(xrefs.get(&anchor_rva).cloned().unwrap_or_default()) else {
         return 0;
     };
-    function_containing(functions, xref_rva).map(|function| function.begin).unwrap_or(0)
+    let Some(function) = function_containing(functions, xref_rva) else {
+        return 0;
+    };
+    (image.bytes_at(function.begin, RECEIVE_PROLOGUE.len()).ok() == Some(RECEIVE_PROLOGUE)).then_some(function.begin).unwrap_or(0)
 }
 
 fn locate_response_chain(
@@ -859,6 +863,10 @@ pub fn probe_packet_binding(send_anchor: &[u8]) -> Result<PacketBindingProbe, El
         send_anchor,
         "anchor",
     )?;
+    if located.receive_rva != 0 {
+        let expected = image.bytes_at(located.receive_rva, RECEIVE_PROLOGUE.len())?;
+        verify_loaded_bytes(&image, module.base, located.receive_rva, expected, "receive")?;
+    }
     for (name, address, length) in [
         ("anchor XRef", located.anchor_xref_rva, 7usize),
         (
