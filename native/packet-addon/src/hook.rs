@@ -339,29 +339,6 @@ mod windows {
                 Some((heap_data.as_ptr(), 32)),
             );
         }
-
-        #[test]
-        fn parses_msf_receive_record_layout() {
-            let payload = b"abc123".to_vec();
-            let mut buffer = vec![payload.as_ptr() as usize, unsafe {
-                payload.as_ptr().add(payload.len()) as usize
-            }];
-            let mut record = vec![0u8; 64];
-            let uin = b"1715311957";
-            record[0] = (uin.len() * 2) as u8;
-            record[1..1 + uin.len()].copy_from_slice(uin);
-            record[24..28].copy_from_slice(&42u32.to_ne_bytes());
-            let command = b"trpc.msg.olpush.OlPushService.MsgPush";
-            record[32] = (command.len() * 2) as u8;
-            record[33..33 + command.len()].copy_from_slice(command);
-            record[56..64].copy_from_slice(&(buffer.as_mut_ptr() as usize).to_ne_bytes());
-
-            let packet = unsafe { parse_receive_packet(record.as_mut_ptr()) }.expect("packet");
-            assert_eq!(packet.uin, "1715311957");
-            assert_eq!(packet.command, "trpc.msg.olpush.OlPushService.MsgPush");
-            assert_eq!(packet.sequence, 42);
-            assert_eq!(packet.payload, payload);
-        }
     }
 }
 
@@ -571,6 +548,34 @@ mod linux {
             return None;
         }
         Some(unsafe { std::slice::from_raw_parts(data, length).to_vec() })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parses_msf_receive_record_layout() {
+            let payload = b"abc123".to_vec();
+            let mut buffer = vec![payload.as_ptr() as usize, unsafe {
+                payload.as_ptr().add(payload.len()) as usize
+            }];
+            let mut record = vec![0u8; 64];
+            let uin = b"1715311957";
+            record[0] = (uin.len() * 2) as u8;
+            record[1..1 + uin.len()].copy_from_slice(uin);
+            record[24..28].copy_from_slice(&42u32.to_ne_bytes());
+            let command = b"trpc.msg.olpush.OlPushService.MsgPush";
+            record[32] = (command.len() * 2) as u8;
+            record[33..33 + command.len()].copy_from_slice(command);
+            record[56..64].copy_from_slice(&(buffer.as_mut_ptr() as usize).to_ne_bytes());
+
+            let packet = unsafe { parse_receive_packet(record.as_mut_ptr()) }.expect("packet");
+            assert_eq!(packet.uin, "1715311957");
+            assert_eq!(packet.command, "trpc.msg.olpush.OlPushService.MsgPush");
+            assert_eq!(packet.sequence, 42);
+            assert_eq!(packet.payload, payload);
+        }
     }
 
     pub fn install(probe: &PacketBindingProbe) -> Result<(), HookError> {
