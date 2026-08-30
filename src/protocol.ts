@@ -225,6 +225,8 @@ export interface QQMessage {
   serviceAction?: { type: 'custom', text: string } | { type: 'phone-call' }
   parts: Array<
     | QQTextPart
+    | { type: 'markdown', content: string }
+    | { type: 'inline-keyboard', keyboard: QQInlineKeyboard }
     | { type: 'media', media: QQMedia }
     | { type: 'sticker', sticker: QQSticker }
     | { type: 'multi-forward', title: string, preview?: string, locator: QQMultiForwardLocator }
@@ -232,6 +234,26 @@ export interface QQMessage {
   >
   /** Per-message state only. The shared definition catalog has its own endpoint. */
   reactionContext?: QQReactionState
+}
+
+export interface QQInlineKeyboard {
+  botAppid: string
+  rows: Array<{ buttons: QQInlineKeyboardButton[] }>
+}
+
+export interface QQInlineKeyboardButton {
+  id: string
+  label: string
+  visitedLabel: string
+  style: number
+  type: number
+  clickLimit: number
+  unsupportTips: string
+  data: string
+  atBotShowChannelList: boolean
+  permissionType: number
+  specifyRoleIds: string[]
+  specifyTinyids: string[]
 }
 
 /** Structured QQ Ark/XML share rendered as a native preview by the relay. */

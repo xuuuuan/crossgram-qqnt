@@ -3463,6 +3463,52 @@ export class QQKernelBridge {
     }
   }
 
+  async clickInlineKeyboardButton(
+    conversation: QQConversation,
+    messageId: string,
+    buttonId: string,
+    callbackData: string,
+    botAppid: string,
+    messageSequence?: string,
+  ): Promise<{ status: number, promptText: string, promptType: number, promptIcon: number }> {
+    if (conversation.chatType !== CHAT_C2C && conversation.chatType !== CHAT_GROUP) {
+      throw new Error('QQ inline keyboards are unavailable in this conversation')
+    }
+    if (!buttonId || !botAppid) throw new Error('inline keyboard buttonId and botAppid are required')
+    const service = this.requireMsgService()
+    if (!service.clickInlineKeyboardButton) {
+      throw new Error('QQNT inline keyboard clicks are unavailable in this QQNT build')
+    }
+    const record = messageSequence
+      ? undefined
+      : await this.getMessageRecord(conversation, messageId).catch(() => undefined)
+    const msgSeq = messageSequence || record?.msgSeq || messageId
+    // clickInlineKeyboardButton expects the native peer ID (UID for C2C and
+    // group ID for groups), not the display UIN used by some contact APIs.
+    const peerId = conversation.peerUid || conversation.peerUin
+    log('info', `native API start name=clickInlineKeyboardButton conversation=${conversation.id} message=${messageId} seq=${msgSeq} button=${buttonId}`)
+    const result = await service.clickInlineKeyboardButton({
+      guildId: '',
+      peerId,
+      botAppid,
+      msgSeq,
+      buttonId,
+      callback_data: callbackData,
+      dmFlag: conversation.chatType === CHAT_C2C ? 1 : 0,
+      chatType: conversation.chatType,
+    })
+    if (result.result !== 0) {
+      throw new Error(`clickInlineKeyboardButton: ${result.errMsg} (${result.result})`)
+    }
+    log('info', `native API complete name=clickInlineKeyboardButton conversation=${conversation.id} message=${messageId} seq=${msgSeq} button=${buttonId} status=${result.status}`)
+    return {
+      status: result.status,
+      promptText: result.promptText,
+      promptType: result.promptType,
+      promptIcon: result.promptIcon,
+    }
+  }
+
   async getMembers(conversation: QQConversation, cursor?: string, limit = 100): Promise<MemberPage> {
     if (conversation.chatType !== CHAT_GROUP) return { members: [], total: 0 }
     const service = this.requireGroupService()
@@ -5749,6 +5795,15 @@ export class QQKernelBridge {
             ...(context.multiForwardRootId ? { parentMessageId: record.msgId } : {}),
           },
         })
+      } else if (element.markdownElement?.content || element.inlineKeyboardElement) {
+        // QQ may expose the markdown body and its inline keyboard either as
+        // separate elements or co-located on one element. Preserve both.
+        if (element.markdownElement?.content) {
+          parts.push({ type: 'markdown', content: element.markdownElement.content })
+        }
+        if (element.inlineKeyboardElement) {
+          parts.push({ type: 'inline-keyboard', keyboard: element.inlineKeyboardElement })
+        }
       } else if (isArkMultiForwardRecord(record) && element.arkElement) {
         parts.push({
           type: 'multi-forward',
@@ -8757,6 +8812,10 @@ function receivedMessageSummary(conversation: QQConversation, message: QQMessage
   const content = message.parts.length
     ? message.parts.map((part) => part.type === 'text'
       ? JSON.stringify(truncateLogText(part.text))
+      : part.type === 'markdown'
+        ? `[markdown ${JSON.stringify(truncateLogText(part.content))}]`
+        : part.type === 'inline-keyboard'
+          ? `[inline-keyboard rows=${part.keyboard.rows.length}]`
       : part.type === 'sticker'
         ? `[sticker id=${JSON.stringify(part.sticker.stickerId)}]`
         : part.type === 'card'

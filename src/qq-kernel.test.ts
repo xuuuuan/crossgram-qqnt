@@ -233,6 +233,9 @@ function fixture() {
       result: 0, errMsg: '', msgList: [] as MsgRecord[],
     })),
     setMsgEmojiLikes: vi.fn(async () => ({ result: 0, errMsg: '' })),
+    clickInlineKeyboardButton: vi.fn<NonNullable<KernelMsgService['clickInlineKeyboardButton']>>(async () => ({
+      result: 0, errMsg: '', status: 0, promptText: '操作成功', promptType: 0, promptIcon: 0,
+    })),
     getMsgEmojiLikesList: vi.fn<NonNullable<KernelMsgService['getMsgEmojiLikesList']>>(async () => ({
       result: 0, errMsg: '', emojiLikesList: [], cookie: '', isLastPage: true, isFirstPage: true,
     })),
@@ -2302,6 +2305,13 @@ describe('QQKernelBridge', () => {
             bytesData: JSON.stringify({ meta: { news: { title: '卡片标题' } } }),
           } },
           { elementType: 14, elementId: 'markdown', markdownElement: { content: '**Markdown**' } },
+          { elementType: 14, elementId: 'keyboard', inlineKeyboardElement: {
+            botAppid: '1024', rows: [{ buttons: [{
+              id: 'confirm', label: '确认', visitedLabel: '已确认', style: 2, type: 1,
+              clickLimit: 1, unsupportTips: '', data: 'confirm:42', atBotShowChannelList: false,
+              permissionType: 2, specifyRoleIds: [], specifyTinyids: [],
+            }] }],
+          } },
           { elementType: 999, elementId: 'unknown' },
         ] },
       ],
@@ -2331,10 +2341,27 @@ describe('QQKernelBridge', () => {
         },
       } },
       { type: 'card', card: { kind: 'application', title: '卡片标题' } },
-      { type: 'text', text: '**Markdown**' },
+      { type: 'markdown', content: '**Markdown**' },
+      { type: 'inline-keyboard', keyboard: { botAppid: '1024', rows: [{ buttons: [{ id: 'confirm', label: '确认' }] }] } },
       { type: 'text', text: '[暂不支持的消息 999]' },
     ] })
     await rm(videoThumbnailDir, { recursive: true, force: true })
+  })
+
+  it('clicks native inline keyboard buttons with the message sequence', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    const result = await bridge.clickInlineKeyboardButton(
+      bridge.getConversation('uid-1715311957'), 'm1', 'confirm', 'confirm:42', '1024',
+    )
+
+    expect(result).toMatchObject({ status: 0, promptText: '操作成功' })
+    expect(f.msg.clickInlineKeyboardButton).toHaveBeenCalledWith({
+      guildId: '', peerId: 'uid-1715311957', botAppid: '1024', msgSeq: 'seq1',
+      buttonId: 'confirm', callback_data: 'confirm:42', dmFlag: 1, chatType: 1,
+    })
   })
 
   it('parses legacy and current mini-app Ark payloads into structured cards', async () => {

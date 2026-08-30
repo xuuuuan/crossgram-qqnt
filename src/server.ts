@@ -702,6 +702,27 @@ export class QQBridgeServer {
       else json(response, 404, { error: 'message not found' })
       return
     }
+    if (request.method === 'POST' && path === '/v1/messages/inline-keyboard/click') {
+      const body = await readJson<{
+        conversationId: string
+        messageId: string
+        messageSequence?: string
+        buttonId: string
+        callbackData?: string
+        botAppid: string
+      }>(request)
+      const result = await this.bridge.clickInlineKeyboardButton(
+        this.bridge.getConversation(body.conversationId),
+        body.messageId,
+        body.buttonId,
+        body.callbackData ?? '',
+        body.botAppid,
+        body.messageSequence,
+      )
+      log('info', `HTTP API inline keyboard click id=${requestId} conversation=${body.conversationId} message=${body.messageId} button=${body.buttonId} status=${result.status}`)
+      json(response, 200, result)
+      return
+    }
     if (request.method === 'POST' && path === '/v1/messages/multi-forward') {
       const locator = await readJson<QQMultiForwardLocator>(request)
       const messages = await this.bridge.getMultiForwardMessages(locator)
