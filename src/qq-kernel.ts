@@ -3725,8 +3725,22 @@ export class QQKernelBridge {
     record: MsgRecord,
     context: MessageMappingContext = {},
   ): Promise<QQMessage> {
-    const message = this.mapMessage(record, context)
+    let message = this.mapMessage(record, context)
     let changed = false
+    const sender = message.sender
+    if (sender && !sender.avatar && sender.id) {
+      // History records often carry an opaque sender UID without a numeric QQ
+      // number. Resolve the UID-scoped avatar through QQNT's avatar API so
+      // these virtual Telegram users still render their real profile photo.
+      const avatar = await this.userAvatar(sender.id, false).catch((error) => {
+        log('warn', `history sender avatar lookup failed uid=${sender.id}`, error)
+        return undefined
+      })
+      if (avatar && isRenderableAvatar(avatar)) {
+        message = { ...message, sender: { ...sender, avatar } }
+        changed = true
+      }
+    }
     const parts = await Promise.all(message.parts.map(async (part) => {
       if (part.type !== 'media' || !part.media.voice) return part
       const media = context.deferVoicePreparation
@@ -8861,6 +8875,11 @@ async function retryHistoryCall<T>(operation: () => Promise<T>): Promise<T> {
 function isTransientNativeError(error: unknown): boolean {
   const message = String(error)
   return message.includes('Invalid argument') || message.includes('timed out')
+}
+
+function isRenderableAvatar(media: QQMedia): boolean {
+  const locator = media.locator
+  return Boolean(locator.filePath || locator.avatarUrl || locator.avatarUin)
 }
 
 function avatarMedia(id: string, filePath?: string): QQMedia {

@@ -4330,6 +4330,38 @@ describe('QQKernelBridge', () => {
     })
   })
 
+  it('resolves UID-scoped avatars for opaque senders in fetched history', async () => {
+    const f = fixture()
+    f.setAvatarUrl('history-member', 'https://thirdqq.qlogo.cn/avatar/history-member/140')
+    const historyRecord: MsgRecord = {
+      ...f.message,
+      msgId: 'history-opaque-sender',
+      chatType: 2,
+      peerUid: '1058754719',
+      peerUin: '1058754719',
+      senderUid: 'history-member',
+      senderUin: '',
+      sendNickName: '历史成员',
+      sendMemberName: '',
+    }
+    f.msg.getLatestDbMsgs.mockResolvedValue({ result: 0, errMsg: '', msgList: [historyRecord] })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    const history = await bridge.getHistory(bridge.getConversation('1058754719'))
+
+    expect(history.messages[0]?.sender).toMatchObject({
+      id: 'history-member',
+      avatar: {
+        locator: {
+          avatarUrl: 'https://thirdqq.qlogo.cn/avatar/history-member/140',
+          peerUid: 'history-member',
+        },
+      },
+    })
+    expect(f.buddy.getAvatarUrl).toHaveBeenCalledWith(['history-member'], 2)
+  })
+
   it('replays events emitted after the last acknowledged stream event', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
