@@ -317,7 +317,9 @@ pub fn install_receive_hook() -> Result<String> {
         return Ok(format!("0x{rva:x}"));
     }
     #[allow(unreachable_code)]
-    Err(Error::from_reason("QQNT receive hook is only supported on Linux"))
+    Err(Error::from_reason(
+        "QQNT receive hook is only supported on Linux",
+    ))
 }
 
 #[napi]

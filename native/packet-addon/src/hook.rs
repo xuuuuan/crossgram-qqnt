@@ -343,7 +343,9 @@ mod windows {
         #[test]
         fn parses_msf_receive_record_layout() {
             let payload = b"abc123".to_vec();
-            let mut buffer = vec![payload.as_ptr() as usize, unsafe { payload.as_ptr().add(payload.len()) as usize }];
+            let mut buffer = vec![payload.as_ptr() as usize, unsafe {
+                payload.as_ptr().add(payload.len()) as usize
+            }];
             let mut record = vec![0u8; 64];
             let uin = b"1715311957";
             record[0] = (uin.len() * 2) as u8;
@@ -391,9 +393,9 @@ mod linux {
         napi_is_buffer, napi_open_handle_scope, napi_resolve_deferred, napi_set_named_property,
         napi_value,
     };
+    use std::collections::VecDeque;
     use std::ffi::c_void;
     use std::sync::Mutex;
-    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     type Converter = unsafe extern "C" fn(*mut u8, napi_env, napi_value);
@@ -415,20 +417,28 @@ mod linux {
     static ORIGINAL_RECEIVE: AtomicUsize = AtomicUsize::new(0);
     static RECEIVE_PAGE: AtomicUsize = AtomicUsize::new(0);
     static RECEIVE_QUEUE: Mutex<VecDeque<super::ReceivePacket>> = Mutex::new(VecDeque::new());
+    static RECEIVE_QUEUE_BYTES: AtomicUsize = AtomicUsize::new(0);
     const RECEIVE_PROLOGUE: [u8; 5] = [0x55, 0x41, 0x57, 0x41, 0x56];
     const RECEIVE_STUB_OFFSET: usize = 64;
     const MAX_RECEIVE_PAYLOAD: usize = 1024 * 1024;
+    const MAX_RECEIVE_QUEUE_BYTES: usize = 8 * 1024 * 1024;
     const MAX_RECEIVE_STRING: usize = 4096;
 
     pub fn drain_receive_packets() -> Vec<super::ReceivePacket> {
-        let mut queue = RECEIVE_QUEUE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        queue.drain(..).collect()
+        let mut queue = RECEIVE_QUEUE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let packets: Vec<_> = queue.drain(..).collect();
+        RECEIVE_QUEUE_BYTES.store(0, Ordering::Release);
+        packets
     }
 
     pub fn install_receive(probe: &PacketBindingProbe) -> Result<u64, HookError> {
         let receive_rva = probe.receive_rva as usize;
         if receive_rva == 0 {
-            return Err(HookError::Create("MSF receive handler xref was not found".into()));
+            return Err(HookError::Create(
+                "MSF receive handler xref was not found".into(),
+            ));
         }
 
         let target = probe
@@ -441,7 +451,9 @@ mod linux {
         if RECEIVE_TARGET.load(Ordering::Acquire) != 0 {
             return Err(HookError::DifferentTarget);
         }
-        let _guard = INSTALL_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = INSTALL_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if RECEIVE_TARGET.load(Ordering::Acquire) == target {
             return Ok(probe.receive_rva);
         }
@@ -465,7 +477,10 @@ mod linux {
                 .wrapping_add(5)
                 .wrapping_sub((near + 10) as isize);
             write_i32(jmp_at.add(1), rel as i32);
-            write_abs_jmp(page.add(RECEIVE_STUB_OFFSET), shim_receive as *const () as usize);
+            write_abs_jmp(
+                page.add(RECEIVE_STUB_OFFSET),
+                shim_receive as *const () as usize,
+            );
         }
         mprotect_rw(near, PAGE_SIZE)
             .and_then(|()| mprotect_rx(near, PAGE_SIZE))
@@ -486,10 +501,22 @@ mod linux {
 
     unsafe extern "C" fn shim_receive(arg1: *mut u8, rec: *mut u8, arg3: *mut u8) -> i64 {
         if let Some(packet) = unsafe { parse_receive_packet(rec) } {
-            let mut queue = RECEIVE_QUEUE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            if queue.len() >= 2048 {
-                queue.pop_front();
+            let mut queue = RECEIVE_QUEUE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let packet_size = packet.payload.len();
+            while (!queue.is_empty()
+                && RECEIVE_QUEUE_BYTES
+                    .load(Ordering::Acquire)
+                    .saturating_add(packet_size)
+                    > MAX_RECEIVE_QUEUE_BYTES)
+                || queue.len() >= 2048
+            {
+                if let Some(old) = queue.pop_front() {
+                    RECEIVE_QUEUE_BYTES.fetch_sub(old.payload.len(), Ordering::AcqRel);
+                }
             }
+            RECEIVE_QUEUE_BYTES.fetch_add(packet_size, Ordering::AcqRel);
             queue.push_back(packet);
         }
         let trampoline = ORIGINAL_RECEIVE.load(Ordering::Acquire);
@@ -1151,7 +1178,9 @@ pub fn drain_receive_packets() -> Vec<ReceivePacket> {
 
 #[cfg(not(target_os = "linux"))]
 pub fn install_receive(_probe: &crate::elf::PacketBindingProbe) -> Result<u64, HookError> {
-    Err(HookError::Create("native receive hook is not implemented on this platform".into()))
+    Err(HookError::Create(
+        "native receive hook is not implemented on this platform".into(),
+    ))
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]

@@ -729,7 +729,9 @@ fn locate_receive_function(image: &ElfImage<'_>, functions: &[FunctionRange]) ->
     let Some(function) = function_containing(functions, xref_rva) else {
         return 0;
     };
-    (image.bytes_at(function.begin, RECEIVE_PROLOGUE.len()).ok() == Some(RECEIVE_PROLOGUE)).then_some(function.begin).unwrap_or(0)
+    (image.bytes_at(function.begin, RECEIVE_PROLOGUE.len()).ok() == Some(RECEIVE_PROLOGUE))
+        .then_some(function.begin)
+        .unwrap_or(0)
 }
 
 fn locate_response_chain(
@@ -865,7 +867,13 @@ pub fn probe_packet_binding(send_anchor: &[u8]) -> Result<PacketBindingProbe, El
     )?;
     if located.receive_rva != 0 {
         let expected = image.bytes_at(located.receive_rva, RECEIVE_PROLOGUE.len())?;
-        verify_loaded_bytes(&image, module.base, located.receive_rva, expected, "receive")?;
+        verify_loaded_bytes(
+            &image,
+            module.base,
+            located.receive_rva,
+            expected,
+            "receive",
+        )?;
     }
     for (name, address, length) in [
         ("anchor XRef", located.anchor_xref_rva, 7usize),
