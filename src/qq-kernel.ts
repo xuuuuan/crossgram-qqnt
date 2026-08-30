@@ -22,7 +22,7 @@ import { decodePttTo, encodePtt, MAX_VOICE_INPUT_BYTES, transcodePttFallbackTo }
 import {
   GroupMsgMask,
   type BuddyRequest, type CustomEmotionData, type DoubtBuddyReqChange, type DoubtBuddyRequest, type EmojiLikesUserInfo, type FileTransNotifyInfo, type GroupFileListResult, type GroupMsgMaskInfo, type GroupNotify, type GroupProfileInfo,
-  type InitSessionConfig, type KernelAVSDKService, type KernelModule, type KernelSession, type MarketStickerPackInfo, type MemberInfo, type MsgElement,
+  type InitSessionConfig, type KernelAVSDKService, type KernelGroupService, type KernelModule, type KernelSession, type MarketStickerPackInfo, type MemberInfo, type MsgElement,
   type MsgRecord, type ProfileSimpleInfo, type RecentContactInfo, type SearchMsgKeywordsResult,
 } from './kernel-types.js'
 import {
@@ -85,6 +85,7 @@ const FAVORITE_STICKER_PACK_TITLE = 'QQ 收藏表情'
 const FAVORITE_STICKER_VERSION = 2
 const STICKER_METADATA_PROBE_BYTES = 256 * 1024
 const STICKER_METADATA_PROBE_TIMEOUT_MS = 5_000
+const MESSAGE_MEMBER_PROFILE_TIMEOUT_MS = 200
 // Large local QQ indexes can take slightly longer than five seconds to emit
 // the first native search callback. Keep the request alive long enough for a
 // cold search without turning a genuinely missing callback into a long hang.
@@ -405,6 +406,7 @@ export class QQKernelBridge {
   }
   private groupFileQueryTail = Promise.resolve()
   private readonly pendingUserProfiles = new Map<string, ReturnType<typeof deferred<void>>>()
+  private readonly pendingMemberProfiles = new Map<string, ReturnType<typeof deferred<MemberInfo | undefined>>>()
   private readonly pendingMemberPages = new Map<string, ReturnType<typeof deferred<{
     ids: Array<{ uid: string, index: number }>
     infos: Map<string, MemberInfo>
@@ -834,6 +836,8 @@ export class QQKernelBridge {
     this.pendingUserProfiles.clear()
     for (const pending of this.pendingMemberPages.values()) pending.reject(new Error('QQNT session detached'))
     this.pendingMemberPages.clear()
+    for (const pending of this.pendingMemberProfiles.values()) pending.reject(new Error('QQNT session detached'))
+    this.pendingMemberProfiles.clear()
     this.reactionAssets.clear()
     this.clearVoiceCache()
   }
@@ -1244,6 +1248,7 @@ export class QQKernelBridge {
     const visibleRecords = response.msgList.filter((record) => !isRecalledRecord(record))
     await this.resolveReplyTargets(visibleRecords)
     await this.resolveGrayTipUsers(visibleRecords)
+    await Promise.all(visibleRecords.map((record) => this.enrichGroupMessageSender(record)))
     const messages = await mapConcurrent(visibleRecords, 8, async (record) => {
       const message = await this.mapMessagePrepared(record)
       // Telegram shows the actor preview directly from the history payload.
@@ -4074,6 +4079,19 @@ export class QQKernelBridge {
           finish: !info.hasNext,
         })
       },
+      onMemberInfoChange: (
+        groupCode: string,
+        _source: unknown,
+        members: Map<string, MemberInfo>,
+      ) => {
+        if (!groupCode || !(members instanceof Map)) return
+        for (const [uid, info] of members) {
+          if (!info || (!info.uid && !uid)) continue
+          const member = { ...info, uid: info.uid || uid }
+          this.rememberSeenUser(mapMember(member).user)
+          this.pendingMemberProfiles.get(`${groupCode}\u0000${member.uid}`)?.resolve(member)
+        }
+      },
       onGroupSingleScreenNotifies: (
         doubt: boolean,
         nextStartSeq: unknown,
@@ -5030,6 +5048,7 @@ export class QQKernelBridge {
     log('info', `native message batch source=${source} count=${records.length}`)
     await this.resolveReplyTargets(records)
     await this.resolveGrayTipUsers(records)
+    await Promise.all(records.map((record) => this.enrichGroupMessageSender(record)))
     for (const record of records) {
       if (!isMessageChatType(record.chatType)) continue
       if (!hasUsableMessagePeer(record)) {
@@ -5710,6 +5729,39 @@ export class QQKernelBridge {
       const conversation = this.contacts.get(uid)
       if (conversation) this.mergeConversation({ ...conversation, title: name })
     }
+  }
+
+  private async enrichGroupMessageSender(record: MsgRecord): Promise<void> {
+    if (record.chatType !== CHAT_GROUP || !record.senderUid) return
+    if (record.sendNickName?.trim() || record.sendRemarkName?.trim()) return
+    const existing = this.seenUsers.get(record.senderUid) ?? this.users.get(record.senderUid)
+    if (existing && !isFallbackUserName(existing)) return
+    const service = this.groupService as (KernelGroupService & {
+      getMemberInfo?: (groupCode: string, uids: string[], forceFetch: boolean) => Promise<{ result: number, errMsg: string }>
+    }) | undefined
+    if (!service?.getMemberInfo) return
+    const groupCode = record.peerUin || record.peerUid
+    if (!groupCode) return
+    const key = `${groupCode}\u0000${record.senderUid}`
+    let pending = this.pendingMemberProfiles.get(key)
+    if (!pending) {
+      pending = deferred<MemberInfo | undefined>()
+      this.pendingMemberProfiles.set(key, pending)
+      const current = pending
+      const timer = setTimeout(() => {
+        if (this.pendingMemberProfiles.get(key) !== current) return
+        this.pendingMemberProfiles.delete(key)
+        current.resolve(undefined)
+      }, MESSAGE_MEMBER_PROFILE_TIMEOUT_MS)
+      timer.unref?.()
+      void Promise.resolve()
+        .then(() => service.getMemberInfo!(groupCode, [record.senderUid], false))
+        .then((result) => {
+          if (result.result !== 0) current.resolve(undefined)
+        })
+        .catch(() => current.resolve(undefined))
+    }
+    await pending.promise.catch(() => undefined)
   }
 
   private rememberRecordSender(record: MsgRecord): void {

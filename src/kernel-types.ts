@@ -858,6 +858,8 @@ export interface KernelGroupService {
     errMsg: string
     result: { ids: Array<{ uid: string, index: number }>, infos: Map<string, MemberInfo>, finish: boolean }
   }>
+  /** Fetches one or more group members; details arrive through onMemberInfoChange. */
+  getMemberInfo?(groupCode: string, uids: string[], forceFetch: boolean): Promise<{ result: number, errMsg: string }>
 }
 
 export interface KernelRichMediaService {

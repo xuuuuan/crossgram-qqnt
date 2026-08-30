@@ -331,6 +331,7 @@ function fixture() {
     }),
     setGroupMsgMask: vi.fn<NonNullable<KernelGroupService['setGroupMsgMask']>>(async () => ({ result: 0, errMsg: 'success' })),
     modifyMemberRole: vi.fn<NonNullable<KernelGroupService['modifyMemberRole']>>(async () => ({ result: 0, errMsg: 'success' })),
+    getMemberInfo: vi.fn<NonNullable<KernelGroupService['getMemberInfo']>>(async () => ({ result: 1, errMsg: 'not found' })),
     createMemberListScene: vi.fn(() => 'scene'), destroyMemberListScene: vi.fn(),
     getNextMemberList: vi.fn(async () => ({
       errCode: 0, errMsg: '', result: {
@@ -546,6 +547,9 @@ function fixture() {
       hasNext: boolean
     }) {
       groupHandlers.onMemberListChange?.(info)
+    },
+    emitMemberInfo(groupCode: string, members: Map<string, unknown>) {
+      groupHandlers.onMemberInfoChange?.(groupCode, 0, members)
     },
     emitSearch(result: import('./kernel-types.js').SearchMsgKeywordsResult) {
       searchHandlers.onSearchMsgKeywordsResult?.(result)
@@ -4971,6 +4975,52 @@ describe('QQKernelBridge', () => {
     await expect(bridge.getUser('actor-a')).resolves.toMatchObject({
       id: 'actor-a', name: 'Alice', avatarUrl: 'https://example.com/a.jpg',
     })
+  })
+
+  it('hydrates a missing group-message nickname within the bounded member lookup window', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.group.getMemberInfo!.mockImplementation(async (groupCode, uids) => {
+      setTimeout(() => f.emitMemberInfo(groupCode, new Map([[uids[0]!, {
+        uid: uids[0]!, uin: '42', nick: 'Personal Name', remark: '', cardName: 'Group Alias', role: 2, avatarPath: '',
+      }]])), 20)
+      return { result: 0, errMsg: '' }
+    })
+    const events = bridge.subscribe()[Symbol.asyncIterator]()
+
+    f.emitReceived([{
+      ...f.message,
+      msgId: 'group-missing-nickname', chatType: 2, sendType: 0,
+      senderUid: 'member', senderUin: '42', peerUid: '1058754719', peerUin: '1058754719',
+      peerName: '', sendNickName: '', sendRemarkName: '', sendMemberName: 'Group Alias',
+    }])
+
+    await expect(events.next()).resolves.toMatchObject({
+      value: { type: 'message', message: { sender: { name: 'Personal Name', alias: 'Group Alias' } } },
+    })
+    expect(f.group.getMemberInfo).toHaveBeenCalledWith('1058754719', ['member'], false)
+  })
+
+  it('does not wait beyond the bounded member lookup timeout when QQ gives no member callback', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.group.getMemberInfo!.mockImplementation(async () => new Promise(() => {}))
+    const events = bridge.subscribe()[Symbol.asyncIterator]()
+    const started = Date.now()
+
+    f.emitReceived([{
+      ...f.message,
+      msgId: 'group-member-timeout', chatType: 2, sendType: 0,
+      senderUid: 'member-timeout', senderUin: '43', peerUid: '1058754719', peerUin: '1058754719',
+      peerName: '', sendNickName: '', sendRemarkName: '', sendMemberName: 'Timeout Alias',
+    }])
+
+    await expect(events.next()).resolves.toMatchObject({
+      value: { type: 'message', message: { sender: { name: '43', alias: 'Timeout Alias' } } },
+    })
+    expect(Date.now() - started).toBeLessThan(500)
   })
 
   it('hydrates small reaction actor previews in history responses', async () => {
