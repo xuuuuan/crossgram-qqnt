@@ -3115,7 +3115,8 @@ describe('QQKernelBridge', () => {
       packId: '42', count: 1,
       stickers: [{
         stickerId: 'market:42:emoji-a', format: 'animated', mimeType: 'image/gif',
-        width: 320, height: 180,
+        width: 320, height: 180, size: gif.length,
+        reference: { staticSize: Buffer.from('static').length },
       }],
     })
     const opened = await bridge.openSticker(pack!.stickers[0].reference)

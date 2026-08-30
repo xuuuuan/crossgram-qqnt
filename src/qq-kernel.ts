@@ -1907,6 +1907,7 @@ export class QQKernelBridge {
         height: positiveInteger(item.wHeightInPhone, 240),
         animated,
         staticPath,
+        staticSize: staticPath && existsSync(staticPath) ? statSync(staticPath).size : undefined,
         dynamicPath,
       }
       reference.mimeType = await this.resolveMarketStickerMimeType(
@@ -1921,6 +1922,13 @@ export class QQKernelBridge {
         mimeType: reference.mimeType,
         width: reference.width,
         height: reference.height,
+        // Telegram's document metadata must advertise the exact number of
+        // bytes that the sticker endpoint can serve. Market sticker paths are
+        // already materialized by getMarketEmoticonPaths above, so derive the
+        // size without opening or decrypting the asset.
+        size: [dynamicPath, staticPath]
+          .map((path) => path && existsSync(path) ? statSync(path).size : undefined)
+          .find((size): size is number => size !== undefined),
         version: 1,
         reference,
       }

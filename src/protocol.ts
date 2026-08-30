@@ -156,6 +156,8 @@ export type QQStickerReference =
       animated: boolean
       mimeType?: 'image/gif' | 'image/apng' | 'image/png'
       staticPath?: string
+      /** Exact byte size of the static (lowest-tier) preview, when present. */
+      staticSize?: number
       dynamicPath?: string
       favoriteResId?: string
     }
