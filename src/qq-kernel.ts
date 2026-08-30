@@ -1331,9 +1331,9 @@ export class QQKernelBridge {
               fileSize: file.fileSize,
               fileUuid: file.fileId,
               fileBizId: file.busId,
-              md5: file.md5 || undefined,
-              sha: file.sha || undefined,
-              sha3: file.sha3 || undefined,
+              md5: normalizeNativeHash(file.md5),
+              sha: normalizeNativeHash(file.sha),
+              sha3: normalizeNativeHash(file.sha3),
             }
             items.push({
               type: 'file' as const,
@@ -7669,6 +7669,19 @@ function parseGroupFileCursor(cursor: string | undefined): number {
   const value = Number(cursor)
   if (!Number.isSafeInteger(value) || value < 0) throw new Error('invalid QQ group file cursor')
   return value
+}
+
+/** Normalize QQNT hash fields before they enter JSON/JSONB storage.
+ *
+ * QQNT exposes some digests as a binary string. PostgreSQL rejects JSON
+ * strings containing NUL or lone UTF-16 surrogates, so encode non-hex native
+ * values as bytes while preserving already canonical hexadecimal digests.
+ */
+export function normalizeNativeHash(value: unknown): string | undefined {
+  if (typeof value !== 'string' || value.length === 0) return undefined
+  if (value.length % 2 === 0 && /^[0-9a-fA-F]+$/.test(value)) return value.toLowerCase()
+  const latin1 = /^[\u0000-\u00ff]*$/.test(value)
+  return Buffer.from(value, latin1 ? 'latin1' : 'utf8').toString('hex')
 }
 
 function safeNonNegativeNumber(value: string | number): number {

@@ -13,7 +13,7 @@ import WebSocket from 'ws'
 import { GroupMsgMask, type ContactMsgBoxInfo, type KernelBuddyService, type KernelGroupService, type KernelModule, type KernelMsgService, type KernelRichMediaService, type KernelSession, type MsgElement, type MsgRecord } from './kernel-types.js'
 import type { PacketAddon } from './packet-addon.js'
 import { parseConversationId, type QQEvent, type QQStickerReference } from './protocol.js'
-import { QQKernelBridge } from './qq-kernel.js'
+import { normalizeNativeHash, QQKernelBridge } from './qq-kernel.js'
 import { QQBridgeServer } from './server.js'
 import { QQPacketClient } from './packet-client.js'
 import {
@@ -596,6 +596,21 @@ async function nextCallSignal(events: AsyncIterator<QQEvent>): Promise<Extract<Q
     if (event.value.type === 'call-signal') return event.value
   }
 }
+
+describe('normalizeNativeHash', () => {
+  it('preserves canonical hex digests and normalizes case', () => {
+    expect(normalizeNativeHash('A0b1')).toBe('a0b1')
+  })
+
+  it('encodes native binary strings as JSON-safe hexadecimal bytes', () => {
+    expect(normalizeNativeHash('\u0000\u0014\ud800')).toBe('0014efbfbd')
+  })
+
+  it('returns undefined for absent values', () => {
+    expect(normalizeNativeHash(undefined)).toBeUndefined()
+    expect(normalizeNativeHash('')).toBeUndefined()
+  })
+})
 
 describe('QQKernelBridge', () => {
   const tempPaths: string[] = []
@@ -6452,6 +6467,43 @@ describe('QQBridgeServer', () => {
     expect(response.status).toBe(200)
     await expect(response.json()).resolves.toEqual({ items: [], total: 0 })
     expect(f.richMedia.getGroupFileList).toHaveReturnedWith(912)
+  })
+
+  it('E2E: serializes native binary group-file hashes as JSON-safe hex', async () => {
+    const f = fixture()
+    f.richMedia.getGroupFileList.mockImplementation(() => {
+      queueMicrotask(() => f.emitGroupFiles({
+        retCode: 0, retMsg: '', clientWording: '', isEnd: true,
+        allFileCount: 1, nextIndex: 1, reqId: 913,
+        item: [{
+          peerId: '1058754719', type: 1,
+          fileInfo: {
+            fileModelId: 'model-b', fileId: 'uuid-b', fileName: 'binary.bin', fileSize: '3',
+            busId: 102, uploadedSize: '3', uploadTime: 200, deadTime: 0, downloadTimes: 0,
+            // QQNT may expose digest bytes as a string rather than hex.
+            md5: '\u0000\u0014\ud800', sha: 'A0b1', sha3: '', uploaderLocalPath: '',
+            uploaderName: 'Bob', uploaderUin: '43', parentFolderId: '', localPath: '',
+            transStatus: 0, transType: 0, elementId: 'element-b', isFolder: false,
+          },
+        }],
+      }))
+      return 913
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const base = `http://127.0.0.1:${server.address().port}/v1`
+
+    const response = await fetch(
+      `${base}/conversations/${encodeURIComponent('2:1058754719')}/group-files?limit=20`,
+    )
+    expect(response.status).toBe(200)
+    const page = await response.json()
+    expect(page.items[0].media.locator).toMatchObject({
+      md5: '0014efbfbd', sha: 'a0b1',
+    })
+    expect(JSON.stringify(page)).not.toContain('\\u0000')
   })
 
   it('serves status, dialogs, and a chunked send endpoint', async () => {
