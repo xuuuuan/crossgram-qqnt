@@ -837,7 +837,6 @@ export class QQKernelBridge {
     this.searchContexts.clear()
     for (const pending of this.pendingReactions.values()) pending.reject(new Error('QQNT session detached'))
     this.pendingReactions.clear()
-    this.reactionPushTails.clear()
     this.pendingReactionDesired.clear()
     for (const pending of this.pendingGroupProfiles.values()) pending.reject(new Error('QQNT session detached'))
     this.pendingGroupProfiles.clear()
