@@ -399,6 +399,11 @@ export class QQKernelBridge {
     assignedMessageId?: string
   }> = []
   private readonly pendingReactions = new Map<string, ReturnType<typeof deferred<QQReactionState>>>()
+  // Native receive callbacks are synchronous, but reaction handling performs
+  // asynchronous target resolution and actor hydration. Keep pushes for the
+  // same QQ message strictly ordered so a slower earlier snapshot cannot be
+  // overwritten by a later push that was computed from stale cache state.
+  private readonly reactionPushTails = new Map<string, Promise<void>>()
   // QQNT may publish an intermediate info snapshot before the reaction write
   // reaches its local message cache. Keep the requested selection briefly so
   // that snapshot cannot make an optimistic reaction disappear.
@@ -5847,8 +5852,19 @@ export class QQKernelBridge {
   /** Consume a packet captured by the native receive hook. */
   handleNativeReceivePacket(value: unknown): void {
     const reaction = decodeGroupReactionPush(value)
-    if (reaction) void this.onReactionPush(reaction).catch((error) =>
-      log('error', `native reaction push failed group=${reaction.groupUin} seq=${reaction.messageSequence}`, error))
+    if (!reaction) return
+    const key = `${reaction.groupUin}\u0000${reaction.messageSequence}`
+    const previous = this.reactionPushTails.get(key) ?? Promise.resolve()
+    const current = previous
+      .catch(() => undefined)
+      .then(() => this.onReactionPush(reaction))
+      .catch((error) => {
+        log('error', `native reaction push failed group=${reaction.groupUin} seq=${reaction.messageSequence}`, error)
+      })
+    this.reactionPushTails.set(key, current)
+    void current.finally(() => {
+      if (this.reactionPushTails.get(key) === current) this.reactionPushTails.delete(key)
+    })
   }
 
   private rememberRecordSender(record: MsgRecord): void {

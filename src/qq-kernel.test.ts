@@ -4774,6 +4774,50 @@ describe('QQKernelBridge', () => {
     expect(f.msg.getMsgsBySeqAndCount).not.toHaveBeenCalled()
   })
 
+  it('serializes rapid reaction pushes for one message across async actor hydration', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    vi.spyOn(bridge as unknown as { initializePlatformData(): Promise<void> }, 'initializePlatformData').mockResolvedValue()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const conversation = bridge.getConversation('1058754719')
+    const target = {
+      ...f.message,
+      msgId: 'ordered-pushed-reaction-target', msgSeq: '799177', chatType: 2 as const,
+      peerUid: '1058754719', peerUin: '1058754719', sendType: 0,
+      senderUid: 'member-a', senderUin: '42', emojiLikesList: [],
+    }
+    f.msg.getLatestDbMsgs.mockResolvedValue({ result: 0, errMsg: '', msgList: [target] })
+    let releaseFirst!: () => void
+    const firstHydration = new Promise<void>((resolve) => { releaseFirst = resolve })
+    let hydrationCalls = 0
+    f.msg.getMsgEmojiLikesList.mockImplementation(async () => {
+      hydrationCalls++
+      if (hydrationCalls === 1) await firstHydration
+      return {
+        result: 0, errMsg: '', cookie: '', isLastPage: true, isFirstPage: true,
+        emojiLikesList: hydrationCalls === 1
+          ? [{ tinyId: 'actor-a', nickName: 'A', headUrl: '' }]
+          : [{ tinyId: 'actor-b', nickName: 'B', headUrl: '' }, { tinyId: 'actor-a', nickName: 'A', headUrl: '' }],
+      }
+    })
+    await bridge.getHistory(conversation)
+    const events = bridge.subscribe()[Symbol.asyncIterator]()
+
+    f.emitS2C(groupReactionPushBytes({ operatorUid: 'actor-a', currentCount: 1 }))
+    f.emitS2C(groupReactionPushBytes({ operatorUid: 'actor-b', currentCount: 2 }))
+    await Promise.resolve()
+    releaseFirst()
+
+    await expect(events.next()).resolves.toMatchObject({ value: {
+      type: 'message-reactions',
+      context: { reactions: [{ count: 1, recentActors: [{ userId: 'actor-a' }] }] },
+    } })
+    await expect(events.next()).resolves.toMatchObject({ value: {
+      type: 'message-reactions',
+      context: { reactions: [{ count: 2, recentActors: [{ userId: 'actor-b' }, { userId: 'actor-a' }] }] },
+    } })
+  })
+
   it('preserves other reaction kinds and updates the selected state from self pushes', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
