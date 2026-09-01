@@ -30,6 +30,16 @@ import {
   type QQFlashTransferManifest, type QQFlashTransferResult, type QQRequest, type QQRequestKind, type QQRequestPage, type QQRequestStatus, type QQSendMediaSpec, type QQSticker, type QQStickerPack, type QQStickerPackSummary, type QQStickerReference, type QQTextPart, type SearchPage, type SearchQuery, type SendManifest,
 } from './protocol.js'
 
+/** A single native group-member page, including identifiers and details
+ * emitted by getNextMemberList/onMemberListChange. Native QQNT builds may
+ * return these two collections asynchronously, so callers should merge them
+ * before projecting members. */
+type NativeMemberPage = {
+  ids: Array<{ uid: string, index: number }>
+  infos: Map<string, MemberInfo>
+  finish: boolean
+}
+
 const CHAT_C2C = 1
 const CHAT_GROUP = 2
 const CHAT_DATA_LINE = 8
@@ -411,11 +421,7 @@ export class QQKernelBridge {
   private groupFileQueryTail = Promise.resolve()
   private readonly pendingUserProfiles = new Map<string, ReturnType<typeof deferred<void>>>()
   private readonly pendingMemberProfiles = new Map<string, ReturnType<typeof deferred<MemberInfo | undefined>>>()
-  private readonly pendingMemberPages = new Map<string, ReturnType<typeof deferred<{
-    ids: Array<{ uid: string, index: number }>
-    infos: Map<string, MemberInfo>
-    finish: boolean
-  }>>>()
+  private readonly pendingMemberPages = new Map<string, ReturnType<typeof deferred<NativeMemberPage>>>()
   private readonly memberScenes = new Map<string, { conversationId: string, lastUsed: number }>()
   private readonly groupProfileAttempts = new Map<string, number>()
   private readonly recentDeletes = new Map<string, number>()
@@ -3623,11 +3629,7 @@ export class QQKernelBridge {
     // and lets the next Telegram offset advance from the emitted cursor.
     const nativeLimit = 30
     log('info', `native API start name=getNextMemberList conversation=${conversation.id} scene=${scene} cursor=${cursor ?? ''} limit=${requested} nativeLimit=${nativeLimit}`)
-    const listenerPage = deferred<{
-      ids: Array<{ uid: string, index: number }>
-      infos: Map<string, MemberInfo>
-      finish: boolean
-    }>()
+    const listenerPage = deferred<NativeMemberPage>()
     this.pendingMemberPages.set(scene, listenerPage)
     let keepScene = false
     try {
@@ -3635,10 +3637,17 @@ export class QQKernelBridge {
       const response = await service.getNextMemberList(scene, nativeStart, nativeLimit)
       if (response.errCode !== 0) throw new Error(`getNextMemberList: ${response.errMsg} (${response.errCode})`)
       let result = response.result
-      if (!result.ids.length && (conversation.participantCount ?? 0) > 0) {
+      // Some QQNT builds return the member IDs immediately but populate the
+      // corresponding info map only in onMemberListChange. If we project the
+      // first response as-is, those IDs are silently dropped and Telegram's
+      // mention/search scan can never find them. Wait briefly for the callback
+      // and merge both payloads when any ID lacks details.
+      const missingInfos = result.ids.some(({ uid }) => !result.infos.has(uid))
+      if ((!result.ids.length || missingInfos) && (conversation.participantCount ?? 0) > 0) {
         try {
-          result = await withTimeout(listenerPage.promise, 3_000, 'QQ member list listener timed out')
-          log('info', `native callback selected name=onMemberListChange conversation=${conversation.id} scene=${scene} ids=${result.ids.length} finish=${result.finish}`)
+          const callbackResult = await withTimeout(listenerPage.promise, 3_000, 'QQ member list listener timed out')
+          result = mergeNativeMemberPages(result, callbackResult)
+          log('info', `native callback selected name=onMemberListChange conversation=${conversation.id} scene=${scene} ids=${callbackResult.ids.length} finish=${callbackResult.finish} merged=${result.ids.length}`)
         } catch (error) {
           log('error', `native member list callback unavailable conversation=${conversation.id} scene=${scene}`, error)
         }
@@ -7830,6 +7839,20 @@ function mapMember(info: MemberInfo): MemberPage['members'][number] {
       avatar: /^\d+$/.test(info.uin) ? qlogoAvatarMedia(info.uid, info.uin) : undefined,
     },
     role: info.role === MEMBER_OWNER ? 'owner' : info.role === MEMBER_ADMIN ? 'administrator' : 'member',
+  }
+}
+
+function mergeNativeMemberPages(primary: NativeMemberPage, callback: NativeMemberPage): NativeMemberPage {
+  const ids = new Map<string, { uid: string, index: number }>()
+  for (const id of primary.ids) ids.set(id.uid, id)
+  for (const id of callback.ids) ids.set(id.uid, id)
+  const infos = new Map(primary.infos)
+  for (const [uid, info] of callback.infos) infos.set(uid, info)
+  return {
+    ids: [...ids.values()],
+    infos,
+    // The callback is the authoritative completion signal when it exists.
+    finish: callback.finish,
   }
 }
 
