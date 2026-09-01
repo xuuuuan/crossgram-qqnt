@@ -1157,7 +1157,13 @@ export class QQKernelBridge {
   async resolveConversation(chatType: 1 | 2, numericId: string): Promise<QQConversation> {
     if (chatType === CHAT_GROUP) this.assistantMaterializedGroups.delete(numericId)
     const known = [...this.contacts.values()].find((item) => item.chatType === chatType && item.peerUin === numericId)
-    if (known) return this.withConversationAvatar(known)
+    if (known) {
+      if (chatType === CHAT_GROUP && !known.selfRole) {
+        await this.ensureGroupProfile(numericId).catch((error) =>
+          log('error', `group profile resolve failed group=${numericId}`, error))
+      }
+      return this.withConversationAvatar(this.contacts.get(known.id) ?? known)
+    }
     if (chatType === CHAT_GROUP) {
       const created: QQConversation = {
         id: conversationId(CHAT_GROUP, numericId), kind: 'group', title: numericId,
@@ -5015,7 +5021,7 @@ export class QQKernelBridge {
 
   private async ensureGroupProfile(groupCode: string): Promise<void> {
     const known = this.groups.get(groupCode)
-    if (known && !isFallbackTitle(known.name, groupCode)) return
+    if (known && !isFallbackTitle(known.name, groupCode) && known.selfRole) return
     const existing = this.pendingGroupProfiles.get(groupCode)
     if (existing) return withTimeout(existing.promise, 2_000, `QQ group profile request timed out: ${groupCode}`)
     const lastAttempt = this.groupProfileAttempts.get(groupCode) ?? 0

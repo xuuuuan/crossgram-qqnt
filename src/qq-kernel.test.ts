@@ -4930,6 +4930,24 @@ describe('QQKernelBridge', () => {
     expect(second.conversations.find((item) => item.id === '1058754719')?.avatar?.locator.filePath).toBe(resolvedPath)
   })
 
+  it('hydrates a missing group self role before returning an existing conversation', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    bridge.getConversation('1058754719')
+    f.group.getGroupDetailInfo.mockImplementationOnce(async (groupCode) => {
+      queueMicrotask(() => f.emitGroupDetail({
+        groupCode, groupName: 'Bridge Test Group', memberRole: 4,
+      }))
+      return { result: 0, errMsg: '' }
+    })
+
+    await expect(bridge.resolveConversation(2, '1058754719')).resolves.toMatchObject({
+      selfRole: 'owner', title: 'Bridge Test Group',
+    })
+    expect(f.group.getGroupDetailInfo).toHaveBeenCalledWith('1058754719', 5)
+  })
+
   it('writes multiple reactions sequentially and emits updates for history messages', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
