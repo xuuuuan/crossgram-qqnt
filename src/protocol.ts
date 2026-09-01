@@ -83,6 +83,8 @@ export interface QQMedia {
   height?: number
   /** Playback duration in seconds. Present for native QQ video elements. */
   duration?: number
+  /** QQ's native speech-to-text result for recorded PTT messages, when available. */
+  transcript?: string
   /** Native QQ thumbnail that can be fetched without downloading the full media. */
   preview?: {
     mimeType?: string
@@ -362,6 +364,16 @@ export interface QQCallSignalEvent {
   timestamp: number
 }
 
+/** Emitted when QQNT exposes (or updates) a native PTT speech-to-text result. */
+export interface QQVoiceTranscriptEvent {
+  type: 'voice-transcript'
+  eventId: string
+  conversation: QQConversation
+  messageId: string
+  transcript: string
+  timestamp: number
+}
+
 export type QQEvent =
   | QQRequestEvent
   | { type: 'message', conversation: QQConversation, message: QQMessage }
@@ -376,6 +388,7 @@ export type QQEvent =
       timestamp: number
     }
   | QQCallSignalEvent
+  | QQVoiceTranscriptEvent
 
 export interface QQReactionDefinition {
   key: string

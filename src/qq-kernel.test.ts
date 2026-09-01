@@ -2246,16 +2246,14 @@ describe('QQKernelBridge', () => {
     await expect(readdir(join(root, 'cache-root', 'voice-cache'))).resolves.toEqual([])
   })
 
-  it('rejects voice manifests with either reply identity before accepting bytes', async () => {
+  it('rejects voice manifests with an unsupported reply sequence before accepting bytes', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
-    for (const manifest of [
-      { conversationId: 'uid-1715311957', replyToId: 'message', media: [{ kind: 'voice' as const, name: 'voice.ogg' }] },
-      { conversationId: 'uid-1715311957', replyToSequence: '42', media: [{ kind: 'voice' as const, name: 'voice.ogg' }] },
-    ]) {
-      await expect(bridge.send(manifest, Readable.from(Uint8Array.of(1)))).rejects.toThrow('voice messages cannot be replies')
-    }
+    await expect(bridge.send({
+      conversationId: 'uid-1715311957', replyToSequence: '42',
+      media: [{ kind: 'voice' as const, name: 'voice.ogg' }],
+    }, Readable.from(Uint8Array.of(1)))).rejects.toThrow('voice messages must contain exactly one voice item')
     expect(f.msg.sendMsg).not.toHaveBeenCalled()
   })
 
@@ -2297,7 +2295,7 @@ describe('QQKernelBridge', () => {
         waveAmplitudes: expect.any(Array),
         fileSubId: '',
         playState: 1,
-        autoConvertText: 0,
+        autoConvertText: 1,
         storeID: 0,
         otherBusinessInfo: { aiVoiceType: 0 },
       })
@@ -4551,6 +4549,40 @@ describe('QQKernelBridge', () => {
     await expect(bridge.setMemberRole(direct, 'member', 'administrator'))
       .rejects.toThrow('member roles are only supported for group conversations')
     expect(f.group.modifyMemberRole).toHaveBeenCalledTimes(1)
+  })
+
+  it('exposes QQ native PTT transcripts and emits a voice-transcript event', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'qqnt-voice-transcript-'))
+    const wav = join(root, 'voice.wav')
+    const silk = join(root, 'voice.silk')
+    await execFileAsync('ffmpeg', ['-nostdin', '-y', '-v', 'error', '-f', 'lavfi', '-i', 'anullsrc=r=24000:cl=mono', '-t', '0.04', wav])
+    await encodePtt(wav, silk)
+    const f = fixture()
+    const record: MsgRecord = {
+      ...f.message,
+      msgId: 'voice-transcript-message',
+      senderUid: 'peer', senderUin: '10001',
+      elements: [{ elementType: 4, elementId: 'voice', pttElement: {
+        duration: 1, fileName: 'voice.silk', filePath: silk,
+        fileSize: String((await readFile(silk)).length), text: '你好，世界',
+      } }],
+    }
+    f.msg.getLatestDbMsgs.mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [record] })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: root })
+
+    await expect(bridge.getHistory(bridge.getConversation('uid-1715311957'))).resolves.toMatchObject({
+      messages: [{ parts: [{ type: 'media', media: { voice: true, transcript: '你好，世界' } }] }],
+    })
+
+    const events = bridge.subscribe()[Symbol.asyncIterator]()
+    const eventRecord = { ...record, msgId: 'voice-transcript-event', msgSeq: 'seq2', sendType: 0 }
+    f.emitReceived([eventRecord])
+    await expect(events.next()).resolves.toMatchObject({ value: { type: 'message', message: { id: eventRecord.msgId } } })
+    await expect(events.next()).resolves.toMatchObject({ value: {
+      type: 'voice-transcript', messageId: eventRecord.msgId, transcript: '你好，世界',
+    } })
+    await rm(root, { recursive: true, force: true })
   })
 
   it('maps Telegram moderation actions to QQ mute, kick, and block APIs', async () => {

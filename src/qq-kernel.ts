@@ -376,6 +376,7 @@ export class QQKernelBridge {
   private reactionCatalogPromise?: Promise<void>
   private reactionEventSequence = 0
   private messageEditEventSequence = 0
+  private voiceTranscriptEventSequence = 0
   private readonly stickerPacks = new Map<string, QQStickerPack>()
   private readonly stickerPackInfo = new Map<string, MarketStickerPackInfo>()
   private readonly stickers = new Map<string, QQSticker>()
@@ -2284,9 +2285,6 @@ export class QQKernelBridge {
 
   async send(manifest: SendManifest, body: Readable): Promise<QQMessage> {
     const voice = manifest.media?.find((media) => media.kind === 'voice')
-    if (voice && (manifest.replyToId || manifest.replyToSequence)) {
-      throw new Error('voice messages cannot be replies')
-    }
     const conversation = this.getConversation(manifest.conversationId)
     if (isDeviceChatType(conversation.chatType)) {
       return this.sendDeviceMessage(conversation, manifest, body)
@@ -2315,7 +2313,7 @@ export class QQKernelBridge {
         throw new Error('uploaded media requires matching media metadata')
       }
       if (manifest.sticker && manifest.media?.length) throw new Error('a message cannot contain both sticker and media')
-      if (voice && (manifest.media?.length !== 1 || manifest.text || manifest.textParts?.length || manifest.sticker || manifest.uploadedMedia)) {
+      if (voice && (manifest.media?.length !== 1 || manifest.text || manifest.textParts?.length || manifest.sticker || manifest.uploadedMedia || manifest.replyToSequence)) {
         throw new Error('voice messages must contain exactly one voice item')
       }
       if (manifest.sticker?.kind === 'sysface') {
@@ -2564,7 +2562,7 @@ export class QQKernelBridge {
           ? 'OidbSvcTrpcTcp.0x6d9_4'
           : 'MessageSvc.PbSendMsg'
       const sendRequest = voicePtt
-        ? this.sendNativeVoice(conversation, voicePtt)
+        ? this.sendNativeVoice(conversation, voicePtt, manifest.replyToId)
         : groupFilePart
           ? this.packetClientForSession().publishGroupFile(peerUin, groupFilePart.upload.fileUuid)
         : this.packetClientForSession().sendDirectMessage(
@@ -2845,7 +2843,9 @@ export class QQKernelBridge {
         waveAmplitudes: QQ_VOICE_WAVE_AMPLITUDES,
         fileSubId: '',
         playState: 1,
-        autoConvertText: 0,
+        // Ask QQNT to run its native speech-to-text pipeline. Any resulting
+        // text is surfaced later through the voice-transcript event.
+        autoConvertText: 1,
         storeID: 0,
         otherBusinessInfo: { aiVoiceType: 0 },
       },
@@ -2913,6 +2913,7 @@ export class QQKernelBridge {
   private async sendNativeVoice(
     conversation: QQConversation,
     ptt: { filePath: string, duration: number },
+    replyToId?: string,
   ): Promise<void> {
     const service = this.requireMsgService()
     const sendMsg = (service as { sendMsg?: unknown }).sendMsg
@@ -2952,7 +2953,9 @@ export class QQKernelBridge {
         waveAmplitudes: [...QQ_VOICE_WAVE_AMPLITUDES],
         fileSubId: '',
         playState: 1,
-        autoConvertText: 0,
+        // Ask QQNT to run its native speech-to-text pipeline. Any resulting
+        // text is surfaced later through the voice-transcript event.
+        autoConvertText: 1,
         storeID: 0,
         otherBusinessInfo: { aiVoiceType: 0 },
       },
@@ -2964,9 +2967,29 @@ export class QQKernelBridge {
     if (!generatedMessageId || generatedMessageId === '0') {
       throw new Error('native QQ voice sending could not generate a message ID')
     }
+    const elements: MsgElement[] = []
+    if (replyToId) {
+      const reply = await this.directReplyPart(conversation, replyToId)
+      if (reply.kind !== 'reply') throw new Error('QQ voice reply mapping failed')
+      elements.push({
+        elementType: ELEMENT_REPLY,
+        elementId: '',
+        replyElement: {
+          replayMsgId: reply.reply.messageId,
+          replayMsgSeq: reply.reply.sequence,
+          replyMsgClientSeq: reply.reply.clientSequence,
+          replyMsgTime: reply.reply.time ? String(reply.reply.time) : undefined,
+          sourceMsgTextElems: [],
+          replyMsgRevokeType: 0,
+          sourceMsgIsIncPic: false,
+          sourceMsgExpired: false,
+        },
+      })
+    }
+    elements.push(element)
     const result = await sendMsg.call(service, '0', {
       chatType: conversation.chatType, peerUid: conversation.peerUid, guildId: generatedMessageId,
-    }, [element], new Map<number, unknown>())
+    }, elements, new Map<number, unknown>())
     if (!result || typeof result !== 'object' || result.result !== 0) {
       throw new Error(`native QQ voice send failed (${String(result?.result ?? 'unknown')}): ${result?.errMsg || 'unknown error'}`)
     }
@@ -5253,6 +5276,8 @@ export class QQKernelBridge {
         continue
       }
       this.rememberMessage(message)
+      const previousTranscript = voiceTranscript(previous)
+      const transcript = voiceTranscript(message)
       const reactionsChanged = Boolean(previous)
         && JSON.stringify(previous?.reactionContext?.reactions) !== JSON.stringify(message.reactionContext?.reactions)
       const projectionChanged = Boolean(previous)
@@ -5299,6 +5324,16 @@ export class QQKernelBridge {
         })
       } else {
         log('info', `native message duplicate suppressed source=${source} id=${message.id} peer=${record.peerUid} status=${record.sendStatus}`)
+      }
+      if (transcript && transcript !== previousTranscript) {
+        this.dispatch({
+          type: 'voice-transcript',
+          eventId: `voice-transcript:${message.id}:${Date.now()}:${++this.voiceTranscriptEventSequence}`,
+          conversation,
+          messageId: message.id,
+          transcript,
+          timestamp: Math.floor(Date.now() / 1000),
+        })
       }
     }
   }
@@ -7495,6 +7530,7 @@ function mapMedia(record: MsgRecord, element: MsgElement): QQMedia | undefined {
       kind: 'file', voice: true, name: ptt.fileName || 'voice.ogg', mimeType: 'audio/ogg',
       size: numberOrUndefined(ptt.fileSize) ?? statSync(filePath).size,
       duration: duration !== undefined && duration >= 0 ? duration : undefined,
+      transcript: ptt.text?.trim() || undefined,
       locator: {
         ...base, kind: 'voice', fileName: ptt.fileName || basename(filePath), fileSize: ptt.fileSize === undefined ? undefined : String(ptt.fileSize),
         filePath, fileUuid: ptt.fileUuid, md5: normalizeNativeHash(ptt.md5HexStr),
@@ -7863,6 +7899,16 @@ function mapMemberRole(role?: number): MemberPage['members'][number]['role'] | u
   if (role === MEMBER_ADMIN) return 'administrator'
   if (role === 2) return 'member'
   return undefined
+}
+
+function voiceTranscript(message: QQMessage | undefined): string | undefined {
+  if (!message) return undefined
+  const transcript = message.parts
+    .filter((part): part is Extract<QQMessage['parts'][number], { type: 'media' }> =>
+      part.type === 'media' && Boolean(part.media.voice))
+    .map((part) => part.media.transcript?.trim() || '')
+    .find(Boolean)
+  return transcript || undefined
 }
 
 function isNativeFailureResult(value: unknown): value is { result: number, errMsg?: string } {
@@ -9121,6 +9167,9 @@ function eventSummary(event: QQEvent): string {
   }
   if (event.type === 'call-signal') {
     return `type=call-signal version=${event.version} signal=${event.signal} media=${event.media}`
+  }
+  if (event.type === 'voice-transcript') {
+    return `type=voice-transcript conversation=${event.conversation.id} message=${event.messageId} text=${JSON.stringify(truncateLogText(event.transcript))}`
   }
   return `type=message-reactions conversation=${event.conversation.id} title=${JSON.stringify(event.conversation.title)} avatar=${event.conversation.avatar?.id ?? '<none>'} message=${event.target.messageId} reactions=${event.context.reactions.length}`
 }
