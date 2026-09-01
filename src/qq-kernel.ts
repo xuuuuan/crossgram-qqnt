@@ -3254,7 +3254,11 @@ export class QQKernelBridge {
       message.reactionContext = previous.reactionContext
     }
     if (message.reactionContext) {
-      message.reactionContext = await this.withReactionActors(conversation, record, message.reactionContext, 3)
+      // Explicit reaction refreshes back the complete actor set. History and
+      // push updates still use the bounded preview path, while
+      // `messages.getMessagesReactions` is also used to warm the full
+      // reaction list after a user opens the reaction details.
+      message.reactionContext = await this.withReactionActors(conversation, record, message.reactionContext)
     }
     this.rememberMessage(message)
     return message.reactionContext ?? { reactions: [], maxSelected: 20 }
