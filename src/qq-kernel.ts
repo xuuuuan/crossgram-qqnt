@@ -421,7 +421,7 @@ export class QQKernelBridge {
   private groupFileQueryTail = Promise.resolve()
   private readonly pendingUserProfiles = new Map<string, ReturnType<typeof deferred<void>>>()
   private readonly pendingMemberProfiles = new Map<string, ReturnType<typeof deferred<MemberInfo | undefined>>>()
-  private readonly pendingMemberPages = new Map<string, ReturnType<typeof deferred<NativeMemberPage>>>()
+  private readonly pendingMemberPages = new Map<string, ReturnType<typeof deferred<NativeMemberPage>>()>()
   private readonly memberScenes = new Map<string, { conversationId: string, lastUsed: number }>()
   private readonly groupProfileAttempts = new Map<string, number>()
   private readonly recentDeletes = new Map<string, number>()
@@ -3254,11 +3254,7 @@ export class QQKernelBridge {
       message.reactionContext = previous.reactionContext
     }
     if (message.reactionContext) {
-      // Explicit reaction refreshes back the complete actor set. History and
-      // push updates still use the bounded preview path, while
-      // `messages.getMessagesReactions` is also used to warm the full
-      // reaction list after a user opens the reaction details.
-      message.reactionContext = await this.withReactionActors(conversation, record, message.reactionContext)
+      message.reactionContext = await this.withReactionActors(conversation, record, message.reactionContext, 3)
     }
     this.rememberMessage(message)
     return message.reactionContext ?? { reactions: [], maxSelected: 20 }
