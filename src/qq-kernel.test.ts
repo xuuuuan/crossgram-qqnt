@@ -4691,6 +4691,41 @@ describe('QQKernelBridge', () => {
     })
   })
 
+  it('merges member details emitted asynchronously when native IDs lack infos', async () => {
+    const f = fixture()
+    f.group.getNextMemberList.mockResolvedValueOnce({
+      errCode: 0, errMsg: '', result: {
+        ids: [{ uid: 'member-a', index: 1 }, { uid: 'member-b', index: 2 }],
+        infos: new Map([['member-a', {
+          uid: 'member-a', uin: '1', nick: 'A', remark: '', cardName: '', role: 2, avatarPath: '',
+        }]]),
+        finish: false,
+      },
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    await bridge.resolveConversation(2, '1058754719')
+    f.emitGroupList([{
+      groupCode: '1058754719', groupName: 'Bridge Test Group', memberCount: 2, memberRole: 4,
+    }])
+
+    const page = bridge.getMembers(bridge.getConversation('1058754719'), undefined, 2)
+    queueMicrotask(() => f.emitMemberList({
+      sceneId: 'scene',
+      ids: [{ uid: 'member-a', index: 1 }, { uid: 'member-b', index: 2 }],
+      infos: new Map([['member-b', {
+        uid: 'member-b', uin: '2', nick: 'B', remark: '', cardName: '', role: 2, avatarPath: '',
+      }]]),
+      hasNext: false,
+    }))
+
+    await expect(page).resolves.toMatchObject({
+      total: 2,
+      members: [{ user: { id: 'member-a' } }, { user: { id: 'member-b' } }],
+      nextCursor: undefined,
+    })
+  })
+
   it('publishes a first-seen info update as a message even with an empty reaction list', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
