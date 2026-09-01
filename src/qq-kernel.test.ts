@@ -5081,8 +5081,8 @@ describe('QQKernelBridge', () => {
       }],
     })
     expect(f.msg.getMsgEmojiLikesList.mock.calls).toEqual([
-      [expect.objectContaining({ peerUid: '1058754719' }), 'seq1', '128522', '2', '', false, 3],
-      [expect.objectContaining({ peerUid: '1058754719' }), 'seq1', '128522', '2', 'next', false, 1],
+      [expect.objectContaining({ peerUid: '1058754719' }), 'seq1', '128522', '2', '', false, 10],
+      [expect.objectContaining({ peerUid: '1058754719' }), 'seq1', '128522', '2', 'next', false, 10],
     ])
     await expect(bridge.getUser('actor-a')).resolves.toMatchObject({
       id: 'actor-a', name: 'Alice', avatarUrl: 'https://example.com/a.jpg',
@@ -5196,6 +5196,7 @@ describe('QQKernelBridge', () => {
           key: '2:128522', count: 4,
           recentActors: [
             { userId: 'actor-a' }, { userId: 'actor-b' }, { userId: 'actor-c' },
+            { userId: 'actor-d' },
           ],
         }],
       })
@@ -5203,7 +5204,7 @@ describe('QQKernelBridge', () => {
       expect.objectContaining({ peerUid: '1058754719' }), '411715', 1, true, true,
     )
     expect(f.msg.getMsgEmojiLikesList).toHaveBeenCalledWith(
-      expect.objectContaining({ peerUid: '1058754719' }), '411715', '128522', '2', '', false, 10,
+      expect.objectContaining({ peerUid: '1058754719' }), '411715', '128522', '2', '', false, 3,
     )
   })
 
