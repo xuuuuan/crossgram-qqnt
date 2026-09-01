@@ -3254,7 +3254,11 @@ export class QQKernelBridge {
       message.reactionContext = previous.reactionContext
     }
     if (message.reactionContext) {
-      message.reactionContext = await this.withReactionActors(conversation, record, message.reactionContext, 3)
+      // Explicit reaction refreshes back the complete actor set. History and
+      // push updates still use the bounded preview path, while
+      // `messages.getMessagesReactions` is also used to warm the full
+      // reaction list after a user opens the reaction details.
+      message.reactionContext = await this.withReactionActors(conversation, record, message.reactionContext)
     }
     this.rememberMessage(message)
     return message.reactionContext ?? { reactions: [], maxSelected: 20 }
@@ -3643,7 +3647,9 @@ export class QQKernelBridge {
       // mention/search scan can never find them. Wait briefly for the callback
       // and merge both payloads when any ID lacks details.
       const missingInfos = result.ids.some(({ uid }) => !result.infos.has(uid))
-      if ((!result.ids.length || missingInfos) && (conversation.participantCount ?? 0) > 0) {
+      const shouldAwaitCallback = missingInfos
+        || (!result.ids.length && (conversation.participantCount ?? 0) > 0)
+      if (shouldAwaitCallback) {
         try {
           const callbackResult = await withTimeout(listenerPage.promise, 3_000, 'QQ member list listener timed out')
           result = mergeNativeMemberPages(result, callbackResult)
