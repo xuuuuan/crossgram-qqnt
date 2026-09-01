@@ -290,6 +290,7 @@ function fixture() {
       expect(sizeType).toBe(2)
       return new Map(uids.flatMap((uid) => avatarUrls.has(uid) ? [[uid, avatarUrls.get(uid)!]] : []))
     }),
+    setBlock: vi.fn(),
   }
   const profile = {
     addKernelProfileListener: vi.fn((listener: { handlers?: typeof profileHandlers }) => {
@@ -331,6 +332,8 @@ function fixture() {
     }),
     setGroupMsgMask: vi.fn<NonNullable<KernelGroupService['setGroupMsgMask']>>(async () => ({ result: 0, errMsg: 'success' })),
     modifyMemberRole: vi.fn<NonNullable<KernelGroupService['modifyMemberRole']>>(async () => ({ result: 0, errMsg: 'success' })),
+    kickMember: vi.fn<NonNullable<KernelGroupService['kickMember']>>(async () => ({ result: 0, errMsg: 'success' })),
+    setMemberShutUp: vi.fn<NonNullable<KernelGroupService['setMemberShutUp']>>(async () => ({ result: 0, errMsg: 'success' })),
     getMemberInfo: vi.fn<NonNullable<KernelGroupService['getMemberInfo']>>(async () => ({ result: 1, errMsg: 'not found' })),
     createMemberListScene: vi.fn(() => 'scene'), destroyMemberListScene: vi.fn(),
     getNextMemberList: vi.fn(async () => ({
@@ -4548,6 +4551,29 @@ describe('QQKernelBridge', () => {
     await expect(bridge.setMemberRole(direct, 'member', 'administrator'))
       .rejects.toThrow('member roles are only supported for group conversations')
     expect(f.group.modifyMemberRole).toHaveBeenCalledTimes(1)
+  })
+
+  it('maps Telegram moderation actions to QQ mute, kick, and block APIs', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const group = bridge.getConversation('1058754719')
+
+    await bridge.moderateMember(group, 'member', 'mute', 1_900_000_000)
+    await bridge.moderateMember(group, 'member', 'unmute')
+    await bridge.moderateMember(group, 'member', 'kick', 0, true)
+    await bridge.setUserBlocked('123456789', true)
+    await bridge.setUserBlocked('123456789', false)
+
+    expect(f.group.setMemberShutUp).toHaveBeenNthCalledWith(1, '1058754719', [
+      { uid: 'member', timeStamp: 1_900_000_000 },
+    ])
+    expect(f.group.setMemberShutUp).toHaveBeenNthCalledWith(2, '1058754719', [
+      { uid: 'member', timeStamp: 0 },
+    ])
+    expect(f.group.kickMember).toHaveBeenCalledWith('1058754719', ['member'], true)
+    expect(f.buddy.setBlock).toHaveBeenNthCalledWith(1, 123456789, true)
+    expect(f.buddy.setBlock).toHaveBeenNthCalledWith(2, 123456789, false)
   })
 
   it('keeps native member cursors opaque and reports the group profile total on every page', async () => {

@@ -1525,6 +1525,45 @@ export class QQKernelBridge {
     }
   }
 
+  async moderateMember(
+    conversation: QQConversation,
+    userId: string,
+    action: 'mute' | 'unmute' | 'kick',
+    untilDate = 0,
+    rejectAddRequest = false,
+  ): Promise<void> {
+    if (conversation.chatType !== CHAT_GROUP) throw new Error('member moderation is only supported for group conversations')
+    if (!userId) throw new Error('member user id is required')
+    const groupService = this.requireGroupService()
+    const groupCode = conversation.peerUin || conversation.peerUid
+    if (action === 'kick') {
+      const method = groupService.kickMember
+      if (!method) throw new Error('QQNT does not expose kickMember')
+      const result = await method.call(groupService, groupCode, [userId], rejectAddRequest)
+      if (isNativeFailureResult(result)) throw new Error(`kickMember: ${result.errMsg} (${result.result})`)
+      return
+    }
+    const method = groupService.setMemberShutUp
+    if (!method) throw new Error('QQNT does not expose setMemberShutUp')
+    const timestamp = action === 'mute' ? Math.max(0, Math.trunc(untilDate)) : 0
+    const result = await method.call(groupService, groupCode, [{ uid: userId, timeStamp: timestamp }])
+    if (result.result !== 0) throw new Error(`setMemberShutUp: ${result.errMsg} (${result.result})`)
+  }
+
+  async setUserBlocked(userId: string, blocked: boolean): Promise<void> {
+    if (!userId) throw new Error('user id is required')
+    const service = this.requireBuddyService()
+    if (!service.setBlock) throw new Error('QQNT does not expose setBlock')
+    let uin = Number(userId)
+    if (!Number.isSafeInteger(uin) || uin <= 0) {
+      const converted = await this.requireSession().getUixConvertService().getUin(new Set([userId]))
+      const value = converted.uinInfo.get(userId)
+      uin = Number(value)
+    }
+    if (!Number.isSafeInteger(uin) || uin <= 0) throw new Error(`QQ user ${userId} could not be resolved to a UIN`)
+    await service.setBlock(uin, blocked)
+  }
+
   private async hydrateRecentTopMessage(conversation: QQConversation): Promise<QQConversation> {
     const target = this.recentTopMessages.get(conversation.id)
     if (!target || conversation.lastMessage?.id === target.id) return conversation
@@ -7798,6 +7837,12 @@ function mapMemberRole(role?: number): MemberPage['members'][number]['role'] | u
   if (role === MEMBER_ADMIN) return 'administrator'
   if (role === 2) return 'member'
   return undefined
+}
+
+function isNativeFailureResult(value: unknown): value is { result: number, errMsg?: string } {
+  if (!value || typeof value !== 'object') return false
+  const result = (value as { result?: unknown }).result
+  return typeof result === 'number' && result !== 0
 }
 
 function parseCursor(value?: string): number {

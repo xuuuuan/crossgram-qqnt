@@ -808,6 +808,7 @@ export interface KernelBuddyService {
   getBuddyNick?(uids: string[]): Map<string, string>
   getBuddyRemark?(uids: string[]): Map<string, string>
   getAvatarUrl?(uids: string[], sizeType: number): Map<string, string>
+  setBlock?(uid: number, isBlock: boolean): unknown
 }
 
 export interface KernelProfileService {
@@ -851,6 +852,8 @@ export interface KernelGroupService {
   setGroupMsgMask?(groupCode: string, mask: GroupMsgMask): Promise<{ result: number, errMsg: string }>
   /** Set or revoke QQ group administrator status. Native roles are Member=2 and Admin=3. */
   modifyMemberRole?(groupCode: string, uid: string, role: 2 | 3): Promise<{ result: number, errMsg: string }>
+  kickMember?(groupCode: string, uids: string[], refuseForever?: boolean, reason?: string): Promise<unknown>
+  setMemberShutUp?(groupCode: string, members: Array<{ uid: string, timeStamp: number }>): Promise<{ result: number, errMsg: string }>
   createMemberListScene(groupCode: string, scene: string): string
   destroyMemberListScene(sceneId: string): void
   getNextMemberList(sceneId: string, lastId: { uid: string, index: number }, count: number): Promise<{

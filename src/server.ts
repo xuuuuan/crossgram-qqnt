@@ -693,6 +693,51 @@ export class QQBridgeServer {
       json(response, 200, { ok: true })
       return
     }
+    const moderationMatch = /^\/v1\/conversations\/([^/]+)\/members\/([^/]+)\/moderate$/.exec(path)
+    if (request.method === 'POST' && moderationMatch) {
+      const conversation = this.bridge.getConversation(decodeURIComponent(moderationMatch[1]))
+      const userId = decodeURIComponent(moderationMatch[2])
+      const body = await readJson<{
+        type?: unknown
+        untilDate?: unknown
+        rejectAddRequest?: unknown
+      }>(request)
+      if (body?.type !== 'mute' && body?.type !== 'unmute' && body?.type !== 'kick') {
+        json(response, 400, { error: 'type must be mute, unmute, or kick' })
+        return
+      }
+      try {
+        await this.bridge.moderateMember(
+          conversation,
+          userId,
+          body.type,
+          typeof body.untilDate === 'number' ? body.untilDate : 0,
+          body.rejectAddRequest === true,
+        )
+      } catch (error) {
+        json(response, 502, { error: errorMessage(error) })
+        return
+      }
+      json(response, 200, { ok: true, conversationId: conversation.id, userId, type: body.type })
+      return
+    }
+    const blockMatch = /^\/v1\/users\/([^/]+)\/block$/.exec(path)
+    if (request.method === 'POST' && blockMatch) {
+      const userId = decodeURIComponent(blockMatch[1])
+      const body = await readJson<{ blocked?: unknown }>(request)
+      if (typeof body?.blocked !== 'boolean') {
+        json(response, 400, { error: 'blocked must be boolean' })
+        return
+      }
+      try {
+        await this.bridge.setUserBlocked(userId, body.blocked)
+      } catch (error) {
+        json(response, 502, { error: errorMessage(error) })
+        return
+      }
+      json(response, 200, { ok: true, userId, blocked: body.blocked })
+      return
+    }
     if (request.method === 'POST' && path === '/v1/messages/get') {
       const body = await readJson<{ conversationId: string, messageId: string }>(request)
       const message = await this.bridge.getMessage(
