@@ -2037,7 +2037,8 @@ export class QQKernelBridge {
     // QQNT can retain an empty favorite snapshot when the kernel service was
     // attached after the desktop client performed its initial collection
     // load. Force a native refresh for the first page, matching QQNT's own UI
-    // and NapCat. Continuing pages must not refresh or the cursor can be reset.
+    // and compatible clients. Continuing pages must not refresh or the cursor
+    // can be reset.
     const result = await service.fetchFavEmojiList(
       cursor ?? '', clamp(limit, 1, 200), true, cursor === undefined || cursor === '',
     )

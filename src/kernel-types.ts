@@ -845,7 +845,7 @@ export interface KernelGroupService {
   getGroupMsgMask?(): Promise<{ result: number, errMsg: string }>
   /**
    * Sets the group notification mask for a single group. Return shape mirrors
-   * getGroupMsgMask: NapCat/Yui stubs expose `(groupCode: string, mask: GroupMsgMask)`
+   * getGroupMsgMask exposes `(groupCode: string, mask: GroupMsgMask)`
    * resolving to `{ result: 0, errMsg: 'success' }`; a non-zero result indicates
    * a native failure. Verified against the public stub signature only.
    */

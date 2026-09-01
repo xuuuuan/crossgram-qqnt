@@ -970,7 +970,7 @@ export function encodeDirectMessageRequest(
       routing,
       content: { field1: 1, field2: 0, field3: 0, field4: 0 },
       body,
-      // QQNT uses a short per-send client sequence (the official/Lagrange
+      // QQNT uses a short per-send client sequence (the official client
       // clients use 10000..99998). Arbitrary int64 values are parsed by SSO
       // but PbSendMsg then returns no usable sequence and never publishes the
       // outgoing message.
