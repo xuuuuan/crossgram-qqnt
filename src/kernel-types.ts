@@ -509,6 +509,18 @@ export interface KernelMsgService {
     downloadType: number
     file_uuid: string
   }): string
+  downloadRichMedia?(request: {
+    msgId: string
+    peerUid: string
+    chatType: number
+    elementId: string
+    downloadType: number
+    thumbSize: number
+    filePath: string
+    fileModelId: string
+    downSourceType: number
+    triggerType: number
+  }): unknown
   recallMsg(peer: Contact, msgIds: string[]): Promise<{ result: number, errMsg: string }>
   setSpecificMsgReadAndReport?(peer: Contact, msgId: string): Promise<{ result: number, errMsg: string }>
   deleteMsg(peer: Contact, msgIds: string[]): Promise<{ result: number, errMsg: string }>

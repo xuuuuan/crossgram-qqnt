@@ -457,8 +457,10 @@ export class QQKernelBridge {
   private avsdkListenerRetry?: NodeJS.Timeout
   private readonly tempPath: string
   private readonly voiceCachePath: string
+  private readonly voiceDownloadPath: string
   private readonly flashTransferPath: string
   private readonly voicePreparations = new Map<string, Promise<QQMedia | undefined>>()
+  private readonly voiceDownloads = new Map<string, Promise<PreparedVoiceSource | undefined>>()
   private readonly sendTimeoutMs: number
   private readonly userResolveTimeoutMs: number
   private readonly packetClientOptions: QQPacketClientOptions
@@ -473,6 +475,7 @@ export class QQKernelBridge {
   constructor(options: QQKernelOptions = {}) {
     this.tempPath = options.tempPath ?? join(process.env.TMPDIR ?? '/tmp', 'qqnt-mtproto-bridge')
     this.voiceCachePath = join(this.tempPath, 'voice-cache')
+    this.voiceDownloadPath = join(this.tempPath, 'voice-download')
     this.flashTransferPath = join(this.tempPath, 'flash-transfer')
     this.sendTimeoutMs = options.sendTimeoutMs ?? 60_000
     this.userResolveTimeoutMs = options.userResolveTimeoutMs ?? 2_000
@@ -3765,8 +3768,11 @@ export class QQKernelBridge {
 
   private clearVoiceCache(): void {
     this.voicePreparations.clear()
+    this.voiceDownloads.clear()
     rmSync(this.voiceCachePath, { recursive: true, force: true })
+    rmSync(this.voiceDownloadPath, { recursive: true, force: true })
     mkdirSync(this.voiceCachePath, { recursive: true, mode: 0o700 })
+    mkdirSync(this.voiceDownloadPath, { recursive: true, mode: 0o700 })
   }
 
   private pruneFlashTransferFiles(): void {
@@ -3796,7 +3802,9 @@ export class QQKernelBridge {
   private trustedVoiceSource(path: string | undefined): PreparedVoiceSource | undefined {
     try {
       const canonical = path && realpathSync(path)
-      if (!canonical || !this.trustedMediaRoots().some((root) => isPathInside(root, canonical))) return
+      if (!canonical || ![
+        ...this.trustedMediaRoots(), realpathSync(this.voiceDownloadPath),
+      ].some((root) => isPathInside(root, canonical))) return
       const info = statSync(canonical)
       return info.isFile() && info.size > 0 ? { path: canonical, size: info.size, mtimeMs: info.mtimeMs } : undefined
     } catch {
@@ -3816,11 +3824,14 @@ export class QQKernelBridge {
 
   private mapMedia(record: MsgRecord, element: MsgElement): QQMedia | undefined {
     const media = mapMedia(record, element)
-    return media?.voice && !this.trustedVoiceSource(media.locator.filePath) ? undefined : media
+    if (!media?.voice || this.trustedVoiceSource(media.locator.filePath)) return media
+    return hasRemoteVoiceIdentity(media.locator)
+      ? { ...media, locator: { ...media.locator, filePath: undefined } }
+      : undefined
   }
 
   private async prepareVoiceMedia(media: QQMedia): Promise<QQMedia | undefined> {
-    const source = this.trustedVoiceSource(media.locator.filePath)
+    const source = this.trustedVoiceSource(media.locator.filePath) ?? await this.downloadVoiceSource(media.locator)
     if (!source) return
     const key = createHash('sha256').update(source.path).update('\0').update(String(source.size)).update('\0').update(String(source.mtimeMs)).digest('hex')
     let preparation = this.voicePreparations.get(key)
@@ -3834,6 +3845,52 @@ export class QQKernelBridge {
       this.voicePreparations.set(key, preparation)
     }
     return preparation
+  }
+
+  private async downloadVoiceSource(locator: QQMediaLocator): Promise<PreparedVoiceSource | undefined> {
+    const service = this.requireMsgService()
+    if (!service.downloadRichMedia || !hasRemoteVoiceIdentity(locator)) return
+    const key = `${locator.chatType}\0${locator.peerUid}\0${locator.messageId}\0${locator.elementId}`
+    let pending = this.voiceDownloads.get(key)
+    if (!pending) {
+      pending = (async () => {
+        const digest = createHash('sha256').update(key).digest('hex')
+        const filePath = join(this.voiceDownloadPath, `${digest}.silk`)
+        await rm(filePath, { force: true }).catch(() => undefined)
+        service.downloadRichMedia!({
+          msgId: locator.messageId,
+          peerUid: locator.peerUid,
+          chatType: locator.chatType,
+          elementId: locator.elementId,
+          downloadType: 1,
+          thumbSize: 0,
+          filePath,
+          fileModelId: locator.fileUuid ?? '',
+          downSourceType: 0,
+          triggerType: 1,
+        })
+        const deadline = Date.now() + 15_000
+        let previousSize = -1
+        let stableReads = 0
+        while (Date.now() < deadline) {
+          const info = await stat(filePath).catch(() => undefined)
+          if (info?.isFile() && info.size > 0) {
+            if (info.size === previousSize) stableReads++
+            else stableReads = 0
+            previousSize = info.size
+            if (stableReads >= 2) return this.trustedVoiceSource(filePath)
+          }
+          await delay(50)
+        }
+        await rm(filePath, { force: true }).catch(() => undefined)
+        return undefined
+      })().catch((error) => {
+        log('warn', `QQ voice download failed message=${locator.messageId} element=${locator.elementId}`, error)
+        return undefined
+      }).finally(() => this.voiceDownloads.delete(key))
+      this.voiceDownloads.set(key, pending)
+    }
+    return pending
   }
 
   private deferVoiceMedia(media: QQMedia): QQMedia | undefined {
@@ -7583,17 +7640,19 @@ function mapMedia(record: MsgRecord, element: MsgElement): QQMedia | undefined {
   }
   if (element.pttElement) {
     const ptt = element.pttElement
-    const filePath = ptt.filePath
-    if (!filePath || !existsSync(filePath) || statSync(filePath).size <= 0) return
+    const filePath = ptt.filePath && existsSync(ptt.filePath) && statSync(ptt.filePath).size > 0
+      ? ptt.filePath
+      : undefined
+    if (!filePath && !element.elementId) return
     const duration = numberOrUndefined(ptt.duration)
     return {
       id: element.elementId || `${record.msgId}:voice`,
       kind: 'file', voice: true, name: ptt.fileName || 'voice.ogg', mimeType: 'audio/ogg',
-      size: numberOrUndefined(ptt.fileSize) ?? statSync(filePath).size,
+      size: numberOrUndefined(ptt.fileSize) ?? (filePath ? statSync(filePath).size : undefined),
       duration: duration !== undefined && duration >= 0 ? duration : undefined,
       transcript: ptt.text?.trim() || undefined,
       locator: {
-        ...base, kind: 'voice', fileName: ptt.fileName || basename(filePath), fileSize: ptt.fileSize === undefined ? undefined : String(ptt.fileSize),
+        ...base, kind: 'voice', fileName: ptt.fileName || (filePath ? basename(filePath) : 'voice.silk'), fileSize: ptt.fileSize === undefined ? undefined : String(ptt.fileSize),
         filePath, fileUuid: ptt.fileUuid, md5: normalizeNativeHash(ptt.md5HexStr),
       },
     }
@@ -7681,6 +7740,10 @@ function mapMedia(record: MsgRecord, element: MsgElement): QQMedia | undefined {
       },
     }
   }
+}
+
+function hasRemoteVoiceIdentity(locator: QQMediaLocator): boolean {
+  return Boolean(locator.messageId && locator.elementId)
 }
 
 function nativeImagePreview(

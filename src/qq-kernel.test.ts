@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { Readable } from 'node:stream'
 import { once } from 'node:events'
 import { existsSync } from 'node:fs'
-import { mkdir, mkdtemp, readFile, readdir, rm, symlink, truncate, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, truncate, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { execFile } from 'node:child_process'
@@ -226,6 +226,7 @@ function fixture() {
     })),
     getRichMediaFilePath: vi.fn(() => ''),
     getRichMediaFilePathForGuild: vi.fn<NonNullable<KernelMsgService['getRichMediaFilePathForGuild']>>(() => ''),
+    downloadRichMedia: undefined as KernelMsgService['downloadRichMedia'],
     getMsgsBySeqAndCount: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [message] })),
     getMsgsByMsgId: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [message] })),
     getSourceOfReplyMsg: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [] as MsgRecord[] })),
@@ -2207,6 +2208,35 @@ describe('QQKernelBridge', () => {
       { type: 'text', text: '[语音 2秒]' },
       { type: 'text', text: '[语音 3秒]' },
     ])
+  })
+
+  it('downloads a missing native PTT before projecting it as playable voice media', async () => {
+    const f = fixture()
+    const root = await mkdtemp(join(tmpdir(), 'qqnt-voice-download-'))
+    tempPaths.push(root)
+    const wav = join(root, 'voice.wav')
+    const silk = join(root, 'voice.silk')
+    await execFileAsync('ffmpeg', ['-nostdin', '-y', '-v', 'error', '-f', 'lavfi', '-i', 'anullsrc=r=24000:cl=mono', '-t', '0.04', wav])
+    await encodePtt(wav, silk)
+    f.message.elements = [{ elementType: 4, elementId: 'remote-voice', pttElement: {
+      duration: 1, fileName: 'voice.silk', filePath: '', fileUuid: 'voice-uuid',
+      fileSize: String((await stat(silk)).size),
+    } }]
+    f.msg.downloadRichMedia = vi.fn((request) => {
+      queueMicrotask(() => void copyFile(silk, request.filePath))
+    })
+    const bridge = new QQKernelBridge({ tempPath: join(root, 'cache-root') })
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: root })
+
+    await expect(bridge.getHistory(bridge.getConversation('uid-1715311957'))).resolves.toMatchObject({
+      messages: [{ parts: [{ type: 'media', media: {
+        voice: true, mimeType: 'audio/ogg', duration: 1,
+      } }] }],
+    })
+    expect(f.msg.downloadRichMedia).toHaveBeenCalledWith(expect.objectContaining({
+      msgId: 'm1', peerUid: 'uid-1715311957', chatType: 1,
+      elementId: 'remote-voice', downloadType: 1,
+    }))
   })
 
   it('falls back from an invalid trusted PTT and removes failed conversion artifacts', async () => {
@@ -6129,6 +6159,37 @@ describe('QQBridgeServer', () => {
     vi.unstubAllEnvs()
     vi.restoreAllMocks()
     await Promise.all(tempPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })))
+  })
+
+  it('serves a remotely downloaded QQ voice as media instead of a text fallback', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'qqnt-voice-http-'))
+    tempPaths.push(root)
+    const wav = join(root, 'voice.wav')
+    const silk = join(root, 'voice.silk')
+    await execFileAsync('ffmpeg', ['-nostdin', '-y', '-v', 'error', '-f', 'lavfi', '-i', 'anullsrc=r=24000:cl=mono', '-t', '0.04', wav])
+    await encodePtt(wav, silk)
+    const f = fixture()
+    f.message.elements = [{ elementType: 4, elementId: 'remote-http-voice', pttElement: {
+      duration: 1, fileName: 'voice.silk', filePath: '', fileUuid: 'voice-uuid',
+      fileSize: String((await stat(silk)).size),
+    } }]
+    f.msg.downloadRichMedia = vi.fn((request) => {
+      queueMicrotask(() => void copyFile(silk, request.filePath))
+    })
+    const bridge = new QQKernelBridge({ tempPath: join(root, 'cache-root') })
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: root })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+
+    const response = await fetch(
+      `http://127.0.0.1:${server.address().port}/v1/conversations/uid-1715311957/history`,
+    )
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toMatchObject({
+      messages: [{ parts: [{ type: 'media', media: {
+        voice: true, mimeType: 'audio/ogg', duration: 1,
+      } }] }],
+    })
   })
 
   it('preserves a forward origin through HTTP and the native observer callback', async () => {
