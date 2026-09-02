@@ -888,6 +888,21 @@ export interface KernelAVSDKService {
   setActionFromAVSDK(action: number, bytes: Uint8Array): unknown
 }
 
+export interface KernelBaseEmojiService {
+  fetchFullSysEmojis?(request: {
+    fetchAdvaceSource: boolean
+    fetchBaseSource: boolean
+    pullMoment: number
+    pullType: number
+    refresh: boolean
+    thresholdValue: number
+  }): Promise<{
+    result: number
+    errMsg: string
+    rsp?: unknown
+  }>
+}
+
 export interface KernelSession {
   getMsgService(): KernelMsgService
   getRecentContactService(): KernelRecentService
@@ -896,6 +911,7 @@ export interface KernelSession {
   getGroupService(): KernelGroupService
   getSearchService?(): KernelSearchService
   getAVSDKService?(): KernelAVSDKService
+  getBaseEmojiService?(): KernelBaseEmojiService
   getRichMediaService(): KernelRichMediaService
   getSettingService?(): KernelSettingService
   getAvatarService?(): {

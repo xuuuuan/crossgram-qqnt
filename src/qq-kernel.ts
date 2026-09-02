@@ -13,6 +13,7 @@ import { resolveMultiForwardParticipants } from './multi-forward-participants.js
 import { decodeGroupReactionPush, type QQGroupReactionPush } from './reaction-push.js'
 import type { PCMMediaLease } from './media-gateway.js'
 import { QQPacketClient, type DirectHighwayUpload, type QQPacketClientOptions } from './packet-client.js'
+import type { NativeSysFace } from './packet-addon.js'
 import {
   FLASH_TRANSFER_BLOCK_SIZE, flashTransferFormatCode, HIGHWAY_BLOCK_SIZE, type DirectMessagePart,
   type FlashTransferFileSpec,
@@ -6443,8 +6444,9 @@ export class QQKernelBridge {
       log('warn', 'native sysface catalog refresh failed while loading reactions', error)
       return []
     })
+    const runtimeFaces = await this.fetchRuntimeSysFaces()
     const knownKeys = new Set(definitions.map((definition) => definition.key))
-    for (const face of nativeFaces) {
+    for (const face of [...nativeFaces, ...runtimeFaces]) {
       if (!face.faceId) continue
       const key = reactionKey('1', face.faceId)
       if (knownKeys.has(key) || !face.url) continue
@@ -6475,6 +6477,26 @@ export class QQKernelBridge {
     for (const definition of definitions) this.reactionByKey.set(definition.key, definition)
     for (const [key, definition] of aliases) this.reactionByKey.set(key, definition)
     log('info', `loaded ${definitions.length} QQ reaction definitions`)
+  }
+
+  private async fetchRuntimeSysFaces(): Promise<NativeSysFace[]> {
+    const service = this.requireSession().getBaseEmojiService?.()
+    if (!service?.fetchFullSysEmojis) return []
+    try {
+      const result = await service.fetchFullSysEmojis({
+        fetchAdvaceSource: true,
+        fetchBaseSource: true,
+        pullMoment: 1,
+        pullType: 0,
+        refresh: true,
+        thresholdValue: 0,
+      })
+      if (result.result !== 0) throw new Error(result.errMsg || `result=${result.result}`)
+      return extractRuntimeSysFaces(result.rsp)
+    } catch (error) {
+      log('warn', 'runtime base-emoji catalog refresh failed while loading reactions', error)
+      return []
+    }
   }
 
   private findLocalReactionRoot(): string | undefined {
@@ -7981,6 +8003,68 @@ function mergeKnownSticker(known: QQSticker | undefined, current: QQSticker): QQ
 
 function sysFaceStickerId(faceId: string): string {
   return `sysface:${faceId}`
+}
+
+function extractRuntimeSysFaces(value: unknown): NativeSysFace[] {
+  const objects: Record<string, unknown>[] = []
+  const visit = (node: unknown): void => {
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item)
+    } else if (node && typeof node === 'object') {
+      const object = node as Record<string, unknown>
+      objects.push(object)
+      for (const child of Object.values(object)) visit(child)
+    }
+  }
+  visit(value)
+
+  const urls = new Map<string, string>()
+  for (const object of objects) {
+    const id = firstNonEmptyString(object.emojiId, object.QSid)
+    const url = firstNonEmptyString(object.baseResDownloadUrl, object.advancedResDownloadUrl, object.url)
+    if (id && url) urls.set(id, url)
+  }
+
+  const faces = new Map<string, NativeSysFace>()
+  for (const object of objects) {
+    const list = object.SysEmojiList
+    if (!Array.isArray(list)) continue
+    for (const raw of list) {
+      if (!raw || typeof raw !== 'object') continue
+      const item = raw as Record<string, unknown>
+      const faceId = firstNonEmptyString(item.emojiId, item.QSid)
+      if (!faceId) continue
+      const url = firstNonEmptyString(
+        item.baseResDownloadUrl,
+        item.advancedResDownloadUrl,
+        item.url,
+        urls.get(faceId),
+      ) ?? ''
+      faces.set(faceId, {
+        faceId,
+        name: firstNonEmptyString(item.describe, item.QDes, item.name) ?? '',
+        url,
+        aniStickerType: firstFiniteNumber(item.aniStickerType, item.AniStickerType),
+        aniStickerPackId: firstFiniteNumber(item.aniStickerPackId, item.AniStickerPackId),
+        aniStickerId: firstFiniteNumber(item.aniStickerId, item.AniStickerId),
+        width: firstFiniteNumber(item.animationWidth, item.AniStickerWidth),
+        height: firstFiniteNumber(item.animationHeigh, item.AniStickerHeight),
+      })
+    }
+  }
+  return [...faces.values()]
+}
+
+function firstNonEmptyString(...values: unknown[]): string | undefined {
+  return values.find((value): value is string => typeof value === 'string' && value.length > 0)
+}
+
+function firstFiniteNumber(...values: unknown[]): number {
+  for (const value of values) {
+    const number = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN
+    if (Number.isFinite(number)) return number
+  }
+  return 0
 }
 
 function systemFaceMimeType(url: string, contentType: string | null | undefined): string {
