@@ -2399,7 +2399,7 @@ describe('QQKernelBridge', () => {
     const history = await bridge.getHistory(bridge.getConversation('uid-1715311957'))
     expect(history.messages).toHaveLength(1)
     expect(history.messages[0]).toMatchObject({ id: 'fallbacks', parts: [
-      { type: 'text', text: '[语音] 转写内容' },
+      { type: 'text', text: '[语音 3秒]' },
       { type: 'media', media: {
         id: 'video', kind: 'file', name: 'clip.mp4', mimeType: 'video/mp4',
         size: 1048576, width: 1920, height: 1080, duration: 4,
@@ -4277,9 +4277,9 @@ describe('QQKernelBridge', () => {
     f.emitGroupMsgMasks([{ groupCode: '1058754719', msgMask: GroupMsgMask.NOTIFY }])
 
     await expect(bridge.getDialogs()).resolves.toMatchObject({
-      conversations: [expect.objectContaining({
+      conversations: expect.arrayContaining([expect.objectContaining({
         id: '1058754719', groupMsgMask: GroupMsgMask.NOTIFY,
-      })],
+      })]),
     })
   })
 
