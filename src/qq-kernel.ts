@@ -430,7 +430,7 @@ export class QQKernelBridge {
   private groupFileQueryTail = Promise.resolve()
   private readonly pendingUserProfiles = new Map<string, ReturnType<typeof deferred<void>>>()
   private readonly pendingMemberProfiles = new Map<string, ReturnType<typeof deferred<MemberInfo | undefined>>>()
-  private readonly pendingMemberPages = new Map<string, ReturnType<typeof deferred<NativeMemberPage>>()>()
+  private readonly pendingMemberPages = new Map<string, ReturnType<typeof deferred<NativeMemberPage>>>()
   private readonly memberScenes = new Map<string, { conversationId: string, lastUsed: number }>()
   private readonly groupProfileAttempts = new Map<string, number>()
   private readonly recentDeletes = new Map<string, number>()
