@@ -5526,6 +5526,41 @@ describe('QQKernelBridge', () => {
     })
   })
 
+  it('merges the official QQNT runtime emoji catalog when local metadata is stale', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'qqnt-runtime-reactions-'))
+    tempPaths.push(root)
+    const resourceRoot = join(root, 'global', 'nt_data', 'Emoji', 'emoji-resource')
+    await Promise.all([
+      mkdir(join(resourceRoot, 'sysface_res', 'static'), { recursive: true }),
+      mkdir(join(resourceRoot, 'sysface_res', 'apng'), { recursive: true }),
+      mkdir(join(resourceRoot, 'emoji_res'), { recursive: true }),
+    ])
+    await writeFile(join(resourceRoot, 'face_config.json'), JSON.stringify({ emoji: [], sysface: [] }))
+    const f = fixture()
+    ;(f.session as any).getBaseEmojiService = () => ({
+      fetchFullSysEmojis: vi.fn(async () => ({
+        result: 0, errMsg: '', rsp: {
+          normalPanelResult: {
+            SysEmojiGroupList: [{ SysEmojiList: [{
+              emojiId: '424', describe: '/续标识', animationWidth: 128, animationHeigh: 128,
+            }] }],
+            downloadInfo: [{ emojiId: '424', baseResDownloadUrl: 'https://face.qq.example/424.png' }],
+          },
+        },
+      })),
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: join(root, 'account') })
+    vi.spyOn(bridge as any, 'packetClientForSession').mockReturnValue({ getSysFaces: async () => [] })
+
+    const catalog = await bridge.getReactionCatalog()
+    expect(catalog.available).toHaveLength(1)
+    expect(catalog.available[0]).toMatchObject({
+      key: '1:424', title: '续标识',
+      presentation: { type: 'custom', resource: { locator: { reactionKey: '1:424' } } },
+    })
+  })
+
   it('does not expose or write reactions in direct conversations', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
