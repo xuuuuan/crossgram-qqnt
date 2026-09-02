@@ -149,7 +149,7 @@ pub fn decode_fetch_sys_faces_response(payload: Buffer) -> Result<Vec<SysFace>> 
                 .map(|face| SysFace {
                     face_id: face.q_sid,
                     name: face.q_des,
-                    url: face.url.map(|url| url.base_url).unwrap_or_default(),
+                    url: select_face_resource_url(face.url),
                     ani_sticker_type: face.ani_sticker_type,
                     ani_sticker_pack_id: face.ani_sticker_pack_id,
                     ani_sticker_id: face.ani_sticker_id,
@@ -159,6 +159,44 @@ pub fn decode_fetch_sys_faces_response(payload: Buffer) -> Result<Vec<SysFace>> 
                 .collect()
         })
         .map_err(|error| Error::from_reason(format!("invalid FetchSysFaces response: {error}")))
+}
+
+fn select_face_resource_url(url: Option<proto::FaceResourceUrl>) -> String {
+    url.and_then(|url| {
+        if !url.base_url.is_empty() {
+            Some(url.base_url)
+        } else if !url.adv_url.is_empty() {
+            Some(url.adv_url)
+        } else {
+            None
+        }
+    })
+    .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_face_resource_url;
+    use crate::proto::FaceResourceUrl;
+
+    #[test]
+    fn prefers_base_face_url_and_falls_back_to_advanced_url() {
+        assert_eq!(
+            select_face_resource_url(Some(FaceResourceUrl {
+                base_url: "https://face/base.png".into(),
+                adv_url: "https://face/advanced.webp".into(),
+            })),
+            "https://face/base.png",
+        );
+        assert_eq!(
+            select_face_resource_url(Some(FaceResourceUrl {
+                base_url: String::new(),
+                adv_url: "https://face/advanced.webp".into(),
+            })),
+            "https://face/advanced.webp",
+        );
+        assert_eq!(select_face_resource_url(None), "");
+    }
 }
 
 #[napi]
