@@ -30,7 +30,13 @@ import {
   type QQFlashTransferManifest, type QQFlashTransferResult, type QQRequest, type QQRequestKind, type QQRequestPage, type QQRequestStatus, type QQSendMediaSpec, type QQSticker, type QQStickerPack, type QQStickerPackSummary, type QQStickerReference, type QQTextPart, type SearchPage, type SearchQuery, type SendManifest,
 } from './protocol.js'
 
-/** A single native group-member page, including identifiers and details
+type ReactionAsset = {
+  path?: string
+  url?: string
+  mimeType: 'image/png' | 'image/apng'
+}
+
+/** A single native group-member page, including the identifiers and details
  * emitted by getNextMemberList/onMemberListChange. Native QQNT builds may
  * return these two collections asynchronously, so callers should merge them
  * before projecting members. */
@@ -372,7 +378,8 @@ export class QQKernelBridge {
   private readonly messages = new Map<string, QQMessage[]>()
   private reactionDefinitions: QQReactionDefinition[] = []
   private readonly reactionByKey = new Map<string, QQReactionDefinition>()
-  private readonly reactionAssets = new Map<string, { path: string, mimeType: 'image/png' | 'image/apng' }>()
+  private readonly reactionAssets = new Map<string, ReactionAsset>()
+  private readonly reactionRemoteCache = new Map<string, Buffer>()
   private reactionCatalogPromise?: Promise<void>
   private reactionEventSequence = 0
   private messageEditEventSequence = 0
@@ -720,6 +727,7 @@ export class QQKernelBridge {
     this.reactionDefinitions = []
     this.reactionByKey.clear()
     this.reactionAssets.clear()
+    this.reactionRemoteCache.clear()
     this.reactionCatalogPromise = undefined
     this.stickerPacks.clear()
     this.stickerPackInfo.clear()
@@ -851,6 +859,7 @@ export class QQKernelBridge {
     for (const pending of this.pendingMemberProfiles.values()) pending.reject(new Error('QQNT session detached'))
     this.pendingMemberProfiles.clear()
     this.reactionAssets.clear()
+    this.reactionRemoteCache.clear()
     this.clearVoiceCache()
   }
 
@@ -3242,15 +3251,34 @@ export class QQKernelBridge {
   ): Promise<{ stream: Readable, mimeType: string, size: number, offset: number, length: number } | undefined> {
     if (!this.reactionDefinitions.length) await this.getReactionCatalog()
     const resource = this.reactionAssets.get(reactionKey)
-    if (!resource || !existsSync(resource.path)) return
-    const size = statSync(resource.path).size
+    if (!resource) return
+    let bytes: Buffer | undefined
+    if (resource.path) {
+      if (!existsSync(resource.path)) return
+    } else if (resource.url) {
+      bytes = this.reactionRemoteCache.get(reactionKey)
+      if (!bytes) {
+        try {
+          const response = await fetch(resource.url)
+          if (!response.ok) return
+          bytes = Buffer.from(await response.arrayBuffer())
+          this.reactionRemoteCache.set(reactionKey, bytes)
+        } catch (error) {
+          log('warn', `remote QQ reaction asset unavailable key=${reactionKey} url=${resource.url}`, error)
+          return
+        }
+      }
+    } else return
+    const size = bytes?.length ?? statSync(resource.path!).size
     const offset = Math.max(0, Math.trunc(range.offset ?? 0))
     const available = Math.max(0, size - offset)
     const requested = range.limit === undefined ? available : Math.max(0, Math.trunc(range.limit))
     const length = Math.min(available, requested)
     return {
       stream: length
-        ? createReadStream(resource.path, { start: offset, end: offset + length - 1 })
+        ? bytes
+          ? Readable.from(bytes.subarray(offset, offset + length))
+          : createReadStream(resource.path!, { start: offset, end: offset + length - 1 })
         : Readable.from([]),
       mimeType: resource.mimeType,
       size,
@@ -6265,7 +6293,7 @@ export class QQKernelBridge {
     }
     const definitions: QQReactionDefinition[] = []
     const aliases = new Map<string, QQReactionDefinition>()
-    const assets = new Map<string, { path: string, mimeType: 'image/png' | 'image/apng' }>()
+    const assets = new Map<string, ReactionAsset>()
     for (const item of config.emoji ?? []) {
       if (item.QHide === '1' || !item.QSid) continue
       const emojiId = item.QCid || item.AQLid
@@ -6350,9 +6378,42 @@ export class QQKernelBridge {
         mimeType: animated ? 'image/apng' : 'image/png',
       })
     }
+    // QQ's packet catalog contains newer system faces that may not yet be
+    // listed in face_config.json (or have no local sysface_res asset). Expose
+    // those faces too, backed by their native CDN URL, so messages such as
+    // `/续标识` and `/不是吧` do not degrade to literal slash labels.
+    const nativeFaces = await this.packetClientForSession().getSysFaces().catch((error) => {
+      log('warn', 'native sysface catalog refresh failed while loading reactions', error)
+      return []
+    })
+    const knownKeys = new Set(definitions.map((definition) => definition.key))
+    for (const face of nativeFaces) {
+      if (!face.faceId) continue
+      const key = reactionKey('1', face.faceId)
+      if (knownKeys.has(key) || !face.url) continue
+      knownKeys.add(key)
+      definitions.push({
+        key,
+        title: cleanFaceName(face.name),
+        presentation: {
+          type: 'custom',
+          alt: '🙂',
+          resource: {
+            version: 1,
+            format: 'static',
+            mimeType: 'image/png',
+            width: face.width > 0 ? face.width : 128,
+            height: face.height > 0 ? face.height : 128,
+            locator: { reactionKey: key },
+          },
+        },
+      })
+      assets.set(key, { url: face.url, mimeType: 'image/png' })
+    }
     this.reactionDefinitions = definitions
     this.reactionByKey.clear()
     this.reactionAssets.clear()
+    this.reactionRemoteCache.clear()
     for (const [key, asset] of assets) this.reactionAssets.set(key, asset)
     for (const definition of definitions) this.reactionByKey.set(definition.key, definition)
     for (const [key, definition] of aliases) this.reactionByKey.set(key, definition)

@@ -191,6 +191,7 @@ describe('QQPacketClient', () => {
     expect(f.addon.decodeFetchSysFacesResponse).toHaveBeenCalledWith(Buffer.from('sys-face-response'))
 
     await expect(f.client.getSysFace('999')).resolves.toBeUndefined()
+    await expect(f.client.getSysFaces()).resolves.toEqual([expect.objectContaining({ faceId: '476' })])
     expect(f.send).toHaveBeenCalledOnce()
   })
 

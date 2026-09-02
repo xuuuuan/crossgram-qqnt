@@ -461,6 +461,16 @@ export class QQPacketClient {
     return this.sysFaces?.get(faceId)
   }
 
+  async getSysFaces(): Promise<NativeSysFace[]> {
+    if (!this.sysFaces) {
+      this.sysFaceRefresh ??= this.fetchSysFaces().finally(() => {
+        this.sysFaceRefresh = undefined
+      })
+      await this.sysFaceRefresh
+    }
+    return [...(this.sysFaces?.values() ?? [])]
+  }
+
   private async fetchSysFaces(): Promise<Map<string, NativeSysFace>> {
     const addon = this.loadAddon()
     const request = addon.encodeFetchSysFacesRequest()

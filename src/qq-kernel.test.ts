@@ -5407,7 +5407,13 @@ describe('QQKernelBridge', () => {
     bridge.attach(f.kernel, f.session, {
       selfUin: '10000', selfUid: 'self', userPath: join(root, 'account'),
     })
-    await vi.waitFor(async () => expect((await bridge.getReactionCatalog()).available).toHaveLength(3))
+    vi.spyOn(bridge as any, 'packetClientForSession').mockReturnValue({
+      getSysFaces: async () => [{
+        faceId: '476', name: '/不是吧', url: 'https://face.qq.example/476.png',
+        aniStickerType: 2, aniStickerPackId: 3, aniStickerId: 476, width: 240, height: 180,
+      }],
+    })
+    await vi.waitFor(async () => expect((await bridge.getReactionCatalog()).available).toHaveLength(4))
 
     const catalog = await bridge.getReactionCatalog()
     expect(catalog.available).toEqual(expect.arrayContaining([
@@ -5438,6 +5444,13 @@ describe('QQKernelBridge', () => {
           }),
         }),
       }),
+      expect.objectContaining({
+        key: '1:476', title: '不是吧',
+        presentation: expect.objectContaining({
+          type: 'custom', alt: '🙂',
+          resource: expect.objectContaining({ locator: { reactionKey: '1:476' } }),
+        }),
+      }),
     ]))
     expect(JSON.stringify(catalog)).not.toContain(root)
     const resource = await bridge.openReactionResource('1:14', { offset: 1, limit: 3 })
@@ -5446,6 +5459,12 @@ describe('QQKernelBridge', () => {
     const animatedResource = await bridge.openReactionResource('1:66')
     expect(animatedResource).toMatchObject({ mimeType: 'image/apng', size: apng.length })
     expect(await readStream(animatedResource!.stream)).toEqual(apng)
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(png, {
+      status: 200, headers: { 'content-type': 'image/png' },
+    })))
+    const remoteResource = await bridge.openReactionResource('1:476', { offset: 1, limit: 3 })
+    expect(remoteResource).toMatchObject({ mimeType: 'image/png', size: png.length, offset: 1, length: 3 })
+    expect(await readStream(remoteResource!.stream)).toEqual(png.subarray(1, 4))
     await expect(bridge.openReactionResource('unknown')).resolves.toBeUndefined()
   })
 
