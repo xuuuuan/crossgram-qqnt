@@ -1763,6 +1763,40 @@ export class QQKernelBridge {
     return response.msgList[0] ?? null
   }
 
+  async transcribeVoice(locator: QQMediaLocator): Promise<string> {
+    if (locator.kind !== 'voice') throw new Error('media is not a voice message')
+    const conversation = this.getConversation(conversationId(locator.chatType, locator.peerUid))
+    const service = this.requireMsgService()
+    if (!service.translatePtt2Text) throw new Error('native QQ voice transcription is unavailable')
+    const findVoice = (record: MsgRecord | null | undefined) => record?.elements.find((element) =>
+      element.elementId === locator.elementId && Boolean(element.pttElement))
+    let record = await this.getRawMessageRecord(conversation, locator.messageId)
+    let voice = findVoice(record)
+    if (!voice) throw new Error('voice message element was not found')
+    const existing = voice.pttElement?.text?.trim()
+    if (existing) return existing
+
+    const result = await service.translatePtt2Text(locator.messageId, contact(conversation), {
+      elementType: 4,
+      elementId: locator.elementId,
+      pttElement: voice.pttElement,
+    })
+    if (result.result !== 0) {
+      throw new Error(`translatePtt2Text: ${result.errMsg} (${result.result})`)
+    }
+    for (let attempt = 0; attempt < 40; attempt++) {
+      await delay(250)
+      record = await this.getRawMessageRecord(conversation, locator.messageId)
+      voice = findVoice(record)
+      const transcript = voice?.pttElement?.text?.trim()
+      if (transcript) return transcript
+      if (voice?.pttElement?.translateStatus !== undefined && voice.pttElement.translateStatus < 0) {
+        throw new Error(`native QQ voice transcription failed (${voice.pttElement.translateStatus})`)
+      }
+    }
+    throw new Error('native QQ voice transcription timed out')
+  }
+
   async getRawMessagesAroundSeq(conversation: QQConversation, seq: string, count = 20): Promise<{
     before: { result: number, errMsg: string, count: number }
     after: { result: number, errMsg: string, count: number }

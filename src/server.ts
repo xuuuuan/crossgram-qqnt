@@ -892,6 +892,13 @@ export class QQBridgeServer {
       await pipe(asset.stream, response)
       return
     }
+    if (request.method === 'POST' && path === '/v1/messages/voice/transcribe') {
+      const locator = await readJson<QQMediaLocator>(request)
+      const transcript = await this.bridge.transcribeVoice(locator)
+      log('info', `HTTP API voice transcript id=${requestId} message=${locator.messageId} element=${locator.elementId}`)
+      json(response, 200, { transcript })
+      return
+    }
     if (request.method === 'POST' && path === '/v1/messages/read') {
       const body = await readJson<{ conversationId: string, messageId: string }>(request)
       await this.bridge.markRead(this.bridge.getConversation(body.conversationId), body.messageId)

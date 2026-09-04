@@ -211,6 +211,7 @@ export interface MsgElement {
     formatType?: number | string
     md5HexStr?: string
     text?: string
+    translateStatus?: number
     voiceType?: number
     voiceChangeType?: number
     canConvert2Text?: boolean
@@ -554,6 +555,11 @@ export interface KernelMsgService {
     peer: Contact, msgSeq: string, count: number, queryOrder: boolean, includeDeleteMsg: boolean,
   ): Promise<{ result: number, errMsg: string, msgList: MsgRecord[] }>
   getMsgsByMsgId(peer: Contact, msgIds: string[]): Promise<{ result: number, errMsg: string, msgList: MsgRecord[] }>
+  translatePtt2Text?(
+    msgId: string,
+    peer: Contact,
+    msgElement: MsgElement,
+  ): Promise<{ result: number, errMsg: string }>
   getSourceOfReplyMsg?(
     peer: Contact, msgId: string, sourceMsgSeq: string,
   ): Promise<{ result: number, errMsg: string, msgList: MsgRecord[] }>

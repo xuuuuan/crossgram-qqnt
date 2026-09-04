@@ -229,6 +229,7 @@ function fixture() {
     downloadRichMedia: undefined as KernelMsgService['downloadRichMedia'],
     getMsgsBySeqAndCount: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [message] })),
     getMsgsByMsgId: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [message] })),
+    translatePtt2Text: vi.fn(async () => ({ result: 0, errMsg: '' })),
     getSourceOfReplyMsg: vi.fn(async () => ({ result: 0, errMsg: '', msgList: [] as MsgRecord[] })),
     getSourceOfReplyMsgByClientSeqAndTime: vi.fn(async () => ({
       result: 0, errMsg: '', msgList: [] as MsgRecord[],
@@ -2183,6 +2184,30 @@ describe('QQKernelBridge', () => {
     await writeFile(silk, Buffer.from('changed'))
     bridge.attach(f.kernel, f.session, options)
     await expect(bridge.openMedia(locator)).resolves.toBeUndefined()
+  })
+
+  it('requests native PTT transcription and waits for the refreshed text', async () => {
+    const f = fixture()
+    const initial = { elementType: 4, elementId: 'voice-to-text', pttElement: {
+      duration: 1, fileName: 'voice.silk', filePath: '', fileSize: '8', canConvert2Text: true,
+    } }
+    const translated = { ...initial, pttElement: { ...initial.pttElement, text: '识别结果' } }
+    f.message.elements = [initial]
+    f.msg.getMsgsByMsgId
+      .mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [f.message] })
+      .mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [{ ...f.message, elements: [translated] }] })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.transcribeVoice({
+      messageId: f.message.msgId, elementId: 'voice-to-text', chatType: 1,
+      peerUid: f.message.peerUid, kind: 'voice', fileName: 'voice.ogg',
+    })).resolves.toBe('识别结果')
+    expect(f.msg.translatePtt2Text).toHaveBeenCalledWith(
+      f.message.msgId,
+      expect.objectContaining({ chatType: 1, peerUid: f.message.peerUid }),
+      expect.objectContaining({ elementId: 'voice-to-text', pttElement: initial.pttElement }),
+    )
   })
 
   it('renders missing, untrusted, and symlink-escaped PTT paths as text fallbacks', async () => {
@@ -6227,6 +6252,30 @@ describe('QQBridgeServer', () => {
     })
   })
 
+  it('exposes native voice transcription through the authenticated HTTP API', async () => {
+    const f = fixture()
+    f.message.elements = [{ elementType: 4, elementId: 'voice-http', pttElement: {
+      duration: 1, fileName: 'voice.silk', filePath: '', fileSize: '8', text: 'HTTP 识别结果',
+    } }]
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    server = new QQBridgeServer(bridge, { port: 0, token: 'voice-token' })
+    await server.start()
+
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/v1/messages/voice/transcribe`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer voice-token', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        messageId: f.message.msgId, elementId: 'voice-http', chatType: 1,
+        peerUid: f.message.peerUid, kind: 'voice', fileName: 'voice.ogg',
+      }),
+    })
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toEqual({ transcript: 'HTTP 识别结果' })
+    expect(f.msg.translatePtt2Text).not.toHaveBeenCalled()
+  })
+
   it('preserves a forward origin through HTTP and the native observer callback', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
@@ -6380,7 +6429,7 @@ describe('QQBridgeServer', () => {
     const base = `http://127.0.0.1:${server.address().port}/v1`
 
     await expect(fetch(`${base}/status`).then((response) => response.json())).resolves.toMatchObject({
-      protocolVersion: 31, ready: true, flashTransferSupported: true,
+      protocolVersion: 32, ready: true, flashTransferSupported: true,
     })
     const manifest = {
       name: 'remote reuse', framing: 'length-prefixed-v1',
@@ -6861,7 +6910,7 @@ describe('QQBridgeServer', () => {
     const { port } = server.address()
     const base = `http://127.0.0.1:${port}/v1`
     await expect(fetch(`${base}/status`).then((response) => response.json())).resolves.toMatchObject({
-      protocolVersion: 31, ready: true, selfUin: '10000',
+      protocolVersion: 32, ready: true, selfUin: '10000',
     })
     const dialogs = await fetch(`${base}/dialogs`)
     expect(dialogs.status).toBe(200)
