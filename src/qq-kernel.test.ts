@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { deflateRawSync } from 'node:zlib'
 import { Readable } from 'node:stream'
 import { once } from 'node:events'
 import { existsSync } from 'node:fs'
@@ -596,6 +597,68 @@ async function readStream(stream: Readable): Promise<Buffer> {
   const chunks: Buffer[] = []
   for await (const chunk of stream) chunks.push(Buffer.from(chunk))
   return Buffer.concat(chunks)
+}
+
+function pngWithSize(width: number, height: number): Buffer {
+  const chunk = (type: string, data: Buffer): Buffer => {
+    const header = Buffer.alloc(8)
+    header.writeUInt32BE(data.length, 0)
+    header.write(type, 4, 'latin1')
+    return Buffer.concat([header, data, Buffer.alloc(4)])
+  }
+  const ihdr = Buffer.alloc(13)
+  ihdr.writeUInt32BE(width, 0)
+  ihdr.writeUInt32BE(height, 4)
+  ihdr[8] = 8
+  ihdr[9] = 6
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk('IHDR', ihdr),
+    chunk('IDAT', Buffer.from([0x78, 0x9c, 0x00])),
+    chunk('IEND', Buffer.alloc(0)),
+  ])
+}
+
+/** Minimal writer for the ZIP bundles QQ serves as system face resources. */
+function zipFaceBundle(entries: ReadonlyArray<[string, Buffer]>): Buffer {
+  const locals: Buffer[] = []
+  const centrals: Buffer[] = []
+  let offset = 0
+  for (const [name, data] of entries) {
+    const nameBytes = Buffer.from(name, 'utf8')
+    const compressed = deflateRawSync(data)
+    const local = Buffer.alloc(30)
+    local.writeUInt32LE(0x04034b50, 0)
+    local.writeUInt16LE(20, 4)
+    local.writeUInt16LE(0x0008, 6)
+    local.writeUInt16LE(8, 8)
+    local.writeUInt16LE(nameBytes.length, 26)
+    const descriptor = Buffer.alloc(16)
+    descriptor.writeUInt32LE(0x08074b50, 0)
+    descriptor.writeUInt32LE(compressed.length, 8)
+    descriptor.writeUInt32LE(data.length, 12)
+    locals.push(local, nameBytes, compressed, descriptor)
+    const central = Buffer.alloc(46)
+    central.writeUInt32LE(0x02014b50, 0)
+    central.writeUInt16LE(20, 4)
+    central.writeUInt16LE(20, 6)
+    central.writeUInt16LE(0x0008, 8)
+    central.writeUInt16LE(8, 10)
+    central.writeUInt32LE(compressed.length, 20)
+    central.writeUInt32LE(data.length, 24)
+    central.writeUInt16LE(nameBytes.length, 28)
+    central.writeUInt32LE(offset, 42)
+    centrals.push(central, nameBytes)
+    offset += local.length + nameBytes.length + compressed.length + descriptor.length
+  }
+  const directory = Buffer.concat(centrals)
+  const end = Buffer.alloc(22)
+  end.writeUInt32LE(0x06054b50, 0)
+  end.writeUInt16LE(entries.length, 8)
+  end.writeUInt16LE(entries.length, 10)
+  end.writeUInt32LE(directory.length, 12)
+  end.writeUInt32LE(offset, 16)
+  return Buffer.concat([...locals, directory, end])
 }
 
 async function nextCallSignal(events: AsyncIterator<QQEvent>): Promise<Extract<QQEvent, { type: 'call-signal' }>> {
@@ -5584,6 +5647,68 @@ describe('QQKernelBridge', () => {
       key: '1:424', title: '续标识',
       presentation: { type: 'custom', resource: { locator: { reactionKey: '1:424' } } },
     })
+  })
+
+  it('unwraps ZIP face bundles into the image a reaction advertises', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'qqnt-reaction-bundles-'))
+    tempPaths.push(root)
+    const resourceRoot = join(root, 'global', 'nt_data', 'Emoji', 'emoji-resource')
+    await Promise.all([
+      mkdir(join(resourceRoot, 'sysface_res', 'static'), { recursive: true }),
+      mkdir(join(resourceRoot, 'emoji_res'), { recursive: true }),
+    ])
+    await writeFile(join(resourceRoot, 'face_config.json'), JSON.stringify({ emoji: [], sysface: [] }))
+    const square = pngWithSize(128, 128)
+    const canvas = pngWithSize(480, 190)
+    const f = fixture()
+    ;(f.session as any).getBaseEmojiService = () => ({
+      fetchFullSysEmojis: vi.fn(async () => ({
+        result: 0, errMsg: '', rsp: {
+          normalPanelResult: {
+            SysEmojiGroupList: [{ SysEmojiList: [
+              { emojiId: '424', describe: '/续标识', animationWidth: 128, animationHeigh: 128 },
+              { emojiId: '416', describe: '/中龙舟', animationWidth: 192, animationHeigh: 76 },
+            ] }],
+            downloadInfo: [
+              { emojiId: '424', baseResDownloadUrl: 'https://face.qq.example/424.zip' },
+              { emojiId: '416', baseResDownloadUrl: 'https://face.qq.example/416.zip' },
+            ],
+          },
+        },
+      })),
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: join(root, 'account') })
+    vi.spyOn(bridge as any, 'packetClientForSession').mockReturnValue({ getSysFaces: async () => [] })
+    await vi.waitFor(async () => expect((await bridge.getReactionCatalog()).available).toHaveLength(2))
+
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const wide = String(input).includes('416')
+      return new Response(wide
+        ? zipFaceBundle([
+          ['416/png/416.png', square],
+          ['416/png/416_0.png', canvas],
+        ])
+        : zipFaceBundle([
+          ['424/png/424.png', square],
+          ['424/png/424_0.png', pngWithSize(512, 512)],
+        ]), { status: 200, headers: { 'content-type': 'image/png' } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const whole = await bridge.openReactionResource('1:424')
+    expect(whole).toMatchObject({ mimeType: 'image/png', size: square.length, offset: 0, length: square.length })
+    expect(await readStream(whole!.stream)).toEqual(square)
+
+    const ranged = await bridge.openReactionResource('1:424', { offset: 4, limit: 8 })
+    expect(ranged).toMatchObject({ mimeType: 'image/png', size: square.length, offset: 4, length: 8 })
+    expect(await readStream(ranged!.stream)).toEqual(square.subarray(4, 12))
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+
+    const wide = await bridge.openReactionResource('1:416')
+    expect(wide).toMatchObject({ mimeType: 'image/png', size: canvas.length })
+    expect(await readStream(wide!.stream)).toEqual(canvas)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
   })
 
   it('does not expose or write reactions in direct conversations', async () => {

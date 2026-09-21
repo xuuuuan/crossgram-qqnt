@@ -7,6 +7,9 @@ import { pipeline } from 'node:stream/promises'
 import { Readable, Transform } from 'node:stream'
 import { types } from 'node:util'
 import { AsyncQueue, deferred } from './async.js'
+import {
+  isZipPayload, resolveFaceAssetImage, sniffFaceImage, type FaceAssetMimeType,
+} from './face-asset-bundle.js'
 import { markBridgeListener, observeAVSDKActions } from './listener-tee.js'
 import { log, logPath } from './log.js'
 import { resolveMultiForwardParticipants } from './multi-forward-participants.js'
@@ -34,7 +37,7 @@ import {
 type ReactionAsset = {
   path?: string
   url?: string
-  mimeType: 'image/png' | 'image/apng'
+  mimeType: FaceAssetMimeType
 }
 
 /** A single native group-member page, including the identifiers and details
@@ -3299,13 +3302,17 @@ export class QQKernelBridge {
         try {
           const response = await fetch(resource.url)
           if (!response.ok) return
-          bytes = Buffer.from(await response.arrayBuffer())
+          bytes = this.resolveReactionAssetPayload(reactionKey, Buffer.from(await response.arrayBuffer()))
           this.reactionRemoteCache.set(reactionKey, bytes)
         } catch (error) {
           log('warn', `remote QQ reaction asset unavailable key=${reactionKey} url=${resource.url}`, error)
           return
         }
       }
+      // Runtime faces are fetched from QQ's CDN, so the advertised catalog type
+      // is a guess until the payload has been inspected at least once.
+      const sniffed = sniffFaceImage(bytes)
+      if (sniffed) resource.mimeType = sniffed.mimeType
     } else return
     const size = bytes?.length ?? statSync(resource.path!).size
     const offset = Math.max(0, Math.trunc(range.offset ?? 0))
@@ -3323,6 +3330,27 @@ export class QQKernelBridge {
       offset,
       length,
     }
+  }
+
+  /**
+   * Runtime QQ system faces are delivered as ZIP bundles that wrap the actual
+   * image next to a larger canvas variant. Relaying the archive verbatim makes
+   * every client drop the face, so unwrap the entry matching the advertised
+   * geometry and keep the payload untouched when it already is a plain image.
+   */
+  private resolveReactionAssetPayload(reactionKey: string, payload: Buffer): Buffer {
+    const definition = this.reactionByKey.get(reactionKey)
+    const resource = definition?.presentation.type === 'custom' ? definition.presentation.resource : undefined
+    const image = resolveFaceAssetImage(payload, {
+      faceId: systemFaceIdFromReactionKey(reactionKey),
+      width: resource?.width,
+      height: resource?.height,
+    })
+    if (image) return image.bytes
+    if (isZipPayload(payload)) {
+      log('warn', `QQ face bundle for ${reactionKey} carried no usable image; serving the archive`)
+    }
+    return payload
   }
 
   async getMessageReactions(
@@ -9563,6 +9591,14 @@ function httpUrl(value: string | undefined): string | undefined {
 
 function reactionKey(emojiType: string, emojiId: string): string {
   return `${emojiType}:${emojiId}`
+}
+
+/** `1:424` names runtime system face 424; other reaction families have no bundle ids. */
+function systemFaceIdFromReactionKey(reactionKey: string): string | undefined {
+  const separator = reactionKey.indexOf(':')
+  if (separator <= 0) return undefined
+  const id = reactionKey.slice(separator + 1)
+  return reactionKey.slice(0, separator) === '1' && id ? id : undefined
 }
 
 function splitReactionKey(key: string): [string, string] {
