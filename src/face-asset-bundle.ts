@@ -1,15 +1,22 @@
-import { inflateRawSync } from 'node:zlib'
+import { crc32 as nodeCrc32, inflateRawSync } from 'node:zlib'
 
 /**
  * QQ hands out several face resources as ZIP bundles. The archive wraps the
  * real image inside an `<id>/<type>/<name>.png` tree (the same layout QQNT
  * keeps under `nt_data/Emoji/emoji-resource`), so relaying the archive verbatim
- * makes every Telegram client fail to decode the face. These helpers unwrap the
- * entry that matches the advertised face id and geometry.
+ * makes every Telegram client fail to decode the face.
  *
- * The observed bundles store their sizes in the central directory and use a
- * trailing data descriptor for the local entries, so entries are located
- * through the end-of-central-directory record instead of the local headers.
+ * These helpers expose two views of a bundle:
+ *
+ * - {@link resolveFaceAssetMetaFromDirectory} reads only the end of the archive
+ *   (end-of-central-directory record plus the central directory). QQ writes the
+ *   real sizes and CRC-32 there and keeps data descriptors in the local
+ *   headers, so a small ranged read is enough to learn the exact size and
+ *   content identity of the image without downloading it.
+ * - {@link resolveFaceAssetImage} inflates the chosen entry for serving.
+ *
+ * Both use {@link pickFaceAssetEntry} so the announced metadata always matches
+ * the bytes that are served.
  */
 
 const END_OF_CENTRAL_DIRECTORY = 0x06054b50
@@ -34,6 +41,18 @@ export interface FaceAssetImage {
   height?: number
 }
 
+/** Identity of the archive entry a bundle offers for one face. */
+export interface FaceAssetMeta {
+  /** Entry name inside the archive, for diagnostics. */
+  name: string
+  /** Uncompressed image length in bytes. */
+  size: number
+  /** CRC-32 of the uncompressed image; changes whenever the remote asset does. */
+  version: number
+  /** ZIP compression method, so callers can tell whether inflating is needed. */
+  method: number
+}
+
 /** Geometry the caller advertises for the requested face, when it is known. */
 export interface FaceAssetTarget {
   /** Face id the caller asked for, for example `424` for the key `1:424`. */
@@ -42,9 +61,15 @@ export interface FaceAssetTarget {
   height?: number
 }
 
+export interface FaceAssetCandidate {
+  name: string
+  size: number
+}
+
 interface ZipEntry {
   name: string
   method: number
+  crc32: number
   compressedSize: number
   uncompressedSize: number
   localHeaderOffset: number
@@ -52,10 +77,88 @@ interface ZipEntry {
 
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
 const PNG_CHUNK_HEADER_BYTES = 8
+const IMAGE_ENTRY_PATTERN = /\.(?:png|apng|gif|webp|jpg|jpeg)$/i
 
 export function isZipPayload(bytes: Uint8Array): boolean {
   return bytes.length >= 4
     && bytes[0] === 0x50 && bytes[1] === 0x4b && bytes[2] === 0x03 && bytes[3] === 0x04
+}
+
+/** CRC-32 of an image, used as the content identity of a face resource. */
+export function faceAssetVersion(bytes: Uint8Array): number {
+  if (typeof nodeCrc32 === 'function') return nodeCrc32(bytes) >>> 0
+  return crc32Fallback(bytes)
+}
+
+/**
+ * Ranks the archive entries that could represent `target`. The square
+ * `<id>.png` entry is the inline face; canvas variants carry an underscore
+ * suffix (`<id>_0.png`) and match the geometry QQ advertises for faces that
+ * animate on a wider canvas.
+ */
+export function rankFaceAssetEntries<T extends FaceAssetCandidate>(
+  candidates: readonly T[],
+  target: FaceAssetTarget = {},
+): T[] {
+  const faceId = target.faceId
+  const square = isSquareGeometry(target.width, target.height)
+  const ranked = candidates.map((candidate) => {
+    const stem = entryStem(candidate.name)
+    const suffixed = /_\d+$/.test(stem)
+    const related = !faceId || stem === faceId || stem.startsWith(`${faceId}_`)
+    const canonical = faceId ? stem === faceId : !suffixed
+    return {
+      candidate,
+      related,
+      // A square face is served by its canonical entry, a wide one by the
+      // canvas variant; without a known geometry prefer the canonical entry.
+      preferred: square ? canonical : related && suffixed,
+      canonical,
+    }
+  })
+  ranked.sort((left, right) => {
+    if (left.related !== right.related) return left.related ? -1 : 1
+    if (left.preferred !== right.preferred) return left.preferred ? -1 : 1
+    if (left.canonical !== right.canonical) return left.canonical ? -1 : 1
+    return left.candidate.size - right.candidate.size
+  })
+  return ranked.map((item) => item.candidate)
+}
+
+/** Alias kept for callers that only need the single best entry. */
+export function pickFaceAssetEntry<T extends FaceAssetCandidate>(
+  candidates: readonly T[],
+  target: FaceAssetTarget = {},
+): T | undefined {
+  return rankFaceAssetEntries(candidates, target)[0]
+}
+
+/**
+ * Reads the central directory of a bundle, which is enough for the size and
+ * content identity of the served image. `directory` may be a tail of the
+ * archive (as returned by a ranged request) because the central directory never
+ * needs the file payload.
+ */
+export function resolveFaceAssetMetaFromDirectory(
+  directory: Buffer,
+  target: FaceAssetTarget = {},
+): FaceAssetMeta | undefined {
+  if (!directory.length) return undefined
+  const entries = readZipEntries(directory)
+  if (!entries?.length) return undefined
+  const ranked = rankFaceAssetEntries(entries.map((entry) => ({
+    name: entry.name, size: entry.uncompressedSize,
+  })), target)
+  for (const candidate of ranked) {
+    const entry = entries.find((item) => item.name === candidate.name)
+    if (!entry) continue
+    if (!entry.uncompressedSize || entry.uncompressedSize === ZIP64_SENTINEL) continue
+    if (entry.uncompressedSize > MAX_ARCHIVE_BYTES) continue
+    return {
+      name: entry.name, size: entry.uncompressedSize, version: entry.crc32 >>> 0, method: entry.method,
+    }
+  }
+  return undefined
 }
 
 /** Detects the image type and intrinsic size of a raw image payload. */
@@ -67,10 +170,7 @@ export function sniffFaceImage(bytes: Buffer): FaceAssetImage | undefined {
   return sniffWebp(bytes)
 }
 
-/**
- * Returns the image a ZIP face bundle advertises for `target`, or `undefined`
- * when the payload is not a bundle this helper understands.
- */
+/** Returns the image a ZIP face bundle serves for `target`. */
 export function resolveFaceAssetImage(
   payload: Buffer,
   target: FaceAssetTarget = {},
@@ -78,61 +178,41 @@ export function resolveFaceAssetImage(
   if (!isZipPayload(payload) || payload.length > MAX_ARCHIVE_BYTES) return undefined
   const entries = readZipEntries(payload)
   if (!entries?.length) return undefined
-  const candidates: Array<{ name: string, image: FaceAssetImage }> = []
-  let budget = MAX_ARCHIVE_BYTES
-  for (const entry of entries) {
-    if (entry.name.endsWith('/')) continue
+  const ranked = rankFaceAssetEntries(entries.map((entry) => ({
+    name: entry.name, size: entry.uncompressedSize,
+  })), target)
+  for (const candidate of ranked) {
+    const entry = entries.find((item) => item.name === candidate.name)
+    if (!entry) continue
     const data = readZipEntryData(payload, entry)
-    if (!data || data.length > budget) continue
+    if (!data || data.length > MAX_ARCHIVE_BYTES) continue
     const image = sniffFaceImage(data)
-    if (!image) continue
-    budget -= data.length
-    candidates.push({ name: entry.name, image })
+    if (image) return image
   }
-  if (!candidates.length) return undefined
-  return pickFaceImage(candidates, target)
+  return undefined
 }
 
-/**
- * Prefers the entry that belongs to the requested face and whose aspect ratio
- * matches what we advertise for it, so a wide face is not stretched into the
- * inline square. Ties resolve to the canonical `<id>.png` entry.
- */
-function pickFaceImage(
-  candidates: Array<{ name: string, image: FaceAssetImage }>,
-  target: FaceAssetTarget,
-): FaceAssetImage {
-  const declaredAspect = positiveRatio(target.width, target.height)
-  const ranked = candidates.map((candidate) => {
-    const stem = entryStem(candidate.name)
-    const related = !target.faceId
-      || stem === target.faceId
-      || stem.startsWith(`${target.faceId}_`)
-    return {
-      candidate,
-      related,
-      canonical: !target.faceId || stem === target.faceId,
-      aspect: aspectDistance(candidate.image, declaredAspect),
-    }
-  })
-  ranked.sort((left, right) => {
-    if (left.related !== right.related) return left.related ? -1 : 1
-    if (left.aspect !== right.aspect) return left.aspect - right.aspect
-    if (left.canonical !== right.canonical) return left.canonical ? -1 : 1
-    return left.candidate.image.bytes.length - right.candidate.image.bytes.length
-  })
-  return ranked[0]!.candidate.image
+/** Returns true when the entry name looks like an image this module can serve. */
+export function isFaceAssetEntryName(name: string): boolean {
+  return IMAGE_ENTRY_PATTERN.test(name) && !name.endsWith('/')
+}
+
+export function inflateFaceAssetEntry(payload: Buffer, meta: FaceAssetMeta): Buffer | undefined {
+  const entries = readZipEntries(payload)
+  const entry = entries?.find((item) => item.name === meta.name)
+  if (!entry) return undefined
+  return readZipEntryData(payload, entry)
+}
+
+function isSquareGeometry(width: number | undefined, height: number | undefined): boolean {
+  const ratio = positiveRatio(width, height)
+  if (!ratio) return true
+  return Math.abs(Math.log(ratio)) < 0.05
 }
 
 function positiveRatio(width: number | undefined, height: number | undefined): number | undefined {
   if (!width || !height || width <= 0 || height <= 0) return undefined
   return width / height
-}
-
-function aspectDistance(image: FaceAssetImage, declaredAspect: number | undefined): number {
-  const actual = positiveRatio(image.width, image.height)
-  if (!declaredAspect || !actual) return Number.POSITIVE_INFINITY
-  return Math.abs(Math.log(actual / declaredAspect))
 }
 
 function entryStem(name: string): string {
@@ -204,6 +284,7 @@ function readZipEntries(bytes: Buffer): ZipEntry[] | undefined {
     if (cursor + CENTRAL_HEADER_BYTES > bytes.length) return undefined
     if (bytes.readUInt32LE(cursor) !== CENTRAL_DIRECTORY_HEADER) return undefined
     const method = bytes.readUInt16LE(cursor + 10)
+    const crc32 = bytes.readUInt32LE(cursor + 16)
     const compressedSize = bytes.readUInt32LE(cursor + 20)
     const uncompressedSize = bytes.readUInt32LE(cursor + 24)
     const nameLength = bytes.readUInt16LE(cursor + 28)
@@ -214,10 +295,7 @@ function readZipEntries(bytes: Buffer): ZipEntry[] | undefined {
     if (nameStart + nameLength > bytes.length) return undefined
     entries.push({
       name: bytes.toString('utf8', nameStart, nameStart + nameLength),
-      method,
-      compressedSize,
-      uncompressedSize,
-      localHeaderOffset,
+      method, crc32, compressedSize, uncompressedSize, localHeaderOffset,
     })
     cursor = nameStart + nameLength + extraLength + commentLength
   }
@@ -253,4 +331,22 @@ function findEndOfCentralDirectory(bytes: Buffer): number | undefined {
     if (bytes.readUInt32LE(offset) === END_OF_CENTRAL_DIRECTORY) return offset
   }
   return undefined
+}
+
+const CRC32_TABLE = (() => {
+  const table = new Uint32Array(256)
+  for (let index = 0; index < 256; index++) {
+    let value = index
+    for (let bit = 0; bit < 8; bit++) value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1
+    table[index] = value >>> 0
+  }
+  return table
+})()
+
+function crc32Fallback(bytes: Uint8Array): number {
+  let value = 0xffffffff
+  for (let index = 0; index < bytes.length; index++) {
+    value = CRC32_TABLE[(value ^ bytes[index]!) & 0xff]! ^ (value >>> 8)
+  }
+  return (value ^ 0xffffffff) >>> 0
 }

@@ -8,7 +8,8 @@ import { Readable, Transform } from 'node:stream'
 import { types } from 'node:util'
 import { AsyncQueue, deferred } from './async.js'
 import {
-  isZipPayload, resolveFaceAssetImage, sniffFaceImage, type FaceAssetMimeType,
+  faceAssetVersion, isZipPayload, resolveFaceAssetImage, resolveFaceAssetMetaFromDirectory, sniffFaceImage,
+  type FaceAssetMimeType, type FaceAssetTarget,
 } from './face-asset-bundle.js'
 import { markBridgeListener, observeAVSDKActions } from './listener-tee.js'
 import { log, logPath } from './log.js'
@@ -34,10 +35,26 @@ import {
   type QQFlashTransferManifest, type QQFlashTransferResult, type QQRequest, type QQRequestKind, type QQRequestPage, type QQRequestStatus, type QQSendMediaSpec, type QQSticker, type QQStickerPack, type QQStickerPackSummary, type QQStickerReference, type QQTextPart, type SearchPage, type SearchQuery, type SendManifest,
 } from './protocol.js'
 
+const REACTION_ASSET_META_TTL_MS = 10 * 60_000
+const REACTION_BUNDLE_TAIL_BYTES = 96 * 1024
+
 type ReactionAsset = {
   path?: string
   url?: string
   mimeType: FaceAssetMimeType
+}
+
+/** Size and content identity of the bytes a reaction key serves. */
+export type ReactionAssetMetadata = {
+  size: number
+  /** Content identity; a different remote asset yields a different version. */
+  version: number
+  mimeType?: FaceAssetMimeType
+  width?: number
+  height?: number
+  /** Archive entry name inside a QQ face bundle, for diagnostics. */
+  entry?: string
+  source: 'path' | 'bundle' | 'payload'
 }
 
 /** A single native group-member page, including the identifiers and details
@@ -383,7 +400,8 @@ export class QQKernelBridge {
   private reactionDefinitions: QQReactionDefinition[] = []
   private readonly reactionByKey = new Map<string, QQReactionDefinition>()
   private readonly reactionAssets = new Map<string, ReactionAsset>()
-  private readonly reactionRemoteCache = new Map<string, Buffer>()
+  private readonly reactionRemoteCache = new Map<string, { bytes: Buffer, version: number }>()
+  private readonly reactionAssetMetadata = new Map<string, { meta: ReactionAssetMetadata, resolvedAt: number }>()
   private reactionCatalogPromise?: Promise<void>
   private reactionEventSequence = 0
   private messageEditEventSequence = 0
@@ -735,6 +753,7 @@ export class QQKernelBridge {
     this.reactionByKey.clear()
     this.reactionAssets.clear()
     this.reactionRemoteCache.clear()
+    this.reactionAssetMetadata.clear()
     this.reactionCatalogPromise = undefined
     this.stickerPacks.clear()
     this.stickerPackInfo.clear()
@@ -867,6 +886,7 @@ export class QQKernelBridge {
     this.pendingMemberProfiles.clear()
     this.reactionAssets.clear()
     this.reactionRemoteCache.clear()
+    this.reactionAssetMetadata.clear()
     this.clearVoiceCache()
   }
 
@@ -3297,24 +3317,43 @@ export class QQKernelBridge {
     if (resource.path) {
       if (!existsSync(resource.path)) return
     } else if (resource.url) {
-      bytes = this.reactionRemoteCache.get(reactionKey)
+      // Serving is also a cache-validation point: after the metadata TTL the
+      // archive may have changed, and a stale payload must not be served under
+      // the previous document identity.
+      const meta = await this.resolveReactionAssetMeta(reactionKey).catch(() => undefined)
+      let cached = this.reactionRemoteCache.get(reactionKey)
+      if (cached && meta && cached.version !== meta.version) {
+        log('info', `QQ reaction asset payload refreshed key=${reactionKey} version=${cached.version}->${meta.version}`)
+        this.reactionRemoteCache.delete(reactionKey)
+        cached = undefined
+      }
+      bytes = cached?.bytes
       if (!bytes) {
-        try {
-          const response = await fetch(resource.url)
-          if (!response.ok) return
-          bytes = this.resolveReactionAssetPayload(reactionKey, Buffer.from(await response.arrayBuffer()))
-          this.reactionRemoteCache.set(reactionKey, bytes)
-        } catch (error) {
-          log('warn', `remote QQ reaction asset unavailable key=${reactionKey} url=${resource.url}`, error)
-          return
-        }
+        bytes = await this.fetchReactionAssetPayload(reactionKey, resource.url)
+        if (!bytes) return
       }
       // Runtime faces are fetched from QQ's CDN, so the advertised catalog type
       // is a guess until the payload has been inspected at least once.
       const sniffed = sniffFaceImage(bytes)
       if (sniffed) resource.mimeType = sniffed.mimeType
+      this.rememberReactionAssetMetadata(reactionKey, {
+        size: bytes.length,
+        version: faceAssetVersion(bytes),
+        mimeType: resource.mimeType,
+        width: sniffed?.width,
+        height: sniffed?.height,
+        source: 'payload',
+      })
     } else return
     const size = bytes?.length ?? statSync(resource.path!).size
+    if (resource.path) {
+      this.rememberReactionAssetMetadata(reactionKey, {
+        size,
+        version: Math.trunc(statSync(resource.path).mtimeMs),
+        mimeType: resource.mimeType,
+        source: 'path',
+      })
+    }
     const offset = Math.max(0, Math.trunc(range.offset ?? 0))
     const available = Math.max(0, size - offset)
     const requested = range.limit === undefined ? available : Math.max(0, Math.trunc(range.limit))
@@ -3333,19 +3372,140 @@ export class QQKernelBridge {
   }
 
   /**
+   * Returns the size and content identity of the bytes a reaction key serves.
+   *
+   * QQ writes the entry sizes and CRC-32 in the bundle's central directory, so
+   * a small ranged read of the archive tail is enough; clients need the exact
+   * EOF length to schedule a download, and Telegram caches custom emoji by
+   * document id, which is derived from the version. Re-resolving after the TTL
+   * picks up remote changes without re-downloading the whole archive.
+   */
+  async resolveReactionAssetMeta(
+    reactionKey: string,
+    options: { maxAgeMs?: number } = {},
+  ): Promise<ReactionAssetMetadata | undefined> {
+    if (!this.reactionDefinitions.length) await this.getReactionCatalog()
+    const cached = this.reactionAssetMetadata.get(reactionKey)
+    const maxAgeMs = options.maxAgeMs ?? REACTION_ASSET_META_TTL_MS
+    if (cached && (maxAgeMs === Number.POSITIVE_INFINITY || Date.now() - cached.resolvedAt <= maxAgeMs)) {
+      return cached.meta
+    }
+    const asset = this.reactionAssets.get(reactionKey)
+    if (!asset) return undefined
+    const meta = asset.path
+      ? this.localReactionAssetMetadata(asset)
+      : asset.url
+        ? await this.remoteReactionAssetMetadata(reactionKey, asset)
+        : undefined
+    if (!meta) return undefined
+    this.rememberReactionAssetMetadata(reactionKey, meta)
+    return meta
+  }
+
+  private reactionAssetTarget(reactionKey: string): FaceAssetTarget {
+    const definition = this.reactionByKey.get(reactionKey)
+    const resource = definition?.presentation.type === 'custom' ? definition.presentation.resource : undefined
+    return {
+      faceId: systemFaceIdFromReactionKey(reactionKey),
+      width: resource?.width,
+      height: resource?.height,
+    }
+  }
+
+  private localReactionAssetMetadata(asset: ReactionAsset): ReactionAssetMetadata | undefined {
+    if (!asset.path || !existsSync(asset.path)) return undefined
+    const info = statSync(asset.path)
+    return { size: info.size, version: Math.trunc(info.mtimeMs), mimeType: asset.mimeType, source: 'path' }
+  }
+
+  private async remoteReactionAssetMetadata(
+    reactionKey: string,
+    asset: ReactionAsset,
+  ): Promise<ReactionAssetMetadata | undefined> {
+    if (!asset.url) return undefined
+    const target = this.reactionAssetTarget(reactionKey)
+    const tail = await this.fetchReactionBundleTail(asset.url, reactionKey)
+    const directory = tail ? resolveFaceAssetMetaFromDirectory(tail.directory, target) : undefined
+    if (directory) {
+      return {
+        size: directory.size,
+        version: directory.version,
+        mimeType: asset.mimeType,
+        entry: directory.name,
+        source: 'bundle',
+      }
+    }
+    const payload = tail?.payload ?? await this.fetchReactionAssetPayload(reactionKey, asset.url)
+    if (!payload) return undefined
+    const image = resolveFaceAssetImage(payload, target)
+    if (!image) return undefined
+    return {
+      size: image.bytes.length,
+      version: faceAssetVersion(image.bytes),
+      mimeType: image.mimeType,
+      width: image.width,
+      height: image.height,
+      source: 'payload',
+    }
+  }
+
+  /**
+   * Reads only the archive tail: QQ's CDN answers range requests with the last
+   * bytes of the file, which is where the central directory lives. A CDN that
+   * ignores the range hands us the whole archive instead, which is unwrapped
+   * and cached for serving.
+   */
+  private async fetchReactionBundleTail(
+    url: string,
+    reactionKey: string,
+  ): Promise<{ directory: Buffer, payload?: Buffer } | undefined> {
+    try {
+      const response = await fetch(url, { headers: { range: `bytes=-${REACTION_BUNDLE_TAIL_BYTES}` } })
+      if (!response.ok) return undefined
+      const body = Buffer.from(await response.arrayBuffer())
+      if (!body.length) return undefined
+      if (response.status === 206) return { directory: body }
+      const payload = this.resolveReactionAssetPayload(reactionKey, body)
+      this.reactionRemoteCache.set(reactionKey, { bytes: payload, version: faceAssetVersion(payload) })
+      return { directory: body, payload }
+    } catch (error) {
+      log('warn', `remote QQ reaction metadata unavailable key=${reactionKey} url=${url}`, error)
+      return undefined
+    }
+  }
+
+  private async fetchReactionAssetPayload(reactionKey: string, url: string): Promise<Buffer | undefined> {
+    const cached = this.reactionRemoteCache.get(reactionKey)
+    if (cached) return cached.bytes
+    try {
+      const response = await fetch(url)
+      if (!response.ok) return undefined
+      const payload = this.resolveReactionAssetPayload(reactionKey, Buffer.from(await response.arrayBuffer()))
+      this.reactionRemoteCache.set(reactionKey, { bytes: payload, version: faceAssetVersion(payload) })
+      return payload
+    } catch (error) {
+      log('warn', `remote QQ reaction asset unavailable key=${reactionKey} url=${url}`, error)
+      return undefined
+    }
+  }
+
+  private rememberReactionAssetMetadata(reactionKey: string, meta: ReactionAssetMetadata): void {
+    const cached = this.reactionAssetMetadata.get(reactionKey)
+    if (cached && cached.meta.source !== 'path' && cached.meta.version !== meta.version) {
+      log('warn', `QQ reaction asset changed key=${reactionKey} size=${cached.meta.size}->${meta.size} version=${cached.meta.version}->${meta.version}`)
+      this.reactionRemoteCache.delete(reactionKey)
+    }
+    this.reactionAssetMetadata.set(reactionKey, { meta, resolvedAt: Date.now() })
+  }
+
+  /**
    * Runtime QQ system faces are delivered as ZIP bundles that wrap the actual
    * image next to a larger canvas variant. Relaying the archive verbatim makes
    * every client drop the face, so unwrap the entry matching the advertised
    * geometry and keep the payload untouched when it already is a plain image.
    */
   private resolveReactionAssetPayload(reactionKey: string, payload: Buffer): Buffer {
-    const definition = this.reactionByKey.get(reactionKey)
-    const resource = definition?.presentation.type === 'custom' ? definition.presentation.resource : undefined
-    const image = resolveFaceAssetImage(payload, {
-      faceId: systemFaceIdFromReactionKey(reactionKey),
-      width: resource?.width,
-      height: resource?.height,
-    })
+    const image = resolveFaceAssetImage(payload, this.reactionAssetTarget(reactionKey))
     if (image) return image.bytes
     if (isZipPayload(payload)) {
       log('warn', `QQ face bundle for ${reactionKey} carried no usable image; serving the archive`)
@@ -6535,6 +6695,7 @@ export class QQKernelBridge {
     this.reactionByKey.clear()
     this.reactionAssets.clear()
     this.reactionRemoteCache.clear()
+    this.reactionAssetMetadata.clear()
     for (const [key, asset] of assets) this.reactionAssets.set(key, asset)
     for (const definition of definitions) this.reactionByKey.set(definition.key, definition)
     for (const [key, definition] of aliases) this.reactionByKey.set(key, definition)

@@ -1,6 +1,9 @@
 import { deflateRawSync } from 'node:zlib'
 import { describe, expect, it } from 'vitest'
-import { isZipPayload, resolveFaceAssetImage, sniffFaceImage } from './face-asset-bundle.js'
+import {
+  faceAssetVersion, isZipPayload, pickFaceAssetEntry, resolveFaceAssetImage, resolveFaceAssetMetaFromDirectory,
+  sniffFaceImage,
+} from './face-asset-bundle.js'
 
 interface BundleEntry {
   name: string
@@ -27,6 +30,7 @@ function buildBundle(entries: readonly BundleEntry[]): Buffer {
     local.writeUInt16LE(name.length, 26)
     const descriptor = Buffer.alloc(16)
     descriptor.writeUInt32LE(0x08074b50, 0)
+    descriptor.writeUInt32LE(faceAssetVersion(entry.data), 4)
     descriptor.writeUInt32LE(data.length, 8)
     descriptor.writeUInt32LE(entry.data.length, 12)
     locals.push(local, name, data, descriptor)
@@ -37,6 +41,7 @@ function buildBundle(entries: readonly BundleEntry[]): Buffer {
     central.writeUInt16LE(20, 6)
     central.writeUInt16LE(flags, 8)
     central.writeUInt16LE(method, 10)
+    central.writeUInt32LE(faceAssetVersion(entry.data), 16)
     central.writeUInt32LE(data.length, 20)
     central.writeUInt32LE(entry.data.length, 24)
     central.writeUInt16LE(name.length, 28)
@@ -110,6 +115,40 @@ describe('face asset bundles', () => {
     ])
     expect(resolveFaceAssetImage(bundle, { faceId: '416', width: 192, height: 76 })?.bytes).toEqual(canvas)
     expect(resolveFaceAssetImage(bundle, { faceId: '416' })?.bytes).toEqual(square)
+  })
+
+  it('reads size and content identity from the archive tail only', () => {
+    const square = pngBytes(128, 128)
+    const canvas = pngBytes(480, 190)
+    const bundle = buildBundle([
+      { name: '416/png/416.png', data: square },
+      { name: '416/png/416_0.png', data: canvas },
+    ])
+    // A ranged request only hands back the end of the archive, where the
+    // central directory lives.
+    const tail = bundle.subarray(Math.max(0, bundle.length - 2048))
+    const wide = resolveFaceAssetMetaFromDirectory(tail, { faceId: '416', width: 192, height: 76 })
+    expect(wide).toEqual({
+      name: '416/png/416_0.png', size: canvas.length, version: faceAssetVersion(canvas), method: 8,
+    })
+    const squareMeta = resolveFaceAssetMetaFromDirectory(tail, { faceId: '416', width: 128, height: 128 })
+    expect(squareMeta).toMatchObject({ name: '416/png/416.png', size: square.length, version: faceAssetVersion(square) })
+    expect(faceAssetVersion(square)).toBe(faceAssetVersion(Buffer.from(square)))
+    // The announced size always matches what serving the archive returns.
+    expect(resolveFaceAssetImage(bundle, { faceId: '416', width: 192, height: 76 })?.bytes.length)
+      .toBe(wide?.size)
+  })
+
+  it('ranks canonical and canvas entries deterministically', () => {
+    const entries = [
+      { name: '416/png/416_0.png', size: 10 },
+      { name: '416/png/416.png', size: 20 },
+      { name: '417/png/417.png', size: 30 },
+    ]
+    expect(pickFaceAssetEntry(entries, { faceId: '416', width: 128, height: 128 })?.name).toBe('416/png/416.png')
+    expect(pickFaceAssetEntry(entries, { faceId: '416', width: 192, height: 76 })?.name).toBe('416/png/416_0.png')
+    expect(pickFaceAssetEntry(entries, { faceId: '416' })?.name).toBe('416/png/416.png')
+    expect(pickFaceAssetEntry(entries, {})?.name).toBe('416/png/416.png')
   })
 
   it('serves stored entries and reports animated payloads', () => {

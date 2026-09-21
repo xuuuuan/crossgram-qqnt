@@ -14,6 +14,7 @@ import WebSocket from 'ws'
 import { GroupMsgMask, type ContactMsgBoxInfo, type KernelBuddyService, type KernelGroupService, type KernelModule, type KernelMsgService, type KernelRichMediaService, type KernelSession, type MsgElement, type MsgRecord } from './kernel-types.js'
 import type { PacketAddon } from './packet-addon.js'
 import { parseConversationId, type QQEvent, type QQStickerReference } from './protocol.js'
+import { faceAssetVersion } from './face-asset-bundle.js'
 import { normalizeNativeHash, QQKernelBridge } from './qq-kernel.js'
 import { QQBridgeServer } from './server.js'
 import { QQPacketClient } from './packet-client.js'
@@ -635,6 +636,7 @@ function zipFaceBundle(entries: ReadonlyArray<[string, Buffer]>): Buffer {
     local.writeUInt16LE(nameBytes.length, 26)
     const descriptor = Buffer.alloc(16)
     descriptor.writeUInt32LE(0x08074b50, 0)
+    descriptor.writeUInt32LE(faceAssetVersion(data), 4)
     descriptor.writeUInt32LE(compressed.length, 8)
     descriptor.writeUInt32LE(data.length, 12)
     locals.push(local, nameBytes, compressed, descriptor)
@@ -644,6 +646,7 @@ function zipFaceBundle(entries: ReadonlyArray<[string, Buffer]>): Buffer {
     central.writeUInt16LE(20, 6)
     central.writeUInt16LE(0x0008, 8)
     central.writeUInt16LE(8, 10)
+    central.writeUInt32LE(faceAssetVersion(data), 16)
     central.writeUInt32LE(compressed.length, 20)
     central.writeUInt32LE(data.length, 24)
     central.writeUInt16LE(nameBytes.length, 28)
@@ -5649,7 +5652,7 @@ describe('QQKernelBridge', () => {
     })
   })
 
-  it('unwraps ZIP face bundles into the image a reaction advertises', async () => {
+  it('unwraps ZIP face bundles and publishes their size and content identity', async () => {
     const root = await mkdtemp(join(tmpdir(), 'qqnt-reaction-bundles-'))
     tempPaths.push(root)
     const resourceRoot = join(root, 'global', 'nt_data', 'Emoji', 'emoji-resource')
@@ -5657,9 +5660,14 @@ describe('QQKernelBridge', () => {
       mkdir(join(resourceRoot, 'sysface_res', 'static'), { recursive: true }),
       mkdir(join(resourceRoot, 'emoji_res'), { recursive: true }),
     ])
-    await writeFile(join(resourceRoot, 'face_config.json'), JSON.stringify({ emoji: [], sysface: [] }))
     const square = pngWithSize(128, 128)
     const canvas = pngWithSize(480, 190)
+    await Promise.all([
+      writeFile(join(resourceRoot, 'face_config.json'), JSON.stringify({
+        emoji: [], sysface: [{ QSid: '14', QDes: '/微笑' }],
+      })),
+      writeFile(join(resourceRoot, 'sysface_res', 'static', 's14.png'), square),
+    ])
     const f = fixture()
     ;(f.session as any).getBaseEmojiService = () => ({
       fetchFullSysEmojis: vi.fn(async () => ({
@@ -5680,21 +5688,31 @@ describe('QQKernelBridge', () => {
     const bridge = new QQKernelBridge()
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: join(root, 'account') })
     vi.spyOn(bridge as any, 'packetClientForSession').mockReturnValue({ getSysFaces: async () => [] })
-    await vi.waitFor(async () => expect((await bridge.getReactionCatalog()).available).toHaveLength(2))
+    await vi.waitFor(async () => expect((await bridge.getReactionCatalog()).available).toHaveLength(3))
 
-    const fetchMock = vi.fn(async (input: string | URL | Request) => {
-      const wide = String(input).includes('416')
-      return new Response(wide
-        ? zipFaceBundle([
-          ['416/png/416.png', square],
-          ['416/png/416_0.png', canvas],
-        ])
-        : zipFaceBundle([
-          ['424/png/424.png', square],
-          ['424/png/424_0.png', pngWithSize(512, 512)],
-        ]), { status: 200, headers: { 'content-type': 'image/png' } })
+    const bundles = new Map<string, Buffer>([
+      ['424', zipFaceBundle([['424/png/424.png', square], ['424/png/424_0.png', pngWithSize(512, 512)]])],
+      ['416', zipFaceBundle([['416/png/416.png', square], ['416/png/416_0.png', canvas]])],
+    ])
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const body = bundles.get(String(input).includes('416') ? '416' : '424')!
+      if (new Headers(init?.headers).has('range')) {
+        // QQ's CDN answers the tail request that only needs the directory.
+        return new Response(body.subarray(Math.max(0, body.length - 4096)), { status: 206 })
+      }
+      return new Response(body, { status: 200, headers: { 'content-type': 'image/png' } })
     })
     vi.stubGlobal('fetch', fetchMock)
+
+    const meta = await bridge.resolveReactionAssetMeta('1:424')
+    expect(meta).toEqual({
+      size: square.length,
+      version: faceAssetVersion(square),
+      mimeType: 'image/png',
+      entry: '424/png/424.png',
+      source: 'bundle',
+    })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
 
     const whole = await bridge.openReactionResource('1:424')
     expect(whole).toMatchObject({ mimeType: 'image/png', size: square.length, offset: 0, length: square.length })
@@ -5703,12 +5721,27 @@ describe('QQKernelBridge', () => {
     const ranged = await bridge.openReactionResource('1:424', { offset: 4, limit: 8 })
     expect(ranged).toMatchObject({ mimeType: 'image/png', size: square.length, offset: 4, length: 8 })
     expect(await readStream(ranged!.stream)).toEqual(square.subarray(4, 12))
-    expect(fetchMock).toHaveBeenCalledTimes(1)
 
     const wide = await bridge.openReactionResource('1:416')
     expect(wide).toMatchObject({ mimeType: 'image/png', size: canvas.length })
     expect(await readStream(wide!.stream)).toEqual(canvas)
-    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect((await bridge.resolveReactionAssetMeta('1:416'))?.size).toBe(canvas.length)
+
+    // Faces backed by local files report their on-disk size and modification time.
+    const local = await bridge.resolveReactionAssetMeta('1:14')
+    expect(local).toMatchObject({ size: square.length, source: 'path', mimeType: 'image/png' })
+    expect(local!.version).toBeGreaterThan(0)
+
+    // A remote change is detected once the metadata TTL expires, and the stale
+    // payload is not served under the previous identity.
+    bundles.set('424', zipFaceBundle([['424/png/424.png', canvas], ['424/png/424_0.png', pngWithSize(512, 512)]]))
+    const changed = await bridge.resolveReactionAssetMeta('1:424', { maxAgeMs: 0 })
+    expect(changed).toMatchObject({
+      size: canvas.length, version: faceAssetVersion(canvas), source: 'bundle',
+    })
+    const refreshed = await bridge.openReactionResource('1:424')
+    expect(refreshed?.size).toBe(canvas.length)
+    expect(await readStream(refreshed!.stream)).toEqual(canvas)
   })
 
   it('does not expose or write reactions in direct conversations', async () => {
@@ -7695,6 +7728,43 @@ describe('QQBridgeServer', () => {
     expect(response.headers.get('content-range')).toBe('bytes 1-3/5')
     expect(Buffer.from(await response.arrayBuffer()).toString()).toBe('bcd')
     expect(open).toHaveBeenCalledWith('1:14', { offset: 1, limit: 3 })
+  })
+
+  it('publishes reaction asset metadata without streaming the payload', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const resolve = vi.spyOn(bridge, 'resolveReactionAssetMeta').mockResolvedValue({
+      size: 19787, version: 2057187757, mimeType: 'image/png', entry: '478/png/478.png', source: 'bundle',
+    })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const base = `http://127.0.0.1:${server.address().port}/v1`
+
+    const response = await fetch(`${base}/reactions/meta`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ reactionKey: '1:478' }),
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({
+      reactionKey: '1:478',
+      size: 19787,
+      version: 2057187757,
+      mimeType: 'image/png',
+      entry: '478/png/478.png',
+      source: 'bundle',
+    })
+    expect(resolve).toHaveBeenCalledWith('1:478')
+
+    resolve.mockResolvedValue(undefined)
+    const missing = await fetch(`${base}/reactions/meta`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ reactionKey: '1:999' }),
+    })
+    expect(missing.status).toBe(404)
   })
 
   it('serves sticker assets with byte ranges', async () => {

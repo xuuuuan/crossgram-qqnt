@@ -939,6 +939,28 @@ export class QQBridgeServer {
       await pipe(asset.stream, response)
       return
     }
+    if (request.method === 'POST' && path === '/v1/reactions/meta') {
+      const locator = await readJson<{ reactionKey?: string }>(request)
+      const meta = locator.reactionKey
+        ? await this.bridge.resolveReactionAssetMeta(locator.reactionKey)
+        : undefined
+      if (!meta) {
+        json(response, 404, { error: 'reaction asset not found' })
+        return
+      }
+      log('info', `HTTP API reaction meta id=${requestId} key=${locator.reactionKey} size=${meta.size} version=${meta.version} source=${meta.source} entry=${meta.entry ?? ''}`)
+      json(response, 200, {
+        reactionKey: locator.reactionKey,
+        size: meta.size,
+        version: meta.version,
+        mimeType: meta.mimeType,
+        width: meta.width,
+        height: meta.height,
+        entry: meta.entry,
+        source: meta.source,
+      })
+      return
+    }
     json(response, 404, { error: 'not found' })
   }
 
