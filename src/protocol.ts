@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 32
+export const PROTOCOL_VERSION = 33
 
 /** Local Unix-socket PCM media protocol. Audio frames use a 1-byte type plus a 4-byte big-endian length. */
 export const PCM_MEDIA_PROTOCOL_VERSION = 1
@@ -342,6 +342,24 @@ export interface QQRequest {
   source?: 'doubt'
   /** QQ's original reason for filtering a doubt friend request. */
   reason?: string
+}
+
+/** Body of `POST /v1/conversations/:id/pokes`. */
+export interface QQPokeRequest {
+  /** Relay-side QQ user id (UID) of the poked account; defaults to the peer itself. */
+  userId?: string
+  /** How many poke notices to send, 1..10; defaults to one. */
+  count?: number
+}
+
+export interface QQPokeResult {
+  /** Poke notices QQ accepted for this request. */
+  count: number
+  /**
+   * The notice QQ appended to the conversation. Only present when the bridge
+   * confirmed it; a missing notice is not an error.
+   */
+  message?: QQMessage
 }
 
 export interface QQRequestPage {

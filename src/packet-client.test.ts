@@ -54,6 +54,11 @@ function fixture() {
     decodePrivateFileDownloadResponse: vi.fn(() => ({
       url: 'http://cdn.qq.example/private-file?token=fresh', ttlSeconds: 300, createdAt: 0,
     })),
+    encodePokeRequest: vi.fn((chatType, peer, targetUin) => ({
+      command: 'OidbSvcTrpcTcp.0xed3_1',
+      payload: Buffer.from(JSON.stringify({ chatType, peer, targetUin })),
+    })),
+    decodePokeResponse: vi.fn(),
     refreshImageUrl: vi.fn((original, rkey) => {
       const url = new URL(original)
       url.searchParams.set('rkey', rkey.replace(/^&?rkey=/, ''))
@@ -334,6 +339,35 @@ describe('QQPacketClient', () => {
     await expect(f.client.getImageDirectUrl(image(
       'https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=group',
     ))).resolves.toBeUndefined()
+  })
+
+  it('sends a group poke through the native packet binding and validates the envelope', async () => {
+    const f = fixture()
+
+    await f.client.poke(2, '1058754719', '1715311957')
+
+    expect(f.send).toHaveBeenCalledWith(
+      'OidbSvcTrpcTcp.0xed3_1',
+      Buffer.from(JSON.stringify({ chatType: 2, peer: '1058754719', targetUin: '1715311957' })),
+    )
+    expect(f.addon.decodePokeResponse).toHaveBeenCalledWith(Buffer.from('response'))
+  })
+
+  it('sends a private poke with the friend UIN as the peer', async () => {
+    const f = fixture()
+
+    await f.client.poke(1, '1715311957', '1715311957')
+
+    expect(f.addon.encodePokeRequest).toHaveBeenCalledWith(1, '1715311957', '1715311957')
+    expect(f.addon.decodePokeResponse).toHaveBeenCalledOnce()
+  })
+
+  it('reports the QQ envelope error when a poke is rejected', async () => {
+    const f = fixture()
+    f.addon.decodePokeResponse = vi.fn(() => { throw new Error('invalid poke response: OIDB error 34') })
+
+    await expect(f.client.poke(2, '1058754719', '1715311957'))
+      .rejects.toThrow('OIDB error 34')
   })
 
   it('does not load the addon or send without an original QQ image URL', async () => {

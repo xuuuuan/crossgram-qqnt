@@ -160,6 +160,30 @@ message RkeyInfo {
 }
 ```
 
+### 3.4 戳一戳协议
+
+**命令**：`OidbSvcTrpcTcp.0xED3_1`
+
+**请求 Body**（Protobuf，同一份 body 覆盖私聊与群聊两种戳）：
+
+```protobuf
+message PokeRequest {
+    uint32 uin = 1;         // 被戳的账号
+    uint32 group_uin = 2;   // 群戳填群号，私聊填 0
+    uint32 friend_uin = 5;  // 私聊戳填好友 uin，群戳填 0
+    uint32 ext = 6;         // 恒为 0，QQ 预留的戳一戳子类型
+}
+```
+
+`POST /v1/conversations/{id}/pokes`（bridge protocol v33）接受 `userId`（被戳账号的 UID）与
+`count`（1..10）。bridge 按 `POKE_INTERVAL_MS` 间隔逐次发包，避免 QQ 把连戳当成刷屏；每次只校验
+`0xED3` 响应的 OIDB 信封错误码，响应 body 为空。
+
+**响应**：QQ 不会回包说明戳是否送达，只为每次戳追加一条本地通知消息（`faceElement.faceType=5`，
+或 `jsonGrayTipElement.busiId=1061`）。`sendPoke` 在发包后轮询 `getLatestDbMsgs` 最长
+`POKE_NOTICE_TIMEOUT_MS`，命中通知且原生监听器没有投递过时就补发一条桥接消息事件，让中转端
+立刻渲染这条系统消息。
+
 ---
 
 ## 4. 动态定位链
@@ -448,3 +472,4 @@ Get-Content -LiteralPath 'Y:\Users\<user>\AppData\Local\qqnt-bridge\qqnt-bridge.
 | 日期 | 版本 | 变更说明 |
 |------|------|----------|
 | 2026-07-25 | 9.9.33-51552 | 初始文档，基于当前实现记录 |
+| 2026-09-23 | 9.9.33-51552 | 补充 0xED3 戳一戳发包与通知确认流程 |

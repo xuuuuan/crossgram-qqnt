@@ -200,6 +200,21 @@ mod tests {
 }
 
 #[napi]
+pub fn encode_poke_request(
+    chat_type: u32,
+    peer: String,
+    target_uin: String,
+) -> Result<PacketRequest> {
+    packet_request(proto::poke_packet(chat_type, &peer, &target_uin), "poke")
+}
+
+#[napi]
+pub fn decode_poke_response(payload: Buffer) -> Result<()> {
+    proto::decode_poke(payload.as_ref())
+        .map_err(|error| Error::from_reason(format!("invalid poke response: {error}")))
+}
+
+#[napi]
 pub fn encode_video_download_request(
     chat_type: u32,
     peer: String,

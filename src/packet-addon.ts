@@ -84,6 +84,8 @@ export interface PacketAddon {
   decodeGroupFileDownloadResponse(payload: Buffer): NativeDirectUrl
   encodePrivateFileDownloadRequest(selfUid: string, fileUuid: string, fileHash: string): NativePacketRequest
   decodePrivateFileDownloadResponse(payload: Buffer): NativeDirectUrl
+  encodePokeRequest(chatType: number, peer: string, targetUin: string): NativePacketRequest
+  decodePokeResponse(payload: Buffer): void
   refreshImageUrl(originalUrl: string, rkey: string): string
   probePacketBinding(): PacketBindingProbe
   locateSendBinding(): NativeSendBindingLocation
@@ -126,6 +128,7 @@ export function validatePacketAddon(required: Partial<PacketAddon>): PacketAddon
     'encodeVideoDownloadRequest', 'decodeVideoDownloadResponse',
     'encodeGroupFileDownloadRequest', 'decodeGroupFileDownloadResponse',
     'encodePrivateFileDownloadRequest', 'decodePrivateFileDownloadResponse',
+    'encodePokeRequest', 'decodePokeResponse',
     'refreshImageUrl', 'probePacketBinding', 'locateSendBinding', 'installSendHook',
   ] satisfies Array<keyof PacketAddon>) {
     if (typeof required[name] !== 'function') throw new Error(`QQNT packet addon is missing ${name}`)

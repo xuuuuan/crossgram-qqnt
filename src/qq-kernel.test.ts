@@ -96,6 +96,8 @@ function packetAddonFixture(): PacketAddon {
     decodeGroupFileDownloadResponse: vi.fn(() => ({ url: '', ttlSeconds: 0, createdAt: 0 })),
     encodePrivateFileDownloadRequest: vi.fn(() => ({ command: '', payload: Buffer.alloc(0) })),
     decodePrivateFileDownloadResponse: vi.fn(() => ({ url: '', ttlSeconds: 0, createdAt: 0 })),
+    encodePokeRequest: vi.fn(() => ({ command: 'OidbSvcTrpcTcp.0xed3_1', payload: Buffer.alloc(0) })),
+    decodePokeResponse: vi.fn(),
     refreshImageUrl: vi.fn((url) => url),
     probePacketBinding: vi.fn(() => ({
       moduleBase: binding.moduleBase, modulePath: '/qqnt/wrapper.node', profile: 'linux-xref-v1',
@@ -464,12 +466,13 @@ function fixture() {
     .mockResolvedValue({ fileId: 'server-file-id', uploadTime: 1, expireLeftTime: 2 })
   const flashUploadFile = vi.spyOn(QQPacketClient.prototype, 'uploadFlashTransferFile')
     .mockImplementation(async (_file, _prepared, source) => { for await (const _chunk of source) {} })
+  const poke = vi.spyOn(QQPacketClient.prototype, 'poke').mockResolvedValue()
   const flashApplyUpload = vi.spyOn(QQPacketClient.prototype, 'applyFlashTransferUpload').mockResolvedValue()
   const flashSetReady = vi.spyOn(QQPacketClient.prototype, 'setFlashTransferFilesetReady').mockResolvedValue()
   return {
     kernel, session, msg, recent, buddy, profile, group, search, avsdk, richMedia, uix, message, sentBodies,
     forceDownloadAvatar,
-    imageUpload, fileUpload, protocolSend, groupFilePublish,
+    imageUpload, fileUpload, protocolSend, groupFilePublish, poke,
     flashApplyFileset, flashCommitFiles, flashCompleteFileset, flashPrepareUpload,
     flashUploadFile, flashApplyUpload, flashSetReady,
     emitMessages(records: MsgRecord[]) {
@@ -1975,6 +1978,98 @@ describe('QQKernelBridge', () => {
     await expect(bridge.getHistory(bridge.getConversation('uid-1715311957'))).resolves.toMatchObject({
       messages: [{ replyToId: 'real-source' }],
     })
+  })
+
+  it('sends a group poke burst and publishes the notice QQ records', async () => {
+    const f = fixture()
+    const calls: Array<{ chatType: number, peer: string, targetUin: string }> = []
+    f.poke.mockImplementation(async (chatType, peer, targetUin) => {
+      calls.push({ chatType, peer, targetUin })
+    })
+    const notice: MsgRecord = {
+      ...f.message, msgId: 'poke-notice', msgSeq: '125', chatType: 2, sendStatus: 2, sendType: 1,
+      peerUid: '1058754719', peerUin: '1058754719', peerName: 'Test Group',
+      msgTime: String(Math.floor(Date.now() / 1000)),
+      elements: [{ elementType: 6, elementId: 'poke', faceElement: {
+        faceIndex: 0, faceType: 5, spokeSummary: '你戳了戳Bob',
+      } }],
+    }
+    f.msg.getLatestDbMsgs.mockResolvedValue({ result: 0, errMsg: '', msgList: [notice] })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const events = bridge.subscribe()[Symbol.asyncIterator]()
+
+    const result = await bridge.sendPoke(bridge.getConversation('1058754719'), 'uid-1715311957', 3)
+
+    expect(calls).toEqual([
+      { chatType: 2, peer: '1058754719', targetUin: '1715311957' },
+      { chatType: 2, peer: '1058754719', targetUin: '1715311957' },
+      { chatType: 2, peer: '1058754719', targetUin: '1715311957' },
+    ])
+    expect(result.count).toBe(3)
+    expect(result.message).toMatchObject({
+      id: 'poke-notice', serviceAction: { type: 'custom', text: '你戳了戳Bob' },
+    })
+    await expect(events.next()).resolves.toMatchObject({
+      value: { type: 'message', message: { id: 'poke-notice' } },
+    })
+  })
+
+  it('sends a private poke to the friend and reuses the notice the listener delivered', async () => {
+    const f = fixture()
+    const calls: Array<{ chatType: number, peer: string, targetUin: string }> = []
+    const notice: MsgRecord = {
+      ...f.message, msgId: 'private-poke', msgSeq: '91', chatType: 1, sendStatus: 2, sendType: 1,
+      senderUid: 'self', senderUin: '10000', peerUid: 'uid-1715311957', peerUin: '1715311957',
+      msgTime: String(Math.floor(Date.now() / 1000)),
+      elements: [{ elementType: 8, elementId: 'poke', grayTipElement: {
+        jsonGrayTipElement: {
+          busiId: '1061', recentAbstract: '',
+          jsonStr: JSON.stringify({ items: [
+            { type: 'qq', uid: 'self', nm: 'Self' },
+            { type: 'nor', txt: '戳了戳' },
+            { type: 'qq', uid: 'uid-1715311957', nm: 'xuuuuan' },
+          ] }),
+        },
+      } }],
+    }
+    f.poke.mockImplementation(async (chatType, peer, targetUin) => {
+      calls.push({ chatType, peer, targetUin })
+      await f.emitMessages([notice])
+    })
+    f.msg.getLatestDbMsgs.mockResolvedValue({ result: 0, errMsg: '', msgList: [notice] })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const events = bridge.subscribe()[Symbol.asyncIterator]()
+
+    const result = await bridge.sendPoke(bridge.getConversation('uid-1715311957'), 'uid-1715311957', 1)
+
+    expect(calls).toEqual([{ chatType: 1, peer: '1715311957', targetUin: '1715311957' }])
+    expect(result.message?.id).toBe('private-poke')
+    await expect(events.next()).resolves.toMatchObject({
+      value: { type: 'message', message: { id: 'private-poke' } },
+    })
+    // The listener already published the notice; the confirmation must not repeat it.
+    await expect(Promise.race([
+      events.next(),
+      new Promise((resolve) => setTimeout(() => resolve('idle'), 50)),
+    ])).resolves.toBe('idle')
+  })
+
+  it('rejects poke bursts and targets QQ cannot accept', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.sendPoke(bridge.getConversation('1058754719'), 'uid-1715311957', 11))
+      .rejects.toThrow('QQ poke count must be between 1 and 10')
+    await expect(bridge.sendPoke(bridge.getConversation('1058754719'), 'uid-1715311957', 0))
+      .rejects.toThrow('QQ poke count must be between 1 and 10')
+    await expect(bridge.sendPoke(bridge.getConversation('1058754719'), 'uid-unknown', 1))
+      .rejects.toThrow('could not be resolved to a UIN')
+    await expect(bridge.sendPoke(bridge.getConversation('device:8:peer'), 'uid-1715311957', 1))
+      .rejects.toThrow('only supported in friend and group conversations')
+    expect(f.poke).not.toHaveBeenCalled()
   })
 
   it('maps poke, member changes, mute notices, and generic gray tips to service actions', async () => {
@@ -6501,6 +6596,51 @@ describe('QQBridgeServer', () => {
     })
   })
 
+  it('exposes a poke burst through the authenticated HTTP API', async () => {
+    const f = fixture()
+    const calls: Array<{ chatType: number, peer: string, targetUin: string }> = []
+    f.poke.mockImplementation(async (chatType, peer, targetUin) => {
+      calls.push({ chatType, peer, targetUin })
+    })
+    const notice: MsgRecord = {
+      ...f.message, msgId: 'http-poke', msgSeq: '77', chatType: 2, sendStatus: 2, sendType: 1,
+      peerUid: '1058754719', peerUin: '1058754719', peerName: 'Test Group',
+      msgTime: String(Math.floor(Date.now() / 1000)),
+      elements: [{ elementType: 6, elementId: 'poke', faceElement: {
+        faceIndex: 0, faceType: 5, spokeSummary: '你戳了戳Bob',
+      } }],
+    }
+    f.msg.getLatestDbMsgs.mockResolvedValue({ result: 0, errMsg: '', msgList: [notice] })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const pokeUrl = `http://127.0.0.1:${server.address().port}/v1/conversations/1058754719/pokes`
+
+    const rejected = await fetch(pokeUrl, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ userId: 'uid-1715311957', count: 99 }),
+    })
+    expect(rejected.status).toBe(400)
+    const missingTarget = await fetch(pokeUrl, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({}),
+    })
+    expect(missingTarget.status).toBe(400)
+    expect(calls).toEqual([])
+
+    const response = await fetch(pokeUrl, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ userId: 'uid-1715311957', count: 2 }),
+    })
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toMatchObject({
+      count: 2,
+      message: { id: 'http-poke', serviceAction: { type: 'custom', text: '你戳了戳Bob' } },
+    })
+    expect(calls).toHaveLength(2)
+  })
+
   it('exposes native voice transcription through the authenticated HTTP API', async () => {
     const f = fixture()
     f.message.elements = [{ elementType: 4, elementId: 'voice-http', pttElement: {
@@ -6678,7 +6818,7 @@ describe('QQBridgeServer', () => {
     const base = `http://127.0.0.1:${server.address().port}/v1`
 
     await expect(fetch(`${base}/status`).then((response) => response.json())).resolves.toMatchObject({
-      protocolVersion: 32, ready: true, flashTransferSupported: true,
+      protocolVersion: 33, ready: true, flashTransferSupported: true,
     })
     const manifest = {
       name: 'remote reuse', framing: 'length-prefixed-v1',
@@ -7196,7 +7336,7 @@ describe('QQBridgeServer', () => {
     const { port } = server.address()
     const base = `http://127.0.0.1:${port}/v1`
     await expect(fetch(`${base}/status`).then((response) => response.json())).resolves.toMatchObject({
-      protocolVersion: 32, ready: true, selfUin: '10000',
+      protocolVersion: 33, ready: true, selfUin: '10000',
     })
     const dialogs = await fetch(`${base}/dialogs`)
     expect(dialogs.status).toBe(200)

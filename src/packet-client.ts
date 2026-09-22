@@ -303,6 +303,17 @@ export class QQPacketClient {
     return { published: true }
   }
 
+  /**
+   * Send one poke (nudge) notice. QQ answers with an empty OIDB body, so only
+   * the envelope's error code is inspected; callers space repeated pokes.
+   */
+  async poke(chatType: 1 | 2, peer: string, targetUin: string): Promise<void> {
+    const addon = this.loadAddon()
+    addon.decodePokeResponse(
+      await this.sendPacket(addon, addon.encodePokeRequest(chatType, peer, targetUin)),
+    )
+  }
+
   async applyFlashTransferFileset(options: {
     name: string
     files: FlashTransferFileSpec[]

@@ -32,7 +32,7 @@ import {
 } from './kernel-types.js'
 import {
   conversationId, parseConversationId, type HistoryQuery, type MemberPage, type QQCallSignalEvent, type QQCard, type QQConversation, type QQEvent, type QQGroupFilePage, type QQMedia, type QQMediaLocator, type QQMediaUploadPlan, type QQMessage, type QQMultiForwardLocator, type QQReactionActorPage, type QQReactionContext, type QQReactionDefinition, type QQReactionState,
-  type QQFlashTransferManifest, type QQFlashTransferResult, type QQRequest, type QQRequestKind, type QQRequestPage, type QQRequestStatus, type QQSendMediaSpec, type QQSticker, type QQStickerPack, type QQStickerPackSummary, type QQStickerReference, type QQTextPart, type SearchPage, type SearchQuery, type SendManifest,
+  type QQFlashTransferManifest, type QQFlashTransferResult, type QQPokeResult, type QQRequest, type QQRequestKind, type QQRequestPage, type QQRequestStatus, type QQSendMediaSpec, type QQSticker, type QQStickerPack, type QQStickerPackSummary, type QQStickerReference, type QQTextPart, type SearchPage, type SearchQuery, type SendManifest,
 } from './protocol.js'
 
 const REACTION_ASSET_META_TTL_MS = 10 * 60_000
@@ -43,6 +43,9 @@ type ReactionAsset = {
   url?: string
   mimeType: FaceAssetMimeType
 }
+
+/** Largest single poke burst a caller may request. */
+export const QQ_POKE_MAX_COUNT = 10
 
 /** Size and content identity of the bytes a reaction key serves. */
 export type ReactionAssetMetadata = {
@@ -99,6 +102,12 @@ const CALL_SIGNAL_SECRET_BYTES = 32
 const CALL_SIGNAL_PROCESS_EPOCH_BYTES = 16
 const CALL_SIGNAL_ACTION_SCAN_BYTES = 4_096
 const CALL_SIGNAL_TUPLE_DOMAIN = Buffer.from('qqnt-call-tuple-v1', 'ascii')
+/** QQ's own poke notices arrive as this JSON gray-tip business id. */
+const POKE_GRAY_TIP_BUSI_ID = '1061'
+/** Space repeated pokes so QQ does not read the burst as a flood. */
+const POKE_INTERVAL_MS = 250
+const POKE_NOTICE_TIMEOUT_MS = 2_500
+const POKE_NOTICE_POLL_INTERVAL_MS = 400
 const CALL_SIGNAL_ID_DOMAIN = Buffer.from('qqnt-call-id-v1', 'ascii')
 const U64_MAX = 0xffff_ffff_ffff_ffffn
 const CALL_SIGNAL_NONTERMINAL_QUEUE_LIMIT = 16
@@ -1565,6 +1574,100 @@ export class QQKernelBridge {
     if (result.result !== 0) {
       throw new Error(`modifyMemberRole: ${result.errMsg} (${result.result})`)
     }
+  }
+
+  /**
+   * Send QQ poke notices through the native packet binding.
+   *
+   * QQ records a notice message for every poke — a poke face element or a
+   * `busiId 1061` JSON gray tip — exactly like a poke sent from a QQ client.
+   * The relay renders that notice, so the bridge waits briefly for it and
+   * dispatches a message event when the native listener delivered nothing.
+   */
+  async sendPoke(
+    conversation: QQConversation,
+    userId: string,
+    count = 1,
+  ): Promise<QQPokeResult> {
+    if (conversation.chatType !== CHAT_C2C && conversation.chatType !== CHAT_GROUP) {
+      throw new Error('QQ pokes are only supported in friend and group conversations')
+    }
+    const requested = Math.trunc(count)
+    if (!Number.isFinite(requested) || requested < 1 || requested > QQ_POKE_MAX_COUNT) {
+      throw new Error(`QQ poke count must be between 1 and ${QQ_POKE_MAX_COUNT}`)
+    }
+    const target = userId?.trim() || conversation.peerUid
+    if (!target) throw new Error('QQ poke target user id is required')
+    const targetUin = await this.resolvePokeUin(
+      target,
+      target === conversation.peerUid ? conversation.peerUin : undefined,
+    )
+    // A group poke names the group, a private poke names the friend.
+    const peerUin = await this.requireProtocolPeerUin(conversation)
+    const client = this.packetClientForSession()
+    const startedAt = Math.floor(Date.now() / 1000)
+    log('info', `protocol API start name=SendPoke conversation=${conversation.id} target=${target} count=${requested}`)
+    for (let index = 0; index < requested; index++) {
+      if (index > 0) await new Promise((resolve) => setTimeout(resolve, POKE_INTERVAL_MS))
+      await client.poke(conversation.chatType as 1 | 2, peerUin, targetUin)
+    }
+    log('info', `protocol API accepted name=SendPoke conversation=${conversation.id} target=${target} count=${requested}`)
+    const notice = await this.waitForPokeNotice(conversation, startedAt)
+    if (notice && !(this.messages.get(conversation.id) ?? []).some((item) => item.id === notice.id)) {
+      // The native listener stayed silent; publish the notice the relay renders.
+      this.rememberMessage(notice)
+      this.dispatch({ type: 'message', conversation, message: notice })
+      log('info', `poke notice published conversation=${conversation.id} message=${notice.id}`)
+    }
+    return { count: requested, ...(notice ? { message: notice } : {}) }
+  }
+
+  /**
+   * Resolve the numeric UIN a poke packet needs. Relay-side ids are UIDs, so a
+   * poked group member goes through the same UID->UIN conversion as the peer.
+   */
+  private async resolvePokeUin(uid: string, known?: string): Promise<string> {
+    if (known && /^\d+$/.test(known)) return known
+    const trimmed = uid?.trim()
+    if (!trimmed) throw new Error('QQ poke target user id is required')
+    if (/^\d+$/.test(trimmed)) return trimmed
+    const cached = this.users.get(trimmed)?.numericId
+      ?? this.seenUsers.get(trimmed)?.numericId
+    if (cached && /^\d+$/.test(cached)) return cached
+    const converted = await retryTransientInvalidArgument(
+      () => this.requireSession().getUixConvertService().getUin(new Set([trimmed])),
+    )
+    const uin = converted.uinInfo.get(trimmed)
+    if (!uin || !/^\d+$/.test(uin)) {
+      throw new Error(`QQ user ${trimmed} could not be resolved to a UIN`)
+    }
+    return uin
+  }
+
+  private async waitForPokeNotice(
+    conversation: QQConversation,
+    startedAt: number,
+  ): Promise<QQMessage | undefined> {
+    const service = this.requireMsgService()
+    const deadline = Date.now() + POKE_NOTICE_TIMEOUT_MS
+    while (Date.now() < deadline) {
+      const response = await withTimeout(
+        Promise.resolve().then(() => service.getLatestDbMsgs
+          ? service.getLatestDbMsgs(contact(conversation), 20)
+          : service.getMsgs(contact(conversation), '0', 20, true)),
+        2_000,
+        'QQ poke notice lookup timed out',
+      ).catch((error) => {
+        log('error', `poke notice lookup failed conversation=${conversation.id}`, error)
+        return { result: -1, errMsg: '', msgList: [] as MsgRecord[] }
+      })
+      const record = response.msgList.find((item) =>
+        Number(item.msgTime) >= startedAt - 2 && isPokeNoticeRecord(item))
+      if (record) return this.mapMessagePrepared(record)
+      await new Promise((resolve) => setTimeout(resolve, POKE_NOTICE_POLL_INTERVAL_MS))
+    }
+    log('warn', `QQ poke notice was not confirmed conversation=${conversation.id}`)
+    return undefined
   }
 
   async moderateMember(
@@ -9854,6 +9957,13 @@ function telegramMessageId(value?: string): number | undefined {
   if (!value || !/^\d+$/.test(value)) return
   const id = Number(value)
   return Number.isSafeInteger(id) && id > 0 && id <= 0x7fffffff ? id : undefined
+}
+
+/** Poke notices are either a poke face element or QQ's JSON poke gray tip. */
+function isPokeNoticeRecord(record: MsgRecord): boolean {
+  return (record.elements ?? []).some((element) =>
+    element.faceElement?.faceType === 5
+    || String(element.grayTipElement?.jsonGrayTipElement?.busiId ?? '') === POKE_GRAY_TIP_BUSI_ID)
 }
 
 function isGrayTipRecord(record: MsgRecord): boolean {

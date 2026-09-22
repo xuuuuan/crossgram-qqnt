@@ -6,7 +6,7 @@ import type { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import WebSocket, { WebSocketServer } from 'ws'
 import {
-  PROTOCOL_VERSION, type QQFlashTransferManifest, type QQMediaLocator, type QQMultiForwardLocator, type QQSendMediaSpec, type QQStickerReference, type SendManifest,
+  PROTOCOL_VERSION, type QQFlashTransferManifest, type QQMediaLocator, type QQMultiForwardLocator, type QQPokeRequest, type QQSendMediaSpec, type QQStickerReference, type SendManifest,
 } from './protocol.js'
 import { GroupMsgMask } from './kernel-types.js'
 import { QQMediaUploadRejectedError } from './upload-protocol.js'
@@ -15,7 +15,7 @@ import {
   QQKernelBridge, QQMediaLeaseAuthorizationError,
   QQMediaLeaseUnavailableError, QQRequestApiUnavailableError, QQRequestConflictError, QQRequestCursorError,
   QQRequestRefreshError, QQRequestResolutionError, QQRequestSessionChangedError, QQRequestUnsupportedError,
-  QQStickerAssetNotFoundError,
+  QQStickerAssetNotFoundError, QQ_POKE_MAX_COUNT,
 } from './qq-kernel.js'
 import { log, recordSlowHttpRequest, slowHttpLogPath } from './log.js'
 import type { QQLoginController } from './login-controller.js'
@@ -557,6 +557,36 @@ export class QQBridgeServer {
       }
       log('info', `HTTP API set member role id=${requestId} conversation=${conversation.id} user=${userId} role=${body.role}`)
       json(response, 200, { ok: true, conversationId: conversation.id, userId, role: body.role })
+      return
+    }
+
+    const pokeMatch = /^\/v1\/conversations\/([^/]+)\/pokes$/.exec(path)
+    if (request.method === 'POST' && pokeMatch) {
+      const conversation = this.bridge.getConversation(decodeURIComponent(pokeMatch[1]))
+      const body = await readJson<QQPokeRequest>(request)
+      const userId = typeof body?.userId === 'string' ? body.userId.trim() : ''
+      const count = body?.count ?? 1
+      if (!userId) {
+        json(response, 400, { error: 'poke userId is required' })
+        return
+      }
+      if (!Number.isInteger(count) || count < 1 || count > QQ_POKE_MAX_COUNT) {
+        json(response, 400, { error: `poke count must be an integer between 1 and ${QQ_POKE_MAX_COUNT}` })
+        return
+      }
+      let result
+      try {
+        result = await this.bridge.sendPoke(conversation, userId, count)
+      } catch (error) {
+        const message = errorMessage(error)
+        if (/not ready|unavailable|expose/i.test(message)) json(response, 503, { error: message })
+        else if (/only supported|must be between|is required|could not be resolved/i.test(message)) {
+          json(response, 400, { error: message })
+        } else json(response, 502, { error: message })
+        return
+      }
+      log('info', `HTTP API poke id=${requestId} conversation=${conversation.id} user=${userId} count=${result.count} notice=${result.message?.id ?? '<none>'}`)
+      json(response, 200, result)
       return
     }
 

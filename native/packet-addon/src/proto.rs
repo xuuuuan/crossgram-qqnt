@@ -373,6 +373,25 @@ pub struct PrivateFileResult {
     pub url: String,
 }
 
+/**
+ * Private and group poke (the QQ "nudge" notice) request body.
+ *
+ * A single body shape serves both flavors: a group poke fills `group_uin` and
+ * a private poke fills `friend_uin`, while `uin` is always the account being
+ * poked. `ext` stays zero; QQ reserves it for newer poke sub-types.
+ */
+#[derive(Clone, PartialEq, Message)]
+pub struct PokeRequest {
+    #[prost(uint32, tag = "1")]
+    pub uin: u32,
+    #[prost(uint32, tag = "2")]
+    pub group_uin: u32,
+    #[prost(uint32, tag = "5")]
+    pub friend_uin: u32,
+    #[prost(uint32, tag = "6")]
+    pub ext: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectUrl {
     pub url: String,
@@ -674,6 +693,47 @@ pub fn decode_private_file_download(bytes: &[u8]) -> Result<DirectUrl, DecodePac
     })
 }
 
+/**
+ * Build a poke request for a private (chat type 1) or group (chat type 2)
+ * conversation. `peer` is the group code or the friend's UIN.
+ */
+pub fn poke_packet(chat_type: u32, peer: &str, target_uin: &str) -> Result<OidbEnvelope, String> {
+    let target = parse_uin(target_uin, "poke target")?;
+    let peer_uin = parse_uin(peer, "poke peer")?;
+    let (group_uin, friend_uin) = match chat_type {
+        1 => (0, peer_uin),
+        2 => (peer_uin, 0),
+        _ => return Err(format!("unsupported QQ chat type: {chat_type}")),
+    };
+    let body = PokeRequest {
+        uin: target,
+        group_uin,
+        friend_uin,
+        ext: 0,
+    }
+    .encode_to_vec();
+    Ok(OidbEnvelope {
+        command: 0xed3,
+        sub_command: 1,
+        error_code: 0,
+        body,
+        error_message: None,
+        is_reserved: 1,
+    })
+}
+
+/** A poke response carries no body; only the envelope's error code matters. */
+pub fn decode_poke(bytes: &[u8]) -> Result<(), DecodePacketError> {
+    decode_envelope(bytes).map(|_body| ())
+}
+
+fn parse_uin(value: &str, label: &str) -> Result<u32, String> {
+    match value.parse::<u32>() {
+        Ok(uin) if uin > 0 => Ok(uin),
+        _ => Err(format!("QQ {label} must be a numeric UIN: {value}")),
+    }
+}
+
 fn decode_envelope(bytes: &[u8]) -> Result<Vec<u8>, DecodePacketError> {
     let envelope = OidbEnvelope::decode(bytes)?;
     if envelope.error_code != 0 {
@@ -722,6 +782,75 @@ pub fn decode_sys_faces(bytes: &[u8]) -> Result<Vec<SysFace>, DecodePacketError>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn group_poke_request_has_stable_wire_shape() {
+        let packet = poke_packet(2, "123456", "654321").unwrap();
+        assert_eq!(packet.command, 0xed3);
+        assert_eq!(packet.sub_command, 1);
+        assert_eq!(packet.is_reserved, 1);
+        assert_eq!(
+            PokeRequest::decode(packet.body.as_slice()).unwrap(),
+            PokeRequest {
+                uin: 654321,
+                group_uin: 123456,
+                friend_uin: 0,
+                ext: 0
+            }
+        );
+        assert_eq!(
+            hex(&packet.encode_to_vec()),
+            "08d31d1001220808f1f72710c0c4076001"
+        );
+    }
+
+    #[test]
+    fn private_poke_request_fills_the_friend_uin() {
+        let packet = poke_packet(1, "123456", "654321").unwrap();
+        assert_eq!(
+            PokeRequest::decode(packet.body.as_slice()).unwrap(),
+            PokeRequest {
+                uin: 654321,
+                group_uin: 0,
+                friend_uin: 123456,
+                ext: 0
+            }
+        );
+        assert_eq!(
+            hex(&packet.encode_to_vec()),
+            "08d31d1001220808f1f72728c0c4076001"
+        );
+    }
+
+    #[test]
+    fn poke_packet_rejects_unusable_targets() {
+        assert!(poke_packet(2, "123456", "u_abcdef").is_err());
+        assert!(poke_packet(2, "group", "654321").is_err());
+        assert!(poke_packet(2, "0", "654321").is_err());
+        assert!(poke_packet(9, "123456", "654321").is_err());
+    }
+
+    #[test]
+    fn poke_response_reports_envelope_errors() {
+        let accepted = OidbEnvelope {
+            command: 0xed3,
+            sub_command: 1,
+            error_code: 0,
+            body: Vec::new(),
+            error_message: None,
+            is_reserved: 1,
+        };
+        assert!(decode_poke(&accepted.encode_to_vec()).is_ok());
+        let rejected = OidbEnvelope {
+            command: 0xed3,
+            sub_command: 1,
+            error_code: 34,
+            body: Vec::new(),
+            error_message: Some("poke rejected".into()),
+            is_reserved: 1,
+        };
+        assert!(decode_poke(&rejected.encode_to_vec()).is_err());
+    }
 
     #[test]
     fn fetch_rkey_request_has_stable_wire_shape() {

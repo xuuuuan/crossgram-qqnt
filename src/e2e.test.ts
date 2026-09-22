@@ -376,6 +376,29 @@ describe.skipIf(!enabled)('live QQNT bridge E2E', () => {
     }
   }, 180_000)
 
+  // Poking the approved account in its own direct chat is the only live poke
+  // this suite is allowed to make: QQ notices stay inside the bridge account.
+  it('sends a self poke through the approved direct chat', async () => {
+    const conversation = await resolve('direct', allowedDirect) as { id: string, peerUid: string }
+    const response = await fetch(
+      `${base}/conversations/${encodeURIComponent(conversation.id)}/pokes`,
+      {
+        method: 'POST',
+        headers: headers({ 'content-type': 'application/json' }),
+        body: JSON.stringify({ userId: conversation.peerUid, count: 1 }),
+      },
+    )
+    expect(response.status, await response.clone().text()).toBe(200)
+    const result = await response.json() as {
+      count: number
+      message?: { id: string, serviceAction?: { text?: string } }
+    }
+    expect(result.count).toBe(1)
+    if (result.message?.serviceAction) {
+      expect(typeof result.message.serviceAction.text).toBe('string')
+    }
+  })
+
   it('shows the QQ users behind a reaction in an approved group', async () => {
     const conversation = await resolve('group', '1084013940')
     const catalogResponse = await fetch(`${base}/reactions/catalog`, { headers: headers() })
