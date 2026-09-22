@@ -623,7 +623,31 @@ function pngWithSize(width: number, height: number): Buffer {
   ])
 }
 
-/** Minimal writer for the ZIP bundles QQ serves as system face resources. */
+/** Minimal shipped emoji resource tree, which the reaction catalog needs. */
+async function writeEmojiResourceRoot(root: string): Promise<void> {
+  const resourceRoot = join(root, 'global', 'nt_data', 'Emoji', 'emoji-resource')
+  await Promise.all([
+    mkdir(join(resourceRoot, 'sysface_res', 'static'), { recursive: true }),
+    mkdir(join(resourceRoot, 'sysface_res', 'apng'), { recursive: true }),
+    mkdir(join(resourceRoot, 'emoji_res'), { recursive: true }),
+  ])
+  await writeFile(join(resourceRoot, 'face_config.json'), JSON.stringify({ emoji: [], sysface: [] }))
+}
+/** Minimal animated PNG: the static layout plus the acTL chunk QQ ships. */
+function apngWithSize(width: number, height: number): Buffer {
+  const png = pngWithSize(width, height)
+  const animation = Buffer.alloc(8)
+  animation.writeUInt32BE(2, 0)
+  const header = Buffer.alloc(8)
+  header.writeUInt32BE(animation.length, 0)
+  header.write('acTL', 4, 'latin1')
+  // The inserted chunk belongs after the signature and the IHDR chunk.
+  const ihdrEnd = 8 + 8 + 13 + 4
+  return Buffer.concat([
+    png.subarray(0, ihdrEnd), header, animation, Buffer.alloc(4), png.subarray(ihdrEnd),
+  ])
+}
+
 function zipFaceBundle(entries: ReadonlyArray<[string, Buffer]>): Buffer {
   const locals: Buffer[] = []
   const centrals: Buffer[] = []
@@ -1791,6 +1815,181 @@ describe('QQKernelBridge', () => {
         url: 'https://face.qq.example/476.png', width: 320, height: 180,
       },
     } }])
+  })
+
+  it('serves a system face from the local download cache with its exact size', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'qqnt-face-cache-'))
+    tempPaths.push(root)
+    const accountPath = join(root, 'account')
+    const cacheRoot = join(accountPath, 'nt_data', 'Emoji', 'BaseEmojiSyastems', 'EmojiSystermResource')
+    const animatedFace = apngWithSize(240, 240)
+    const resourceRoot = join(root, 'global', 'nt_data', 'Emoji', 'emoji-resource')
+    await Promise.all([
+      mkdir(join(resourceRoot, 'sysface_res', 'static'), { recursive: true }),
+      mkdir(join(resourceRoot, 'emoji_res'), { recursive: true }),
+      mkdir(join(cacheRoot, '506', 'apng'), { recursive: true }),
+    ])
+    await writeFile(join(resourceRoot, 'face_config.json'), JSON.stringify({ emoji: [], sysface: [] }))
+    await writeFile(join(cacheRoot, '506', 'apng', '506.png'), animatedFace)
+    const bridge = new QQKernelBridge()
+    const f = fixture()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: accountPath })
+    vi.spyOn(bridge as any, 'packetClientForSession').mockReturnValue({
+      getSysFaces: async () => [], getSysFace: async () => undefined,
+    })
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('the cache must not reach the CDN') }))
+
+    const reference = { kind: 'sysface' as const, faceId: '506', faceType: 3, name: '/捡到宝了', animated: true as const }
+    const asset = await bridge.openSticker(reference)
+    expect(asset).toMatchObject({ mimeType: 'image/apng', size: animatedFace.length })
+    expect(await readStream(asset.stream)).toEqual(animatedFace)
+    const meta = await bridge.resolveStickerAssetMeta(reference)
+    expect(meta).toMatchObject({
+      size: animatedFace.length, mimeType: 'image/apng', source: 'path', width: 240, height: 240,
+    })
+    expect(meta!.version).toBeGreaterThan(0)
+    expect(await bridge.listFaceCatalog()).toEqual([
+      expect.objectContaining({ faceId: '506', source: 'local', mimeType: 'image/apng' }),
+    ])
+    expect(JSON.stringify(await bridge.listFaceCatalog())).not.toContain(root)
+  })
+
+  it('unwraps the animated bundle a catalog face advertises', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'qqnt-face-bundle-'))
+    tempPaths.push(root)
+    const accountPath = join(root, 'account')
+    await writeEmojiResourceRoot(root)
+    const staticFace = pngWithSize(240, 240)
+    const animatedFace = apngWithSize(240, 240)
+    const bundle = zipFaceBundle([
+      ['506/png/506.png', staticFace],
+      ['506/apng/506.png', animatedFace],
+      ['506/lottie/506.json', Buffer.from('{"v":"5.7.0"}')],
+    ])
+    const addon = packetAddonFixture()
+    addon.encodeFetchSysFacesRequest = vi.fn(() => ({
+      command: 'OidbSvcTrpcTcp.0x9154_1', payload: Buffer.from('catalog-request'),
+    }))
+    addon.decodeFetchSysFacesResponse = vi.fn(() => [{
+      faceId: '506', name: '/捡到宝了', url: 'https://face.qq.example/506_base_1790000000.zip',
+      aniStickerType: 2, aniStickerPackId: 4, aniStickerId: 108, width: 240, height: 240,
+    }])
+    const f = fixture()
+    f.msg.sendSsoCmdReqByContend = vi.fn(async () => ({
+      result: 0, errMsg: '', rspbuffer: Buffer.from('catalog-response'),
+    }))
+    const requests: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
+      requests.push(String(input))
+      return new Response(bundle, { status: 200, headers: { 'content-type': 'application/zip' } })
+    }))
+    const bridge = new QQKernelBridge({ packetClient: { addon } })
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: accountPath })
+
+    const reference = { kind: 'sysface' as const, faceId: '506', faceType: 3, name: '/捡到宝了', animated: true as const }
+    const asset = await bridge.openSticker(reference)
+    expect(asset).toMatchObject({ mimeType: 'image/apng', size: animatedFace.length })
+    expect(await readStream(asset.stream)).toEqual(animatedFace)
+    // The animated batch address is derived from the catalog address first.
+    expect(requests[0]).toBe('https://face.qq.example/506_adv_1790000000.zip')
+    const meta = await bridge.resolveStickerAssetMeta(reference)
+    expect(meta).toMatchObject({
+      size: animatedFace.length,
+      version: faceAssetVersion(animatedFace),
+      mimeType: 'image/apng',
+      source: 'bundle',
+    })
+    expect(await bridge.listFaceCatalog()).toEqual([
+      expect.objectContaining({
+        faceId: '506', source: 'remote', url: 'https://face.qq.example/506_base_1790000000.zip',
+      }),
+    ])
+  })
+
+  it('rebuilds the bundle address of a face the catalog has never listed', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'qqnt-face-probe-'))
+    tempPaths.push(root)
+    const accountPath = join(root, 'account')
+    await writeEmojiResourceRoot(root)
+    const animatedFace = apngWithSize(300, 300)
+    const bundle = zipFaceBundle([['506/apng/506.png', animatedFace]])
+    const addon = packetAddonFixture()
+    addon.encodeFetchSysFacesRequest = vi.fn(() => ({
+      command: 'OidbSvcTrpcTcp.0x9154_1', payload: Buffer.from('catalog-request'),
+    }))
+    // The catalog stops at face 488: 506 only exists on the CDN side.
+    addon.decodeFetchSysFacesResponse = vi.fn(() => [{
+      faceId: '488', name: '/新脸', url: 'https://face.qq.example/488_base_1790000000.zip',
+      aniStickerType: 2, aniStickerPackId: 4, aniStickerId: 99, width: 300, height: 300,
+    }])
+    const f = fixture()
+    f.msg.sendSsoCmdReqByContend = vi.fn(async () => ({
+      result: 0, errMsg: '', rspbuffer: Buffer.from('catalog-response'),
+    }))
+    const requests: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
+      const url = String(input)
+      requests.push(url)
+      return url === 'https://face.qq.example/506_adv_1790000000.zip'
+        ? new Response(bundle, { status: 200 })
+        : new Response('not found', { status: 404 })
+    }))
+    const bridge = new QQKernelBridge({ packetClient: { addon } })
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: accountPath })
+
+    const reference = { kind: 'sysface' as const, faceId: '506', faceType: 3, name: '/捡到宝了', animated: true as const }
+    const meta = await bridge.resolveStickerAssetMeta(reference)
+    expect(meta).toMatchObject({ size: animatedFace.length, mimeType: 'image/apng', source: 'bundle' })
+    expect(requests).toContain('https://face.qq.example/506_adv_1790000000.zip')
+    const asset = await bridge.openSticker(reference)
+    expect(await readStream(asset.stream)).toEqual(animatedFace)
+    expect(asset).toMatchObject({ mimeType: 'image/apng', size: animatedFace.length })
+  })
+
+  it('merges runtime panel faces that describe their download info inline', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'qqnt-runtime-panels-'))
+    tempPaths.push(root)
+    const resourceRoot = join(root, 'global', 'nt_data', 'Emoji', 'emoji-resource')
+    await Promise.all([
+      mkdir(join(resourceRoot, 'sysface_res', 'static'), { recursive: true }),
+      mkdir(join(resourceRoot, 'emoji_res'), { recursive: true }),
+    ])
+    await writeFile(join(resourceRoot, 'face_config.json'), JSON.stringify({ emoji: [], sysface: [] }))
+    const f = fixture()
+    ;(f.session as any).getBaseEmojiService = () => ({
+      fetchFullSysEmojis: vi.fn(async () => ({
+        result: 0, errMsg: '', rsp: {
+          superPanelResult: {
+            SysEmojiGroupList: [{
+              groupName: '新表情',
+              SysEmojiList: [
+                {
+                  emojiId: '506', describe: '/捡到宝了', aniStickerType: 2, aniStickerPackId: 4, aniStickerId: 108,
+                  downloadBaseEmojiInfo: { baseResDownloadUrl: 'https://face.qq.example/506_base_1790000000.zip' },
+                },
+                { emojiId: '507', describe: '/被发现了', qzoneCode: '10507' },
+              ],
+            }],
+            downloadBaseEmojiInfo: [
+              { emojiId: '507', advancedResDownloadUrl: 'https://face.qq.example/507_adv_1790000000.zip' },
+            ],
+          },
+        },
+      })),
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: join(root, 'account') })
+    vi.spyOn(bridge as any, 'packetClientForSession').mockReturnValue({
+      getSysFaces: async () => [], getSysFace: async () => undefined,
+    })
+
+    const catalog = await bridge.getReactionCatalog()
+    expect(catalog.available.map((definition) => definition.key))
+      .toEqual(expect.arrayContaining(['1:506', '1:507']))
+    expect(await bridge.listFaceCatalog()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ faceId: '506', url: 'https://face.qq.example/506_base_1790000000.zip' }),
+      expect.objectContaining({ faceId: '507', url: 'https://face.qq.example/507_adv_1790000000.zip' }),
+    ]))
   })
 
   it('resolves received group and C2C reply targets when QQNT only exposes sequence metadata', async () => {
@@ -5738,7 +5937,9 @@ describe('QQKernelBridge', () => {
     })
     const bridge = new QQKernelBridge()
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: join(root, 'account') })
-    vi.spyOn(bridge as any, 'packetClientForSession').mockReturnValue({ getSysFaces: async () => [] })
+    vi.spyOn(bridge as any, 'packetClientForSession').mockReturnValue({
+      getSysFaces: async () => [], getSysFace: async () => undefined,
+    })
 
     const catalog = await bridge.getReactionCatalog()
     expect(catalog.available).toHaveLength(1)
@@ -5783,7 +5984,9 @@ describe('QQKernelBridge', () => {
     })
     const bridge = new QQKernelBridge()
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: join(root, 'account') })
-    vi.spyOn(bridge as any, 'packetClientForSession').mockReturnValue({ getSysFaces: async () => [] })
+    vi.spyOn(bridge as any, 'packetClientForSession').mockReturnValue({
+      getSysFaces: async () => [], getSysFace: async () => undefined,
+    })
     await vi.waitFor(async () => expect((await bridge.getReactionCatalog()).available).toHaveLength(3))
 
     const bundles = new Map<string, Buffer>([

@@ -969,6 +969,23 @@ export class QQBridgeServer {
       await pipe(asset.stream, response)
       return
     }
+    if (request.method === 'POST' && path === '/v1/stickers/meta') {
+      const reference = await readJson<QQStickerReference>(request)
+      const meta = await this.bridge.resolveStickerAssetMeta(reference)
+      if (!meta) {
+        json(response, 404, { error: 'sticker asset not found' })
+        return
+      }
+      log('info', `HTTP API sticker meta id=${requestId} size=${meta.size} version=${meta.version} source=${meta.source}`)
+      json(response, 200, meta)
+      return
+    }
+    if (request.method === 'GET' && path === '/v1/faces/catalog') {
+      const faces = await this.bridge.listFaceCatalog()
+      log('info', `HTTP API face catalog id=${requestId} faces=${faces.length}`)
+      json(response, 200, { faces })
+      return
+    }
     if (request.method === 'POST' && path === '/v1/reactions/meta') {
       const locator = await readJson<{ reactionKey?: string }>(request)
       const meta = locator.reactionKey

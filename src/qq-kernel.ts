@@ -9,7 +9,7 @@ import { types } from 'node:util'
 import { AsyncQueue, deferred } from './async.js'
 import {
   faceAssetVersion, isZipPayload, resolveFaceAssetImage, resolveFaceAssetMetaFromDirectory, sniffFaceImage,
-  type FaceAssetMimeType, type FaceAssetTarget,
+  type FaceAssetImage, type FaceAssetMimeType, type FaceAssetTarget,
 } from './face-asset-bundle.js'
 import { markBridgeListener, observeAVSDKActions } from './listener-tee.js'
 import { log, logPath } from './log.js'
@@ -37,6 +37,12 @@ import {
 
 const REACTION_ASSET_META_TTL_MS = 10 * 60_000
 const REACTION_BUNDLE_TAIL_BYTES = 96 * 1024
+const FACE_ASSET_META_TTL_MS = 10 * 60_000
+/** CDN batch timestamps probed per unknown face before giving up. */
+const MAX_FACE_RESOURCE_PROBE_TIMESTAMPS = 6
+/** Remote face images kept in memory while the relay serves them. */
+const MAX_CACHED_FACE_IMAGES = 64
+const FACE_RESOURCE_SNIFF_BYTES = 64 * 1024
 
 type ReactionAsset = {
   path?: string
@@ -46,6 +52,34 @@ type ReactionAsset = {
 
 /** Largest single poke burst a caller may request. */
 export const QQ_POKE_MAX_COUNT = 10
+
+/**
+ * A system-face image the relay can serve.
+ *
+ * Path entries stream from disk (the shipped resource tree or QQ's own download
+ * cache) while byte entries are unwrapped CDN bundles. Message stickers must
+ * publish the size of exactly what they serve, so both flavors carry their own
+ * length and content identity.
+ */
+type FacePathAsset = {
+  kind: 'path'
+  path: string
+  mimeType: FaceAssetMimeType
+  size: number
+  version: number
+  width?: number
+  height?: number
+}
+
+type FaceAssetEntry = FacePathAsset | {
+  kind: 'bytes'
+  bytes: Buffer
+  mimeType: FaceAssetMimeType
+  size: number
+  version: number
+  width?: number
+  height?: number
+}
 
 /** Size and content identity of the bytes a reaction key serves. */
 export type ReactionAssetMetadata = {
@@ -411,6 +445,11 @@ export class QQKernelBridge {
   private readonly reactionAssets = new Map<string, ReactionAsset>()
   private readonly reactionRemoteCache = new Map<string, { bytes: Buffer, version: number }>()
   private readonly reactionAssetMetadata = new Map<string, { meta: ReactionAssetMetadata, resolvedAt: number }>()
+  private readonly faceAssetEntries = new Map<string, { entry: FaceAssetEntry, resolvedAt: number }>()
+  private readonly faceAssetLookups = new Map<string, Promise<FaceAssetEntry | undefined>>()
+  private readonly faceRemoteImages = new Map<string, { url: string, image: FaceAssetImage }>()
+  private readonly faceResourceUrlOverrides = new Map<string, string>()
+  private localFaceRoots?: { resource?: string, caches: string[] }
   private reactionCatalogPromise?: Promise<void>
   private reactionEventSequence = 0
   private messageEditEventSequence = 0
@@ -762,6 +801,11 @@ export class QQKernelBridge {
     this.reactionAssets.clear()
     this.reactionRemoteCache.clear()
     this.reactionAssetMetadata.clear()
+    this.faceAssetEntries.clear()
+    this.faceAssetLookups.clear()
+    this.faceRemoteImages.clear()
+    this.faceResourceUrlOverrides.clear()
+    this.localFaceRoots = undefined
     this.reactionCatalogPromise = undefined
     this.stickerPacks.clear()
     this.stickerPackInfo.clear()
@@ -895,6 +939,11 @@ export class QQKernelBridge {
     this.reactionAssets.clear()
     this.reactionRemoteCache.clear()
     this.reactionAssetMetadata.clear()
+    this.faceAssetEntries.clear()
+    this.faceAssetLookups.clear()
+    this.faceRemoteImages.clear()
+    this.faceResourceUrlOverrides.clear()
+    this.localFaceRoots = undefined
     this.clearVoiceCache()
   }
 
@@ -2243,11 +2292,9 @@ export class QQKernelBridge {
     if (reference.kind === 'sysface') {
       const resolved = reference.url
         ? undefined
-        : await this.packetClientForSession().getSysFace(reference.faceId)
-      const url = reference.url || resolved?.url
-      if (!url) throw new Error(`QQ system face resource is unavailable: ${reference.faceId}`)
+        : await this.packetClientForSession().getSysFace(reference.faceId).catch(() => undefined)
       if (resolved) {
-        reference.url = resolved.url
+        if (resolved.url) reference.url = resolved.url
         reference.name ||= resolved.name
         reference.packId ??= String(resolved.aniStickerPackId)
         reference.stickerId ??= String(resolved.aniStickerId)
@@ -2255,14 +2302,21 @@ export class QQKernelBridge {
         reference.width ??= positiveInteger(resolved.width, 240)
         reference.height ??= positiveInteger(resolved.height, 240)
       }
-      const response = await fetch(url)
-      if (!response.ok || !response.body) {
-        throw new Error(`QQ system face download failed: ${response.status}`)
-      }
+      const entry = await this.resolveFaceAssetEntry(reference.faceId, {
+        animated: reference.animated === true,
+        url: reference.url,
+      })
+      if (!entry) throw new Error(`QQ system face resource is unavailable: ${reference.faceId}`)
+      reference.width ??= entry.width
+      reference.height ??= entry.height
+      // Face bundles arrive as ZIP archives; the entry always carries the
+      // wrapped image, so clients never receive an archive to decode.
       return {
-        stream: Readable.fromWeb(response.body),
-        mimeType: systemFaceMimeType(url, response.headers.get('content-type')),
-        size: numberOrUndefined(response.headers.get('content-length') ?? undefined),
+        stream: entry.kind === 'path'
+          ? fileStream(entry.path, false)
+          : Readable.from(entry.bytes),
+        mimeType: entry.mimeType,
+        size: entry.size,
       }
     }
     if (reference.kind === 'favorite') {
@@ -3613,6 +3667,303 @@ export class QQKernelBridge {
       log('warn', `QQ face bundle for ${reactionKey} carried no usable image; serving the archive`)
     }
     return payload
+  }
+
+  /**
+   * Publishes the exact size and content identity of the image a QQ system face
+   * serves, so Telegram documents can schedule the right download.
+   *
+   * Telegram reads Document.size to schedule sticker and custom-emoji downloads
+   * and caches the bytes by document identity. QQ hands faces out as ZIP
+   * archives that no client can decode, and it exposes newer faces only through
+   * the runtime panel catalog, so the relay resolves both the wrapped image and
+   * its length here instead of trusting the advertised catalog metadata.
+   */
+  async resolveStickerAssetMeta(reference: QQStickerReference): Promise<{
+    size: number
+    version: number
+    mimeType: string
+    width?: number
+    height?: number
+    source: 'path' | 'bundle'
+  } | undefined> {
+    if (reference.kind !== 'sysface') return undefined
+    const faceId = String(reference.faceId ?? '').trim()
+    if (!faceId) return undefined
+    const entry = await this.resolveFaceAssetEntry(faceId, {
+      animated: reference.animated === true,
+      url: reference.url,
+    })
+    if (!entry) return undefined
+    return {
+      size: entry.size,
+      version: entry.version,
+      mimeType: entry.mimeType,
+      ...(entry.width === undefined ? {} : { width: entry.width }),
+      ...(entry.height === undefined ? {} : { height: entry.height }),
+      source: entry.kind === 'path' ? 'path' : 'bundle',
+    }
+  }
+
+  /** Diagnostics: the system faces this process resolves today, and from where. */
+  async listFaceCatalog(): Promise<Array<{
+    faceId: string
+    name?: string
+    source: 'local' | 'remote'
+    mimeType?: string
+    url?: string
+  }>> {
+    await this.getReactionCatalog().catch(() => undefined)
+    const faces: Array<{
+      faceId: string
+      name?: string
+      source: 'local' | 'remote'
+      mimeType?: string
+      url?: string
+    }> = []
+    for (const [key, asset] of this.reactionAssets) {
+      const faceId = systemFaceIdFromReactionKey(key)
+      if (!faceId) continue
+      const definition = this.reactionByKey.get(key)
+      const local = this.localFaceAsset(faceId, this.reactionAssetTarget(key))
+      const mimeType = local?.mimeType ?? asset.mimeType
+      faces.push({
+        faceId,
+        ...(definition?.title ? { name: definition.title } : {}),
+        source: local ? 'local' : 'remote',
+        ...(mimeType ? { mimeType } : {}),
+        ...(asset.url ? { url: asset.url } : {}),
+      })
+    }
+    return faces.sort((left, right) => Number(left.faceId) - Number(right.faceId))
+  }
+
+  /**
+   * Resolves the image of a QQ system face, wherever QQ currently keeps it.
+   *
+   * QQ exposes face images through three unrelated places and a client can send
+   * a face that only one of them knows about: the shipped sysface_res tree, the
+   * account's downloaded EmojiSystermResource cache, and CDN ZIP bundles whose
+   * addresses come from the system-face catalog. Every lookup funnels through
+   * here so message stickers and reaction cells always describe the same bytes.
+   */
+  private async resolveFaceAssetEntry(
+    faceId: string,
+    options: { animated?: boolean, url?: string } = {},
+  ): Promise<FaceAssetEntry | undefined> {
+    const cached = this.faceAssetEntries.get(faceId)
+    if (cached && Date.now() - cached.resolvedAt <= FACE_ASSET_META_TTL_MS) return cached.entry
+    const pending = this.faceAssetLookups.get(faceId)
+    if (pending) return pending
+    let lookup!: Promise<FaceAssetEntry | undefined>
+    lookup = this.lookupFaceAssetEntry(faceId, options).finally(() => {
+      if (this.faceAssetLookups.get(faceId) === lookup) this.faceAssetLookups.delete(faceId)
+    })
+    this.faceAssetLookups.set(faceId, lookup)
+    const entry = await lookup
+    if (entry) this.faceAssetEntries.set(faceId, { entry, resolvedAt: Date.now() })
+    return entry
+  }
+
+  private async lookupFaceAssetEntry(
+    faceId: string,
+    options: { animated?: boolean, url?: string },
+  ): Promise<FaceAssetEntry | undefined> {
+    const target = this.reactionAssetTarget(reactionKey('1', faceId))
+    const local = this.localFaceAsset(faceId, target)
+    if (local) return local
+    if (!this.reactionDefinitions.length) await this.getReactionCatalog().catch(() => undefined)
+    for (const url of this.faceResourceUrls(faceId, options)) {
+      const image = await this.fetchFaceResourceImage(faceId, url, { ...target, animated: options.animated })
+      if (!image) continue
+      this.faceResourceUrlOverrides.set(faceId, url)
+      return {
+        kind: 'bytes',
+        bytes: image.bytes,
+        mimeType: image.mimeType,
+        size: image.bytes.length,
+        version: faceAssetVersion(image.bytes),
+        ...(image.width === undefined ? {} : { width: image.width }),
+        ...(image.height === undefined ? {} : { height: image.height }),
+      }
+    }
+    return undefined
+  }
+
+  /**
+   * Serves the face images already on disk, preferring the shipped resource
+   * tree and the account's own download cache over any network round trip.
+   */
+  private localFaceAsset(faceId: string, target: FaceAssetTarget = {}): FacePathAsset | undefined {
+    for (const path of this.localFaceFileCandidates(faceId, target)) {
+      const info = statSync(path, { throwIfNoEntry: false })
+      if (!info?.size) continue
+      const sniffed = faceImageMimeType(path)
+      if (!sniffed) continue
+      return {
+        kind: 'path',
+        path,
+        mimeType: sniffed.mimeType,
+        size: info.size,
+        version: Math.trunc(info.mtimeMs),
+        ...(sniffed.width === undefined ? {} : { width: sniffed.width }),
+        ...(sniffed.height === undefined ? {} : { height: sniffed.height }),
+      }
+    }
+    return undefined
+  }
+
+  /** Candidate face files on disk, most authoritative first. */
+  private localFaceFileCandidates(faceId: string, target: FaceAssetTarget = {}): string[] {
+    if (!/^\d{1,12}$/.test(faceId)) return []
+    const variant = faceGeometryIsSquare(target.width, target.height) ? '' : '_0'
+    const alternative = variant === '' ? '_0' : ''
+    const candidates: string[] = []
+    const resourceRoot = this.localFaceResourceRoot()
+    if (resourceRoot) {
+      candidates.push(
+        join(resourceRoot, 'apng', `s${faceId}.png`),
+        join(resourceRoot, 'static', `s${faceId}.png`),
+      )
+    }
+    for (const root of this.localFaceCacheRoots()) {
+      candidates.push(
+        join(root, faceId, 'apng', `${faceId}${variant}.png`),
+        join(root, faceId, 'png', `${faceId}${variant}.png`),
+        join(root, faceId, 'apng', `${faceId}${alternative}.png`),
+        join(root, faceId, 'png', `${faceId}${alternative}.png`),
+      )
+    }
+    return candidates.filter((path) => existsSync(path))
+  }
+
+  /**
+   * CDN addresses to try for a face.
+   *
+   * The catalog only lists the faces this QQ build knows, so the batches the
+   * account already downloaded are rebuilt for the requested id as well: QQ
+   * publishes face bundles in batches that share one path and timestamp, which
+   * is how a face sent by a newer client than the headless QQ relay stays
+   * reachable.
+   */
+  private faceResourceUrls(
+    faceId: string,
+    options: { animated?: boolean, url?: string },
+  ): string[] {
+    const urls: string[] = []
+    const push = (url: string | undefined) => {
+      if (url && !urls.includes(url)) urls.push(url)
+    }
+    const animated = options.animated === true
+    for (const source of [
+      options.url,
+      this.faceResourceUrlOverrides.get(faceId),
+      this.reactionAssets.get(reactionKey('1', faceId))?.url,
+    ]) {
+      if (!source) continue
+      // QQ wraps the animated face in an `adv` bundle and its static fallback
+      // in the `base` bundle, so the requested flavor is tried first.
+      const animatedUrl = advancedFaceResourceUrl(source)
+      if (animated) push(animatedUrl)
+      push(source)
+      if (!animated) push(animatedUrl)
+    }
+    for (const candidate of faceResourceProbeUrls(faceId, animated, this.knownFaceResourceUrls())) {
+      push(candidate)
+    }
+    return urls
+  }
+
+  private knownFaceResourceUrls(): string[] {
+    const urls = new Set<string>(this.faceResourceUrlOverrides.values())
+    for (const asset of this.reactionAssets.values()) if (asset.url) urls.add(asset.url)
+    return [...urls]
+  }
+
+  private localFaceResourceRoot(): string | undefined {
+    this.localFaceRoots ??= this.findLocalFaceRoots()
+    return this.localFaceRoots.resource
+  }
+
+  private localFaceCacheRoots(): string[] {
+    this.localFaceRoots ??= this.findLocalFaceRoots()
+    return this.localFaceRoots.caches
+  }
+
+  private findLocalFaceRoots(): { resource?: string, caches: string[] } {
+    const resources = new Set<string>()
+    const caches = new Set<string>()
+    const add = (base: string | undefined) => {
+      if (!base) return
+      for (const prefix of ['global', 'qqnt-bridge-injection/global', '']) {
+        const baseDir = prefix ? join(base, prefix) : base
+        resources.add(join(baseDir, 'nt_data', 'Emoji', 'emoji-resource', 'sysface_res'))
+        caches.add(join(baseDir, 'nt_data', 'Emoji', 'BaseEmojiSyastems', 'EmojiSystermResource'))
+      }
+      resources.add(join(base, 'Emoji', 'emoji-resource', 'sysface_res'))
+      caches.add(join(base, 'Emoji', 'BaseEmojiSyastems', 'EmojiSystermResource'))
+    }
+    add(process.env.XDG_CONFIG_HOME)
+    add(process.env.HOME ? join(process.env.HOME, '.config') : undefined)
+    let current = this.config?.userPath
+    for (let depth = 0; depth < 8 && current; depth++) {
+      add(current)
+      const parent = dirname(current)
+      if (parent === current) break
+      current = parent
+    }
+    return {
+      resource: [...resources].find((candidate) => existsSync(candidate)),
+      caches: [...caches].filter((candidate) => existsSync(candidate)),
+    }
+  }
+
+  /**
+   * Downloads a face bundle and unwraps the image it wraps. QQ serves the same
+   * resources as ZIP archives whose entries are named <id>/<format>/<id>.png,
+   * so relaying the archive verbatim leaves clients unable to decode the face.
+   */
+  private async fetchFaceResourceImage(
+    faceId: string,
+    url: string,
+    target: FaceAssetTarget,
+  ): Promise<FaceAssetImage | undefined> {
+    const cached = this.faceRemoteImages.get(faceId)
+    if (cached && cached.url === url) return cached.image
+    let image: FaceAssetImage | undefined
+    try {
+      const response = await fetch(url)
+      if (!response.ok) return undefined
+      const payload = Buffer.from(await response.arrayBuffer())
+      if (!payload.length) return undefined
+      image = resolveFaceAssetImage(payload, { ...target, faceId })
+      if (!image && !isZipPayload(payload)) {
+        // Non-archive payloads stay opaque: QQ occasionally serves a bare image
+        // whose type only the transport knows.
+        image = sniffFaceImage(payload) ?? {
+          bytes: payload,
+          mimeType: faceResponseMimeType(url, response.headers.get('content-type')),
+        }
+      }
+      if (!image) {
+        log('warn', `QQ face bundle for ${faceId} carried no usable image url=${url}`)
+        return undefined
+      }
+    } catch (error) {
+      log('warn', `remote QQ face asset unavailable face=${faceId} url=${url}`, error)
+      return undefined
+    }
+    this.rememberFaceRemoteImage(faceId, url, image)
+    return image
+  }
+
+  private rememberFaceRemoteImage(faceId: string, url: string, image: FaceAssetImage): void {
+    this.faceRemoteImages.set(faceId, { url, image })
+    while (this.faceRemoteImages.size > MAX_CACHED_FACE_IMAGES) {
+      const oldest = this.faceRemoteImages.keys().next()
+      if (oldest.done) break
+      this.faceRemoteImages.delete(oldest.value)
+    }
   }
 
   async getMessageReactions(
@@ -6798,6 +7149,40 @@ export class QQKernelBridge {
       })
       assets.set(key, { url: face.url, mimeType: 'image/png' })
     }
+    // QQ renders the base emoji system resources from its own download cache
+    // under the account directory, in the same <id>/<format>/<id>.png layout
+    // the CDN bundles wrap. Those files are the authoritative bytes for faces
+    // newer than the shipped face_config.json, so a face the account already
+    // downloaded is served from disk instead of from its CDN address.
+    for (const cacheRoot of this.localFaceCacheRoots()) {
+      for (const faceId of await localFaceCacheIds(cacheRoot)) {
+        const key = reactionKey('1', faceId)
+        const cached = this.localFaceAsset(faceId, this.reactionAssetTarget(key))
+        if (!cached) continue
+        if (!knownKeys.has(key)) {
+          knownKeys.add(key)
+          const animated = cached.mimeType === 'image/apng'
+          definitions.push({
+            key,
+            title: faceId,
+            presentation: {
+              type: 'custom',
+              alt: '🙂',
+              resource: {
+                version: cached.version,
+                format: animated ? 'video' : 'static',
+                mimeType: animated ? 'video/webm' : 'image/png',
+                width: cached.width ?? 128,
+                height: cached.height ?? 128,
+                size: cached.size,
+                locator: { reactionKey: key },
+              },
+            },
+          })
+        }
+        assets.set(key, { path: cached.path, mimeType: cached.mimeType })
+      }
+    }
     this.reactionDefinitions = definitions
     this.reactionByKey.clear()
     this.reactionAssets.clear()
@@ -8336,7 +8721,57 @@ function sysFaceStickerId(faceId: string): string {
 }
 
 function extractRuntimeSysFaces(value: unknown): NativeSysFace[] {
-  const objects: Record<string, unknown>[] = []
+  const objects = collectRuntimeObjects(value)
+  // Panel download lists carry addresses for faces described elsewhere, so the
+  // address map is built first and every face falls back to it.
+  const urls = new Map<string, string>()
+  for (const object of objects) {
+    const faceId = runtimeFaceId(object)
+    const url = runtimeFaceUrl(object)
+    if (faceId && url) urls.set(faceId, url)
+  }
+
+  const faces = new Map<string, NativeSysFace>()
+  for (const object of objects) {
+    const faceId = runtimeFaceId(object)
+    const name = firstNonEmptyString(
+      object.describe, object.Describe, object.qDes, object.QDes, object.name, object.Name,
+    )
+    // Records without a label only contribute an address for a face that is
+    // described elsewhere in the panel payload.
+    if (!faceId || !name) continue
+    const entry: NativeSysFace = {
+      faceId,
+      name,
+      url: runtimeFaceUrl(object) ?? urls.get(faceId) ?? '',
+      aniStickerType: firstFiniteNumber(object.aniStickerType, object.AniStickerType, object.stickerType),
+      aniStickerPackId: firstFiniteNumber(object.aniStickerPackId, object.AniStickerPackId, object.packId),
+      aniStickerId: firstFiniteNumber(object.aniStickerId, object.AniStickerId, object.stickerId),
+      width: firstFiniteNumber(object.animationWidth, object.AniStickerWidth, object.width, object.Width),
+      height: firstFiniteNumber(
+        object.animationHeigh, object.animationHeight, object.AniStickerHeight, object.height, object.Height,
+      ),
+    }
+    const known = faces.get(faceId)
+    faces.set(faceId, known
+      ? {
+          ...known,
+          name: known.name || entry.name,
+          url: known.url || entry.url,
+          aniStickerType: known.aniStickerType || entry.aniStickerType,
+          aniStickerPackId: known.aniStickerPackId || entry.aniStickerPackId,
+          aniStickerId: known.aniStickerId || entry.aniStickerId,
+          width: known.width || entry.width,
+          height: known.height || entry.height,
+        }
+      : entry)
+  }
+  return [...faces.values()]
+}
+
+/** Every object reachable from a runtime panel response. */
+function collectRuntimeObjects(value: unknown): Array<Record<string, unknown>> {
+  const objects: Array<Record<string, unknown>> = []
   const visit = (node: unknown): void => {
     if (Array.isArray(node)) {
       for (const item of node) visit(item)
@@ -8347,42 +8782,41 @@ function extractRuntimeSysFaces(value: unknown): NativeSysFace[] {
     }
   }
   visit(value)
+  return objects
+}
 
-  const urls = new Map<string, string>()
-  for (const object of objects) {
-    const id = firstNonEmptyString(object.emojiId, object.QSid)
-    const url = firstNonEmptyString(object.baseResDownloadUrl, object.advancedResDownloadUrl, object.url)
-    if (id && url) urls.set(id, url)
+/** The face id a runtime panel record describes, when it describes one. */
+function runtimeFaceId(object: Record<string, unknown>): string | undefined {
+  for (const value of [object.emojiId, object.emojiID, object.QSid, object.qSid]) {
+    if (typeof value === 'string' && value.length) return value.trim()
+    if (typeof value === 'number' && Number.isFinite(value)) return String(value)
   }
+  // Some panels only carry the anonymous face id, which QQ keeps numeric.
+  for (const value of [object.faceId, object.FaceId]) {
+    if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) return String(value)
+    if (typeof value === 'string' && /^\d{1,12}$/.test(value)) return value
+  }
+  return undefined
+}
 
-  const faces = new Map<string, NativeSysFace>()
-  for (const object of objects) {
-    const list = object.SysEmojiList
-    if (!Array.isArray(list)) continue
-    for (const raw of list) {
-      if (!raw || typeof raw !== 'object') continue
-      const item = raw as Record<string, unknown>
-      const faceId = firstNonEmptyString(item.emojiId, item.QSid)
-      if (!faceId) continue
-      const url = firstNonEmptyString(
-        item.baseResDownloadUrl,
-        item.advancedResDownloadUrl,
-        item.url,
-        urls.get(faceId),
-      ) ?? ''
-      faces.set(faceId, {
-        faceId,
-        name: firstNonEmptyString(item.describe, item.QDes, item.name) ?? '',
-        url,
-        aniStickerType: firstFiniteNumber(item.aniStickerType, item.AniStickerType),
-        aniStickerPackId: firstFiniteNumber(item.aniStickerPackId, item.AniStickerPackId),
-        aniStickerId: firstFiniteNumber(item.aniStickerId, item.AniStickerId),
-        width: firstFiniteNumber(item.animationWidth, item.AniStickerWidth),
-        height: firstFiniteNumber(item.animationHeigh, item.AniStickerHeight),
-      })
-    }
+/** The download address a runtime panel record advertises. */
+function runtimeFaceUrl(object: Record<string, unknown>): string | undefined {
+  for (const nested of [object.downloadBaseEmojiInfo, object.url]) {
+    if (!nested || typeof nested !== 'object') continue
+    const url = firstNonEmptyString(
+      (nested as Record<string, unknown>).baseResDownloadUrl,
+      (nested as Record<string, unknown>).advancedResDownloadUrl,
+      (nested as Record<string, unknown>).baseUrl,
+      (nested as Record<string, unknown>).advUrl,
+      (nested as Record<string, unknown>).url,
+    )
+    if (url) return url
   }
-  return [...faces.values()]
+  return firstNonEmptyString(
+    object.baseResDownloadUrl, object.advancedResDownloadUrl, object.downloadedBaseUrl,
+    object.downloadedAdvanceUrl, object.baseUrl, object.advUrl, object.base_url, object.adv_url,
+    typeof object.url === 'string' ? object.url : undefined,
+  )
 }
 
 function firstNonEmptyString(...values: unknown[]): string | undefined {
@@ -8395,6 +8829,91 @@ function firstFiniteNumber(...values: unknown[]): number {
     if (Number.isFinite(number)) return number
   }
   return 0
+}
+
+/**
+ * Rebuilds the CDN addresses of faces this QQ build no longer lists.
+ *
+ * QQ publishes face bundles in batches whose members share one path and
+ * timestamp (a <prefix>/<id>_adv_<ts>.zip address), so the newest batches the
+ * account already knows are enough to rebuild the address of a face it has
+ * never seen. Faces sent by newer clients than the headless relay runs are
+ * exactly that case, and the probe is what keeps them reachable.
+ */
+function faceResourceProbeUrls(
+  faceId: string,
+  animated: boolean,
+  knownUrls: readonly string[],
+): string[] {
+  const batches = new Map<string, Set<number>>()
+  for (const url of knownUrls) {
+    const match = /^(.*\/)\d+_(?:base|adv)_(\d+)\.zip$/i.exec(url)
+    if (!match) continue
+    const timestamps = batches.get(match[1]!) ?? new Set<number>()
+    timestamps.add(Number(match[2]))
+    batches.set(match[1]!, timestamps)
+  }
+  const candidates: string[] = []
+  for (const [prefix, timestamps] of batches) {
+    const newest = [...timestamps].sort((left, right) => right - left)
+      .slice(0, MAX_FACE_RESOURCE_PROBE_TIMESTAMPS)
+    for (const timestamp of newest) {
+      for (const suffix of animated ? ['adv', 'base'] : ['base', 'adv']) {
+        candidates.push(`${prefix}${faceId}_${suffix}_${timestamp}.zip`)
+      }
+    }
+  }
+  return candidates
+}
+
+/** The animated variant of a face bundle address, when there is one. */
+function advancedFaceResourceUrl(url: string): string | undefined {
+  return /_base_\d+\.zip$/i.test(url) ? url.replace(/_base_(\d+)\.zip$/i, '_adv_$1.zip') : undefined
+}
+
+/** Sniffed type and intrinsic size of a face image already on disk. */
+function faceImageMimeType(path: string): {
+  mimeType: FaceAssetMimeType
+  width?: number
+  height?: number
+} | undefined {
+  let handle: number | undefined
+  try {
+    handle = openSync(path, 'r')
+    const header = Buffer.alloc(FACE_RESOURCE_SNIFF_BYTES)
+    const length = readSync(handle, header, 0, header.length, 0)
+    return sniffFaceImage(header.subarray(0, length))
+  } catch {
+    return undefined
+  } finally {
+    if (handle !== undefined) closeSync(handle)
+  }
+}
+
+/** Numeric ids QQ downloaded into its own system-emoji resource cache. */
+async function localFaceCacheIds(root: string): Promise<string[]> {
+  try {
+    return (await readdir(root)).filter((entry) => /^\d{1,12}$/.test(entry))
+  } catch {
+    return []
+  }
+}
+
+/** True when a face advertises square geometry, which selects the inline entry. */
+function faceGeometryIsSquare(width: number | undefined, height: number | undefined): boolean {
+  if (!width || !height || width <= 0 || height <= 0) return true
+  return Math.abs(Math.log(width / height)) < 0.05
+}
+
+/** Image type of a face payload, mirroring QQ's own transport hints. */
+function faceResponseMimeType(url: string, contentType: string | null | undefined): FaceAssetMimeType {
+  const normalized = contentType?.split(';', 1)[0]?.trim().toLowerCase()
+  if (normalized === 'image/png' || normalized === 'image/apng'
+    || normalized === 'image/gif' || normalized === 'image/webp') return normalized
+  if (/\.gif(?:$|[?#])/i.test(url)) return 'image/gif'
+  if (/\.webp(?:$|[?#])/i.test(url)) return 'image/webp'
+  if (/\.png(?:$|[?#])/i.test(url)) return 'image/png'
+  return 'image/apng'
 }
 
 function systemFaceMimeType(url: string, contentType: string | null | undefined): string {

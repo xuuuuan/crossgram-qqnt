@@ -78,6 +78,94 @@ describe.skipIf(!enabled)('live QQNT bridge E2E', () => {
     }
   }, 180_000)
 
+  it('serves every resolvable system face as a decodable image with a matching size', async () => {
+    const catalogResponse = await fetch(`${base}/faces/catalog`, { headers: headers() })
+    expect(catalogResponse.status, await catalogResponse.clone().text()).toBe(200)
+    const catalog = await catalogResponse.json() as {
+      faces: Array<{ faceId: string, name?: string, source: string, mimeType?: string, url?: string }>
+    }
+    expect(catalog.faces.length, 'expected the relay to resolve QQ system faces').toBeGreaterThan(0)
+
+    // Sampled faces must serve the wrapped image itself (never the ZIP bundle
+    // QQ hands out) under the size the meta endpoint advertises.
+    const sampled = catalog.faces.filter((_, index) => index % 20 === 0).slice(0, 10)
+    for (const face of sampled) {
+      const reference = {
+        kind: 'sysface', faceId: face.faceId, faceType: 3,
+        name: face.name ?? face.faceId, animated: true,
+      }
+      const metaResponse = await fetch(`${base}/stickers/meta`, {
+        method: 'POST', headers: headers({ 'content-type': 'application/json' }),
+        body: JSON.stringify(reference),
+      })
+      expect(metaResponse.status, `${face.faceId}: ${await metaResponse.clone().text()}`).toBe(200)
+      const meta = await metaResponse.json() as {
+        size: number, version: number, mimeType: string, source: string
+      }
+      expect(meta.size, face.faceId).toBeGreaterThan(0)
+      expect(meta.mimeType, face.faceId).toMatch(/^image\//)
+
+      const assetResponse = await fetch(`${base}/stickers/asset`, {
+        method: 'POST', headers: headers({ 'content-type': 'application/json' }),
+        body: JSON.stringify(reference),
+      })
+      expect(assetResponse.status, `${face.faceId}: ${await assetResponse.clone().text()}`).toBe(200)
+      const bytes = Buffer.from(await assetResponse.arrayBuffer())
+      const sniffed = sniffStickerMime(bytes)
+      expect(sniffed, `unrecognized face bytes for ${face.faceId}`).toBeDefined()
+      expect(bytes.length, face.faceId).toBe(meta.size)
+      expect(assetResponse.headers.get('content-type'), face.faceId).toBe(sniffed)
+      expect(meta.mimeType, face.faceId).toBe(sniffed)
+    }
+  }, 300_000)
+
+  it('resolves a relayed system-face sticker from history to real image bytes', async () => {
+    const dialogsResponse = await fetch(`${base}/dialogs?limit=50`, { headers: headers() })
+    expect(dialogsResponse.status, await dialogsResponse.clone().text()).toBe(200)
+    const page = await dialogsResponse.json() as { conversations: Array<{ id: string }> }
+    let reference: Record<string, unknown> | undefined
+    for (const conversation of page.conversations) {
+      const historyResponse = await fetch(
+        `${base}/conversations/${encodeURIComponent(conversation.id)}/history?limit=50`,
+        { headers: headers() },
+      )
+      if (!historyResponse.ok) continue
+      const history = await historyResponse.json() as {
+        messages: Array<{
+          parts: Array<{ type: string, sticker?: { stickerId: string, reference: Record<string, unknown> } }>
+        }>
+      }
+      for (const message of history.messages) {
+        const sticker = message.parts?.find((part) => part.type === 'sticker'
+          && String(part.sticker?.stickerId ?? '').startsWith('sysface:'))
+        if (sticker?.sticker) {
+          reference = sticker.sticker.reference
+          break
+        }
+      }
+      if (reference) break
+    }
+    expect(reference, 'expected a relayed QQ system face sticker in recent history').toBeDefined()
+
+    const metaResponse = await fetch(`${base}/stickers/meta`, {
+      method: 'POST', headers: headers({ 'content-type': 'application/json' }),
+      body: JSON.stringify(reference),
+    })
+    expect(metaResponse.status, await metaResponse.clone().text()).toBe(200)
+    const meta = await metaResponse.json() as { size: number, version: number, mimeType: string, source: string }
+    expect(meta.size).toBeGreaterThan(0)
+
+    const assetResponse = await fetch(`${base}/stickers/asset`, {
+      method: 'POST', headers: headers({ 'content-type': 'application/json' }),
+      body: JSON.stringify(reference),
+    })
+    expect(assetResponse.status, await assetResponse.clone().text()).toBe(200)
+    const bytes = Buffer.from(await assetResponse.arrayBuffer())
+    expect(bytes.length).toBe(meta.size)
+    expect(assetResponse.headers.get('content-type')).toBe(meta.mimeType)
+    expect(sniffStickerMime(bytes)).toBe(meta.mimeType)
+  }, 180_000)
+
   it('keeps a real animated market sticker MIME aligned with the raw asset bytes', async () => {
     const packsResponse = await fetch(`${base}/stickers/packs?limit=100`, { headers: headers() })
     expect(packsResponse.status, await packsResponse.clone().text()).toBe(200)

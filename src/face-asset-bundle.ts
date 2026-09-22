@@ -53,12 +53,18 @@ export interface FaceAssetMeta {
   method: number
 }
 
-/** Geometry the caller advertises for the requested face, when it is known. */
+/** Geometry and animation the caller advertises for the requested face. */
 export interface FaceAssetTarget {
   /** Face id the caller asked for, for example `424` for the key `1:424`. */
   faceId?: string
   width?: number
   height?: number
+  /**
+   * Whether the caller expects an animated face. When the value is known,
+   * entries under an `apng/` directory win (or lose) so the bytes that are
+   * served carry the animation the catalog advertises.
+   */
+  animated?: boolean
 }
 
 export interface FaceAssetCandidate {
@@ -107,6 +113,9 @@ export function rankFaceAssetEntries<T extends FaceAssetCandidate>(
     const suffixed = /_\d+$/.test(stem)
     const related = !faceId || stem === faceId || stem.startsWith(`${faceId}_`)
     const canonical = faceId ? stem === faceId : !suffixed
+    // Bundles wrap the animated face under `apng/` and its static fallback
+    // under `png/`; the advertised animation decides between them.
+    const animated = /(?:^|\/)apng\//i.test(candidate.name)
     return {
       candidate,
       related,
@@ -114,11 +123,13 @@ export function rankFaceAssetEntries<T extends FaceAssetCandidate>(
       // canvas variant; without a known geometry prefer the canonical entry.
       preferred: square ? canonical : related && suffixed,
       canonical,
+      format: target.animated === undefined || target.animated === animated ? 0 : 1,
     }
   })
   ranked.sort((left, right) => {
     if (left.related !== right.related) return left.related ? -1 : 1
     if (left.preferred !== right.preferred) return left.preferred ? -1 : 1
+    if (left.format !== right.format) return left.format - right.format
     if (left.canonical !== right.canonical) return left.canonical ? -1 : 1
     return left.candidate.size - right.candidate.size
   })

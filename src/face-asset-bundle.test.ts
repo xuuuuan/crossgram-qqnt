@@ -151,6 +151,23 @@ describe('face asset bundles', () => {
     expect(pickFaceAssetEntry(entries, {})?.name).toBe('416/png/416.png')
   })
 
+  it('prefers the animated entry when the caller advertises animation', () => {
+    const staticFace = pngBytes(240, 240)
+    const animatedFace = pngBytes(240, 240, { animated: true })
+    const bundle = buildBundle([
+      { name: '506/png/506.png', data: staticFace },
+      { name: '506/apng/506.png', data: animatedFace },
+    ])
+    // Without a hint the deterministic tie break keeps the smaller entry,
+    // which is the static fallback QQ ships next to the animation.
+    expect(resolveFaceAssetImage(bundle, { faceId: '506', width: 240, height: 240 })?.mimeType)
+      .toBe('image/png')
+    expect(resolveFaceAssetImage(bundle, { faceId: '506', width: 240, height: 240, animated: true }))
+      .toMatchObject({ mimeType: 'image/apng', width: 240, height: 240 })
+    expect(resolveFaceAssetImage(bundle, { faceId: '506', width: 240, height: 240, animated: false })?.mimeType)
+      .toBe('image/png')
+  })
+
   it('serves stored entries and reports animated payloads', () => {
     const apng = pngBytes(240, 240, { animated: true })
     const bundle = buildBundle([{ name: '476/apng/476.png', data: apng, stored: true }])
