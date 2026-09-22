@@ -5960,6 +5960,38 @@ describe('QQKernelBridge', () => {
     expect(received).toBe('timeout')
   })
 
+  it('preserves the new session group waiter when an old native getter completes', async () => {
+    vi.useFakeTimers()
+    try {
+      const f = fixture()
+      let finishOld!: (value: unknown) => void
+      f.group.getSingleScreenNotifies.mockImplementationOnce(() => new Promise((resolve) => { finishOld = resolve }))
+        .mockImplementation(async (doubt) => doubt ? { notifies: [] } : { result: 0, errMsg: '' })
+      const bridge = new QQKernelBridge()
+      vi.spyOn(bridge as unknown as { initializePlatformData(): Promise<void> }, 'initializePlatformData').mockResolvedValue()
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'account-a', userPath: '/tmp' })
+      const old = bridge.getRequests('group-join')
+      bridge.attach(f.kernel, f.session, { selfUin: '20000', selfUid: 'account-b', userPath: '/tmp' })
+      const current = bridge.getRequests('group-join')
+      expect(f.group.getSingleScreenNotifies).toHaveBeenCalledTimes(2)
+
+      finishOld({ notifies: [{ seq: 'old', type: 7, status: 1,
+        group: { groupCode: '123' }, user1: { uid: 'account-a-joiner' } }] })
+      await old
+      f.emitGroupRequests(false, [{ seq: 'new', type: 7, status: 1,
+        group: { groupCode: '123' }, user1: { uid: 'account-b-joiner' } }])
+      await Promise.all([
+        expect(current).resolves.toMatchObject({ requests: [{ requester: { id: 'account-b-joiner' } }] }),
+        vi.advanceTimersByTimeAsync(1_500),
+      ])
+      expect(f.group.getSingleScreenNotifies.mock.calls).toEqual([
+        [false, '', 100], [false, '', 100], [true, '', 100],
+      ])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('uses stable non-reversible request IDs', async () => {
     const records = [
       { friendUid: 'uid-secret-one', reqTime: '111', isInitiator: false, isDecide: false },
@@ -6140,6 +6172,64 @@ describe('QQKernelBridge', () => {
       operateType: 1,
       targetMsg: { seq: '1', type: 7, groupCode: '100', postscript: ' ' },
     })
+  })
+
+  it.each([0, '0'])('stops both group queues at terminal cursor %j', async (terminal) => {
+    const f = fixture()
+    f.group.getSingleScreenNotifies.mockImplementation(async (doubt, startSeq) => ({
+      nextStartSeq: startSeq === '' ? 'next' : terminal,
+      notifies: [{ seq: startSeq || 'first', type: 7, status: 1,
+        group: { groupCode: '123' }, user1: { uid: `${doubt}:${startSeq}` } }],
+    }))
+    const bridge = new QQKernelBridge()
+    vi.spyOn(bridge as unknown as { initializePlatformData(): Promise<void> }, 'initializePlatformData').mockResolvedValue()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    expect((await bridge.getRequests('group-join')).requests).toHaveLength(4)
+    expect(f.group.getSingleScreenNotifies.mock.calls).toEqual([
+      [false, '', 100], [false, 'next', 100], [true, '', 100], [true, 'next', 100],
+    ])
+  })
+
+  it.each([false, true])('retries identical group pages after a listener timeout in doubt=%s', async (failingDoubt) => {
+    vi.useFakeTimers()
+    try {
+      const f = fixture()
+      let retry = false
+      f.group.getSingleScreenNotifies.mockImplementation(async (doubt, startSeq) => {
+        if (retry || doubt !== failingDoubt || startSeq === '') {
+          queueMicrotask(() => f.emitGroupRequests(doubt, [{
+            seq: startSeq || 'first', type: 7, status: 1,
+            group: { groupCode: '123' }, user1: { uid: `${doubt}:${startSeq}` },
+          }], startSeq === '' ? 'next' : ''))
+        }
+        return { result: 0, errMsg: '' }
+      })
+      const bridge = new QQKernelBridge()
+      vi.spyOn(bridge as unknown as { initializePlatformData(): Promise<void> }, 'initializePlatformData').mockResolvedValue()
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+      const failed = expect(bridge.getRequests('group-join')).rejects.toThrow('getSingleScreenNotifies listener timed out')
+      await vi.advanceTimersByTimeAsync(1_500)
+      await failed
+
+      retry = true
+      f.group.getSingleScreenNotifies.mockClear()
+      const retried = Promise.all([bridge.getRequests('group-join'), bridge.getRequests('group-join')])
+      await Promise.all([
+        expect(retried).resolves.toMatchObject([
+          { requests: expect.any(Array) }, { requests: expect.any(Array) },
+        ]),
+        vi.advanceTimersByTimeAsync(1_500),
+      ])
+      const [first, second] = await retried
+      expect(first.requests).toHaveLength(4)
+      expect(second.requests).toEqual(first.requests)
+      expect(f.group.getSingleScreenNotifies.mock.calls).toEqual([
+        [false, '', 100], [false, 'next', 100], [true, '', 100], [true, 'next', 100],
+      ])
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('rejects repeated group pagination cursors for either doubt queue', async () => {
@@ -6614,6 +6704,43 @@ describe('QQBridgeServer', () => {
       error: 'QQ remote media cannot be reused without downloading it: remote.bin',
     })
     expect(f.flashUploadFile).not.toHaveBeenCalled()
+  })
+
+  it('recovers group requests over HTTP after a partial callback timeout and stops at zero', async () => {
+    const f = fixture()
+    let retry = false
+    f.group.getSingleScreenNotifies.mockImplementation(async (doubt, startSeq) => {
+      if (retry || !doubt || startSeq === '') {
+        queueMicrotask(() => f.emitGroupRequests(doubt, [{
+          seq: startSeq || 'first', type: 7, status: 1,
+          group: { groupCode: '123' }, user1: { uid: `${doubt}:${startSeq}` },
+        }], startSeq === '' ? 'next' : (retry ? '0' : '')))
+      }
+      return { result: 0, errMsg: '' }
+    })
+    const bridge = new QQKernelBridge()
+    vi.spyOn(bridge as unknown as { initializePlatformData(): Promise<void> }, 'initializePlatformData').mockResolvedValue()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const endpoint = `http://127.0.0.1:${server.address().port}/v1/requests?kind=group-join`
+
+    const failed = await fetch(endpoint)
+    expect(failed.status).toBe(502)
+    await expect(failed.json()).resolves.toEqual({
+      error: expect.stringContaining('getSingleScreenNotifies listener timed out'),
+    })
+    retry = true
+    f.group.getSingleScreenNotifies.mockClear()
+    const recovered = await fetch(endpoint)
+    expect(recovered.status).toBe(200)
+    const page = await recovered.json() as { requests: Array<{ requester: { id: string } }> }
+    expect(page.requests.map((request) => request.requester.id).sort()).toEqual([
+      'false:', 'false:next', 'true:', 'true:next',
+    ])
+    expect(f.group.getSingleScreenNotifies.mock.calls).toEqual([
+      [false, '', 100], [false, 'next', 100], [true, '', 100], [true, 'next', 100],
+    ])
   })
 
   it('returns a non-success response when the initial native request getter fails', async () => {

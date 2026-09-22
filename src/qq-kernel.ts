@@ -719,7 +719,6 @@ export class QQKernelBridge {
     this.activeDoubtRequestIds.clear()
     this.activeGroupRequestPages.clear()
     this.consumedGroupRequestPages.clear()
-    this.groupRequestPageToken = 0
     this.resolveRequestUpdates()
     this.requestRefreshGeneration++
     this.requestAttachmentGeneration++
@@ -4941,6 +4940,7 @@ export class QQKernelBridge {
   private refreshGroupRequests(): Promise<void> {
     if (this.groupRequestSnapshotLoaded) return Promise.resolve()
     if (this.groupRequestRefresh) return this.groupRequestRefresh
+    this.consumedGroupRequestPages.clear()
     const generation = this.requestRefreshGeneration
     const task = this.requestGroupRequests(generation).then(() => {
       if (generation === this.requestRefreshGeneration) this.groupRequestSnapshotLoaded = true
@@ -5044,7 +5044,7 @@ export class QQKernelBridge {
         }
         if (generation !== this.requestRefreshGeneration) return
         const nextStartSeq = page?.nextStartSeq
-        if (!nextStartSeq) break
+        if (!nextStartSeq || nextStartSeq === '0') break
         if (seen.has(nextStartSeq) || seen.size >= 100) {
           throw new QQRequestRefreshError(
             new Error(`group request pagination continuation is invalid doubt=${doubt} nextStartSeq=${JSON.stringify(nextStartSeq)}`),
