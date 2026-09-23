@@ -2033,6 +2033,9 @@ export class QQKernelBridge {
     if (response.result !== 0) throw new Error(`getMultiMsg: ${response.errMsg} (${response.result})`)
     const records = response.msgList.filter((record) => !isRecalledRecord(record))
     const participants = resolveMultiForwardParticipants(locator, records)
+    // QQ archives the original author avatar outside the record's sender
+    // account, so report how many records carried one.
+    log('info', `native API merged-forward avatars conversation=${conversation.id} root=${locator.rootMessageId} records=${records.length} archivedAvatars=${records.filter((record) => record.multiTransInfo?.fromFaceUrl?.trim()).length}`)
     return Promise.all(records.map(async (record) => {
       const participant = participants.get(record)!
       return this.mapMessagePrepared(record, {
@@ -2047,9 +2050,13 @@ export class QQKernelBridge {
           id: participant.id,
           name: participant.name,
           alias: participant.alias,
-          avatar: participant.avatarUin
-            ? qlogoAvatarMedia(participant.id, participant.avatarUin)
-            : undefined,
+          // The archived face URL is per author; the record's own UIN only
+          // ever names the shared placeholder account.
+          avatar: participant.avatarUrl
+            ? directAvatarMedia(participant.id, participant.avatarUrl, participant.avatarUin)
+            : participant.avatarUin
+              ? qlogoAvatarMedia(participant.id, participant.avatarUin)
+              : undefined,
         },
         // A merged-forward transcript is an archive. Even the current QQ
         // account is a participant in that archive, not the live account peer.

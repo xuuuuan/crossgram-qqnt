@@ -3198,6 +3198,59 @@ describe('QQKernelBridge', () => {
     ])
     expect(repeated.map((message) => message.senderId)).toEqual(first.map((message) => message.senderId))
     expect(otherTranscript.map((message) => message.senderId)).not.toEqual(first.map((message) => message.senderId))
+    // Without an archived face URL the placeholder account is all QQ offers,
+    // so the qlogo avatar stays the fallback.
+    expect(first[0]!.sender?.avatar).toMatchObject({
+      id: 'avatar:user:' + first[0]!.senderId,
+      locator: { avatarUin: '1094950020' },
+    })
+  })
+
+  it('prefers the avatar QQ archived beside each merged-forward record', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    await bridge.getDialogs()
+    const forwarded = [
+      {
+        ...f.message, msgId: 'archived-alice-1', senderUid: 'placeholder', senderUin: '1094950020',
+        sendType: 0, sendNickName: 'Alice', sendMemberName: '', avatarMeta: 'avatar-a',
+        multiTransInfo: { status: 1, msgId: 1, friendFlag: 1, fromAnonId: 'anon-alice', fromFaceUrl: 'https://thirdqq.qlogo.cn/avatar/alice/100' },
+      },
+      {
+        ...f.message, msgId: 'archived-alice-2', senderUid: 'placeholder', senderUin: '1094950020',
+        sendType: 0, sendNickName: 'Alice', sendMemberName: '', avatarMeta: 'avatar-a',
+        multiTransInfo: { fromFaceUrl: 'https://thirdqq.qlogo.cn/avatar/alice/100' },
+      },
+      {
+        ...f.message, msgId: 'archived-namesake', senderUid: 'placeholder', senderUin: '1094950020',
+        sendType: 0, sendNickName: 'Alice', sendMemberName: '', avatarMeta: 'avatar-a',
+        multiTransInfo: { fromFaceUrl: 'https://thirdqq.qlogo.cn/avatar/other-alice/100' },
+      },
+      {
+        ...f.message, msgId: 'archived-bob', senderUid: 'placeholder', senderUin: '1094950020',
+        sendType: 0, sendNickName: 'Bob', sendMemberName: '', avatarMeta: 'avatar-b',
+        multiTransInfo: { fromFaceUrl: 'not-a-url' },
+      },
+    ] satisfies MsgRecord[]
+    f.msg.getMultiMsg.mockResolvedValue({ result: 0, errMsg: '', msgList: forwarded })
+    const locator = { conversationId: 'uid-1715311957', rootMessageId: 'merged-archived' }
+
+    const messages = await bridge.getMultiForwardMessages(locator)
+
+    // Records that share the archived avatar stay one participant; the same
+    // name with another archived avatar is another author.
+    expect(messages[0]!.senderId).toBe(messages[1]!.senderId)
+    expect(messages[2]!.senderId).not.toBe(messages[0]!.senderId)
+    expect(messages[0]!.sender?.avatar).toMatchObject({
+      kind: 'image',
+      locator: { avatarUrl: 'https://thirdqq.qlogo.cn/avatar/alice/100' },
+    })
+    expect(messages[2]!.sender?.avatar).toMatchObject({
+      locator: { avatarUrl: 'https://thirdqq.qlogo.cn/avatar/other-alice/100' },
+    })
+    // An unusable archived URL falls back to the placeholder account avatar.
+    expect(messages[3]!.sender?.avatar).toMatchObject({ locator: { avatarUin: '1094950020' } })
   })
 
   it('uses include-self for current QQ direct-chat history', async () => {

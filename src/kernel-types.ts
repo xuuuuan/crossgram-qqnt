@@ -384,6 +384,19 @@ export interface MsgRecord {
   /** Per-record avatar identity retained by QQ for imported/forwarded messages. */
   avatarMeta?: string
   avatarFlag?: number
+  /**
+   * Provenance QQ keeps for the records of one merged forward.  The record's
+   * own sender account is a placeholder shared by unrelated authors, so the
+   * archived author avatar travels here instead.
+   */
+  multiTransInfo?: {
+    status?: number
+    msgId?: number | string
+    friendFlag?: number
+    fromAnonId?: string
+    /** Avatar of the archived author of this record. */
+    fromFaceUrl?: string
+  }
   elements: MsgElement[]
   records?: MsgRecord[]
   emojiLikesList?: Array<{

@@ -7,13 +7,17 @@ export interface MultiForwardParticipant {
   name: string
   alias?: string
   avatarUin?: string
+  /** Avatar QQ archived for this author inside the merged forward. */
+  avatarUrl?: string
 }
 
 /**
  * Resolve the authors of one downloaded merged-forward transcript without
  * trusting its native sender IDs. QQ assigns the same placeholder account to
  * unrelated authors in many imported bundles, so an identity is derived from
- * the record-owned name and avatar evidence instead.
+ * the record-owned name and avatar evidence instead.  That evidence includes
+ * the per-record `multiTransInfo.fromFaceUrl` avatar, which is the only image
+ * QQ keeps for an archived author.
  *
  * IDs are deterministic within one transcript and intentionally differ across
  * transcripts. They can therefore be exposed as temporary peers without ever
@@ -33,11 +37,12 @@ export function resolveMultiForwardParticipants(
 
   for (const record of records) {
     const name = participantName(record)
-    // avatarMeta is the only per-author identity QQ retains for many imported
-    // records. A qlogo reference is still avatar evidence when a real UIN is
-    // available; the name prevents a shared placeholder avatar from merging
-    // unrelated people.
-    const avatarIdentity = record.avatarMeta?.trim()
+    const faceUrl = archivedFaceUrl(record)
+    // avatarMeta and the archived face URL are the per-author identity QQ
+    // retains for imported records. A qlogo reference is still avatar evidence
+    // when a real UIN is available; the name prevents a shared placeholder
+    // avatar from merging unrelated people.
+    const avatarIdentity = [record.avatarMeta?.trim(), faceUrl].filter(Boolean).join('|')
       || (/^\d+$/.test(record.senderUin) ? `qlogo:${record.senderUin}` : '')
     const fingerprint = JSON.stringify([
       normalizeIdentity(name),
@@ -55,6 +60,7 @@ export function resolveMultiForwardParticipants(
         name,
         alias: record.sendMemberName?.trim() || undefined,
         avatarUin: /^\d+$/.test(record.senderUin) ? record.senderUin : undefined,
+        avatarUrl: faceUrl,
       }
       participants.set(fingerprint, participant)
     }
@@ -68,6 +74,22 @@ function participantName(record: MsgRecord): string {
     || record.sendRemarkName?.trim()
     || record.sendMemberName?.trim()
     || 'QQ用户'
+}
+
+/**
+ * Avatar URL QQ archived next to one merged-forward record.  It identifies the
+ * original author even though the record's own sender account is a placeholder
+ * shared with every other author of the same transcript.
+ */
+function archivedFaceUrl(record: MsgRecord): string | undefined {
+  const value = record.multiTransInfo?.fromFaceUrl?.trim()
+  if (!value) return
+  try {
+    const url = new URL(value)
+    return url.protocol === 'https:' || url.protocol === 'http:' ? url.toString() : undefined
+  } catch {
+    return
+  }
 }
 
 function normalizeIdentity(value: string): string {
