@@ -449,6 +449,15 @@ export class QQKernelBridge {
   private readonly faceAssetLookups = new Map<string, Promise<FaceAssetEntry | undefined>>()
   private readonly faceRemoteImages = new Map<string, { url: string, image: FaceAssetImage }>()
   private readonly faceResourceUrlOverrides = new Map<string, string>()
+  /**
+   * Wide canvas geometry QQ advertises for a system face.
+   *
+   * A face ships two renderings: the square icon (`<id>/png/<id>.png`) QQ draws
+   * inline, and the wide canvas (`<id>/png/<id>_0.png`) it plays when the face is
+   * sent as a message sticker. The catalog geometry describes the canvas, so it
+   * must never size an inline reaction.
+   */
+  private readonly faceCanvasGeometry = new Map<string, { width: number, height: number }>()
   private localFaceRoots?: { resource?: string, caches: string[] }
   private reactionCatalogPromise?: Promise<void>
   private reactionEventSequence = 0
@@ -805,6 +814,7 @@ export class QQKernelBridge {
     this.faceAssetLookups.clear()
     this.faceRemoteImages.clear()
     this.faceResourceUrlOverrides.clear()
+    this.faceCanvasGeometry.clear()
     this.localFaceRoots = undefined
     this.reactionCatalogPromise = undefined
     this.stickerPacks.clear()
@@ -943,6 +953,7 @@ export class QQKernelBridge {
     this.faceAssetLookups.clear()
     this.faceRemoteImages.clear()
     this.faceResourceUrlOverrides.clear()
+    this.faceCanvasGeometry.clear()
     this.localFaceRoots = undefined
     this.clearVoiceCache()
   }
@@ -3507,6 +3518,7 @@ export class QQKernelBridge {
         size,
         version: Math.trunc(statSync(resource.path).mtimeMs),
         mimeType: resource.mimeType,
+        ...this.reactionAssetGeometry(reactionKey),
         source: 'path',
       })
     }
@@ -3549,7 +3561,7 @@ export class QQKernelBridge {
     const asset = this.reactionAssets.get(reactionKey)
     if (!asset) return undefined
     const meta = asset.path
-      ? this.localReactionAssetMetadata(asset)
+      ? this.localReactionAssetMetadata(asset, this.reactionAssetGeometry(reactionKey))
       : asset.url
         ? await this.remoteReactionAssetMetadata(reactionKey, asset)
         : undefined
@@ -3558,20 +3570,49 @@ export class QQKernelBridge {
     return meta
   }
 
+  /**
+   * Asset target of a reaction cell.
+   *
+   * A reaction renders the square icon a face ships for inline use, so the
+   * target deliberately carries no canvas geometry: without one a wide canvas
+   * face resolves its canonical `<id>.png` entry instead of the `<id>_0.png`
+   * artwork that only belongs in a message.
+   */
   private reactionAssetTarget(reactionKey: string): FaceAssetTarget {
-    const definition = this.reactionByKey.get(reactionKey)
-    const resource = definition?.presentation.type === 'custom' ? definition.presentation.resource : undefined
+    return this.faceIconTarget(systemFaceIdFromReactionKey(reactionKey))
+  }
+
+  /**
+   * Asset target of a face rendered as a message sticker, which uses the wide
+   * canvas QQ advertises whenever the catalog carries one.
+   */
+  private faceCanvasTarget(faceId: string): FaceAssetTarget {
+    const canvas = this.faceCanvasGeometry.get(faceId)
+    return { faceId, width: canvas?.width, height: canvas?.height }
+  }
+
+  /** Asset target of a face rendered inline, which always prefers the square icon. */
+  private faceIconTarget(faceId: string | undefined): FaceAssetTarget {
+    return { faceId }
+  }
+
+  private localReactionAssetMetadata(
+    asset: ReactionAsset,
+    geometry: { width?: number, height?: number } = {},
+  ): ReactionAssetMetadata | undefined {
+    if (!asset.path || !existsSync(asset.path)) return undefined
+    const info = statSync(asset.path)
     return {
-      faceId: systemFaceIdFromReactionKey(reactionKey),
-      width: resource?.width,
-      height: resource?.height,
+      size: info.size, version: Math.trunc(info.mtimeMs), mimeType: asset.mimeType,
+      ...geometry, source: 'path',
     }
   }
 
-  private localReactionAssetMetadata(asset: ReactionAsset): ReactionAssetMetadata | undefined {
-    if (!asset.path || !existsSync(asset.path)) return undefined
-    const info = statSync(asset.path)
-    return { size: info.size, version: Math.trunc(info.mtimeMs), mimeType: asset.mimeType, source: 'path' }
+  /** Geometry the published catalog advertises for a reaction resource. */
+  private reactionAssetGeometry(reactionKey: string): { width?: number, height?: number } {
+    const definition = this.reactionByKey.get(reactionKey)
+    const resource = definition?.presentation.type === 'custom' ? definition.presentation.resource : undefined
+    return { width: resource?.width, height: resource?.height }
   }
 
   private async remoteReactionAssetMetadata(
@@ -3588,6 +3629,7 @@ export class QQKernelBridge {
         version: directory.version,
         mimeType: asset.mimeType,
         entry: directory.name,
+        ...this.reactionAssetGeometry(reactionKey),
         source: 'bundle',
       }
     }
@@ -3725,7 +3767,7 @@ export class QQKernelBridge {
       const faceId = systemFaceIdFromReactionKey(key)
       if (!faceId) continue
       const definition = this.reactionByKey.get(key)
-      const local = this.localFaceAsset(faceId, this.reactionAssetTarget(key))
+      const local = this.localFaceAsset(faceId, this.faceIconTarget(faceId))
       const mimeType = local?.mimeType ?? asset.mimeType
       faces.push({
         faceId,
@@ -3769,10 +3811,11 @@ export class QQKernelBridge {
     faceId: string,
     options: { animated?: boolean, url?: string },
   ): Promise<FaceAssetEntry | undefined> {
-    const target = this.reactionAssetTarget(reactionKey('1', faceId))
+    // The catalog carries the canvas geometry a message face is drawn with.
+    if (!this.reactionDefinitions.length) await this.getReactionCatalog().catch(() => undefined)
+    const target = this.faceCanvasTarget(faceId)
     const local = this.localFaceAsset(faceId, target)
     if (local) return local
-    if (!this.reactionDefinitions.length) await this.getReactionCatalog().catch(() => undefined)
     for (const url of this.faceResourceUrls(faceId, options)) {
       const image = await this.fetchFaceResourceImage(faceId, url, { ...target, animated: options.animated })
       if (!image) continue
@@ -7026,9 +7069,14 @@ export class QQKernelBridge {
       emojiPath = emojiResult.resourcePath
     }
     const config = JSON.parse(await readFile(configPath, 'utf8')) as {
-      sysface?: Array<{ QSid: string, QDes?: string, QHide?: string }>
+      sysface?: Array<{
+        QSid: string, QDes?: string, QHide?: string,
+        AniStickerWidth?: unknown, AniStickerHeight?: unknown,
+        AnimationWidth?: unknown, AnimationHeigh?: unknown,
+      }>
       emoji?: Array<{ QSid: string, QCid?: string, AQLid?: string, QDes?: string, QHide?: string }>
     }
+    this.faceCanvasGeometry.clear()
     const definitions: QQReactionDefinition[] = []
     const aliases = new Map<string, QQReactionDefinition>()
     const assets = new Map<string, ReactionAsset>()
@@ -7088,6 +7136,8 @@ export class QQKernelBridge {
       const info = await stat(resourcePath)
       const dimensions = pngDimensions(await readFile(filePath))
       const key = reactionKey('1', item.QSid)
+      const canvas = faceCatalogCanvasGeometry(item)
+      if (canvas) this.faceCanvasGeometry.set(item.QSid, canvas)
       definitions.push({
         key,
         title: cleanFaceName(item.QDes),
@@ -7129,8 +7179,14 @@ export class QQKernelBridge {
     for (const face of [...nativeFaces, ...runtimeFaces]) {
       if (!face.faceId) continue
       const key = reactionKey('1', face.faceId)
+      // The catalog geometry sizes the face's message canvas; an inline
+      // reaction renders the square icon instead, so it keeps the default
+      // until QQ has downloaded that icon for this account.
+      const canvas = faceCatalogCanvasGeometry(face)
+      if (canvas) this.faceCanvasGeometry.set(face.faceId, canvas)
       if (knownKeys.has(key) || !face.url) continue
       knownKeys.add(key)
+      const icon = this.localFaceAsset(face.faceId, this.faceIconTarget(face.faceId))
       definitions.push({
         key,
         title: cleanFaceName(face.name),
@@ -7141,8 +7197,8 @@ export class QQKernelBridge {
             version: 1,
             format: 'static',
             mimeType: 'image/png',
-            width: face.width > 0 ? face.width : 128,
-            height: face.height > 0 ? face.height : 128,
+            width: icon?.width ?? 128,
+            height: icon?.height ?? 128,
             locator: { reactionKey: key },
           },
         },
@@ -7157,7 +7213,7 @@ export class QQKernelBridge {
     for (const cacheRoot of this.localFaceCacheRoots()) {
       for (const faceId of await localFaceCacheIds(cacheRoot)) {
         const key = reactionKey('1', faceId)
-        const cached = this.localFaceAsset(faceId, this.reactionAssetTarget(key))
+        const cached = this.localFaceAsset(faceId, this.faceIconTarget(faceId))
         if (!cached) continue
         if (!knownKeys.has(key)) {
           knownKeys.add(key)
@@ -9016,6 +9072,28 @@ function numberOrUndefined(value?: string | number): number | undefined {
 
 function positiveInteger(value: number | undefined, fallback: number): number {
   return Number.isSafeInteger(value) && value! > 0 ? value! : fallback
+}
+
+/**
+ * Wide canvas geometry a face catalog entry advertises, when it has one.
+ *
+ * QQ reports the size of the 大表情 canvas a face is sent with; the shipped
+ * face_config.json spells it `AniSticker*` while the runtime panel uses
+ * `Animation*` or a plain width/height pair.
+ */
+function faceCatalogCanvasGeometry(entry: {
+  AniStickerWidth?: unknown, AniStickerHeight?: unknown,
+  AnimationWidth?: unknown, AnimationHeigh?: unknown,
+  width?: unknown, height?: unknown,
+}): { width: number, height: number } | undefined {
+  const width = faceSizeNumber(entry.AniStickerWidth ?? entry.AnimationWidth ?? entry.width)
+  const height = faceSizeNumber(entry.AniStickerHeight ?? entry.AnimationHeigh ?? entry.height)
+  return width && height ? { width, height } : undefined
+}
+
+function faceSizeNumber(value: unknown): number | undefined {
+  const parsed = typeof value === 'string' ? Number(value) : value
+  return typeof parsed === 'number' && Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined
 }
 
 function marketStickerId(packageId: string, stickerId: string): string {

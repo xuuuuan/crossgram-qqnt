@@ -5949,6 +5949,53 @@ describe('QQKernelBridge', () => {
     })
   })
 
+  it('sizes a wide reaction face from its inline icon instead of the canvas', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'qqnt-runtime-reaction-icon-'))
+    tempPaths.push(root)
+    const resourceRoot = join(root, 'global', 'nt_data', 'Emoji', 'emoji-resource')
+    await Promise.all([
+      mkdir(join(resourceRoot, 'sysface_res', 'static'), { recursive: true }),
+      mkdir(join(resourceRoot, 'sysface_res', 'apng'), { recursive: true }),
+      mkdir(join(resourceRoot, 'emoji_res'), { recursive: true }),
+    ])
+    const icon = pngWithSize(128, 128)
+    await Promise.all([
+      writeFile(join(resourceRoot, 'face_config.json'), JSON.stringify({ emoji: [], sysface: [] })),
+      writeFile(join(resourceRoot, 'sysface_res', 'static', 's416.png'), icon),
+    ])
+    const f = fixture()
+    ;(f.session as any).getBaseEmojiService = () => ({
+      fetchFullSysEmojis: vi.fn(async () => ({
+        result: 0, errMsg: '', rsp: {
+          normalPanelResult: {
+            SysEmojiGroupList: [{ SysEmojiList: [{
+              emojiId: '416', describe: '/中龙舟', animationWidth: 192, animationHeigh: 76,
+            }] }],
+            downloadInfo: [{ emojiId: '416', baseResDownloadUrl: 'https://face.qq.example/416.zip' }],
+          },
+        },
+      })),
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: join(root, 'account') })
+    vi.spyOn(bridge as any, 'packetClientForSession').mockReturnValue({
+      getSysFaces: async () => [], getSysFace: async () => undefined,
+    })
+
+    // QQ advertises the wide 大表情 canvas, but a reaction cell renders the
+    // square icon this face ships, so the definition must describe that icon.
+    const catalog = await bridge.getReactionCatalog()
+    expect(catalog.available).toHaveLength(1)
+    expect(catalog.available[0]).toMatchObject({
+      key: '1:416', title: '中龙舟',
+      presentation: { type: 'custom', resource: { width: 128, height: 128 } },
+    })
+    // The message face of the same face keeps serving the icon from disk with
+    // its own geometry, so both renderings agree on the file they describe.
+    await expect(bridge.resolveStickerAssetMeta({
+      kind: 'sysface', faceId: '416', animated: false,
+    })).resolves.toMatchObject({ size: icon.length, width: 128, height: 128, source: 'path' })
+  })
   it('unwraps ZIP face bundles and publishes their size and content identity', async () => {
     const root = await mkdtemp(join(tmpdir(), 'qqnt-reaction-bundles-'))
     tempPaths.push(root)
@@ -6008,6 +6055,8 @@ describe('QQKernelBridge', () => {
       size: square.length,
       version: faceAssetVersion(square),
       mimeType: 'image/png',
+      width: 128,
+      height: 128,
       entry: '424/png/424.png',
       source: 'bundle',
     })
@@ -6021,10 +6070,24 @@ describe('QQKernelBridge', () => {
     expect(ranged).toMatchObject({ mimeType: 'image/png', size: square.length, offset: 4, length: 8 })
     expect(await readStream(ranged!.stream)).toEqual(square.subarray(4, 12))
 
-    const wide = await bridge.openReactionResource('1:416')
-    expect(wide).toMatchObject({ mimeType: 'image/png', size: canvas.length })
-    expect(await readStream(wide!.stream)).toEqual(canvas)
-    expect((await bridge.resolveReactionAssetMeta('1:416'))?.size).toBe(canvas.length)
+    // The catalog advertises the wide canvas a face plays in a message, but a
+    // reaction renders the square icon the same bundle wraps: the served bytes
+    // and the published geometry both describe that icon.
+    const reaction = await bridge.openReactionResource('1:416')
+    expect(reaction).toMatchObject({ mimeType: 'image/png', size: square.length })
+    expect(await readStream(reaction!.stream)).toEqual(square)
+    expect(await bridge.resolveReactionAssetMeta('1:416')).toMatchObject({
+      size: square.length,
+      version: faceAssetVersion(square),
+      width: 128,
+      height: 128,
+    })
+
+    // The message face of the same face keeps the wide 大表情 canvas, so the two
+    // renderings never collapse into one document.
+    expect(await bridge.resolveStickerAssetMeta({
+      kind: 'sysface', faceId: '416', animated: false,
+    })).toMatchObject({ size: canvas.length, width: 480, height: 190 })
 
     // Faces backed by local files report their on-disk size and modification time.
     const local = await bridge.resolveReactionAssetMeta('1:14')
