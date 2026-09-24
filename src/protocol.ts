@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 33
+export const PROTOCOL_VERSION = 34
 
 /** Local Unix-socket PCM media protocol. Audio frames use a 1-byte type plus a 4-byte big-endian length. */
 export const PCM_MEDIA_PROTOCOL_VERSION = 1
@@ -202,6 +202,33 @@ export interface QQStickerPack extends QQStickerPackSummary {
   stickers: QQSticker[]
 }
 
+/** Member named by a QQ service notice, such as a member joining a group. */
+export interface QQServiceMember {
+  /** Relay-side QQ user id (UID) of the member. */
+  id: string
+  /** Display name carried by the notice, used until the profile is resolved. */
+  name?: string
+}
+
+export type QQServiceAction =
+  | { type: 'custom', text: string }
+  | { type: 'phone-call' }
+  | {
+      /**
+       * Group member join notice (QQ gray tip `groupElement.memberAdd`), which
+       * Telegram renders natively as a join service message.
+       */
+      type: 'members-joined'
+      /** QQ wording, used when the relay cannot project a native join action. */
+      text: string
+      /** Members the notice says joined. */
+      members: QQServiceMember[]
+      /** Member that invited or added them; absent when QQ names nobody. */
+      actor?: QQServiceMember
+      /** The members joined through a shared invite link or QR code. */
+      viaInviteLink?: true
+    }
+
 export interface QQMessage {
   id: string
   sourceIds?: string[]
@@ -226,7 +253,7 @@ export interface QQMessage {
   /** Opaque QQ msgId referenced by a native reply element. */
   replyToId?: string
   /** QQ service message rendered by the relay as a Telegram MessageService. */
-  serviceAction?: { type: 'custom', text: string } | { type: 'phone-call' }
+  serviceAction?: QQServiceAction
   parts: Array<
     | QQTextPart
     | { type: 'markdown', content: string }

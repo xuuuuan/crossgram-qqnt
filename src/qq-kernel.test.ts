@@ -2338,16 +2338,143 @@ describe('QQKernelBridge', () => {
     expect(messages.map((message) => ({ parts: message.parts, serviceAction: message.serviceAction }))).toMatchObject([
       { parts: [], serviceAction: { type: 'custom', text: 'Alice戳了戳你' } },
       { parts: [], serviceAction: { type: 'custom', text: '你戳了戳Bob的猫耳' } },
-      { parts: [], serviceAction: { type: 'custom', text: 'Alice邀请Bob加入了群聊。' } },
+      {
+        parts: [],
+        serviceAction: {
+          type: 'members-joined', text: 'Alice邀请Bob加入了群聊。',
+          members: [{ id: 'bob', name: 'Bob' }], actor: { id: 'alice', name: 'Alice' },
+        },
+      },
       { parts: [], serviceAction: { type: 'custom', text: '你被管理员禁言1小时1分钟1秒' } },
       { parts: [], serviceAction: { type: 'custom', text: '安全提醒：请修改密码' } },
       { parts: [], serviceAction: { type: 'custom', text: '你领取了红包' } },
       { parts: [], serviceAction: { type: 'custom', text: 'Alice邀请Bob加入了群聊。' } },
     ])
+    expect(messages[2]).toMatchObject({ senderId: 'alice', sender: { name: 'Alice' } })
     expect(messages.every((message) => message.telegramMessageId === undefined)).toBe(true)
   })
 
-  it('drops zero-peer sidecars while preserving the paired group service message', async () => {
+  it('maps every group join gray tip to a structured join service action', async () => {
+    const f = fixture()
+    const add = (msgId: string, memberAdd: NonNullable<NonNullable<NonNullable<MsgRecord['elements'][number]['grayTipElement']>['groupElement']>['memberAdd']>): MsgRecord => ({
+      ...f.message, msgId, msgSeq: '456', chatType: 2,
+      sendType: 0, senderUid: '0', senderUin: '0', sendNickName: '0',
+      peerUid: '1058754719', peerUin: '1058754719', peerName: 'Test Group',
+      elements: [{
+        elementType: 8, elementId: msgId,
+        grayTipElement: {
+          groupElement: {
+            type: 1, role: 0, groupName: '', memberUid: '', memberNick: '', memberRemark: '',
+            adminUid: '', adminNick: '', adminRemark: '', memberAdd,
+          },
+        },
+      }],
+    })
+    f.msg.getLatestDbMsgs.mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [
+      add('joined', { showType: 0, otherAdd: { uid: 'bob', name: 'Bob' } }),
+      add('you-joined', { showType: 1 }),
+      add('joined-by-other-qr', {
+        showType: 2,
+        otherAddByOtherQRCode: {
+          inviter: { uid: 'alice', name: 'Alice' }, invited: { uid: 'carol', name: 'Carol' },
+        },
+      }),
+      add('joined-by-your-qr', { showType: 3, otherAddByYourQRCode: { uid: 'carol', name: 'Carol' } }),
+      add('you-joined-by-qr', { showType: 4, youAddByOtherQRCode: { uid: 'alice', name: 'Alice' } }),
+      add('invited-other', {
+        showType: 5,
+        otherInviteOther: {
+          inviter: { uid: 'alice', name: 'Alice' }, invited: { uid: 'bob', name: 'Bob' },
+        },
+      }),
+      add('invited-you', { showType: 6, otherInviteYou: { uid: 'alice', name: 'Alice' } }),
+      add('you-invited', { showType: 7, youInviteOther: { uid: 'bob', name: 'Bob' } }),
+      add('already-member', { showType: 8 }),
+      add('unnamed-member', { showType: 0, otherAdd: { uid: '', name: '' } }),
+      add('unknown-variant', { showType: 9, otherAdd: { uid: 'bob', name: 'Bob' } }),
+    ] })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    const messages = (await bridge.getHistory(bridge.getConversation('1058754719'))).messages
+    expect(messages.map((message) => ({
+      senderId: message.senderId,
+      sender: message.sender?.name,
+      serviceAction: message.serviceAction,
+    }))).toEqual([
+      {
+        senderId: 'bob', sender: 'Bob',
+        serviceAction: {
+          type: 'members-joined', text: 'Bob加入了群聊。',
+          members: [{ id: 'bob', name: 'Bob' }],
+        },
+      },
+      {
+        senderId: 'self', sender: 'Self',
+        serviceAction: { type: 'members-joined', text: '你加入了群聊。', members: [{ id: 'self' }] },
+      },
+      {
+        senderId: 'carol', sender: 'Carol',
+        serviceAction: {
+          type: 'members-joined', text: 'Carol通过扫描Alice分享的二维码加入了群聊。',
+          members: [{ id: 'carol', name: 'Carol' }], actor: { id: 'alice', name: 'Alice' },
+          viaInviteLink: true,
+        },
+      },
+      {
+        senderId: 'carol', sender: 'Carol',
+        serviceAction: {
+          type: 'members-joined', text: 'Carol通过扫描你分享的二维码加入了群聊。',
+          members: [{ id: 'carol', name: 'Carol' }], actor: { id: 'self' },
+          viaInviteLink: true,
+        },
+      },
+      {
+        senderId: 'self', sender: 'Self',
+        serviceAction: {
+          type: 'members-joined', text: '你通过扫描Alice分享的二维码加入了群聊。',
+          members: [{ id: 'self' }], actor: { id: 'alice', name: 'Alice' },
+          viaInviteLink: true,
+        },
+      },
+      {
+        senderId: 'alice', sender: 'Alice',
+        serviceAction: {
+          type: 'members-joined', text: 'Alice邀请Bob加入了群聊。',
+          members: [{ id: 'bob', name: 'Bob' }], actor: { id: 'alice', name: 'Alice' },
+        },
+      },
+      {
+        senderId: 'alice', sender: 'Alice',
+        serviceAction: {
+          type: 'members-joined', text: 'Alice邀请你加入了群聊。',
+          members: [{ id: 'self' }], actor: { id: 'alice', name: 'Alice' },
+        },
+      },
+      {
+        senderId: 'self', sender: 'Self',
+        serviceAction: {
+          type: 'members-joined', text: '你邀请Bob加入了群聊。',
+          members: [{ id: 'bob', name: 'Bob' }], actor: { id: 'self' },
+        },
+      },
+      {
+        senderId: '0', sender: '0',
+        serviceAction: { type: 'custom', text: '你已经是群成员了。' },
+      },
+      {
+        senderId: '0', sender: '0',
+        serviceAction: { type: 'custom', text: '有新成员加入了群聊。' },
+      },
+      {
+        senderId: '0', sender: '0',
+        serviceAction: { type: 'custom', text: 'Bob加入了群聊。' },
+      },
+    ])
+    expect(messages.every((message) => message.telegramMessageId === undefined)).toBe(true)
+  })
+
+it('drops zero-peer sidecars while preserving the paired group service message', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
@@ -7137,7 +7264,7 @@ describe('QQBridgeServer', () => {
     const base = `http://127.0.0.1:${server.address().port}/v1`
 
     await expect(fetch(`${base}/status`).then((response) => response.json())).resolves.toMatchObject({
-      protocolVersion: 33, ready: true, flashTransferSupported: true,
+      protocolVersion: 34, ready: true, flashTransferSupported: true,
     })
     const manifest = {
       name: 'remote reuse', framing: 'length-prefixed-v1',
@@ -7655,7 +7782,7 @@ describe('QQBridgeServer', () => {
     const { port } = server.address()
     const base = `http://127.0.0.1:${port}/v1`
     await expect(fetch(`${base}/status`).then((response) => response.json())).resolves.toMatchObject({
-      protocolVersion: 33, ready: true, selfUin: '10000',
+      protocolVersion: 34, ready: true, selfUin: '10000',
     })
     const dialogs = await fetch(`${base}/dialogs`)
     expect(dialogs.status).toBe(200)

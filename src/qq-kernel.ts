@@ -32,7 +32,7 @@ import {
 } from './kernel-types.js'
 import {
   conversationId, parseConversationId, type HistoryQuery, type MemberPage, type QQCallSignalEvent, type QQCard, type QQConversation, type QQEvent, type QQGroupFilePage, type QQMedia, type QQMediaLocator, type QQMediaUploadPlan, type QQMessage, type QQMultiForwardLocator, type QQReactionActorPage, type QQReactionContext, type QQReactionDefinition, type QQReactionState,
-  type QQFlashTransferManifest, type QQFlashTransferResult, type QQPokeResult, type QQRequest, type QQRequestKind, type QQRequestPage, type QQRequestStatus, type QQSendMediaSpec, type QQSticker, type QQStickerPack, type QQStickerPackSummary, type QQStickerReference, type QQTextPart, type SearchPage, type SearchQuery, type SendManifest,
+  type QQFlashTransferManifest, type QQFlashTransferResult, type QQPokeResult, type QQRequest, type QQRequestKind, type QQRequestPage, type QQRequestStatus, type QQSendMediaSpec, type QQServiceMember, type QQSticker, type QQStickerPack, type QQStickerPackSummary, type QQStickerReference, type QQTextPart, type SearchPage, type SearchQuery, type SendManifest,
 } from './protocol.js'
 
 const REACTION_ASSET_META_TTL_MS = 10 * 60_000
@@ -6814,6 +6814,10 @@ export class QQKernelBridge {
     const parts: QQMessage['parts'] = []
     let replyToId: string | undefined
     let serviceAction: QQMessage['serviceAction']
+    // Join notices name themselves: the message belongs to the joined member
+    // even though QQ stores the notice under a placeholder sender.
+    let noticeSenderName: string | undefined
+    let useRecordSenderFields = true
     for (const element of record.elements ?? []) {
       const mappedSticker = mapSticker(record, element)
       if (mappedSticker) {
@@ -6897,8 +6901,19 @@ export class QQKernelBridge {
             this.config?.selfUid,
             (uid) => this.seenUsers.get(uid)?.name ?? this.users.get(uid)?.name,
           )
-          serviceAction = { type: 'custom', text: action.text }
-          if ((!senderId || senderId === '0') && action.actorId) senderId = action.actorId
+          serviceAction = action.join
+            ? { type: 'members-joined', text: action.text, ...action.join }
+            : { type: 'custom', text: action.text }
+          if (action.join) {
+            // A join notice is attributed to the member QQ names, not to the
+            // gray tip's own placeholder sender, so the record sender fields
+            // (uin, nick, member name) must not follow the new sender id.
+            if (action.senderId) senderId = action.senderId
+            noticeSenderName = joinMemberName(action.join, senderId)
+            useRecordSenderFields = false
+          } else if ((!senderId || senderId === '0') && action.actorId) {
+            senderId = action.actorId
+          }
           continue
         }
         const media = this.mapMedia(record, element)
@@ -6910,6 +6925,8 @@ export class QQKernelBridge {
       }
     }
     const sender = this.seenUsers.get(senderId) ?? this.users.get(senderId)
+    const recordSenderUin = useRecordSenderFields ? record.senderUin : undefined
+    const senderUin = sender?.numericId || recordSenderUin
     const nativeReply = record.elements?.find((element) => element.replyElement)?.replyElement
     return {
       id: record.msgId,
@@ -6917,11 +6934,16 @@ export class QQKernelBridge {
       senderId,
       sender: context.sender ?? {
         id: senderId,
-        numericId: sender?.numericId || record.senderUin || undefined,
-        name: sender?.name || record.sendNickName || record.sendRemarkName || record.senderUin || record.senderUid,
-        alias: record.chatType === CHAT_GROUP ? record.sendMemberName || undefined : undefined,
-        avatar: /^\d+$/.test(sender?.numericId || record.senderUin)
-          ? qlogoAvatarMedia(senderId, sender?.numericId || record.senderUin)
+        numericId: senderUin || undefined,
+        name: sender?.name || noticeSenderName
+          || (useRecordSenderFields
+            ? record.sendNickName || record.sendRemarkName || record.senderUin || record.senderUid
+            : '') || senderId,
+        alias: useRecordSenderFields && record.chatType === CHAT_GROUP
+          ? record.sendMemberName || undefined
+          : undefined,
+        avatar: senderUin && /^\d+$/.test(senderUin)
+          ? qlogoAvatarMedia(senderId, senderUin)
           : undefined,
       },
       timestamp: Number(record.msgTime) || Math.floor(Date.now() / 1000),
@@ -9915,14 +9937,32 @@ function fallbackElementText(element: MsgElement, selfUid?: string): string {
   return `[暂不支持的消息 ${element.elementType}]`
 }
 
+/**
+ * Telegram-facing projection of a QQ gray tip: the wording QQ itself shows plus
+ * the native join notice it maps to, when both are available.
+ */
+interface GrayTipAction {
+  text: string
+  actorId?: string
+  /** Member the notice is about, used as the message sender. */
+  senderId?: string
+  /** Group join details Telegram renders as a native join service message. */
+  join?: {
+    members: QQServiceMember[]
+    actor?: QQServiceMember
+    viaInviteLink?: true
+  }
+}
+
 function grayTipAction(
   gray: NonNullable<MsgElement['grayTipElement']>,
   selfUid?: string,
   resolveUser: (uid: string) => string | undefined = () => undefined,
-): { text: string, actorId?: string } {
+): GrayTipAction {
   const json = jsonGrayTipText(gray.jsonGrayTipElement, selfUid, resolveUser)
+  const group = groupGrayTipNotice(gray.groupElement, selfUid)
   return {
-    text: groupGrayTipText(gray.groupElement, selfUid)
+    text: group.text
     || (gray.buddyElement?.type === 1 ? '你们已成功添加为好友，现在可以开始聊天了。' : '')
     || json.text
     || xmlGrayTipText(gray.xmlElement)
@@ -9935,6 +9975,8 @@ function grayTipAction(
     || genericGrayTipText(gray)
     || '[系统消息]',
     actorId: json.actorId,
+    senderId: group.senderId,
+    join: group.join,
   }
 }
 
@@ -9992,47 +10034,140 @@ function xmlAttribute(attributes: string, name: string): string {
   return decodeXmlText(match?.[1] ?? match?.[2] ?? '')
 }
 
-function groupGrayTipText(
+interface GrayTipGroupNotice {
+  text: string
+  /** Member the notice is about, used as the message sender when known. */
+  senderId?: string
+  /** Join details Telegram renders natively instead of the QQ wording. */
+  join?: {
+    members: QQServiceMember[]
+    actor?: QQServiceMember
+    viaInviteLink?: true
+  }
+}
+
+/**
+ * QQ group notices (`groupElement`) carry the wording QQ itself renders plus,
+ * for member joins, the members involved. Telegram can render those natively as
+ * a join service message, so the structured form is kept next to the wording.
+ *
+ * `memberAdd.showType` follows QQ's own MemberAddShowType enum, which is not
+ * numbered in the order the QQ client renders its variants.
+ */
+function groupGrayTipNotice(
   group: NonNullable<MsgElement['grayTipElement']>['groupElement'],
   selfUid?: string,
-): string {
-  if (!group) return ''
+): GrayTipGroupNotice {
+  if (!group) return { text: '' }
   const name = (member?: { uid: string, name: string }) =>
     member?.uid === selfUid ? '你' : member?.name || member?.uid || ''
+  const ref = (member?: { uid: string, name: string }): QQServiceMember | undefined =>
+    member?.uid ? { id: member.uid, ...(member.name ? { name: member.name } : {}) } : undefined
+  const self = (): QQServiceMember | undefined => selfUid ? { id: selfUid } : undefined
   const roleName = (uid: string, remark: string, nick: string) =>
     uid === selfUid ? '你' : remark || nick || uid
+  const joined = (
+    members: Array<QQServiceMember | undefined>,
+    actor?: QQServiceMember,
+    viaInviteLink?: true,
+  ): GrayTipGroupNotice['join'] => members.every(Boolean)
+    ? { members: members as QQServiceMember[], actor, viaInviteLink }
+    : undefined
   if (group.type === 1) {
     const add = group.memberAdd
-    if (!add) return '有新成员加入了群聊'
-    if (add.showType === 1) return '你已经是群成员了。'
+    if (!add) return { text: '有新成员加入了群聊' }
+    if (add.showType === 1) {
+      return {
+        text: '你加入了群聊。',
+        senderId: selfUid,
+        join: joined([self()]),
+      }
+    }
+    if (add.showType === 8) return { text: '你已经是群成员了。' }
     if (add.showType === 2 && add.otherAddByOtherQRCode) {
-      return `${name(add.otherAddByOtherQRCode.invited)}通过扫描${name(add.otherAddByOtherQRCode.inviter)}分享的二维码加入了群聊。`
+      const { inviter, invited } = add.otherAddByOtherQRCode
+      return {
+        text: `${name(invited)}通过扫描${name(inviter)}分享的二维码加入了群聊。`,
+        senderId: invited.uid,
+        join: joined([ref(invited)], ref(inviter), true),
+      }
     }
-    if (add.showType === 3) return `${name(add.otherAddByYourQRCode)}通过扫描你分享的二维码加入了群聊。`
-    if (add.showType === 4) return `你通过扫描${name(add.youAddByOtherQRCode)}分享的二维码加入了群聊。`
+    if (add.showType === 3) {
+      const invited = add.otherAddByYourQRCode
+      return {
+        text: `${name(invited)}通过扫描你分享的二维码加入了群聊。`,
+        senderId: invited?.uid,
+        join: joined([ref(invited)], self(), true),
+      }
+    }
+    if (add.showType === 4) {
+      const inviter = add.youAddByOtherQRCode
+      return {
+        text: `你通过扫描${name(inviter)}分享的二维码加入了群聊。`,
+        senderId: selfUid,
+        join: joined([self()], ref(inviter), true),
+      }
+    }
     if (add.showType === 5 && add.otherInviteOther) {
-      return `${name(add.otherInviteOther.inviter)}邀请${name(add.otherInviteOther.invited)}加入了群聊。`
+      const { inviter, invited } = add.otherInviteOther
+      return {
+        text: `${name(inviter)}邀请${name(invited)}加入了群聊。`,
+        senderId: inviter.uid || invited.uid,
+        join: joined([ref(invited)], ref(inviter)),
+      }
     }
-    if (add.showType === 6) return `${name(add.otherInviteYou)}邀请你加入了群聊。`
-    if (add.showType === 7) return `你邀请${name(add.youInviteOther)}加入了群聊。`
-    return `${name(add.otherAdd) || '有新成员'}加入了群聊。`
+    if (add.showType === 6) {
+      const inviter = add.otherInviteYou
+      return {
+        text: `${name(inviter)}邀请你加入了群聊。`,
+        senderId: inviter?.uid,
+        join: joined([self()], ref(inviter)),
+      }
+    }
+    if (add.showType === 7) {
+      const invited = add.youInviteOther
+      return {
+        text: `你邀请${name(invited)}加入了群聊。`,
+        senderId: selfUid,
+        join: joined([ref(invited)], self()),
+      }
+    }
+    if (add.showType !== undefined && add.showType !== 0) {
+      // An unrecognized variant: keep QQ's wording instead of guessing.
+      return { text: `${name(add.otherAdd) || '有新成员'}加入了群聊。` }
+    }
+    const invited = ref(add.otherAdd)
+    return {
+      text: `${name(add.otherAdd) || '有新成员'}加入了群聊。`,
+      senderId: invited?.id,
+      join: joined([invited]),
+    }
   }
-  if (group.type === 2) return '该群已被群主解散'
-  if (group.type === 3) return '你已被移出群聊'
+  if (group.type === 2) return { text: '该群已被群主解散' }
+  if (group.type === 3) return { text: '你已被移出群聊' }
   if (group.type === 4) {
     const members = group.createGroup?.memberInfo.map(name).filter(Boolean).join('、')
-    return members ? `你邀请了${members}加入群聊。` : '群聊已创建'
+    return { text: members ? `你邀请了${members}加入群聊。` : '群聊已创建' }
   }
   if (group.type === 5) {
     const operator = roleName(group.memberUid, group.memberRemark, group.memberNick)
-    return `${operator || '管理员'}修改了群名称为“${group.groupName}”`
+    return { text: `${operator || '管理员'}修改了群名称为“${group.groupName}”` }
   }
-  if (group.type === 6) return '你已屏蔽该群聊消息'
-  if (group.type === 7) return '你已取消屏蔽该群聊消息'
-  if (group.type === 8 && group.shutUp) return groupShutUpText(group.shutUp, selfUid)
-  if (group.type === 9) return '由于该群长时间未活跃，已被系统自动回收'
-  if (group.type === 10) return '该群已被群主解散或被删除'
-  return ''
+  if (group.type === 6) return { text: '你已屏蔽该群聊消息' }
+  if (group.type === 7) return { text: '你已取消屏蔽该群聊消息' }
+  if (group.type === 8 && group.shutUp) return { text: groupShutUpText(group.shutUp, selfUid) }
+  if (group.type === 9) return { text: '由于该群长时间未活跃，已被系统自动回收' }
+  if (group.type === 10) return { text: '该群已被群主解散或被删除' }
+  return { text: '' }
+}
+
+/** Name QQ attached to the member a join notice is attributed to. */
+function joinMemberName(join: GrayTipAction['join'], memberId: string): string | undefined {
+  if (!join || !memberId) return undefined
+  for (const member of [join.actor, ...join.members]) {
+    if (member && member.id === memberId && member.name) return member.name
+  }
+  return undefined
 }
 
 function groupShutUpText(
