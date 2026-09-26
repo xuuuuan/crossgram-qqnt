@@ -6129,6 +6129,58 @@ it('drops zero-peer sidecars while preserving the paired group service message',
     })
   })
 
+  it('keeps the local reaction catalog when a native catalog step never responds', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'qqnt-reaction-hang-'))
+    tempPaths.push(root)
+    const resourceRoot = join(root, 'global', 'nt_data', 'Emoji', 'emoji-resource')
+    await Promise.all([
+      mkdir(join(resourceRoot, 'sysface_res', 'static'), { recursive: true }),
+      mkdir(join(resourceRoot, 'sysface_res', 'apng'), { recursive: true }),
+      mkdir(join(resourceRoot, 'emoji_res'), { recursive: true }),
+    ])
+    await Promise.all([
+      writeFile(join(resourceRoot, 'face_config.json'), JSON.stringify({
+        emoji: [], sysface: [{ QSid: '14', QDes: '/微笑' }],
+      })),
+      writeFile(join(resourceRoot, 'sysface_res', 'static', 's14.png'), pngWithSize(128, 128)),
+    ])
+    const f = fixture()
+    const bridge = new QQKernelBridge({ reactionNativeStepTimeoutMs: 25, reactionCatalogLoadTimeoutMs: 2_000 })
+    // Both native catalogs only enrich the catalog and neither ever settles.
+    vi.spyOn(bridge as any, 'packetClientForSession').mockReturnValue({
+      getSysFaces: () => new Promise(() => {}), getSysFace: async () => undefined,
+    })
+    ;(f.session as any).getBaseEmojiService = () => ({
+      fetchFullSysEmojis: () => new Promise(() => {}),
+    })
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: join(root, 'account') })
+
+    const startedAt = Date.now()
+    const catalog = await bridge.getReactionCatalog()
+    // Each stuck step costs its own bounded budget, never the whole request.
+    expect(Date.now() - startedAt).toBeLessThan(1_000)
+    expect(catalog.available).toEqual([
+      expect.objectContaining({ key: '1:14', title: '微笑' }),
+    ])
+  })
+
+  it('abandons a stuck catalog load so the next request starts a fresh attempt', async () => {
+    // No attach here: the background catalog refresh it starts would race the
+    // assertion with an attempt of its own.
+    const bridge = new QQKernelBridge({ reactionCatalogLoadTimeoutMs: 20 })
+    let attempts = 0
+    const load = vi.spyOn(bridge as any, 'loadReactionCatalog').mockImplementation(() => {
+      attempts += 1
+      return attempts === 1 ? new Promise(() => {}) : Promise.resolve()
+    })
+
+    // The first load never settles, so its shared attempt must time out...
+    await expect(bridge.getReactionCatalog()).rejects.toThrow('QQ reaction catalog request timed out')
+    // ...and the next request must start a fresh load instead of reusing it.
+    await expect(bridge.getReactionCatalog()).resolves.toMatchObject({ available: [] })
+    expect(load).toHaveBeenCalledTimes(2)
+  })
+
   it('sizes a wide reaction face from its inline icon instead of the canvas', async () => {
     const root = await mkdtemp(join(tmpdir(), 'qqnt-runtime-reaction-icon-'))
     tempPaths.push(root)
@@ -7009,6 +7061,41 @@ describe('QQBridgeServer', () => {
     vi.unstubAllEnvs()
     vi.restoreAllMocks()
     await Promise.all(tempPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })))
+  })
+
+  it('serves the reactions catalog over HTTP while a native catalog step is stuck', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'qqnt-reaction-http-hang-'))
+    tempPaths.push(root)
+    const resourceRoot = join(root, 'global', 'nt_data', 'Emoji', 'emoji-resource')
+    await Promise.all([
+      mkdir(join(resourceRoot, 'sysface_res', 'static'), { recursive: true }),
+      mkdir(join(resourceRoot, 'sysface_res', 'apng'), { recursive: true }),
+      mkdir(join(resourceRoot, 'emoji_res'), { recursive: true }),
+    ])
+    await Promise.all([
+      writeFile(join(resourceRoot, 'face_config.json'), JSON.stringify({
+        emoji: [{ QSid: '😊', QCid: '128522', AQLid: '0', QDes: '/嘿嘿' }], sysface: [],
+      })),
+      writeFile(join(resourceRoot, 'emoji_res', 'emoji_000.png'), pngWithSize(56, 56)),
+    ])
+    const f = fixture()
+    const bridge = new QQKernelBridge({ reactionNativeStepTimeoutMs: 25, reactionCatalogLoadTimeoutMs: 2_000 })
+    vi.spyOn(bridge as any, 'packetClientForSession').mockReturnValue({
+      getSysFaces: () => new Promise(() => {}), getSysFace: async () => undefined,
+    })
+    ;(f.session as any).getBaseEmojiService = () => ({
+      fetchFullSysEmojis: () => new Promise(() => {}),
+    })
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: join(root, 'account') })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/v1/reactions/catalog`)
+    expect(response.status, await response.clone().text()).toBe(200)
+    await expect(response.json()).resolves.toMatchObject({
+      available: [{ key: '2:128522', title: '嘿嘿' }],
+      maxSelected: 20,
+    })
   })
 
   it('serves a remotely downloaded QQ voice as media instead of a text fallback', async () => {

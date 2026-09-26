@@ -37,6 +37,22 @@ import {
 
 const REACTION_ASSET_META_TTL_MS = 10 * 60_000
 const REACTION_BUNDLE_TAIL_BYTES = 96 * 1024
+/**
+ * Deadline for one whole reaction-catalog attempt.
+ *
+ * Callers bound their own request slightly above this so the loader, not the
+ * HTTP layer, decides when an attempt is abandoned.
+ */
+const REACTION_CATALOG_LOAD_TIMEOUT_MS = 4_500
+/**
+ * Deadline for one optional native catalog step.
+ *
+ * Every native step only enriches the catalog: the definitions built from the
+ * local emoji resources are already usable without it. A step that stops
+ * responding must therefore be abandoned rather than allowed to hold the whole
+ * catalog hostage.
+ */
+const REACTION_NATIVE_STEP_TIMEOUT_MS = 2_000
 const FACE_ASSET_META_TTL_MS = 10 * 60_000
 /** CDN batch timestamps probed per unknown face before giving up. */
 const MAX_FACE_RESOURCE_PROBE_TIMESTAMPS = 6
@@ -197,6 +213,10 @@ export interface QQKernelOptions {
   marketStickerMimeCacheDir?: string | false
   /** Test-only override; production uses the 32 MiB voice body limit. */
   voiceInputLimitBytes?: number
+  /** Test-only override; production bounds one optional native catalog step. */
+  reactionNativeStepTimeoutMs?: number
+  /** Test-only override; production bounds one whole reaction-catalog attempt. */
+  reactionCatalogLoadTimeoutMs?: number
   mediaGateway?: QQMediaLeaseIssuer
   callController?: QQCallController
 }
@@ -547,6 +567,8 @@ export class QQKernelBridge {
   private readonly stickerMissingCacheTtlMs: number
   private readonly marketStickerMimeCacheDir?: string
   private readonly voiceInputLimitBytes: number
+  private readonly reactionNativeStepTimeoutMs: number
+  private readonly reactionCatalogLoadTimeoutMs: number
 
   private readonly mediaGateway?: QQMediaLeaseIssuer
   private readonly callController?: QQCallController
@@ -564,6 +586,14 @@ export class QQKernelBridge {
     this.voiceInputLimitBytes = options.voiceInputLimitBytes ?? MAX_VOICE_INPUT_BYTES
     if (!Number.isSafeInteger(this.voiceInputLimitBytes) || this.voiceInputLimitBytes <= 0) {
       throw new Error('voice input limit must be a positive integer')
+    }
+    this.reactionNativeStepTimeoutMs = options.reactionNativeStepTimeoutMs ?? REACTION_NATIVE_STEP_TIMEOUT_MS
+    this.reactionCatalogLoadTimeoutMs = options.reactionCatalogLoadTimeoutMs ?? REACTION_CATALOG_LOAD_TIMEOUT_MS
+    if (!Number.isSafeInteger(this.reactionNativeStepTimeoutMs) || this.reactionNativeStepTimeoutMs <= 0) {
+      throw new Error('reaction native step timeout must be a positive integer')
+    }
+    if (!Number.isSafeInteger(this.reactionCatalogLoadTimeoutMs) || this.reactionCatalogLoadTimeoutMs <= 0) {
+      throw new Error('reaction catalog load timeout must be a positive integer')
     }
     this.marketStickerMimeCacheDir = options.marketStickerMimeCacheDir === false
       || (options.marketStickerMimeCacheDir === undefined && Boolean(process.env.VITEST))
@@ -5822,15 +5852,30 @@ export class QQKernelBridge {
     }
   }
 
+  /**
+   * Load the reaction catalog, sharing one bounded attempt across callers.
+   *
+   * A native step inside the loader can stop responding without ever rejecting.
+   * Only the bounded attempt is shared: once its deadline passes the promise is
+   * cleared, so the next request starts a fresh load instead of reusing the
+   * same stuck one. Without that, a single hung load kept every group's
+   * reaction catalog empty until the bridge was restarted.
+   */
   private async loadReactionCatalogOnce(): Promise<void> {
     if (this.reactionDefinitions.length) return
     if (this.reactionCatalogPromise) return this.reactionCatalogPromise
     const pending = this.loadReactionCatalog()
-    this.reactionCatalogPromise = pending
+    // The attempt may still settle after we abandoned it, so observe it to keep
+    // a late rejection from surfacing as an unhandled rejection.
+    pending.catch(() => undefined)
+    const attempt = withTimeout(
+      pending, this.reactionCatalogLoadTimeoutMs, 'QQ reaction catalog request timed out',
+    )
+    this.reactionCatalogPromise = attempt
     try {
-      await pending
+      await attempt
     } finally {
-      if (this.reactionCatalogPromise === pending) this.reactionCatalogPromise = undefined
+      if (this.reactionCatalogPromise === attempt) this.reactionCatalogPromise = undefined
     }
   }
 
@@ -7085,11 +7130,15 @@ export class QQKernelBridge {
     let emojiPath = localRoot ? join(localRoot, 'emoji_res') : ''
     if (!configPath || !existsSync(configPath) || !existsSync(facePath) || !existsSync(emojiPath)) {
       if (!service.getEmojiResourcePath) return
-      const [configResult, faceResult, emojiResult] = await Promise.all([
-        service.getEmojiResourcePath(0),
-        service.getEmojiResourcePath(1),
-        service.getEmojiResourcePath(2),
-      ])
+      const [configResult, faceResult, emojiResult] = await withTimeout(
+        Promise.all([
+          service.getEmojiResourcePath(0),
+          service.getEmojiResourcePath(1),
+          service.getEmojiResourcePath(2),
+        ]),
+        this.reactionNativeStepTimeoutMs,
+        'QQ emoji resource path lookup timed out',
+      )
       if (configResult.result !== 0 || faceResult.result !== 0 || emojiResult.result !== 0) {
         throw new Error(`getEmojiResourcePath: ${configResult.errMsg || faceResult.errMsg || emojiResult.errMsg}`)
       }
@@ -7195,14 +7244,15 @@ export class QQKernelBridge {
         mimeType: animated ? 'image/apng' : 'image/png',
       })
     }
+    // Publish what the local resources already describe before the optional
+    // native enrichment. A native catalog that stops responding then costs a
+    // few extra faces instead of leaving every client with none.
+    this.publishReactionCatalog(definitions, aliases, assets)
     // QQ's packet catalog contains newer system faces that may not yet be
     // listed in face_config.json (or have no local sysface_res asset). Expose
     // those faces too, backed by their native CDN URL, so messages such as
     // `/续标识` and `/不是吧` do not degrade to literal slash labels.
-    const nativeFaces = await this.packetClientForSession().getSysFaces().catch((error) => {
-      log('warn', 'native sysface catalog refresh failed while loading reactions', error)
-      return []
-    })
+    const nativeFaces = await this.loadNativeSysFaces()
     const runtimeFaces = await this.fetchRuntimeSysFaces()
     const knownKeys = new Set(definitions.map((definition) => definition.key))
     for (const face of [...nativeFaces, ...runtimeFaces]) {
@@ -7268,29 +7318,68 @@ export class QQKernelBridge {
         assets.set(key, { path: cached.path, mimeType: cached.mimeType })
       }
     }
-    this.reactionDefinitions = definitions
+    this.publishReactionCatalog(definitions, aliases, assets)
+    log('info', `loaded ${definitions.length} QQ reaction definitions`)
+  }
+
+  /**
+   * Install one immutable snapshot of the reaction catalog.
+   *
+   * The loader publishes the snapshot the local resources already describe and
+   * republishes it once the optional native enrichment finishes, so consumers
+   * always read a consistent catalog.
+   */
+  private publishReactionCatalog(
+    definitions: readonly QQReactionDefinition[],
+    aliases: ReadonlyMap<string, QQReactionDefinition>,
+    assets: ReadonlyMap<string, ReactionAsset>,
+  ): void {
+    this.reactionDefinitions = [...definitions]
     this.reactionByKey.clear()
     this.reactionAssets.clear()
     this.reactionRemoteCache.clear()
     this.reactionAssetMetadata.clear()
     for (const [key, asset] of assets) this.reactionAssets.set(key, asset)
-    for (const definition of definitions) this.reactionByKey.set(definition.key, definition)
+    for (const definition of this.reactionDefinitions) this.reactionByKey.set(definition.key, definition)
     for (const [key, definition] of aliases) this.reactionByKey.set(key, definition)
-    log('info', `loaded ${definitions.length} QQ reaction definitions`)
+  }
+
+  /**
+   * Native system-face directory, bounded because it only enriches the catalog.
+   *
+   * The packet layer has a timeout of its own, but that budget is longer than a
+   * catalog request may spend, so the catalog applies a smaller one and keeps
+   * the definitions it already has.
+   */
+  private async loadNativeSysFaces(): Promise<NativeSysFace[]> {
+    try {
+      return await withTimeout(
+        this.packetClientForSession().getSysFaces(),
+        this.reactionNativeStepTimeoutMs,
+        'QQ native system-face catalog timed out',
+      )
+    } catch (error) {
+      log('warn', 'native sysface catalog refresh failed while loading reactions', error)
+      return []
+    }
   }
 
   private async fetchRuntimeSysFaces(): Promise<NativeSysFace[]> {
     const service = this.requireSession().getBaseEmojiService?.()
     if (!service?.fetchFullSysEmojis) return []
     try {
-      const result = await service.fetchFullSysEmojis({
-        fetchAdvaceSource: true,
-        fetchBaseSource: true,
-        pullMoment: 1,
-        pullType: 0,
-        refresh: true,
-        thresholdValue: 0,
-      })
+      const result = await withTimeout(
+        service.fetchFullSysEmojis({
+          fetchAdvaceSource: true,
+          fetchBaseSource: true,
+          pullMoment: 1,
+          pullType: 0,
+          refresh: true,
+          thresholdValue: 0,
+        }),
+        this.reactionNativeStepTimeoutMs,
+        'QQ runtime system-face catalog timed out',
+      )
       if (result.result !== 0) throw new Error(result.errMsg || `result=${result.result}`)
       return extractRuntimeSysFaces(result.rsp)
     } catch (error) {
