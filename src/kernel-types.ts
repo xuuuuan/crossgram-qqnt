@@ -68,6 +68,13 @@ export interface MemberInfo {
   avatarPath: string
 }
 
+/** Result of one native group-member removal request. */
+export interface KickMemberResponse {
+  errCode: number
+  errMsg: string
+  resultList: Array<{ uid: string, result: number }>
+}
+
 /**
  * Group notification behavior verified live on QQ Linux 3.2.32.
  *
@@ -883,7 +890,12 @@ export interface KernelGroupService {
   setGroupMsgMask?(groupCode: string, mask: GroupMsgMask): Promise<{ result: number, errMsg: string }>
   /** Set or revoke QQ group administrator status. Native roles are Member=2 and Admin=3. */
   modifyMemberRole?(groupCode: string, uid: string, role: 2 | 3): Promise<{ result: number, errMsg: string }>
-  kickMember?(groupCode: string, uids: string[], refuseForever?: boolean, reason?: string): Promise<unknown>
+  /**
+   * Removes group members. The native method asserts four arguments, so the
+   * reason string must always be supplied; `errCode` covers the request and
+   * `resultList` reports each target on its own.
+   */
+  kickMember?(groupCode: string, uids: string[], refuseForever: boolean, reason: string): Promise<KickMemberResponse>
   setMemberShutUp?(groupCode: string, members: Array<{ uid: string, timeStamp: number }>): Promise<{ result: number, errMsg: string }>
   createMemberListScene(groupCode: string, scene: string): string
   destroyMemberListScene(sceneId: string): void

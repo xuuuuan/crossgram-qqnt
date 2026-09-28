@@ -731,6 +731,7 @@ export class QQBridgeServer {
         type?: unknown
         untilDate?: unknown
         rejectAddRequest?: unknown
+        reason?: unknown
       }>(request)
       if (body?.type !== 'mute' && body?.type !== 'unmute' && body?.type !== 'kick') {
         json(response, 400, { error: 'type must be mute, unmute, or kick' })
@@ -743,6 +744,7 @@ export class QQBridgeServer {
           body.type,
           typeof body.untilDate === 'number' ? body.untilDate : 0,
           body.rejectAddRequest === true,
+          typeof body.reason === 'string' ? body.reason.slice(0, 60) : '',
         )
       } catch (error) {
         json(response, 502, { error: errorMessage(error) })

@@ -338,7 +338,9 @@ function fixture() {
     }),
     setGroupMsgMask: vi.fn<NonNullable<KernelGroupService['setGroupMsgMask']>>(async () => ({ result: 0, errMsg: 'success' })),
     modifyMemberRole: vi.fn<NonNullable<KernelGroupService['modifyMemberRole']>>(async () => ({ result: 0, errMsg: 'success' })),
-    kickMember: vi.fn<NonNullable<KernelGroupService['kickMember']>>(async () => ({ result: 0, errMsg: 'success' })),
+    kickMember: vi.fn<NonNullable<KernelGroupService['kickMember']>>(async (_groupCode, uids) => ({
+      errCode: 0, errMsg: '', resultList: uids.map((uid) => ({ uid, result: 0 })),
+    })),
     setMemberShutUp: vi.fn<NonNullable<KernelGroupService['setMemberShutUp']>>(async () => ({ result: 0, errMsg: 'success' })),
     getMemberInfo: vi.fn<NonNullable<KernelGroupService['getMemberInfo']>>(async () => ({ result: 1, errMsg: 'not found' })),
     createMemberListScene: vi.fn(() => 'scene'), destroyMemberListScene: vi.fn(),
@@ -5198,9 +5200,49 @@ it('drops zero-peer sidecars while preserving the paired group service message',
     expect(f.group.setMemberShutUp).toHaveBeenNthCalledWith(2, '1058754719', [
       { uid: 'member', timeStamp: 0 },
     ])
-    expect(f.group.kickMember).toHaveBeenCalledWith('1058754719', ['member'], true)
+    expect(f.group.kickMember).toHaveBeenCalledWith('1058754719', ['member'], true, '')
     expect(f.buddy.setBlock).toHaveBeenNthCalledWith(1, 123456789, true)
     expect(f.buddy.setBlock).toHaveBeenNthCalledWith(2, 123456789, false)
+  })
+
+  it('always supplies the fourth native kick argument, including the caller reason', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const group = bridge.getConversation('1058754719')
+
+    await bridge.moderateMember(group, 'member', 'kick', 0, false, '长期未发言')
+    await bridge.moderateMember(group, 'other', 'kick')
+
+    // Native QQNT asserts exactly four arguments, so the reason must never be omitted.
+    expect(f.group.kickMember).toHaveBeenNthCalledWith(1, '1058754719', ['member'], false, '长期未发言')
+    expect(f.group.kickMember).toHaveBeenNthCalledWith(2, '1058754719', ['other'], false, '')
+  })
+
+  it('surfaces native kick failures from the request code and the per-member result', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const group = bridge.getConversation('1058754719')
+
+    f.group.kickMember.mockResolvedValueOnce({ errCode: 0, errMsg: '', resultList: [{ uid: 'member', result: 2 }] })
+    await expect(bridge.moderateMember(group, 'member', 'kick')).rejects.toThrow('kickMember: member was not removed (2)')
+
+    f.group.kickMember.mockResolvedValueOnce({ errCode: 66, errMsg: 'busy', resultList: [] })
+    await expect(bridge.moderateMember(group, 'member', 'kick')).rejects.toThrow('kickMember: busy (66)')
+
+    f.group.kickMember.mockResolvedValueOnce({ errCode: 0, errMsg: '', resultList: [] })
+    await expect(bridge.moderateMember(group, 'member', 'kick')).resolves.toBeUndefined()
+  })
+
+  it('still rejects the legacy kick result shape when a build reports it that way', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const group = bridge.getConversation('1058754719')
+
+    f.group.kickMember.mockResolvedValueOnce({ result: 2, errMsg: 'no permission' } as never)
+    await expect(bridge.moderateMember(group, 'member', 'kick')).rejects.toThrow('kickMember: no permission (2)')
   })
 
   it('keeps native member cursors opaque and reports the group profile total on every page', async () => {

@@ -1766,6 +1766,7 @@ export class QQKernelBridge {
     action: 'mute' | 'unmute' | 'kick',
     untilDate = 0,
     rejectAddRequest = false,
+    reason = '',
   ): Promise<void> {
     if (conversation.chatType !== CHAT_GROUP) throw new Error('member moderation is only supported for group conversations')
     if (!userId) throw new Error('member user id is required')
@@ -1774,8 +1775,19 @@ export class QQKernelBridge {
     if (action === 'kick') {
       const method = groupService.kickMember
       if (!method) throw new Error('QQNT does not expose kickMember')
-      const result = await method.call(groupService, groupCode, [userId], rejectAddRequest)
-      if (isNativeFailureResult(result)) throw new Error(`kickMember: ${result.errMsg} (${result.result})`)
+      // The native method asserts exactly four arguments, so the reason string
+      // is always passed even when the caller has nothing to record.
+      const response = await method.call(groupService, groupCode, [userId], rejectAddRequest, reason)
+      if (isNativeFailureResult(response)) {
+        throw new Error(`kickMember: ${response.errMsg} (${response.result})`)
+      }
+      if (typeof response?.errCode === 'number' && response.errCode !== 0) {
+        throw new Error(`kickMember: ${response.errMsg || 'native request failed'} (${response.errCode})`)
+      }
+      const rejected = response?.resultList?.find((item) => item.uid === userId) ?? response?.resultList?.[0]
+      if (rejected && rejected.result !== 0) {
+        throw new Error(`kickMember: ${response?.errMsg || 'member was not removed'} (${rejected.result})`)
+      }
       return
     }
     const method = groupService.setMemberShutUp
