@@ -6083,6 +6083,7 @@ export class QQKernelBridge {
           && (!item.expectedMediaName || record.elements.some((element) =>
             element.fileElement?.fileName === item.expectedMediaName
             || element.picElement?.fileName === item.expectedMediaName
+            || element.videoElement?.fileName === item.expectedMediaName
             || element.pttElement?.fileName === item.expectedMediaName)
             || item.expectedMediaKind === 'image'))
         // Current QQNT builds can return no usable ID from getMsgUniqueId().

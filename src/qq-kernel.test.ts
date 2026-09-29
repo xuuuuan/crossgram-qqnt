@@ -1006,6 +1006,47 @@ describe('QQKernelBridge', () => {
     })
   })
 
+  it('tags a prepared video echo that QQ delivers before the send response', async () => {
+    const f = fixture()
+    f.msg.getMsgUniqueId.mockReturnValue('0')
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const messageId = 'video-native-id'
+    f.protocolSend.mockImplementationOnce(async () => {
+      // Production order: the finished onRecvMsg echo (videoElement named after
+      // the uploaded file) is published ~360 ms before PbSendMsg answers.
+      await f.emitMessages([{
+        ...f.message, msgId: messageId, sendStatus: 2,
+        elements: [{
+          elementType: 5, elementId: 'video-element', videoElement: {
+            fileName: 'clip.mp4', fileSize: '1084921', fileUuid: 'video-uuid',
+            filePath: '', fileTime: 25, fileFormat: 2, thumbPath: new Map(),
+          },
+        }],
+      }])
+      return { sequence: 1n, clientSequence: 2n, sendTime: 3 }
+    })
+    const subscription = bridge.subscribe()
+    const nextEvent = subscription[Symbol.asyncIterator]().next()
+
+    const sent = await bridge.send({
+      conversationId: 'uid-1715311957', originRequestId: 'relay-video-send',
+      media: [{
+        kind: 'video', name: 'clip.mp4', mimeType: 'video/mp4', size: 1084921,
+        md5: 'a'.repeat(32), sha1: 'b'.repeat(40), sha1Checkpoints: ['b'.repeat(40), 'c'.repeat(40)],
+      }],
+      uploadedMedia: [{ kind: 'video', fileUuid: 'video-uuid', msgInfo: Buffer.from('m').toString('base64url') }],
+    }, Readable.from([]))
+    const event = await nextEvent
+    bridge.unsubscribe(subscription)
+
+    expect(sent).toMatchObject({ id: messageId, originRequestId: 'relay-video-send' })
+    expect(event.value).toMatchObject({
+      type: 'message',
+      message: { id: messageId, originRequestId: 'relay-video-send', outgoing: true },
+    })
+  })
+
   it('loads the authoritative self profile before exposing the account and keeps it stable', async () => {
     const f = fixture()
     f.setProfile({
