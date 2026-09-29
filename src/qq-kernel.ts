@@ -7277,7 +7277,12 @@ export class QQKernelBridge {
       if (canvas) this.faceCanvasGeometry.set(face.faceId, canvas)
       if (knownKeys.has(key) || !face.url) continue
       knownKeys.add(key)
+      // Faces hidden from face_config.json still ship their animation in the
+      // resource tree or the account's download cache. Serve those bytes and
+      // advertise their real format: the CDN `base` bundle only carries the
+      // static icon, and a local APNG published as a PNG never animates.
       const icon = this.localFaceAsset(face.faceId, this.faceIconTarget(face.faceId))
+      const animated = icon?.mimeType === 'image/apng'
       definitions.push({
         key,
         title: cleanFaceName(face.name),
@@ -7285,16 +7290,19 @@ export class QQKernelBridge {
           type: 'custom',
           alt: '🙂',
           resource: {
-            version: 1,
-            format: 'static',
-            mimeType: 'image/png',
+            version: icon?.version ?? 1,
+            format: animated ? 'video' : 'static',
+            mimeType: animated ? 'video/webm' : 'image/png',
             width: icon?.width ?? 128,
             height: icon?.height ?? 128,
+            ...(icon ? { size: icon.size } : {}),
             locator: { reactionKey: key },
           },
         },
       })
-      assets.set(key, { url: face.url, mimeType: 'image/png' })
+      assets.set(key, icon
+        ? { path: icon.path, mimeType: icon.mimeType }
+        : { url: face.url, mimeType: 'image/png' })
     }
     // QQ renders the base emoji system resources from its own download cache
     // under the account directory, in the same <id>/<format>/<id>.png layout

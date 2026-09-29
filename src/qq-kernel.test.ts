@@ -6223,6 +6223,73 @@ it('drops zero-peer sidecars while preserving the paired group service message',
     })
   })
 
+  it('publishes a hidden native face as animated when its APNG is already on disk', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'qqnt-runtime-reaction-apng-'))
+    tempPaths.push(root)
+    const resourceRoot = join(root, 'global', 'nt_data', 'Emoji', 'emoji-resource')
+    const cacheRoot = join(root, 'account', 'nt_data', 'Emoji', 'BaseEmojiSyastems', 'EmojiSystermResource')
+    await Promise.all([
+      mkdir(join(resourceRoot, 'sysface_res', 'static'), { recursive: true }),
+      mkdir(join(resourceRoot, 'sysface_res', 'apng'), { recursive: true }),
+      mkdir(join(resourceRoot, 'emoji_res'), { recursive: true }),
+      mkdir(join(cacheRoot, '466', 'png'), { recursive: true }),
+    ])
+    const shipped = apngWithSize(128, 128)
+    const cached = apngWithSize(128, 128)
+    await Promise.all([
+      // 402 is hidden from face_config.json, so only the native catalog lists
+      // it, yet QQ still ships its APNG next to the static icon.
+      writeFile(join(resourceRoot, 'face_config.json'), JSON.stringify({
+        emoji: [], sysface: [{ QSid: '402', QDes: '/别说话', QHide: '1' }],
+      })),
+      writeFile(join(resourceRoot, 'sysface_res', 'apng', 's402.png'), shipped),
+      writeFile(join(resourceRoot, 'sysface_res', 'static', 's402.png'), pngWithSize(128, 128)),
+      // 466 exists only in the account's download cache, animated.
+      writeFile(join(cacheRoot, '466', 'png', '466.png'), cached),
+    ])
+    const f = fixture()
+    ;(f.session as any).getBaseEmojiService = () => ({
+      fetchFullSysEmojis: vi.fn(async () => ({
+        result: 0, errMsg: '', rsp: {
+          normalPanelResult: {
+            SysEmojiGroupList: [{ SysEmojiList: [
+              { emojiId: '402', describe: '/别说话', animationWidth: 128, animationHeigh: 128 },
+              { emojiId: '466', describe: '/羞羞哒', animationWidth: 128, animationHeigh: 128 },
+              { emojiId: '777', describe: '/仅远端', animationWidth: 128, animationHeigh: 128 },
+            ] }],
+            downloadInfo: [
+              { emojiId: '402', baseResDownloadUrl: 'https://face.qq.example/402_base.zip' },
+              { emojiId: '466', baseResDownloadUrl: 'https://face.qq.example/466_base.zip' },
+              { emojiId: '777', baseResDownloadUrl: 'https://face.qq.example/777_base.zip' },
+            ],
+          },
+        },
+      })),
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: join(root, 'account') })
+    vi.spyOn(bridge as any, 'packetClientForSession').mockReturnValue({
+      getSysFaces: async () => [], getSysFace: async () => undefined,
+    })
+
+    const catalog = await bridge.getReactionCatalog()
+    const byKey = new Map(catalog.available.map((definition) => [definition.key, definition]))
+    // The CDN base bundle only wraps the static icon; the animation on disk is
+    // what the reaction must advertise and serve, or it never plays.
+    for (const [key, bytes] of [['1:402', shipped], ['1:466', cached]] as const) {
+      expect(byKey.get(key), key).toMatchObject({
+        presentation: { type: 'custom', resource: { format: 'video', mimeType: 'video/webm', size: bytes.length } },
+      })
+      await expect(bridge.resolveReactionAssetMeta(key), key).resolves.toMatchObject({
+        size: bytes.length, mimeType: 'image/apng', source: 'path',
+      })
+    }
+    // A face with nothing on disk still falls back to its CDN icon.
+    expect(byKey.get('1:777')).toMatchObject({
+      presentation: { type: 'custom', resource: { format: 'static', mimeType: 'image/png' } },
+    })
+  })
+
   it('keeps the local reaction catalog when a native catalog step never responds', async () => {
     const root = await mkdtemp(join(tmpdir(), 'qqnt-reaction-hang-'))
     tempPaths.push(root)
