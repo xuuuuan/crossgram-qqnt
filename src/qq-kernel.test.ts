@@ -6290,6 +6290,64 @@ it('drops zero-peer sidecars while preserving the paired group service message',
     })
   })
 
+  it('finds the account face cache under nt_qq_<hash> when userPath does not lead there', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'qqnt-home-'))
+    tempPaths.push(home)
+    const profile = join(home, '.config', 'qqnt-bridge-injection')
+    const resourceRoot = join(profile, 'global', 'nt_data', 'Emoji', 'emoji-resource')
+    const cacheRoot = join(profile, 'nt_qq_68ec66907a2a3679', 'nt_data', 'Emoji', 'BaseEmojiSyastems', 'EmojiSystermResource')
+    await Promise.all([
+      mkdir(join(resourceRoot, 'sysface_res', 'static'), { recursive: true }),
+      mkdir(join(resourceRoot, 'sysface_res', 'apng'), { recursive: true }),
+      mkdir(join(resourceRoot, 'emoji_res'), { recursive: true }),
+      mkdir(join(cacheRoot, '466', 'png'), { recursive: true }),
+    ])
+    const cached = apngWithSize(128, 128)
+    await Promise.all([
+      writeFile(join(resourceRoot, 'face_config.json'), JSON.stringify({ emoji: [], sysface: [] })),
+      writeFile(join(cacheRoot, '466', 'png', '466.png'), cached),
+    ])
+    const previousHome = process.env.HOME
+    const previousXdg = process.env.XDG_CONFIG_HOME
+    process.env.HOME = home
+    delete process.env.XDG_CONFIG_HOME
+    try {
+      const f = fixture()
+      ;(f.session as any).getBaseEmojiService = () => ({
+        fetchFullSysEmojis: vi.fn(async () => ({
+          result: 0, errMsg: '', rsp: {
+            normalPanelResult: {
+              SysEmojiGroupList: [{ SysEmojiList: [
+                { emojiId: '466', describe: '/羞羞哒', animationWidth: 128, animationHeigh: 128 },
+              ] }],
+              downloadInfo: [{ emojiId: '466', baseResDownloadUrl: 'https://face.qq.example/466_base.zip' }],
+            },
+          },
+        })),
+      })
+      const bridge = new QQKernelBridge()
+      // Production reports a userPath whose parents never reach the
+      // per-account nt_qq_<hash> directory QQ downloads faces into.
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: join(profile, 'global') })
+      vi.spyOn(bridge as any, 'packetClientForSession').mockReturnValue({
+        getSysFaces: async () => [], getSysFace: async () => undefined,
+      })
+
+      const catalog = await bridge.getReactionCatalog()
+      expect(catalog.available.find((definition) => definition.key === '1:466')).toMatchObject({
+        presentation: { type: 'custom', resource: { format: 'video', size: cached.length } },
+      })
+      await expect(bridge.resolveReactionAssetMeta('1:466')).resolves.toMatchObject({
+        size: cached.length, mimeType: 'image/apng', source: 'path',
+      })
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME
+      else process.env.HOME = previousHome
+      if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME
+      else process.env.XDG_CONFIG_HOME = previousXdg
+    }
+  })
+
   it('keeps the local reaction catalog when a native catalog step never responds', async () => {
     const root = await mkdtemp(join(tmpdir(), 'qqnt-reaction-hang-'))
     tempPaths.push(root)

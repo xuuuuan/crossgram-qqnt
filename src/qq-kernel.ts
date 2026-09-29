@@ -1,5 +1,5 @@
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
-import { closeSync, createReadStream, createWriteStream, existsSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { closeSync, createReadStream, createWriteStream, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { copyFile, mkdir, mkdtemp, open as openFile, readFile, readdir, rename, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
@@ -3997,6 +3997,27 @@ export class QQKernelBridge {
     }
     add(process.env.XDG_CONFIG_HOME)
     add(process.env.HOME ? join(process.env.HOME, '.config') : undefined)
+    // Linux QQ can omit userPath from the session config, and the account
+    // download cache lives under a per-account `nt_qq_<hash>` directory that
+    // the fixed prefixes above never reach. Scan the injected profile roots
+    // for those account directories so their cached faces stay servable.
+    for (const base of [process.env.XDG_CONFIG_HOME, process.env.HOME ? join(process.env.HOME, '.config') : undefined]) {
+      if (!base) continue
+      for (const profile of ['qqnt-bridge-injection', 'QQ']) {
+        const profileRoot = join(base, profile)
+        let entries: string[] = []
+        try {
+          entries = readdirSync(profileRoot)
+        } catch {
+          continue
+        }
+        for (const entry of entries) {
+          if (/^nt_qq_[0-9a-f]+$/i.test(entry)) {
+            caches.add(join(profileRoot, entry, 'nt_data', 'Emoji', 'BaseEmojiSyastems', 'EmojiSystermResource'))
+          }
+        }
+      }
+    }
     let current = this.config?.userPath
     for (let depth = 0; depth < 8 && current; depth++) {
       add(current)
@@ -7314,26 +7335,32 @@ export class QQKernelBridge {
         const key = reactionKey('1', faceId)
         const cached = this.localFaceAsset(faceId, this.faceIconTarget(faceId))
         if (!cached) continue
+        const animated = cached.mimeType === 'image/apng'
+        const resource: Extract<QQReactionDefinition['presentation'], { type: 'custom' }>['resource'] = {
+          version: cached.version,
+          format: animated ? 'video' : 'static',
+          mimeType: animated ? 'video/webm' : 'image/png',
+          width: cached.width ?? 128,
+          height: cached.height ?? 128,
+          size: cached.size,
+          locator: { reactionKey: key },
+        }
         if (!knownKeys.has(key)) {
           knownKeys.add(key)
-          const animated = cached.mimeType === 'image/apng'
           definitions.push({
             key,
             title: faceId,
-            presentation: {
-              type: 'custom',
-              alt: '🙂',
-              resource: {
-                version: cached.version,
-                format: animated ? 'video' : 'static',
-                mimeType: animated ? 'video/webm' : 'image/png',
-                width: cached.width ?? 128,
-                height: cached.height ?? 128,
-                size: cached.size,
-                locator: { reactionKey: key },
-              },
-            },
+            presentation: { type: 'custom', alt: '🙂', resource },
           })
+        } else {
+          // The asset below switches to these bytes, so a definition an
+          // earlier source published must describe them too; a cached APNG
+          // advertised as a static PNG never animates.
+          const index = definitions.findIndex((definition) => definition.key === key)
+          const existing = definitions[index]
+          if (existing?.presentation.type === 'custom') {
+            definitions[index] = { ...existing, presentation: { ...existing.presentation, resource } }
+          }
         }
         assets.set(key, { path: cached.path, mimeType: cached.mimeType })
       }
