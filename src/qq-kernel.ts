@@ -3887,12 +3887,13 @@ export class QQKernelBridge {
    * tree and the account's own download cache over any network round trip.
    */
   private localFaceAsset(faceId: string, target: FaceAssetTarget = {}): FacePathAsset | undefined {
+    let fallback: FacePathAsset | undefined
     for (const path of this.localFaceFileCandidates(faceId, target)) {
       const info = statSync(path, { throwIfNoEntry: false })
       if (!info?.size) continue
       const sniffed = faceImageMimeType(path)
       if (!sniffed) continue
-      return {
+      const asset: FacePathAsset = {
         kind: 'path',
         path,
         mimeType: sniffed.mimeType,
@@ -3901,8 +3902,13 @@ export class QQKernelBridge {
         ...(sniffed.width === undefined ? {} : { width: sniffed.width }),
         ...(sniffed.height === undefined ? {} : { height: sniffed.height }),
       }
+      // The shipped `apng` directory sometimes holds a plain PNG while the
+      // account cache has the real animation: keep looking for an animated
+      // file before settling for the first static one.
+      if (asset.mimeType === 'image/apng') return asset
+      fallback ??= asset
     }
-    return undefined
+    return fallback
   }
 
   /** Candidate face files on disk, most authoritative first. */

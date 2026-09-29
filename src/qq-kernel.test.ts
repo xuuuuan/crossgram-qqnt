@@ -6348,6 +6348,46 @@ it('drops zero-peer sidecars while preserving the paired group service message',
     }
   })
 
+  it('prefers the cached APNG over a plain PNG QQ shipped in its apng directory', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'qqnt-reaction-fake-apng-'))
+    tempPaths.push(root)
+    const resourceRoot = join(root, 'global', 'nt_data', 'Emoji', 'emoji-resource')
+    const cacheRoot = join(root, 'account', 'nt_data', 'Emoji', 'BaseEmojiSyastems', 'EmojiSystermResource')
+    await Promise.all([
+      mkdir(join(resourceRoot, 'sysface_res', 'static'), { recursive: true }),
+      mkdir(join(resourceRoot, 'sysface_res', 'apng'), { recursive: true }),
+      mkdir(join(resourceRoot, 'emoji_res'), { recursive: true }),
+      mkdir(join(cacheRoot, '344', 'apng'), { recursive: true }),
+      mkdir(join(cacheRoot, '344', 'png'), { recursive: true }),
+    ])
+    const animation = apngWithSize(128, 128)
+    await Promise.all([
+      writeFile(join(resourceRoot, 'face_config.json'), JSON.stringify({
+        emoji: [], sysface: [{ QSid: '344', QDes: '/大怨种' }],
+      })),
+      // QQ shipped a still frame where the animation belongs.
+      writeFile(join(resourceRoot, 'sysface_res', 'apng', 's344.png'), pngWithSize(128, 128)),
+      writeFile(join(resourceRoot, 'sysface_res', 'static', 's344.png'), pngWithSize(128, 128)),
+      writeFile(join(cacheRoot, '344', 'apng', '344.png'), animation),
+      writeFile(join(cacheRoot, '344', 'png', '344.png'), pngWithSize(128, 128)),
+    ])
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: join(root, 'account') })
+    vi.spyOn(bridge as any, 'packetClientForSession').mockReturnValue({
+      getSysFaces: async () => [], getSysFace: async () => undefined,
+    })
+
+    const catalog = await bridge.getReactionCatalog()
+    expect(catalog.available.find((definition) => definition.key === '1:344')).toMatchObject({
+      title: '大怨种',
+      presentation: { type: 'custom', resource: { format: 'video', size: animation.length } },
+    })
+    await expect(bridge.resolveReactionAssetMeta('1:344')).resolves.toMatchObject({
+      size: animation.length, mimeType: 'image/apng', source: 'path',
+    })
+  })
+
   it('keeps the local reaction catalog when a native catalog step never responds', async () => {
     const root = await mkdtemp(join(tmpdir(), 'qqnt-reaction-hang-'))
     tempPaths.push(root)
