@@ -15,7 +15,7 @@ import { GroupMsgMask, type ContactMsgBoxInfo, type KernelBuddyService, type Ker
 import type { PacketAddon } from './packet-addon.js'
 import { parseConversationId, type QQEvent, type QQStickerReference } from './protocol.js'
 import { faceAssetVersion } from './face-asset-bundle.js'
-import { normalizeNativeHash, QQKernelBridge } from './qq-kernel.js'
+import { isGenericMultiForwardSummary, normalizeNativeHash, QQKernelBridge } from './qq-kernel.js'
 import { QQBridgeServer } from './server.js'
 import { QQPacketClient } from './packet-client.js'
 import {
@@ -3232,6 +3232,58 @@ it('drops zero-peer sidecars while preserving the paired group service message',
         preview: 'Alice: 第一条\nBob: 第二条 & 回复\nCarol: 第三条',
       }],
     }])
+  })
+
+  it('reads merged-forward previews from the card rows and never reports the QQ footer', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    await bridge.getDialogs()
+    const card = (msgId: string, xmlContent: string) => ({
+      ...f.message, msgId,
+      elements: [{
+        elementType: 16, elementId: `${msgId}-element`,
+        multiForwardMsgElement: { fileName: '群聊的聊天记录', resId: `${msgId}-resource`, xmlContent },
+      }],
+    })
+    // The layout QQ sends: a size-34 header, size-26 content rows and a
+    // footer summary that only counts the records.
+    const rows = card('rows', '<?xml version="1.0" encoding="utf-8"?>'
+      + '<msg brief="[聊天记录]" m_fileName="rows" action="viewMultiMsg" tSum="2" flag="3" m_resid="rows" serviceID="35">'
+      + '<item layout="1"><title color="#000000" size="34">群聊的聊天记录</title>'
+      + '<title color="#777777" size="26">SaDOS: 解剖结论</title>'
+      + '<title color="#777777" size="26">Bob: [图片]</title>'
+      + '<hr></hr><summary color="#808080" size="26">查看2条转发消息</summary></item>'
+      + '<source name="聊天记录"></source></msg>')
+    const footerOnly = card('footer', '<msg><item layout="1">'
+      + '<title color="#000000" size="34">群聊的聊天记录</title>'
+      + '<summary color="#808080">查看 1 条转发消息</summary></item></msg>')
+    f.msg.getMultiMsg.mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [rows, footerOnly] })
+
+    const messages = await bridge.getMultiForwardMessages({
+      conversationId: 'uid-1715311957', rootMessageId: 'outer',
+    })
+    expect(messages.map((message) => message.parts[0])).toMatchObject([
+      { type: 'multi-forward', title: '群聊的聊天记录', preview: 'SaDOS: 解剖结论\nBob: [图片]' },
+      { type: 'multi-forward', title: '群聊的聊天记录' },
+    ])
+    // A card whose only text is the footer carries no preview: the relay
+    // builds one from the archived records instead.
+    const footerPart = messages[1].parts[0] as { preview?: string }
+    expect(footerPart.preview).toBeUndefined()
+    expect(JSON.stringify(messages)).not.toMatch(/查看\s*\d+\s*条转发消息/)
+  })
+
+  it('recognizes every QQ merged-forward placeholder as content-free', () => {
+    for (const value of [
+      '查看1条转发消息', '查看 12 条转发消息', '点击查看转发消息', '查看转发消息',
+      '6条消息的合并转发', '共3条消息的合并转发', '[聊天记录]', '聊天记录', '合并转发',
+    ]) {
+      expect(isGenericMultiForwardSummary(value), value).toBe(true)
+    }
+    for (const value of ['Alice: 查看1条转发消息吗？', 'Bob: [图片]', '查看群聊的聊天记录']) {
+      expect(isGenericMultiForwardSummary(value), value).toBe(false)
+    }
   })
 
   it('defers merged-forward voice conversion until the media is opened', async () => {

@@ -9951,10 +9951,30 @@ function multiForwardPreview(
     .matchAll(/<summary\b[^>]*>(?:<!\[CDATA\[([\s\S]*?)\]\]>|([\s\S]*?))<\/summary>/gi)]
     .map((match) => normalizeMultiForwardPreview(match[1] ?? match[2] ?? ''))
     .filter(Boolean)
-  const detailed = summaries.filter((summary) =>
-    !/^(?:点击)?查看(?:\s*\d+\s*条)?转发消息$/.test(summary))
-  return ( [...new Set(detailed.length ? detailed : summaries)].join('\n') || undefined
-  )
+  // QQ's `<summary>` is the card footer ("查看N条转发消息"), not content. The
+  // preview lines live in the `<title>` rows after the header. Only real
+  // content may become a preview: with none, the relay builds one from the
+  // archived records instead of repeating QQ's footer.
+  const titles = [...(element.xmlContent ?? '')
+    .matchAll(/<title\b([^>]*)>(?:<!\[CDATA\[([\s\S]*?)\]\]>|([\s\S]*?))<\/title>/gi)]
+    .map((match) => ({
+      size: /\bsize\s*=\s*"(\d+)"/i.exec(match[1] ?? '')?.[1],
+      text: normalizeMultiForwardPreview(match[2] ?? match[3] ?? ''),
+    }))
+    .filter((title) => title.text)
+  const header = titles.findIndex((title) => title.size === '34')
+  const lines = titles.filter((_title, index) => index !== (header < 0 ? 0 : header))
+    .map((title) => title.text)
+  const detailed = [...lines, ...summaries].filter((line) => !isGenericMultiForwardSummary(line))
+  return [...new Set(detailed)].join('\n') || undefined
+}
+
+/** QQ's card footer or placeholder text, which describes no forwarded content. */
+export function isGenericMultiForwardSummary(value: string): boolean {
+  const compact = value.replace(/\s+/g, '')
+  return /^(?:点击)?查看(?:[xX×\d]+条)?(?:消息的)?(?:合并)?转发(?:消息)?$/.test(compact)
+    || /^(?:共)?[xX×\d]+条消息的合并转发$/.test(compact)
+    || /^(?:\[?聊天记录\]?|合并转发)$/.test(compact)
 }
 
 function normalizeMultiForwardPreview(value: string): string {
