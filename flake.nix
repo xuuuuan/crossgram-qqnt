@@ -114,6 +114,8 @@
         mkdir -p /root/.local/share /root/.config /etc/ssl/certs /etc/fonts /etc/dbus /run/dbus /tmp /usr/bin /bin
         printf '%s\n' 'root:x:0:0::/root:${pkgs.runtimeShell}' > /etc/passwd
         printf '%s\n' 'root:x:0:' > /etc/group
+        printf '%s\n' '127.0.0.1 localhost' '::1 localhost' > /etc/hosts
+        printf '%s\n' 'hosts: files dns' > /etc/nsswitch.conf
         ln -s ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt /etc/ssl/certs/ca-bundle.crt
         ln -s ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt /etc/ssl/certs/ca-certificates.crt
         ln -s ${fonts} /etc/fonts/fonts.conf
@@ -129,7 +131,7 @@
         # LibVNCServer counts free descriptors by walking 0..RLIMIT_NOFILE with
         # fcntl() on every incoming connection, so an inherited "infinity" soft
         # limit (pm2, systemd) wedges the accept path at 100% CPU. Cap it.
-        create_service x11vnc "ulimit -Sn 1024; exec x11vnc -forever -display :$display -rfbport $vnc_port"
+        create_service x11vnc "ulimit -Sn 1024; exec x11vnc -forever -shared -display :$display -rfbport $vnc_port"
         create_service novnc "novnc --vnc localhost:$vnc_port --listen $novnc_port --file-only"
         create_service dbus 'dbus-daemon --nofork --config-file=/etc/dbus/system.conf'
         create_service dunst 'dunst'
