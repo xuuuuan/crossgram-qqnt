@@ -3031,6 +3031,37 @@ it('drops zero-peer sidecars while preserving the paired group service message',
     })
   })
 
+  it('renders QQ group announcement shares as their decoded announcement text', async () => {
+    const f = fixture()
+    const encode = (value: string) => Buffer.from(value, 'utf8').toString('base64')
+    f.message.elements = [{
+      elementType: 10, elementId: 'announcement', arkElement: { bytesData: JSON.stringify({
+        app: 'com.tencent.mannounce', view: 'main', ver: '1.0.0.43', prompt: '[群公告]',
+        meta: { mannounce: {
+          encode: 1, title: encode('群公告'),
+          text: encode('本周六晚八点开团\r\n请提前准备好干员'), cr: 1, fr: 1, tw: 1,
+        } },
+      }) },
+    }, {
+      elementType: 10, elementId: 'plain-announcement', arkElement: { bytesData: JSON.stringify({
+        app: 'com.tencent.mannounce', meta: { mannounce: { title: '入群须知', text: '禁止刷屏' } },
+      }) },
+    }, {
+      elementType: 10, elementId: 'empty-announcement', arkElement: { bytesData: JSON.stringify({
+        app: 'com.tencent.mannounce', meta: { mannounce: { encode: 1, title: '', text: '' } },
+      }) },
+    }]
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    const history = await bridge.getHistory(bridge.getConversation('uid-1715311957'))
+    expect(history.messages[0]?.parts).toEqual([
+      { type: 'text', text: '[群公告]\n本周六晚八点开团\n请提前准备好干员' },
+      { type: 'text', text: '[入群须知]\n禁止刷屏' },
+      { type: 'text', text: '[群公告]' },
+    ])
+  })
+
   it('parses generic Ark shares and legacy XML structure messages into structured cards', async () => {
     const f = fixture()
     f.message.elements = [{
@@ -7426,6 +7457,31 @@ describe('QQBridgeServer', () => {
       messages: [{ parts: [{ type: 'media', media: {
         voice: true, mimeType: 'audio/ogg', duration: 1,
       } }] }],
+    })
+  })
+
+  it('serves a QQ group announcement share as readable text over HTTP', async () => {
+    const f = fixture()
+    f.message.elements = [{ elementType: 10, elementId: 'announcement', arkElement: {
+      bytesData: JSON.stringify({
+        app: 'com.tencent.mannounce', prompt: '[群公告]',
+        meta: { mannounce: {
+          encode: 1, title: Buffer.from('群公告').toString('base64'),
+          text: Buffer.from('今晚维护，暂停开团').toString('base64'),
+        } },
+      }),
+    } }]
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+
+    const response = await fetch(
+      `http://127.0.0.1:${server.address().port}/v1/conversations/uid-1715311957/history`,
+    )
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toMatchObject({
+      messages: [{ parts: [{ type: 'text', text: '[群公告]\n今晚维护，暂停开团' }] }],
     })
   })
 

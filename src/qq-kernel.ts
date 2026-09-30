@@ -6975,6 +6975,13 @@ export class QQKernelBridge {
           },
         })
       } else {
+        const announcement = element.arkElement?.bytesData
+          ? arkAnnouncementText(element.arkElement.bytesData)
+          : undefined
+        if (announcement) {
+          parts.push({ type: 'text', text: announcement })
+          continue
+        }
         const card = structuredCard(element)
         if (card) {
           parts.push({ type: 'card', card })
@@ -10362,6 +10369,8 @@ function structuredContentSummary(value: string | undefined): string {
   if (!value) return ''
   try {
     const parsed = JSON.parse(value) as unknown
+    const announcement = announcementText(parsed)
+    if (announcement) return announcement
     const card = arkCard(parsed)
     if (card) return cardFallbackText(card)
     const preferred = findStructuredString(parsed, new Set([
@@ -10370,6 +10379,51 @@ function structuredContentSummary(value: string | undefined): string {
     return preferred || ''
   } catch {
     return xmlText(value)
+  }
+}
+
+/**
+ * Text of a QQ group announcement share (`com.tencent.mannounce`).
+ *
+ * The announcement is content, not a link: QQ renders it as a header label and
+ * the full body, and it has no jump target. With `encode: 1` both fields are
+ * base64 UTF-8, which a generic card would otherwise surface verbatim.
+ */
+function arkAnnouncementText(bytesData: string): string | undefined {
+  try {
+    return announcementText(JSON.parse(bytesData) as unknown)
+  } catch {
+    return
+  }
+}
+
+function announcementText(value: unknown): string | undefined {
+  const root = recordValue(value)
+  const meta = recordValue(root?.meta)
+  if (!root || !meta) return
+  const app = stringValue(root.app)
+  if (app !== 'com.tencent.mannounce' && !recordValue(meta.mannounce)) return
+  const payload = recordValue(meta.mannounce)
+    ?? Object.values(meta).map(recordValue).find(Boolean)
+  if (!payload) return
+  const encoded = payload.encode === 1 || payload.encode === '1'
+  const field = (name: string) => {
+    const raw = typeof payload[name] === 'string' ? payload[name] as string : ''
+    return (encoded ? decodeBase64Text(raw) : raw).replace(/\r\n?/g, '\n').trim()
+  }
+  const title = field('title') || '群公告'
+  const text = field('text')
+  return text ? `[${title}]\n${text}` : `[${title}]`
+}
+
+/** Decodes base64 UTF-8, keeping the raw value when it is not valid base64 text. */
+function decodeBase64Text(raw: string): string {
+  const compact = raw.replace(/\s+/g, '')
+  if (!compact || !/^[A-Za-z0-9+/_-]+={0,2}$/.test(compact)) return raw
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(Buffer.from(compact, 'base64'))
+  } catch {
+    return raw
   }
 }
 
