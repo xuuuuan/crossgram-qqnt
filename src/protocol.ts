@@ -242,6 +242,8 @@ export interface QQMessage {
     name: string
     alias?: string
     avatar?: QQMedia
+    /** QQ robot account, from member flags, robot UIN ranges, or bot keyboards. */
+    bot?: true
   }
   msgSeq?: string
   /** Telegram megagroup message ID; QQ group msgSeq is conversation-scoped and monotonic. */
@@ -651,6 +653,7 @@ export interface MemberPage {
       alias?: string
       avatarUrl?: string
       avatar?: QQMedia
+      bot?: true
     }
     role: 'owner' | 'administrator' | 'member'
   }>

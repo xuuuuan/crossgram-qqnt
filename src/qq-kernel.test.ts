@@ -11,7 +11,7 @@ import { promisify, types } from 'node:util'
 import { create, toBinary } from '@bufbuild/protobuf'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import WebSocket from 'ws'
-import { GroupMsgMask, type ContactMsgBoxInfo, type KernelBuddyService, type KernelGroupService, type KernelModule, type KernelMsgService, type KernelRichMediaService, type KernelSession, type MsgElement, type MsgRecord } from './kernel-types.js'
+import { GroupMsgMask, type ContactMsgBoxInfo, type KernelBuddyService, type KernelGroupService, type KernelModule, type KernelMsgService, type KernelRichMediaService, type KernelRobotService, type KernelSession, type MsgElement, type MsgRecord } from './kernel-types.js'
 import type { PacketAddon } from './packet-addon.js'
 import { parseConversationId, type QQEvent, type QQStickerReference } from './protocol.js'
 import { faceAssetVersion } from './face-asset-bundle.js'
@@ -383,6 +383,11 @@ function fixture() {
       return 1
     }),
   }
+  const robot = {
+    getRobotUinRange: vi.fn<NonNullable<KernelRobotService['getRobotUinRange']>>(async () => ({
+      response: { robotUinRanges: [] },
+    })),
+  }
   const uix = {
     getUid: vi.fn(async (uins: Set<string>) => ({ uidInfo: new Map([...uins].flatMap((uin) => {
       if (uin === '1715311957') return [[uin, 'uid-1715311957']]
@@ -412,6 +417,7 @@ function fixture() {
     getGroupService: () => group,
     getSearchService: () => search,
     getAVSDKService: vi.fn(() => avsdkAvailable ? avsdk : undefined),
+    getRobotService: () => robot,
     getRichMediaService: () => richMedia,
     getAvatarService: () => ({
       getAvatarPath: () => avatarPath, forceDownloadAvatar,
@@ -472,7 +478,7 @@ function fixture() {
   const flashApplyUpload = vi.spyOn(QQPacketClient.prototype, 'applyFlashTransferUpload').mockResolvedValue()
   const flashSetReady = vi.spyOn(QQPacketClient.prototype, 'setFlashTransferFilesetReady').mockResolvedValue()
   return {
-    kernel, session, msg, recent, buddy, profile, group, search, avsdk, richMedia, uix, message, sentBodies,
+    kernel, session, msg, recent, buddy, profile, group, search, avsdk, richMedia, uix, robot, message, sentBodies,
     forceDownloadAvatar,
     imageUpload, fileUpload, protocolSend, groupFilePublish, poke,
     flashApplyFileset, flashCommitFiles, flashCompleteFileset, flashPrepareUpload,
@@ -5421,6 +5427,28 @@ it('drops zero-peer sidecars while preserving the paired group service message',
     expect(f.group.destroyMemberListScene).toHaveBeenCalledWith('scene')
   })
 
+  it('exposes the QQ robot flag on group member pages', async () => {
+    const f = fixture()
+    f.group.getNextMemberList.mockResolvedValueOnce({
+      errCode: 0, errMsg: '', result: {
+        ids: [{ uid: 'robot', index: 1 }, { uid: 'human', index: 2 }],
+        infos: new Map([
+          ['robot', { uid: 'robot', uin: '5', nick: 'Bot', remark: '', cardName: '', role: 2, avatarPath: '', isRobot: true }],
+          ['human', { uid: 'human', uin: '6', nick: 'Human', remark: '', cardName: '', role: 2, avatarPath: '', isRobot: false }],
+        ]),
+        finish: true,
+      },
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    await bridge.resolveConversation(2, '1058754719')
+
+    const page = await bridge.getMembers(bridge.getConversation('1058754719'))
+    expect(page.members[0]?.user).toMatchObject({ id: 'robot', bot: true })
+    expect(page.members[1]?.user.bot).toBeUndefined()
+    await expect(bridge.getUser('robot')).resolves.toMatchObject({ bot: true })
+  })
+
   it('terminates a member chain when QQ returns a non-advancing page', async () => {
     const f = fixture()
     const repeated = {
@@ -5905,6 +5933,98 @@ it('drops zero-peer sidecars while preserving the paired group service message',
       value: { type: 'message', message: { sender: { name: 'Personal Name', alias: 'Group Alias' } } },
     })
     expect(f.group.getMemberInfo).toHaveBeenCalledWith('1058754719', ['member'], false)
+  })
+
+  it('flags robot senders from QQ member snapshots', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.group.getMemberInfo!.mockImplementation(async (groupCode, uids) => {
+      setTimeout(() => f.emitMemberInfo(groupCode, new Map([[uids[0]!, {
+        uid: uids[0]!, uin: '42', nick: 'Helper', remark: '', cardName: '', role: 2, avatarPath: '', isRobot: true,
+      }]])), 5)
+      return { result: 0, errMsg: '' }
+    })
+    const events = bridge.subscribe()[Symbol.asyncIterator]()
+
+    f.emitReceived([{
+      ...f.message,
+      msgId: 'group-robot', chatType: 2, sendType: 0,
+      senderUid: 'robot-member', senderUin: '42', peerUid: '1058754719', peerUin: '1058754719',
+      peerName: '', sendNickName: '', sendRemarkName: '', sendMemberName: '',
+    }])
+
+    await expect(events.next()).resolves.toMatchObject({
+      value: { type: 'message', message: { sender: { id: 'robot-member', name: 'Helper', bot: true } } },
+    })
+    await expect(bridge.getUser('robot-member')).resolves.toMatchObject({ id: 'robot-member', bot: true })
+  })
+
+  it('does not flag ordinary group members as robots', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const events = bridge.subscribe()[Symbol.asyncIterator]()
+
+    f.emitReceived([{
+      ...f.message,
+      msgId: 'group-human', chatType: 2, sendType: 0,
+      senderUid: 'member', senderUin: '42', peerUid: '1058754719', peerUin: '1058754719',
+      peerName: '', sendNickName: 'Human', sendRemarkName: '', sendMemberName: '',
+    }])
+
+    const event = await events.next()
+    expect(event.value).toMatchObject({ type: 'message', message: { sender: { id: 'member' } } })
+    expect((event.value as { message: { sender?: { bot?: true } } }).message.sender?.bot).toBeUndefined()
+  })
+
+  it('flags members inside robot UIN ranges loaded from the QQ robot service', async () => {
+    const f = fixture()
+    f.robot.getRobotUinRange.mockResolvedValue({
+      response: { robotUinRanges: [{ minUin: '3889000000', maxUin: '3889999999' }, { minUin: 'bad' }] },
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    await vi.waitFor(() => expect(f.robot.getRobotUinRange).toHaveBeenCalledWith({
+      justFetchMsgConfig: '1', type: 1, version: 0, aioKeywordVersion: 0,
+    }))
+    const events = bridge.subscribe()[Symbol.asyncIterator]()
+
+    await vi.waitFor(async () => {
+      f.emitReceived([{
+        ...f.message,
+        msgId: `range-${Date.now()}`, chatType: 2, sendType: 0,
+        senderUid: 'range-robot', senderUin: '3889123456', peerUid: '1058754719', peerUin: '1058754719',
+        peerName: '', sendNickName: 'Range Bot', sendRemarkName: '', sendMemberName: '',
+      }])
+      await expect(events.next()).resolves.toMatchObject({
+        value: { type: 'message', message: { sender: { id: 'range-robot', bot: true } } },
+      })
+    })
+  })
+
+  it('flags a sender that attaches a QQ bot inline keyboard', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const events = bridge.subscribe()[Symbol.asyncIterator]()
+
+    f.emitReceived([{
+      ...f.message,
+      msgId: 'keyboard-bot', chatType: 2, sendType: 0,
+      senderUid: 'keyboard-robot', senderUin: '77', peerUid: '1058754719', peerUin: '1058754719',
+      peerName: '', sendNickName: 'Keyboard Bot', sendRemarkName: '', sendMemberName: '',
+      elements: [{ elementType: 14, elementId: 'keyboard', inlineKeyboardElement: {
+        botAppid: '1024', rows: [{ buttons: [{
+          id: 'ok', label: 'OK', visitedLabel: 'OK', style: 1, type: 1, clickLimit: 0, unsupportTips: '',
+          data: 'ok', atBotShowChannelList: false, permissionType: 2, specifyRoleIds: [], specifyTinyids: [],
+        }] }],
+      } }],
+    }])
+
+    await expect(events.next()).resolves.toMatchObject({
+      value: { type: 'message', message: { sender: { id: 'keyboard-robot', bot: true } } },
+    })
   })
 
   it('does not wait beyond the bounded member lookup timeout when QQ gives no member callback', async () => {

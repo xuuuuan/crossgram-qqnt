@@ -66,6 +66,8 @@ export interface MemberInfo {
   cardName: string
   role: number
   avatarPath: string
+  /** Kernel-provided QQ robot flag carried by group member snapshots. */
+  isRobot?: boolean
 }
 
 /** Result of one native group-member removal request. */
@@ -902,7 +904,7 @@ export interface KernelGroupService {
   getNextMemberList(sceneId: string, lastId: { uid: string, index: number }, count: number): Promise<{
     errCode: number
     errMsg: string
-    result: { ids: Array<{ uid: string, index: number }>, infos: Map<string, MemberInfo>, finish: boolean }
+    result: { ids: Array<{ uid: string, index: number }>, infos: Map<string, MemberInfo>, finish: boolean, hasRobot?: boolean }
   }>
   /** Fetches one or more group members; details arrive through onMemberInfoChange. */
   getMemberInfo?(groupCode: string, uids: string[], forceFetch: boolean): Promise<{ result: number, errMsg: string }>
@@ -934,6 +936,19 @@ export interface KernelBaseEmojiService {
   }>
 }
 
+export interface KernelRobotService {
+  /**
+   * Returns the UIN ranges QQ reserves for robot accounts. The element shape
+   * is not documented; NapCat shows `{ minUin, maxUin }` entries.
+   */
+  getRobotUinRange?(request: {
+    justFetchMsgConfig: string
+    type: number
+    version: number
+    aioKeywordVersion: number
+  }): Promise<{ response?: { robotUinRanges?: unknown[] } } & Record<string, unknown>>
+}
+
 export interface KernelSession {
   getMsgService(): KernelMsgService
   getRecentContactService(): KernelRecentService
@@ -942,6 +957,7 @@ export interface KernelSession {
   getGroupService(): KernelGroupService
   getSearchService?(): KernelSearchService
   getAVSDKService?(): KernelAVSDKService
+  getRobotService?(): KernelRobotService
   getBaseEmojiService?(): KernelBaseEmojiService
   getRichMediaService(): KernelRichMediaService
   getSettingService?(): KernelSettingService

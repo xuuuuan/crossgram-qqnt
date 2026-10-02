@@ -494,6 +494,9 @@ export class QQKernelBridge {
   private readonly pendingAcceptances = new Map<string, ReturnType<typeof deferred<void>>>()
   private readonly pendingMinimumStatuses = new Map<string, number>()
   private readonly messageOrigins = new Map<string, string>()
+  /** UIDs QQ flagged as robots through member snapshots or bot-only message elements. */
+  private readonly robotUids = new Set<string>()
+  private robotUinRanges: Array<{ min: bigint, max: bigint }> = []
   private readonly resolvedReplyTargets = new Map<string, string>()
   private readonly pendingForwards: Array<{
     conversationId: string
@@ -814,6 +817,8 @@ export class QQKernelBridge {
     this.friendRequestSnapshotLoaded = false
     this.groupRequestSnapshotLoaded = false
     this.seenUsers.clear()
+    this.robotUids.clear()
+    this.robotUinRanges = []
     this.groups.clear()
     this.groupMsgMasks.clear()
     this.assistantMaterializedGroups.clear()
@@ -1131,7 +1136,7 @@ export class QQKernelBridge {
   async getContacts(
     cursor?: string, limit = 500,
   ): Promise<{
-    users: Array<{ id: string, numericId?: string, name: string, signature?: string, avatar?: QQMedia }>
+    users: Array<{ id: string, numericId?: string, name: string, signature?: string, avatar?: QQMedia, bot?: true }>
     nextCursor?: string
   }> {
     // getBuddyList delivers the full address book through onBuddyListChange.
@@ -1158,6 +1163,7 @@ export class QQKernelBridge {
       ...user,
       name: firstUsefulTitle(user.id, user.name, user.numericId, user.id),
       avatar: await this.userAvatar(user.id, false),
+      ...this.robotField(user.id, user.numericId),
     }))
     return { users, nextCursor: offset + users.length < all.length ? String(offset + users.length) : undefined }
   }
@@ -3484,6 +3490,7 @@ export class QQKernelBridge {
           cached.numericId,
           cached.id,
         ), avatar: await this.userAvatar(uid, false),
+        ...this.robotField(uid, cached.numericId),
       } }
     let numericId: string | undefined
     try {
@@ -3512,6 +3519,7 @@ export class QQKernelBridge {
         resolved.id,
       ),
       avatar: await this.userAvatar(uid, false),
+      ...this.robotField(uid, resolved.numericId),
     }
   }
 
@@ -4514,7 +4522,8 @@ export class QQKernelBridge {
         if (!info) return []
         const member = mapMember(info)
         this.rememberSeenUser(member.user)
-        return [member]
+        const bot = this.robotFlag(member.user.id, member.user.numericId)
+        return [bot ? { ...member, user: { ...member.user, bot } } : member]
       })
       const hasMore = selectedIds.length < result.ids.length || !result.finish
       const last = selectedIds.at(-1)
@@ -5815,6 +5824,7 @@ export class QQKernelBridge {
 
   private async initializePlatformData(): Promise<void> {
     void this.ensureReactionCatalog()
+    void this.loadRobotUinRanges()
     if (this.config?.selfUid) {
       await this.ensureUserProfiles([this.config.selfUid]).catch((error) =>
         log('error', 'initial self profile refresh failed', error))
@@ -5823,6 +5833,37 @@ export class QQKernelBridge {
     await this.refreshRequests().catch((error) => {
       if (!(error instanceof QQRequestApiUnavailableError)) log('error', 'initial request refresh failed', error)
     })
+  }
+
+  private async loadRobotUinRanges(): Promise<void> {
+    const service = this.session?.getRobotService?.()
+    if (!service?.getRobotUinRange) {
+      log('info', 'native API unavailable name=getRobotUinRange')
+      return
+    }
+    try {
+      log('info', 'native API start name=getRobotUinRange')
+      const result = await service.getRobotUinRange({ justFetchMsgConfig: '1', type: 1, version: 0, aioKeywordVersion: 0 })
+      // The response shape is undocumented, so keep the whole payload in the
+      // log until live captures confirm which fields carry the ranges.
+      log('info', `native API complete name=getRobotUinRange raw=${debugJson(result)}`)
+      this.robotUinRanges = parseRobotUinRanges(result?.response?.robotUinRanges)
+      log('info', `robot UIN ranges loaded count=${this.robotUinRanges.length} ranges=${this.robotUinRanges.map((range) => `${range.min}-${range.max}`).join(',')}`)
+    } catch (error) {
+      log('error', 'native API failed name=getRobotUinRange', error)
+    }
+  }
+
+  private robotField(uid: string, uin: string | undefined): { bot?: true } {
+    return this.robotFlag(uid, uin) ? { bot: true } : {}
+  }
+
+  /** Whether a QQ account is a robot; only ever returns true or undefined. */
+  private robotFlag(uid: string | undefined, uin: string | undefined): true | undefined {
+    if (uid && this.robotUids.has(uid)) return true
+    if (!uin || !/^\d+$/.test(uin)) return undefined
+    const value = BigInt(uin)
+    return this.robotUinRanges.some((range) => value >= range.min && value <= range.max) ? true : undefined
   }
 
   private async ensureUserProfiles(uids: string[]): Promise<void> {
@@ -6854,16 +6895,18 @@ export class QQKernelBridge {
   }
 
   private rememberSeenUser(
-    candidate: { id: string, numericId?: string, name: string, avatarUrl?: string, signature?: string },
+    candidate: { id: string, numericId?: string, name: string, avatarUrl?: string, signature?: string, bot?: true },
   ): void {
     if (!candidate.id) return
+    if (candidate.bot) this.robotUids.add(candidate.id)
     const current = this.seenUsers.get(candidate.id)
     const currentFallback = !current?.name || current.name === current.id || current.name === current.numericId
     const candidateFallback = !candidate.name || candidate.name === candidate.id || candidate.name === candidate.numericId
     const keepStableSelfName = candidate.id === this.config?.selfUid && current && !currentFallback
+    const { bot: _bot, ...profile } = candidate
     this.seenUsers.set(candidate.id, {
       ...current,
-      ...candidate,
+      ...profile,
       numericId: candidate.numericId || current?.numericId,
       name: keepStableSelfName
         ? current.name
@@ -6961,6 +7004,11 @@ export class QQKernelBridge {
         }
         if (element.inlineKeyboardElement) {
           parts.push({ type: 'inline-keyboard', keyboard: element.inlineKeyboardElement })
+          // Only QQ robots can attach an inline keyboard to their messages.
+          if (element.inlineKeyboardElement.botAppid && !context.sender && record.senderUid
+            && record.senderUid !== this.config?.selfUid) {
+            this.robotUids.add(record.senderUid)
+          }
         }
       } else if (isArkMultiForwardRecord(record) && element.arkElement) {
         parts.push({
@@ -7037,6 +7085,7 @@ export class QQKernelBridge {
         avatar: senderUin && /^\d+$/.test(senderUin)
           ? qlogoAvatarMedia(senderId, senderUin)
           : undefined,
+        ...this.robotField(senderId, senderUin),
       },
       timestamp: Number(record.msgTime) || Math.floor(Date.now() / 1000),
       outgoing: context.outgoing
@@ -9159,6 +9208,36 @@ function systemFaceMimeType(url: string, contentType: string | null | undefined)
   return 'image/apng'
 }
 
+function parseRobotUinRanges(value: unknown): Array<{ min: bigint, max: bigint }> {
+  if (!Array.isArray(value)) return []
+  return value.flatMap((entry) => {
+    if (!entry || typeof entry !== 'object') return []
+    const record = entry as Record<string, unknown>
+    const min = uinBigInt(record.minUin ?? record.min ?? record.beginUin ?? record.startUin)
+    const max = uinBigInt(record.maxUin ?? record.max ?? record.endUin)
+    return min !== undefined && max !== undefined && min <= max ? [{ min, max }] : []
+  })
+}
+
+function uinBigInt(value: unknown): bigint | undefined {
+  if (typeof value === 'bigint') return value
+  if (typeof value === 'number' && Number.isSafeInteger(value)) return BigInt(value)
+  if (typeof value === 'string' && /^\d+$/.test(value.trim())) return BigInt(value.trim())
+  return undefined
+}
+
+function debugJson(value: unknown): string {
+  try {
+    return JSON.stringify(value, (_key, item: unknown) => {
+      if (typeof item === 'bigint') return item.toString()
+      if (item instanceof Map) return Object.fromEntries(item)
+      return item
+    }) ?? String(value)
+  } catch {
+    return String(value)
+  }
+}
+
 function mapMember(info: MemberInfo): MemberPage['members'][number] {
   return {
     user: {
@@ -9167,6 +9246,7 @@ function mapMember(info: MemberInfo): MemberPage['members'][number] {
       name: info.nick || info.remark || info.uin,
       alias: info.cardName || undefined,
       avatar: /^\d+$/.test(info.uin) ? qlogoAvatarMedia(info.uid, info.uin) : undefined,
+      ...(info.isRobot === true ? { bot: true as const } : {}),
     },
     role: info.role === MEMBER_OWNER ? 'owner' : info.role === MEMBER_ADMIN ? 'administrator' : 'member',
   }
