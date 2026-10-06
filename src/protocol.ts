@@ -626,6 +626,8 @@ export interface HistoryQuery {
   afterId?: string
   /** Native QQ sequence used only to open a chat around its unread boundary. */
   aroundUnreadSeq?: string
+  /** Open an unanchored page at the newest message rather than the unread boundary. */
+  latest?: boolean
 }
 
 export interface SearchQuery {

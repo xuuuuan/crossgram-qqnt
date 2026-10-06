@@ -603,6 +603,7 @@ export class QQBridgeServer {
           beforeId: url.searchParams.get('beforeId') ?? undefined,
           afterId: url.searchParams.get('afterId') ?? undefined,
           aroundUnreadSeq: url.searchParams.get('aroundUnreadSeq') ?? undefined,
+          latest: url.searchParams.get('latest') === '1',
           limit: numberParam(url, 'limit', 50),
         })
         log('info', `HTTP API history id=${requestId} conversation=${conversation.id} count=${page.messages.length} next=${page.nextCursor ?? ''}`)

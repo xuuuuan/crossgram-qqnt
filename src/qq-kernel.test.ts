@@ -3160,6 +3160,39 @@ it('drops zero-peer sidecars while preserving the paired group service message',
     expect(f.msg.getABatchOfContactMsgBoxInfo).toHaveBeenCalledOnce()
   })
 
+  it('opens an unanchored latest page at the newest message instead of the unread boundary', async () => {
+    const f = fixture()
+    f.recent.getRecentContactInfos.mockResolvedValue({
+      result: 0,
+      errMsg: '',
+      relation: [{
+        chatType: 1, peerUid: 'uid-1715311957', peerUin: '1715311957', peerName: 'xuuuuan',
+        remark: '', avatarUrl: '', unreadCnt: '7', msgId: 'm1', msgTime: '1800000000',
+        senderUid: 'uid-1715311957', senderUin: '1715311957',
+        abstractContent: [{ elementType: 1, content: 'hello preview' }],
+      }],
+    })
+    f.msg.getABatchOfContactMsgBoxInfo.mockResolvedValueOnce({
+      result: 0,
+      errMsg: '',
+      contactMsgBoxInfos: [{
+        contact: { chatType: 1, peerUid: 'uid-1715311957', guildId: '' },
+        firstUnreadMsgInfo: { msgSeq: 'seq1', msgTime: '1800000000' },
+        unreadCnt: '7',
+      }],
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const [conversation] = (await bridge.getDialogs()).conversations
+    expect(conversation.firstUnread).toEqual({ msgSeq: 'seq1', msgTime: '1800000000' })
+
+    const page = await bridge.getHistory(conversation, { latest: true, limit: 2 })
+
+    expect(f.msg.getMsgsBySeqAndCount).not.toHaveBeenCalled()
+    expect(f.msg.getLatestDbMsgs).toHaveBeenCalledWith(expect.objectContaining({ peerUid: 'uid-1715311957' }), 2)
+    expect(page.messages.map((message) => message.id)).toEqual([f.message.msgId])
+  })
+
   it('uses single forward for one source message and merged forward for multiple messages', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()

@@ -1350,7 +1350,7 @@ export class QQKernelBridge {
     const anchor = query.beforeId ?? query.afterId ?? query.cursor ?? '0'
     const peer = contact(conversation)
     const initial = !query.beforeId && !query.afterId && !query.cursor
-    const unreadSeq = query.aroundUnreadSeq || (initial ? conversation.firstUnread?.msgSeq : undefined)
+    const unreadSeq = query.aroundUnreadSeq || (initial && !query.latest ? conversation.firstUnread?.msgSeq : undefined)
     let response: { result: number, errMsg: string, msgList: MsgRecord[] }
     const primaryName = unreadSeq && service.getMsgsBySeqAndCount
       ? 'getMsgsBySeqAndCount(unread)'
