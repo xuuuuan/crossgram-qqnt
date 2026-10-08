@@ -10507,8 +10507,24 @@ function decodeBase64Text(raw: string): string {
   }
 }
 
+/** Hash fingerprints of Ark payloads already archived; history syncs replay cards. */
+const archivedArkPayloads = new Set<string>()
+
+/**
+ * Archives every raw Ark payload to the log so card types the parser does not
+ * fully support (missing jump links, unseen fields) can be fixed later from
+ * the actual data instead of guessing at field names.
+ */
+function logArkPayload(bytesData: string): void {
+  const fingerprint = createHash('md5').update(bytesData).digest('hex')
+  if (archivedArkPayloads.has(fingerprint)) return
+  archivedArkPayloads.add(fingerprint)
+  log('info', `ark card payload ${bytesData}`)
+}
+
 function structuredCard(element: MsgElement): QQCard | undefined {
   if (element.arkElement?.bytesData) {
+    logArkPayload(element.arkElement.bytesData)
     try {
       const card = arkCard(JSON.parse(element.arkElement.bytesData) as unknown)
       if (card) return card
@@ -10519,6 +10535,13 @@ function structuredCard(element: MsgElement): QQCard | undefined {
   const xml = element.structLongMsgElement?.xmlContent || element.structMsgElement?.xmlContent
   return xml ? xmlCard(xml) : undefined
 }
+
+/** URL field names QQ cards use for their jump target, most preferred first. */
+const URL_KEYS = [
+  'qqdocurl', 'pcJumpUrl', 'jumpUrl', 'url', 'webUrl', 'shareUrl',
+  // QQ group-invite cards: the universal join link is the only web target.
+  'group_qqlink_universal', 'group_qqlink',
+]
 
 function arkCard(value: unknown): QQCard | undefined {
   const root = recordValue(value)
@@ -10547,9 +10570,9 @@ function arkCard(value: unknown): QQCard | undefined {
     || source
   if (!title) return
   const description = legacyMiniApp ? '' : firstString(record, ['desc', 'description', 'summary', 'brief'])
-  const url = firstWebUrl(record, [
-    'qqdocurl', 'pcJumpUrl', 'jumpUrl', 'url', 'webUrl', 'shareUrl',
-  ]) || firstWebUrl(root, ['jumpUrl', 'url'])
+  const url = firstWebUrl(record, URL_KEYS)
+    || candidates.map(({ record }) => record).map((other) => firstWebUrl(other, URL_KEYS)).find(Boolean)
+    || firstWebUrl(root, ['jumpUrl', 'url'])
   const thumbnailUrl = firstWebUrl(record, [
     'preview', 'previewUrl', 'imageUrl', 'image', 'cover', 'coverUrl', 'icon', 'iconUrl', 'avatar',
   ])

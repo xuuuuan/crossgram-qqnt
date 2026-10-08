@@ -3037,6 +3037,58 @@ it('drops zero-peer sidecars while preserving the paired group service message',
     })
   })
 
+  it('parses group-invite Ark cards with their universal join link', async () => {
+    const f = fixture()
+    f.message.elements = [{
+      elementType: 10, elementId: 'group-invite', arkElement: { bytesData: JSON.stringify({
+        app: 'com.tencent.groupinvite', prompt: '[邀请加群]邀请你加入群聊',
+        meta: { detail_1: {
+          title: '邀请你加入群聊',
+          desc: '邀请你加入群聊“2026 ICPC 成都赛站”，进入可查看详情。',
+          source: '邀请加群',
+          avatar: 'https://p.qlogo.cn/gh/557665508/557665508/100',
+          group_qqlink_universal: 'https://qm.qq.com/cgi-bin/qm/qr?k=AbcDef123&from=app',
+        } },
+      }) },
+    }, {
+      elementType: 10, elementId: 'group-invite-link-elsewhere', arkElement: { bytesData: JSON.stringify({
+        app: 'com.tencent.groupinvite', prompt: '[邀请加群]邀请你加入群聊',
+        meta: {
+          detail_1: { title: '邀请你加入群聊', desc: '邀请你加入群聊“测试群”，进入可查看详情。', source: '邀请加群' },
+          groupinvite: { group_qqlink_universal: 'https://qm.qq.com/cgi-bin/qm/qr?k=Elsewhere9' },
+        },
+      }) },
+    }, {
+      elementType: 10, elementId: 'group-invite-no-link', arkElement: { bytesData: JSON.stringify({
+        app: 'com.tencent.groupinvite', prompt: '[邀请加群]邀请你加入群聊',
+        meta: { detail_1: {
+          title: '邀请你加入群聊',
+          desc: '邀请你加入群聊“无链接群”，进入可查看详情。',
+          source: '邀请加群',
+          avatar: 'https://p.qlogo.cn/gh/123456/123456/100',
+        } },
+      }) },
+    }]
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.getHistory(bridge.getConversation('uid-1715311957'))).resolves.toMatchObject({
+      messages: [{ parts: [{ type: 'card', card: {
+        kind: 'link', source: '邀请加群', title: '邀请你加入群聊',
+        description: '邀请你加入群聊“2026 ICPC 成都赛站”，进入可查看详情。',
+        url: 'https://qm.qq.com/cgi-bin/qm/qr?k=AbcDef123&from=app',
+        thumbnailUrl: 'https://p.qlogo.cn/gh/557665508/557665508/100',
+      } }, { type: 'card', card: {
+        kind: 'link', title: '邀请你加入群聊',
+        url: 'https://qm.qq.com/cgi-bin/qm/qr?k=Elsewhere9',
+      } }, { type: 'card', card: {
+        kind: 'application', title: '邀请你加入群聊',
+        description: '邀请你加入群聊“无链接群”，进入可查看详情。',
+        thumbnailUrl: 'https://p.qlogo.cn/gh/123456/123456/100',
+      } }] }],
+    })
+  })
+
   it('renders QQ group announcement shares as their decoded announcement text', async () => {
     const f = fixture()
     const encode = (value: string) => Buffer.from(value, 'utf8').toString('base64')
