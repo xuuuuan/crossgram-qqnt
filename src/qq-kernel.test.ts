@@ -1070,6 +1070,31 @@ describe('QQKernelBridge', () => {
     await expect(bridge.getUser('self')).resolves.toMatchObject({ name: 'Canonical Self' })
   })
 
+  it('resolves a plain QQ number to its UID before the profile lookup', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.getUser('1715311957')).resolves.toMatchObject({
+      id: 'uid-1715311957', numericId: '1715311957',
+    })
+    expect(f.uix.getUid).toHaveBeenCalledWith(new Set(['1715311957']))
+  })
+
+  it('answers a plain-number user ID from the cache without a UID conversion', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.emitBuddyList([{ buddyList: [{
+      uid: '99887766', uin: '99887766', nick: 'Cached Number', remark: '', avatarUrl: '',
+    }] }])
+
+    await expect(bridge.getUser('99887766')).resolves.toMatchObject({
+      id: '99887766', numericId: '99887766', name: 'Cached Number',
+    })
+    expect(f.uix.getUid).not.toHaveBeenCalled()
+  })
+
   it('loads a root longNick for an already named buddy and preserves it across partial updates', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()

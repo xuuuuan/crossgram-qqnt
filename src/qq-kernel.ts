@@ -3475,13 +3475,32 @@ export class QQKernelBridge {
     }
   }
 
-  async getUser(uid: string) {
+  async getUser(uid: string): Promise<{
+    id: string, numericId?: string, name: string, avatarUrl?: string, signature?: string,
+    avatar?: QQMedia, bot?: true
+  } | undefined> {
     if (!uid.trim()) return undefined
     let cached = this.seenUsers.get(uid) ?? this.users.get(uid)
     if (cached && (isFallbackUserName(cached) || cached.signature === undefined)) {
       await this.ensureUserProfiles([uid]).catch((error) =>
         log('error', `QQ profile resolve failed uid=${uid}; using cached fallback`, error))
       cached = this.seenUsers.get(uid) ?? this.users.get(uid)
+    }
+    // Plain QQ numbers (Satori mention targets) that missed the cache resolve
+    // through the UID conversion service. The cache is checked first because
+    // plain-number IDs are not always QQ numbers: a record without senderUid
+    // falls back to senderUin as the user ID, so a cached entry keyed by the
+    // plain number is already the right user.
+    if (!cached && /^\d+$/.test(uid)) {
+      try {
+        const converted = await retryTransientInvalidArgument(
+          () => this.requireSession().getUixConvertService().getUid(new Set([uid])),
+        )
+        const resolvedUid = converted.uidInfo.get(uid)
+        if (resolvedUid && resolvedUid !== uid) return this.getUser(resolvedUid)
+      } catch (error) {
+        log('error', `QQ number ${uid} could not be resolved to a UID`, error)
+      }
     }
     if (cached) { return { ...cached,
         name: firstUsefulTitle(
