@@ -3792,6 +3792,37 @@ it('drops zero-peer sidecars while preserving the paired group service message',
     }, Readable.from([]))).rejects.toThrow('prepared media parts must cover every media item')
   })
 
+  it('sends an ordered body whose media is already prepared for CDN reuse', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const image = (name: string, fileUuid: string) => ({
+      type: 'media' as const,
+      media: {
+        kind: 'image' as const, name, size: 4, mimeType: 'image/png',
+        md5: 'a'.repeat(32), sha1: 'b'.repeat(40),
+      },
+      prepared: { kind: 'image' as const, fileUuid, msgInfo: 'bXNnLWluZm8' },
+    })
+
+    // The shape a relay sends: every media item already uploaded to QQ's CDN.
+    const message = await bridge.send({
+      conversationId: 'uid-1715311957',
+      parts: [
+        { type: 'text', text: 'leading' },
+        image('first.png', 'first-uuid'),
+        { type: 'text', text: 'closing' },
+        image('second.png', 'second-uuid'),
+      ],
+    }, Readable.from([]))
+
+    const parts = f.protocolSend.mock.calls.at(-1)?.[3] ?? []
+    expect(parts.map((part) => part.kind)).toEqual(['text', 'image', 'text', 'image'])
+    expect(parts[1]).toMatchObject({ kind: 'image', upload: { fileUuid: 'first-uuid' } })
+    expect(parts[3]).toMatchObject({ kind: 'image', upload: { fileUuid: 'second-uuid' } })
+    expect(message.id).toBeTruthy()
+  })
+
   it('publishes a hashed group file through CDN upload and OidbSvcTrpcTcp.0x6d9_4', async () => {
     const f = fixture()
     const file = Buffer.from([4, 5, 6, 7])
