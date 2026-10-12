@@ -3747,7 +3747,7 @@ it('drops zero-peer sidecars while preserving the paired group service message',
     expect(sent.parts.filter((part) => part.type === 'media')).toHaveLength(2)
   })
 
-  it('keeps the caller element order for text and image segments', async () => {
+  it('keeps the caller element order for an interleaved text and image body', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
@@ -3761,17 +3761,11 @@ it('drops zero-peer sidecars while preserving the paired group service message',
     await bridge.send({
       conversationId: 'uid-1715311957',
       mediaFraming: 'length-prefixed-v1',
-      text: 'leading\nclosing',
-      textParts: [{ type: 'text', text: 'leading' }, { type: 'text', text: 'closing' }],
-      media: [
-        { kind: 'image', name: 'first.png', size: png.length },
-        { kind: 'image', name: 'second.png', size: png.length },
-      ],
-      segments: [
+      parts: [
         { type: 'text', text: 'leading' },
-        { type: 'media', index: 0 },
+        { type: 'media', media: { kind: 'image', name: 'first.png', size: png.length } },
         { type: 'text', text: 'closing' },
-        { type: 'media', index: 1 },
+        { type: 'media', media: { kind: 'image', name: 'second.png', size: png.length } },
       ],
     }, Readable.from([...frame(png), ...frame(png)]))
 
@@ -3781,29 +3775,21 @@ it('drops zero-peer sidecars while preserving the paired group service message',
     expect(parts[2]).toMatchObject({ kind: 'text', text: 'closing' })
   })
 
-  it('rejects an ordered body that duplicates, drops, or misplaces a media item', async () => {
+  it('rejects an ordered body whose prepared media does not cover every item', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
-    const media = [
-      { kind: 'image' as const, name: 'first.png', size: 4 },
-      { kind: 'image' as const, name: 'second.png', size: 4 },
-    ]
 
     await expect(bridge.send({
-      conversationId: 'uid-1715311957', media,
-      segments: [{ type: 'media', index: 0 }, { type: 'media', index: 0 }],
-    }, Readable.from([]))).rejects.toThrow('appears more than once')
-
-    await expect(bridge.send({
-      conversationId: 'uid-1715311957', media,
-      segments: [{ type: 'media', index: 0 }, { type: 'media', index: 5 }],
-    }, Readable.from([]))).rejects.toThrow('out of range')
-
-    await expect(bridge.send({
-      conversationId: 'uid-1715311957', media,
-      segments: [{ type: 'text', text: 'caption' }, { type: 'media', index: 0 }],
-    }, Readable.from([]))).rejects.toThrow('must reference every media item')
+      conversationId: 'uid-1715311957',
+      parts: [
+        {
+          type: 'media', media: { kind: 'image', name: 'first.png', size: 4 },
+          prepared: { kind: 'image', fileUuid: 'first', msgInfo: 'msg-info' },
+        },
+        { type: 'media', media: { kind: 'image', name: 'second.png', size: 4 } },
+      ],
+    }, Readable.from([]))).rejects.toThrow('prepared media parts must cover every media item')
   })
 
   it('publishes a hashed group file through CDN upload and OidbSvcTrpcTcp.0x6d9_4', async () => {
@@ -8608,6 +8594,44 @@ describe('QQBridgeServer', () => {
     })
     expect(repeatedRead.status).toBe(200)
     await expect(repeatedRead.json()).resolves.toEqual({ ok: true })
+  })
+
+  it('E2E: sends an ordered HTTP body as interleaved text and image elements', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const base = `http://127.0.0.1:${server.address().port}/v1`
+    const png = completePng(1, 1)
+    const manifest = Buffer.from(JSON.stringify({
+      conversationId: 'uid-1715311957',
+      mediaFraming: 'length-prefixed-v1',
+      parts: [
+        { type: 'text', text: 'leading' },
+        {
+          type: 'media',
+          media: { kind: 'image', name: 'first.png', size: png.length, mimeType: 'image/png' },
+        },
+        { type: 'text', text: 'closing' },
+        {
+          type: 'media',
+          media: { kind: 'image', name: 'second.png', size: png.length, mimeType: 'image/png' },
+        },
+      ],
+    })).toString('base64url')
+
+    const response = await fetch(`${base}/messages`, {
+      method: 'POST',
+      headers: { 'x-qqnt-manifest': manifest, 'content-length': String(png.length * 2 + 16) },
+      body: framedUpload(png, png),
+    })
+
+    expect(response.status, await response.clone().text()).toBe(200)
+    const parts = f.protocolSend.mock.calls.at(-1)?.[3] ?? []
+    expect(parts.map((part) => part.kind)).toEqual(['text', 'image', 'text', 'image'])
+    expect(parts[0]).toMatchObject({ kind: 'text', text: 'leading' })
+    expect(parts[2]).toMatchObject({ kind: 'text', text: 'closing' })
   })
 
   it('returns and negatively caches missing favorite sticker assets as HTTP 404', async () => {

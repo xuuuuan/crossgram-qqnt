@@ -694,7 +694,7 @@ export class QQBridgeServer {
         json(response, 413, { error: `voice input exceeds the ${this.bridge.voiceInputLimit} byte limit` })
         return
       }
-      log('info', `HTTP API send start id=${requestId} conversation=${manifest.conversationId} textLength=${manifest.text?.length ?? 0} media=${manifest.media?.map((item) => `${item.kind}:${item.name}:${item.size ?? '?'}`).join(',') || '<none>'}`)
+      log('info', `HTTP API send start id=${requestId} conversation=${manifest.conversationId} ${sendContentSummary(manifest)}`)
       let message
       try {
         message = await this.bridge.send(manifest, request)
@@ -1253,6 +1253,17 @@ function optionalNumberParam(url: URL, name: string): number | undefined {
   const value = Number(raw)
   if (!Number.isFinite(value)) throw new Error(`invalid ${name}`)
   return value
+}
+
+/** Content summary of a send, whichever shape its manifest uses. */
+function sendContentSummary(manifest: SendManifest): string {
+  if (manifest.parts?.length) {
+    return `parts=${manifest.parts.map((part) => part.type === 'text'
+      ? `text:${part.text.length}`
+      : `media:${part.media.kind}:${part.media.name}:${part.media.size ?? '?'}`).join(',')}`
+  }
+  const media = manifest.media?.map((item) => `${item.kind}:${item.name}:${item.size ?? '?'}`).join(',')
+  return `textLength=${manifest.text?.length ?? 0} media=${media || '<none>'}`
 }
 
 function parseByteRange(value: string | undefined): { offset: number, limit?: number } | null | false {
