@@ -568,7 +568,22 @@ export interface SendManifest {
   media?: QQSendMediaSpec[]
   /** CDN metadata returned by /uploads/prepare after the platform uploaded Highway bytes directly. */
   uploadedMedia?: QQPreparedMedia[]
+  /**
+   * Ordered message content, for callers that need text and media interleaved.
+   *
+   * `text`/`textParts`/`media` remain the content description; `segments` only
+   * says in which order their elements appear. Every `media` item must be
+   * referenced exactly once, and the media bytes are still read in `media`
+   * order. Without `segments` the message keeps the QQ-ordered default of text
+   * first, then media.
+   */
+  segments?: QQSendSegment[]
 }
+
+/** One element of an ordered {@link SendManifest} body. */
+export type QQSendSegment =
+  | { type: 'text', text: string, entities?: QQTextPart['entities'] }
+  | { type: 'media', index: number }
 
 /** One file uploaded from the caller into a QQ Flash Transfer file set. */
 export interface QQFlashTransferUploadFile {

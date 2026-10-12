@@ -32,7 +32,7 @@ import {
 } from './kernel-types.js'
 import {
   conversationId, parseConversationId, type HistoryQuery, type MemberPage, type QQCallSignalEvent, type QQCard, type QQConversation, type QQEvent, type QQGroupFilePage, type QQMedia, type QQMediaLocator, type QQMediaUploadPlan, type QQMessage, type QQMultiForwardLocator, type QQReactionActorPage, type QQReactionContext, type QQReactionDefinition, type QQReactionState,
-  type QQFlashTransferManifest, type QQFlashTransferResult, type QQPokeResult, type QQRequest, type QQRequestKind, type QQRequestPage, type QQRequestStatus, type QQSendMediaSpec, type QQServiceMember, type QQSticker, type QQStickerPack, type QQStickerPackSummary, type QQStickerReference, type QQTextPart, type SearchPage, type SearchQuery, type SendManifest,
+  type QQFlashTransferManifest, type QQFlashTransferResult, type QQPokeResult, type QQRequest, type QQRequestKind, type QQRequestPage, type QQRequestStatus, type QQSendMediaSpec, type QQSendSegment, type QQServiceMember, type QQSticker, type QQStickerPack, type QQStickerPackSummary, type QQStickerReference, type QQTextPart, type SearchPage, type SearchQuery, type SendManifest,
 } from './protocol.js'
 
 const REACTION_ASSET_META_TTL_MS = 10 * 60_000
@@ -2578,6 +2578,8 @@ export class QQKernelBridge {
   async send(manifest: SendManifest, body: Readable): Promise<QQMessage> {
     const voice = manifest.media?.find((media) => media.kind === 'voice')
     const conversation = this.getConversation(manifest.conversationId)
+    const segments = orderedSendSegments(manifest)
+    const manifestText = manifestTextContent(manifest)
     if (isDeviceChatType(conversation.chatType)) {
       return this.sendDeviceMessage(conversation, manifest, body)
     }
@@ -2586,16 +2588,20 @@ export class QQKernelBridge {
       ? manifest.media?.find((media) => media.kind === 'file')
       : undefined
     if (groupFile && (
-      manifest.media?.length !== 1 || manifest.text || manifest.textParts?.length
+      manifest.media?.length !== 1 || manifestText
       || manifest.replyToId || manifest.replyToSequence || manifest.sticker
     )) {
       throw new Error('QQ group file messages must contain exactly one file without a caption or reply')
     }
     const protocolParts: DirectMessagePart[] = []
     if (manifest.replyToId) protocolParts.push(await this.directReplyPart(conversation, manifest.replyToId))
-    if (manifest.textParts?.length) {
+    if (!segments?.length && manifest.textParts?.length) {
       for (const part of manifest.textParts) protocolParts.push(...directTextParts(part))
-    } else if (manifest.text) protocolParts.push({ kind: 'text', text: manifest.text })
+    } else if (!segments?.length && manifest.text) protocolParts.push({ kind: 'text', text: manifest.text })
+    // Media elements are collected per media item and appended once the whole
+    // body has been read, so an ordered send can place them after the text
+    // segments without changing the streaming order of the bytes.
+    const mediaParts: DirectMessagePart[][] = (manifest.media ?? []).map(() => [])
     const cleanup: string[] = []
     const sentMediaPaths: Array<string | undefined> = []
     let voicePtt: { filePath: string, duration: number } | undefined
@@ -2605,7 +2611,7 @@ export class QQKernelBridge {
         throw new Error('uploaded media requires matching media metadata')
       }
       if (manifest.sticker && manifest.media?.length) throw new Error('a message cannot contain both sticker and media')
-      if (voice && (manifest.media?.length !== 1 || manifest.text || manifest.textParts?.length || manifest.sticker || manifest.uploadedMedia || manifest.replyToSequence)) {
+      if (voice && (manifest.media?.length !== 1 || manifestText || manifest.sticker || manifest.uploadedMedia || manifest.replyToSequence)) {
         throw new Error('voice messages must contain exactly one voice item')
       }
       if (manifest.sticker?.kind === 'sysface') {
@@ -2674,6 +2680,7 @@ export class QQKernelBridge {
           : undefined
         if (manifest.uploadedMedia) body.resume()
         for (const [index, spec] of manifest.media.entries()) {
+          const mediaElement = mediaParts[index]!
           if (spec.kind === 'voice') {
             const stagingRoot = this.stagingPath('voice')
             mkdirSync(stagingRoot, { recursive: true })
@@ -2702,7 +2709,7 @@ export class QQKernelBridge {
             if (prepared.kind === 'image') {
               const msgInfo = Buffer.from(prepared.msgInfo, 'base64url')
               if (!prepared.fileUuid || !msgInfo.length) throw new Error(`uploaded image ${index} metadata is incomplete`)
-              protocolParts.push({ kind: 'image', upload: {
+              mediaElement.push({ kind: 'image', upload: {
                 fileUuid: prepared.fileUuid, ipv4s: [], msgInfo, msgInfoBodies: [],
                 ...(prepared.compatQMsg ? { compatQMsg: Buffer.from(prepared.compatQMsg, 'base64url') } : {}),
               } })
@@ -2711,7 +2718,7 @@ export class QQKernelBridge {
             if (prepared.kind === 'video') {
               const msgInfo = Buffer.from(prepared.msgInfo, 'base64url')
               if (!prepared.fileUuid || !msgInfo.length) throw new Error(`uploaded video ${index} metadata is incomplete`)
-              protocolParts.push({ kind: 'video', upload: {
+              mediaElement.push({ kind: 'video', upload: {
                 fileUuid: prepared.fileUuid,
                 thumbnailFileUuid: '',
                 msgInfo,
@@ -2733,7 +2740,7 @@ export class QQKernelBridge {
             await this.packetClientForSession().completeFileUpload(
               conversation.chatType as 1 | 2, conversation.peerUid, this.requireConfig().selfUid, uploaded,
             )
-            protocolParts.push({
+            mediaElement.push({
               kind: 'file', upload: uploaded,
               spec: { name: spec.name, size, md5, sha1, file10MMd5: spec.file10MMd5 },
             })
@@ -2790,7 +2797,7 @@ export class QQKernelBridge {
               uploadBody,
             )
             sentMediaPaths.push(path)
-            protocolParts.push({ kind: 'image', upload: uploaded })
+            mediaElement.push({ kind: 'image', upload: uploaded })
             continue
           }
           if (spec.kind === 'video') {
@@ -2805,7 +2812,7 @@ export class QQKernelBridge {
               uploadBody,
             )
             sentMediaPaths.push(path)
-            protocolParts.push({ kind: 'video', upload: uploaded })
+            mediaElement.push({ kind: 'video', upload: uploaded })
             continue
           }
           if (!file10MMd5) throw new Error(`file ${index} metadata is incomplete`)
@@ -2819,7 +2826,7 @@ export class QQKernelBridge {
             uploadBody,
           )
           sentMediaPaths.push(path)
-          protocolParts.push({
+          mediaElement.push({
             kind: 'file', upload: uploaded,
             spec: { name: spec.name, size, md5, sha1, file10MMd5 },
           })
@@ -2827,6 +2834,14 @@ export class QQKernelBridge {
         await reader?.finish()
       } else {
         body.resume()
+      }
+      if (segments?.length) {
+        for (const segment of segments) {
+          if (segment.type === 'text') protocolParts.push(...directTextParts(segment))
+          else protocolParts.push(...mediaParts[segment.index]!)
+        }
+      } else {
+        for (const element of mediaParts) protocolParts.push(...element)
       }
       if (!protocolParts.length && !voicePtt) throw new Error('message must contain text, media, or sticker')
       const startedAt = Math.floor(Date.now() / 1000)
@@ -2840,7 +2855,7 @@ export class QQKernelBridge {
         accepted,
         minimumStatus,
         startedAt,
-        expectedText: manifest.textParts?.map((part) => part.text).join('') || manifest.text,
+        expectedText: manifestText,
         expectedMediaName: manifest.media?.[0]?.kind === 'voice' ? undefined : manifest.media?.[0]?.name,
         expectedMediaKind: manifest.sticker ? 'sticker' : manifest.media?.[0]?.kind,
         originRequestId: manifest.originRequestId,
@@ -3168,7 +3183,7 @@ export class QQKernelBridge {
       accepted,
       minimumStatus,
       startedAt,
-      expectedText: manifest.textParts?.map((part) => part.text).join('') || manifest.text,
+      expectedText: manifestTextContent(manifest),
       expectedMediaName: manifest.media?.[0]?.kind === 'voice' ? undefined : manifest.media?.[0]?.name,
       expectedMediaKind: manifest.sticker ? 'sticker' : manifest.media?.[0]?.kind,
       originRequestId: manifest.originRequestId,
@@ -8556,6 +8571,40 @@ class FramedUploadReader {
     this.buffered = this.buffered.subarray(length)
     return output
   }
+}
+
+/**
+ * Validate a caller-supplied element order.
+ *
+ * The media bytes are still read in `media` order, so the order can only name
+ * media items rather than describe them; every item must be named exactly once
+ * or its elements would be silently dropped.
+ */
+function orderedSendSegments(manifest: SendManifest): QQSendSegment[] | undefined {
+  const segments = manifest.segments
+  if (!segments?.length) return
+  const mediaCount = manifest.media?.length ?? 0
+  const referenced = new Set<number>()
+  for (const segment of segments) {
+    if (segment.type === 'text') continue
+    const index = segment.index
+    if (!Number.isInteger(index) || index < 0 || index >= mediaCount) {
+      throw new Error(`ordered segment media index ${String(index)} is out of range`)
+    }
+    if (referenced.has(index)) throw new Error(`ordered segment media index ${index} appears more than once`)
+    referenced.add(index)
+  }
+  if (referenced.size !== mediaCount) throw new Error('ordered segments must reference every media item')
+  return segments
+}
+
+/** Text a sent message carries, used to recognize QQ's echo of it. */
+function manifestTextContent(manifest: SendManifest): string | undefined {
+  if (manifest.segments?.length) {
+    return manifest.segments.flatMap((segment) => segment.type === 'text' ? [segment.text] : []).join('')
+      || undefined
+  }
+  return manifest.textParts?.map((part) => part.text).join('') || manifest.text
 }
 
 function directTextParts(part: QQTextPart): DirectMessagePart[] {

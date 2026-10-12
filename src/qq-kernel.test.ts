@@ -3747,6 +3747,65 @@ it('drops zero-peer sidecars while preserving the paired group service message',
     expect(sent.parts.filter((part) => part.type === 'media')).toHaveLength(2)
   })
 
+  it('keeps the caller element order for text and image segments', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const png = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+      'base64',
+    )
+    const frame = (bytes: Buffer) => [
+      Buffer.from([0, 0, 0, bytes.length]), bytes, Buffer.alloc(4),
+    ]
+    await bridge.send({
+      conversationId: 'uid-1715311957',
+      mediaFraming: 'length-prefixed-v1',
+      text: 'leading\nclosing',
+      textParts: [{ type: 'text', text: 'leading' }, { type: 'text', text: 'closing' }],
+      media: [
+        { kind: 'image', name: 'first.png', size: png.length },
+        { kind: 'image', name: 'second.png', size: png.length },
+      ],
+      segments: [
+        { type: 'text', text: 'leading' },
+        { type: 'media', index: 0 },
+        { type: 'text', text: 'closing' },
+        { type: 'media', index: 1 },
+      ],
+    }, Readable.from([...frame(png), ...frame(png)]))
+
+    const parts = f.protocolSend.mock.calls.at(-1)?.[3] ?? []
+    expect(parts.map((part) => part.kind)).toEqual(['text', 'image', 'text', 'image'])
+    expect(parts[0]).toMatchObject({ kind: 'text', text: 'leading' })
+    expect(parts[2]).toMatchObject({ kind: 'text', text: 'closing' })
+  })
+
+  it('rejects an ordered body that duplicates, drops, or misplaces a media item', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const media = [
+      { kind: 'image' as const, name: 'first.png', size: 4 },
+      { kind: 'image' as const, name: 'second.png', size: 4 },
+    ]
+
+    await expect(bridge.send({
+      conversationId: 'uid-1715311957', media,
+      segments: [{ type: 'media', index: 0 }, { type: 'media', index: 0 }],
+    }, Readable.from([]))).rejects.toThrow('appears more than once')
+
+    await expect(bridge.send({
+      conversationId: 'uid-1715311957', media,
+      segments: [{ type: 'media', index: 0 }, { type: 'media', index: 5 }],
+    }, Readable.from([]))).rejects.toThrow('out of range')
+
+    await expect(bridge.send({
+      conversationId: 'uid-1715311957', media,
+      segments: [{ type: 'text', text: 'caption' }, { type: 'media', index: 0 }],
+    }, Readable.from([]))).rejects.toThrow('must reference every media item')
+  })
+
   it('publishes a hashed group file through CDN upload and OidbSvcTrpcTcp.0x6d9_4', async () => {
     const f = fixture()
     const file = Buffer.from([4, 5, 6, 7])
