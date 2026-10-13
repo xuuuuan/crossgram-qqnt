@@ -8252,6 +8252,11 @@ interface SendBody {
 function normalizeSendBody(manifest: SendManifest): SendBody {
   if (!manifest.parts?.length) {
     const media = manifest.media ?? []
+    if (manifest.uploadedMedia && !media.length) {
+      // ponytail: some senders attach an uploaded-media marker even to text-only
+      // manifests; dropping it is safer than failing a send that has no media.
+      manifest = { ...manifest, uploadedMedia: undefined }
+    }
     if (manifest.uploadedMedia && manifest.uploadedMedia.length !== media.length) {
       throw new Error('uploaded media count does not match media metadata')
     }
