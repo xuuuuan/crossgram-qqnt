@@ -8268,15 +8268,9 @@ function directTextParts(part: QQTextPart): DirectMessagePart[] {
     if (entity.offset > offset) parts.push({ kind: 'text', text: part.text.slice(offset, entity.offset) })
     const content = part.text.slice(entity.offset, entity.offset + entity.length)
     if (entity.type === 'mention') {
-      // A plain-number userId is a QQ number (satori's numeric id space), not an NT
-      // uid: passing it as userUid puts an invalid uid on the wire and the client
-      // renders a plain-text @. Leave userUid empty so the mention extra carries the
-      // uin only, which the server resolves on its own.
-      const plainNumber = /^\d+$/.test(entity.userId)
       parts.push({
         kind: 'mention', text: content,
-        userUid: plainNumber ? '' : entity.userId,
-        userUin: entity.numericId ?? (plainNumber ? entity.userId : undefined),
+        userUid: entity.userId, userUin: entity.numericId,
       })
     } else {
       const faceIndex = Number(entity.faceId)
