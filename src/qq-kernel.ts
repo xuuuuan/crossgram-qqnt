@@ -2463,6 +2463,7 @@ export class QQKernelBridge {
       ? content.textParts.map(() => [])
       : undefined
     const mediaSlots: DirectMessagePart[][] = content.media.map(() => [])
+    for (const part of content.textParts) await this.resolveNumericMentions(part)
     if (textSlots) {
       content.textParts.forEach((part, index) => textSlots[index]!.push(...directTextParts(part)))
     } else {
@@ -3353,6 +3354,37 @@ export class QQKernelBridge {
     } finally {
       const index = this.pendingForwards.indexOf(pendingForward)
       if (index >= 0) this.pendingForwards.splice(index, 1)
+    }
+  }
+
+  /**
+  * Satori's id space is numeric QQ numbers, but the wire mention element needs
+  * the NT uid. Rewrite every plain-number mention userId to its uid in place
+  * (keeping the number as numericId) before the send parts are built.
+  */
+  private async resolveNumericMentions(part: QQTextPart): Promise<void> {
+    const numbers = new Set<string>()
+    for (const entity of part.entities ?? []) {
+      if (entity.type === 'mention' && /^\d+$/.test(entity.userId)) {
+        if (!entity.numericId) entity.numericId = entity.userId
+        numbers.add(entity.userId)
+      }
+    }
+    if (!numbers.size) return
+    const uidByNumber = new Map<string, string>()
+    await Promise.all([...numbers].map(async (number) => {
+      try {
+        const converted = await retryTransientInvalidArgument(
+          () => this.requireSession().getUixConvertService().getUid(new Set([number])),
+        )
+        const resolvedUid = converted.uidInfo.get(number)
+        if (resolvedUid && resolvedUid !== number) uidByNumber.set(number, resolvedUid)
+      } catch (error) {
+        log('error', `mention QQ number ${number} could not be resolved to a UID`, error)
+      }
+    }))
+    for (const entity of part.entities ?? []) {
+      if (entity.type === 'mention' && uidByNumber.has(entity.userId)) entity.userId = uidByNumber.get(entity.userId)!
     }
   }
 
