@@ -1,3 +1,13 @@
+/**
+ * Version of the HTTP protocol this bridge speaks.
+ *
+ * The relay gates on this number: `platform-qqnt` refuses a bridge older than
+ * its minimum and uses each capability only from the version that introduced
+ * it, while a newer bridge is accepted as-is. So raise it only for additive
+ * changes, and keep the two sides in sync — a new version must not need a relay
+ * change just for the account to keep working, and the relay's minimum must be
+ * deployable together with the matching bridge.
+ */
 export const PROTOCOL_VERSION = 35
 
 /** Local Unix-socket PCM media protocol. Audio frames use a 1-byte type plus a 4-byte big-endian length. */
