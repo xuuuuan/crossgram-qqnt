@@ -17,7 +17,7 @@
 ### Linux x86_64（systemd）
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/xuuuuan/crossgram-qqnt/master/deploy/install.sh | sudo sh
+curl -fsSL https://raw.githubusercontent.com/xuuuuan/crossgram-qqnt/main/deploy/install.sh | sudo sh
 ```
 
 Debian/Ubuntu 会自动下载官方 Linux QQ `.deb`；Fedora/RHEL、Arch、openSUSE 请先安装官方 Linux QQ 再运行安装脚本。安装器会自动配置依赖（Xvfb、D-Bus、ffmpeg、qrencode 等）、创建 `qqnt-bridge` 系统用户并启动 `qqnt-bridge.service`。
@@ -36,7 +36,7 @@ sudo qqntctl update                # 升级到最新 Release
 自定义 QQ 安装路径：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/xuuuuan/crossgram-qqnt/master/deploy/install.sh \
+curl -fsSL https://raw.githubusercontent.com/xuuuuan/crossgram-qqnt/main/deploy/install.sh \
   | sudo env QQNT_BINARY=/path/to/qq QQNT_RESOURCES_DIR=/path/to/resources sh
 ```
 

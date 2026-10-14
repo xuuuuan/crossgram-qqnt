@@ -1,4 +1,5 @@
 *.sh text eol=lf
 *.service text eol=lf
 *.mjs text eol=lf
+Dockerfile text eol=lf
 deploy/qqntctl text eol=lf

@@ -1,8 +1,15 @@
 name: release packages
 
+# PUBLISH_IMAGES=false 可跳过全部构建与发布任务（只放源码的仓库用）；不设置即发布，fork 无需配置，会推到自己 namespace。
 on:
   workflow_dispatch:
+    inputs:
+      qq-deb-url:
+        description: Linux QQ .deb to bundle instead of the default
+        required: false
   push:
+    branches:
+      - main
     tags:
       - 'v*'
 
@@ -11,6 +18,7 @@ permissions:
 
 jobs:
   test:
+    if: vars.PUBLISH_IMAGES != 'false'
     strategy:
       fail-fast: false
       matrix:
@@ -35,6 +43,7 @@ jobs:
       - run: pnpm test
 
   package:
+    if: vars.PUBLISH_IMAGES != 'false'
     needs: test
     strategy:
       fail-fast: false
@@ -70,7 +79,7 @@ jobs:
           gh release upload "$GITHUB_REF_NAME" dist/packages/*.tar.gz --clobber
 
   publish:
-    if: startsWith(github.ref, 'refs/tags/')
+    if: vars.PUBLISH_IMAGES != 'false' && startsWith(github.ref, 'refs/tags/')
     needs: package
     runs-on: ubuntu-latest
     steps:
@@ -78,3 +87,52 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
+
+  image:
+    if: vars.PUBLISH_IMAGES != 'false' && startsWith(github.ref, 'refs/tags/')
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Collect tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=${{ github.ref_name }}
+            type=raw,value=latest
+            type=sha,format=short
+
+      # Linux QQ only ships an amd64 package, so the image is amd64 too. The
+      # injection comes from the release this run just published.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: deploy/docker
+          file: deploy/docker/Dockerfile
+          platforms: linux/amd64
+          build-args: |
+            QQNT_BRIDGE_ARCHIVE_URL=${{ github.server_url }}/${{ github.repository }}/releases/download/${{ github.ref_name }}/qqnt-bridge-linux-x64-release.tar.gz
+            QQNT_BRIDGE_VERSION=${{ github.ref_name }}
+            QQ_DEB_URL=${{ inputs.qq-deb-url || vars.QQ_DEB_URL || 'https://qqdl.gtimg.cn/qqfile/QQNT/9.9.36/beta/9ee04bef/linuxqq_3.2.34-53644_amd64.deb' }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=qqnt-bridge
+          cache-to: type=gha,mode=max,scope=qqnt-bridge
