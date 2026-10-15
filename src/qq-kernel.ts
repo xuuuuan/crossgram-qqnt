@@ -37,26 +37,11 @@ import {
 
 const REACTION_ASSET_META_TTL_MS = 10 * 60_000
 const REACTION_BUNDLE_TAIL_BYTES = 96 * 1024
-/**
- * Deadline for one whole reaction-catalog attempt.
- *
- * Callers bound their own request slightly above this so the loader, not the
- * HTTP layer, decides when an attempt is abandoned.
- */
 const REACTION_CATALOG_LOAD_TIMEOUT_MS = 4_500
-/**
- * Deadline for one optional native catalog step.
- *
- * Every native step only enriches the catalog: the definitions built from the
- * local emoji resources are already usable without it. A step that stops
- * responding must therefore be abandoned rather than allowed to hold the whole
- * catalog hostage.
- */
+/** 单个可选原生表情目录步骤的超时上限，超时后直接使用本地资源已构建的目录。 */
 const REACTION_NATIVE_STEP_TIMEOUT_MS = 2_000
 const FACE_ASSET_META_TTL_MS = 10 * 60_000
-/** CDN batch timestamps probed per unknown face before giving up. */
 const MAX_FACE_RESOURCE_PROBE_TIMESTAMPS = 6
-/** Remote face images kept in memory while the relay serves them. */
 const MAX_CACHED_FACE_IMAGES = 64
 const FACE_RESOURCE_SNIFF_BYTES = 64 * 1024
 
@@ -66,17 +51,8 @@ type ReactionAsset = {
   mimeType: FaceAssetMimeType
 }
 
-/** Largest single poke burst a caller may request. */
 export const QQ_POKE_MAX_COUNT = 10
 
-/**
- * A system-face image the relay can serve.
- *
- * Path entries stream from disk (the shipped resource tree or QQ's own download
- * cache) while byte entries are unwrapped CDN bundles. Message stickers must
- * publish the size of exactly what they serve, so both flavors carry their own
- * length and content identity.
- */
 type FacePathAsset = {
   kind: 'path'
   path: string
@@ -97,23 +73,16 @@ type FaceAssetEntry = FacePathAsset | {
   height?: number
 }
 
-/** Size and content identity of the bytes a reaction key serves. */
 export type ReactionAssetMetadata = {
   size: number
-  /** Content identity; a different remote asset yields a different version. */
   version: number
   mimeType?: FaceAssetMimeType
   width?: number
   height?: number
-  /** Archive entry name inside a QQ face bundle, for diagnostics. */
   entry?: string
   source: 'path' | 'bundle' | 'payload'
 }
 
-/** A single native group-member page, including the identifiers and details
- * emitted by getNextMemberList/onMemberListChange. Native QQNT builds may
- * return these two collections asynchronously, so callers should merge them
- * before projecting members. */
 type NativeMemberPage = {
   ids: Array<{ uid: string, index: number }>
   infos: Map<string, MemberInfo>
@@ -152,9 +121,8 @@ const CALL_SIGNAL_SECRET_BYTES = 32
 const CALL_SIGNAL_PROCESS_EPOCH_BYTES = 16
 const CALL_SIGNAL_ACTION_SCAN_BYTES = 4_096
 const CALL_SIGNAL_TUPLE_DOMAIN = Buffer.from('qqnt-call-tuple-v1', 'ascii')
-/** QQ's own poke notices arrive as this JSON gray-tip business id. */
+/** 戳一戳灰条的 JSON busiId。 */
 const POKE_GRAY_TIP_BUSI_ID = '1061'
-/** Space repeated pokes so QQ does not read the burst as a flood. */
 const POKE_INTERVAL_MS = 250
 const POKE_NOTICE_TIMEOUT_MS = 2_500
 const POKE_NOTICE_POLL_INTERVAL_MS = 400
@@ -182,13 +150,9 @@ const FAVORITE_STICKER_VERSION = 2
 const STICKER_METADATA_PROBE_BYTES = 256 * 1024
 const STICKER_METADATA_PROBE_TIMEOUT_MS = 5_000
 const MESSAGE_MEMBER_PROFILE_TIMEOUT_MS = 200
-// Large local QQ indexes can take slightly longer than five seconds to emit
-// the first native search callback. Keep the request alive long enough for a
-// cold search without turning a genuinely missing callback into a long hang.
 const SEARCH_PAGE_TIMEOUT_MS = 15_000
 const REQUEST_PAGE_LIMIT = 100
-// Keep this in sync with Telegram's account-level reaction catalog. QQ emoji
-// outside this set are exposed as custom reactions backed by QQ's own icon.
+// Telegram 标准内置回应集合，集合外的 QQ 表情作为自定义表情下发。
 const TELEGRAM_STANDARD_REACTIONS = new Set([
   '❤', '👍', '👎', '🔥', '🥰', '👏', '😁', '🤔', '🤯', '😱', '🤬', '😢', '🎉', '🤩', '🤮', '💩',
   '🙏', '👌', '🕊', '🤡', '🥱', '🥴', '😍', '🐳', '❤‍🔥', '🌚', '🌭', '💯', '🤣', '⚡', '🍌', '🏆',
@@ -211,11 +175,8 @@ export interface QQKernelOptions {
   deleteDedupTtlMs?: number
   stickerMissingCacheTtlMs?: number
   marketStickerMimeCacheDir?: string | false
-  /** Test-only override; production uses the 32 MiB voice body limit. */
   voiceInputLimitBytes?: number
-  /** Test-only override; production bounds one optional native catalog step. */
   reactionNativeStepTimeoutMs?: number
-  /** Test-only override; production bounds one whole reaction-catalog attempt. */
   reactionCatalogLoadTimeoutMs?: number
   mediaGateway?: QQMediaLeaseIssuer
   callController?: QQCallController
@@ -428,7 +389,6 @@ export class QQKernelBridge {
   private readonly users = new Map<string, {
     id: string, numericId?: string, name: string, avatarUrl?: string, signature?: string
   }>()
-  /** Native action data is kept process-local; the wire request only exposes structured fields. */
   private readonly requests = new Map<string, CachedRequest>()
   private readonly requestResolutionFlights = new Map<string, Promise<QQRequest>>()
   private readonly pendingRequestUpdates = new Map<string, Set<(update: RequestUpdate) => void>>()
@@ -469,14 +429,7 @@ export class QQKernelBridge {
   private readonly faceAssetLookups = new Map<string, Promise<FaceAssetEntry | undefined>>()
   private readonly faceRemoteImages = new Map<string, { url: string, image: FaceAssetImage }>()
   private readonly faceResourceUrlOverrides = new Map<string, string>()
-  /**
-   * Wide canvas geometry QQ advertises for a system face.
-   *
-   * A face ships two renderings: the square icon (`<id>/png/<id>.png`) QQ draws
-   * inline, and the wide canvas (`<id>/png/<id>_0.png`) it plays when the face is
-   * sent as a message sticker. The catalog geometry describes the canvas, so it
-   * must never size an inline reaction.
-   */
+  /** 系统表情作为大表情发送时的宽幅画布尺寸（`<id>_0.png`），不用于行内小图标（`<id>.png`）。 */
   private readonly faceCanvasGeometry = new Map<string, { width: number, height: number }>()
   private localFaceRoots?: { resource?: string, caches: string[] }
   private reactionCatalogPromise?: Promise<void>
@@ -494,7 +447,6 @@ export class QQKernelBridge {
   private readonly pendingAcceptances = new Map<string, ReturnType<typeof deferred<void>>>()
   private readonly pendingMinimumStatuses = new Map<string, number>()
   private readonly messageOrigins = new Map<string, string>()
-  /** UIDs QQ flagged as robots through member snapshots or bot-only message elements. */
   private readonly robotUids = new Set<string>()
   private robotUinRanges: Array<{ min: bigint, max: bigint }> = []
   private readonly resolvedReplyTargets = new Map<string, string>()
@@ -519,9 +471,7 @@ export class QQKernelBridge {
     assignedMessageId?: string
   }> = []
   private readonly pendingReactions = new Map<string, ReturnType<typeof deferred<QQReactionState>>>()
-  // QQNT may publish an intermediate info snapshot before the reaction write
-  // reaches its local message cache. Keep the requested selection briefly so
-  // that snapshot cannot make an optimistic reaction disappear.
+  // QQNT 在回应写入落盘前可能先推送旧快照，短暂保留期望状态防止乐观更新闪烁。
   private readonly pendingReactionDesired = new Map<string, { keys: Set<string>, expiresAt: number }>()
   private readonly pendingGroupProfiles = new Map<string, ReturnType<typeof deferred<void>>>()
   private pendingGroupFilePage?: {
@@ -608,9 +558,7 @@ export class QQKernelBridge {
       this.requestCursorSecret = randomBytes(32)
       this.callSignalSecret = randomBytes(CALL_SIGNAL_SECRET_BYTES)
       this.callSignalProcessEpoch = randomBytes(CALL_SIGNAL_PROCESS_EPOCH_BYTES)
-    } catch {
-      // Incoming call projection fails closed when instance crypto is unavailable.
-    }
+    } catch {}
     mkdirSync(this.tempPath, { recursive: true })
     this.clearVoiceCache()
     this.pruneFlashTransferFiles()
@@ -764,11 +712,6 @@ export class QQKernelBridge {
     return this.mediaGateway.issueLease({ callId: state.callId })
   }
 
-  /**
-   * Control the exact active QQ call through QQ's mounted renderer handlers.
-   * The opaque call ID prevents a stale Telegram call from accepting or ending
-   * a newer invite.
-   */
   async controlCall(callId: unknown, operation: QQCallOperation): Promise<void> {
     const state = this.callSignalState
     if (typeof callId !== 'string' || !state || state.callId !== callId || state.signal === 'ended') {
@@ -797,8 +740,7 @@ export class QQKernelBridge {
     this.detach()
     this.clearVoiceCache()
     log('info', `bridge attach start selfUin=${config.selfUin} selfUid=${config.selfUid} listenerConstructors=msg:${Boolean(kernel.NodeIKernelMsgListener)},buddy:${Boolean(kernel.NodeIKernelBuddyListener)},group:${Boolean(kernel.NodeIKernelGroupListener)},recent:${Boolean(kernel.NodeIKernelRecentContactListener)}`)
-    // A native wrapper can be re-initialized after logout/account switching.
-    // Never leak the previous account's seen peers into the new address book.
+    // 切换账号重新初始化时清空上一个账号的缓存状态。
     this.contacts.clear()
     this.recentContactIds.clear()
     this.recentTopMessages.clear()
@@ -1034,9 +976,7 @@ export class QQKernelBridge {
     let recentError: unknown
     if (recentService.getRecentContactList) {
       log('info', 'native API start name=getRecentContactList')
-      // QQNT returns only an acknowledgement here. The refreshed rows arrive
-      // asynchronously through the recent-contact listener, so do not read
-      // the small startup cache (often eight rows) before that callback lands.
+      // `getRecentContactList` 仅返回确认状态，完整会话列表通过 listener 异步下发。
       const recentListUpdate = this.waitForRecentListUpdate(1_500)
       try {
         const loaded = await recentService.getRecentContactList()
@@ -1049,17 +989,12 @@ export class QQKernelBridge {
         }
       } catch (error) {
         recentListUpdate.cancel()
-        // Older kernels may expose a stub with an incompatible implementation.
-        // getRecentContactInfos below remains a useful cache fallback.
         log('error', 'full recent contact refresh failed; using cached infos', error)
       }
     }
     log('info', 'native API start name=getRecentContactsSnapshot')
     try {
-      // The unbounded legacy snapshot only materializes the small UI cache on
-      // current QQNT builds (typically 8-10 rows), even though its sorted ID
-      // list contains every recent conversation. The count-aware variant
-      // returns the matching RecentContactInfo rows, including each top msgId.
+      // 不带 limit 的 `getRecentContactListSync` 仅返回约 8-10 条 UI 缓存，需优先调用 `getRecentContactListSyncLimit`。
       const snapshot = recentService.getRecentContactListSyncLimit?.(500)
         ?? recentService.getRecentContactListSync?.()
       if (snapshot?.errCode === 0) {
@@ -1075,7 +1010,6 @@ export class QQKernelBridge {
     } catch (error) {
       recentError = error
     }
-    // These methods deliver their actual data through listeners.
     await Promise.allSettled([
       this.requestBuddyList(),
       this.requestGroupList(),
@@ -1092,15 +1026,11 @@ export class QQKernelBridge {
     nextCursor?: string
     total: number
   }> {
-    // Group masks are acknowledged by the getter but delivered asynchronously
-    // through the group listener. Bound the first page on that callback so an
-    // assistant-only group can appear without a second dialog request.
+    // 首次拉取时等待群消息屏蔽状态回调，确保群助手内的群能立即归位。
     if (!this.groupMsgMasksLoaded) {
       await withTimeout(this.requestGroupMsgMask(), 2_500, 'QQ group message mask refresh timed out')
         .catch((error) => log('error', 'group message mask refresh failed; using cache', error))
     }
-    // A refresh failure must not erase/block the already subscribed recent
-    // contact snapshot (QQ can transiently reject this call during startup).
     if (!this.contacts.size) {
       await withTimeout(this.refreshContacts(), 5_000, 'QQ dialog refresh timed out')
         .catch((error) => log('error', 'dialog refresh failed; using cache', error))
@@ -1139,14 +1069,11 @@ export class QQKernelBridge {
     users: Array<{ id: string, numericId?: string, name: string, signature?: string, avatar?: QQMedia, bot?: true }>
     nextCursor?: string
   }> {
-    // getBuddyList delivers the full address book through onBuddyListChange.
+    // `getBuddyList` 触发后通过 `onBuddyListChange` 异步下发完整好友列表。
     for (let attempt = 0; !this.buddySnapshotLoaded && attempt < 10; attempt++) {
       try {
         await withTimeout(this.requestBuddyList(), 2_000, 'QQ buddy refresh timed out')
-      } catch {
-        // QQ can reject duplicate refreshes while its own UI is fetching. The
-        // listener-maintained full buddy snapshot remains authoritative.
-      }
+      } catch {}
       if (!this.buddySnapshotLoaded) await new Promise((resolve) => setTimeout(resolve, 250))
     }
     this.enrichBuddyNames()
@@ -1157,8 +1084,6 @@ export class QQKernelBridge {
     })
     const offset = parseCursor(cursor)
     const selected = all.slice(offset, offset + clamp(limit, 1, 1_000))
-    // Bounded concurrency avoids a native thundering herd while ensuring a
-    // cold-cache miss does not stay permanent.
     const users = await mapConcurrent(selected, 4, async (user) => ({
       ...user,
       name: firstUsefulTitle(user.id, user.name, user.numericId, user.id),
@@ -1380,8 +1305,7 @@ export class QQKernelBridge {
           response = { ...response, msgList: response.msgList.filter((record) => record.msgId !== anchor).slice(0, limit) }
         }
       }
-      // Some QQNT releases expose getLatestDbMsgs but return an initialization
-      // error for it. getMsgs(peer, "0", ...) is the documented equivalent.
+      // 部分 QQNT 版本虽然导出了 `getLatestDbMsgs` 但返回未初始化错误，回退到等价的 `getMsgs(peer, "0", ...)`。
       if (initial && response.result !== 0) {
         log('info', `native API fallback name=getMsgs conversation=${conversation.id} previousResult=${response.result}`)
         response = await withTimeout(
@@ -1409,11 +1333,7 @@ export class QQKernelBridge {
     await Promise.all(visibleRecords.map((record) => this.enrichGroupMessageSender(record)))
     const messages = await mapConcurrent(visibleRecords, 8, async (record) => {
       const message = await this.mapMessagePrepared(record)
-      // Telegram shows the actor preview directly from the history payload.
-      // QQ's message record only contains counts, so hydrate the small
-      // reaction sets while building history (the same three-actor preview
-      // used by getMessageReactions).  Larger sets are left to the explicit
-      // actor-list RPC to avoid multiplying native calls for busy chats.
+      // `MsgRecord` 仅包含回应计数，总数 <= 3 时顺带拉取前 3 个回应用户供客户端预览。
       const total = message.reactionContext?.reactions.reduce((sum, reaction) => sum + reaction.count, 0) ?? 0
       if (record.chatType === CHAT_GROUP && message.reactionContext && total > 0 && total <= 3) {
         message.reactionContext = await this.withReactionActors(
@@ -1446,7 +1366,7 @@ export class QQKernelBridge {
       const pendingPage = { groupCode, result: pending }
       this.pendingGroupFilePage = pendingPage
       try {
-        // QQNT returns only a numeric dispatch token here. The listener callback below is authoritative.
+        // `getGroupFileList` 仅返回请求序号，结果通过 `onGroupFileInfoUpdate` 回调下发。
         service.getGroupFileList!(conversation.peerUin || conversation.peerUid, {
           sortType: 1,
           fileCount: limit,
@@ -1564,9 +1484,7 @@ export class QQKernelBridge {
   ): Promise<{ result: number, errMsg: string, msgList: MsgRecord[] }> {
     const peer = contact(conversation)
     const started = Date.now()
-    // QQ does not await getAioFirstViewLatestMsgs by itself. ChatStore starts
-    // the local-first-view and include-self paths together, races them, and
-    // keeps local data only when it is already a complete screen.
+    // 对齐 QQ ChatStore：并发请求本地首屏缓存与远端历史，仅当本地缓存已凑满整屏且无需继续拉取时直接采用。
     const local = retryHistoryCall(() => service.getAioFirstViewLatestMsgs!(peer, limit))
     const remote = retryHistoryCall(() => service.getMsgsIncludeSelf
       ? service.getMsgsIncludeSelf(peer, '0', limit, true)
@@ -1647,8 +1565,6 @@ export class QQKernelBridge {
     if (result.result !== 0) {
       throw new Error(`setGroupMsgMask: ${result.errMsg} (${result.result})`)
     }
-    // Reflect the change locally so the UI updates immediately; the registered
-    // onGroupsMsgMaskResult listener will deduplicate/overwrite when it arrives.
     this.updateGroupMsgMask(groupCode, mask)
   }
 
@@ -1672,14 +1588,7 @@ export class QQKernelBridge {
     }
   }
 
-  /**
-   * Send QQ poke notices through the native packet binding.
-   *
-   * QQ records a notice message for every poke — a poke face element or a
-   * `busiId 1061` JSON gray tip — exactly like a poke sent from a QQ client.
-   * The relay renders that notice, so the bridge waits briefly for it and
-   * dispatches a message event when the native listener delivered nothing.
-   */
+  /** 发送戳一戳，并在原生 listener 未推送时主动轮询补发灰条通知（`faceType 5` 或 `busiId 1061`）。 */
   async sendPoke(
     conversation: QQConversation,
     userId: string,
@@ -1698,7 +1607,6 @@ export class QQKernelBridge {
       target,
       target === conversation.peerUid ? conversation.peerUin : undefined,
     )
-    // A group poke names the group, a private poke names the friend.
     const peerUin = await this.requireProtocolPeerUin(conversation)
     const client = this.packetClientForSession()
     const startedAt = Math.floor(Date.now() / 1000)
@@ -1710,7 +1618,6 @@ export class QQKernelBridge {
     log('info', `protocol API accepted name=SendPoke conversation=${conversation.id} target=${target} count=${requested}`)
     const notice = await this.waitForPokeNotice(conversation, startedAt)
     if (notice && !(this.messages.get(conversation.id) ?? []).some((item) => item.id === notice.id)) {
-      // The native listener stayed silent; publish the notice the relay renders.
       this.rememberMessage(notice)
       this.dispatch({ type: 'message', conversation, message: notice })
       log('info', `poke notice published conversation=${conversation.id} message=${notice.id}`)
@@ -1718,10 +1625,6 @@ export class QQKernelBridge {
     return { count: requested, ...(notice ? { message: notice } : {}) }
   }
 
-  /**
-   * Resolve the numeric UIN a poke packet needs. Relay-side ids are UIDs, so a
-   * poked group member goes through the same UID->UIN conversion as the peer.
-   */
   private async resolvePokeUin(uid: string, known?: string): Promise<string> {
     if (known && /^\d+$/.test(known)) return known
     const trimmed = uid?.trim()
@@ -1781,8 +1684,6 @@ export class QQKernelBridge {
     if (action === 'kick') {
       const method = groupService.kickMember
       if (!method) throw new Error('QQNT does not expose kickMember')
-      // The native method asserts exactly four arguments, so the reason string
-      // is always passed even when the caller has nothing to record.
       const response = await method.call(groupService, groupCode, [userId], rejectAddRequest, reason)
       if (isNativeFailureResult(response)) {
         throw new Error(`kickMember: ${response.errMsg} (${response.result})`)
@@ -1834,9 +1735,6 @@ export class QQKernelBridge {
         ? conversation
         : this.mergeConversation({ ...conversation, lastMessage: latest })
     } catch (error) {
-      // A recent-contact abstract is lossy and must never be persisted as a
-      // substitute for a real message. Keep the last hydrated message and let
-      // the next dialogs request retry this native lookup.
       log('warn', `recent top message hydration failed conversation=${conversation.id} message=${target.id}`, error)
       return conversation
     }
@@ -2066,10 +1964,7 @@ export class QQKernelBridge {
       contact(conversation), locator.rootMessageId, parentMessageId,
     ))
     log('info', `native API complete name=getMultiMsg conversation=${conversation.id} root=${locator.rootMessageId} parent=${parentMessageId} result=${response.result} err=${JSON.stringify(response.errMsg)} messages=${response.msgList.length}`)
-    // QQ normally indexes nested bundles by (outer root, nested record). Some
-    // forwarded bundles keep the nested resource attached to its original
-    // message instead, in which case QQ's normal lookup reports Data Not
-    // Existed even though (nested record, nested record) is still readable.
+    // 部分被再次转发的嵌套合并转发会将资源挂在嵌套消息自身而非最外层 rootMsgId 下，查找失败时回退为 `(parent, parent)`。
     if (response.result !== 0 && parentMessageId !== locator.rootMessageId) {
       log('info', `native API retry name=getMultiMsg conversation=${conversation.id} root=${parentMessageId} parent=${parentMessageId} reason=nested-resource-fallback`)
       const fallback = await retryTransientInvalidArgument(() => service.getMultiMsg!(
@@ -2081,33 +1976,24 @@ export class QQKernelBridge {
     if (response.result !== 0) throw new Error(`getMultiMsg: ${response.errMsg} (${response.result})`)
     const records = response.msgList.filter((record) => !isRecalledRecord(record))
     const participants = resolveMultiForwardParticipants(locator, records)
-    // QQ archives the original author avatar outside the record's sender
-    // account, so report how many records carried one.
     log('info', `native API merged-forward avatars conversation=${conversation.id} root=${locator.rootMessageId} records=${records.length} archivedAvatars=${records.filter((record) => record.multiTransInfo?.fromFaceUrl?.trim()).length}`)
     return Promise.all(records.map(async (record) => {
       const participant = participants.get(record)!
       return this.mapMessagePrepared(record, {
         multiForwardRootId: locator.rootMessageId,
         multiForwardConversationId: locator.conversationId,
-        // A transcript may contain hundreds of PTT records. Converting every
-        // item before returning the first page makes opening the archive wait
-        // for all media. Preserve a trusted source identity here and perform
-        // the OGG conversion only when Telegram actually requests that voice.
+        // 延迟语音转码，避免打开含大量语音的合并转发时阻塞首屏返回。
         deferVoicePreparation: true,
         sender: {
           id: participant.id,
           name: participant.name,
           alias: participant.alias,
-          // The archived face URL is per author; the record's own UIN only
-          // ever names the shared placeholder account.
           avatar: participant.avatarUrl
             ? directAvatarMedia(participant.id, participant.avatarUrl, participant.avatarUin)
             : participant.avatarUin
               ? qlogoAvatarMedia(participant.id, participant.avatarUin)
               : undefined,
         },
-        // A merged-forward transcript is an archive. Even the current QQ
-        // account is a participant in that archive, not the live account peer.
         outgoing: false,
       })
     }))
@@ -2127,10 +2013,7 @@ export class QQKernelBridge {
     const record = response.msgList.find((item) => item.msgId === id)
     if (record && !isRecalledRecord(record)) return record
 
-    // QQNT may evict an older message from its msgId index while the
-    // conversation-scoped group msgSeq remains queryable. Crossgram persists
-    // both identifiers, so use the sequence as an authoritative fallback for
-    // reaction previews, actor lists, and writes.
+    // 旧消息可能已从 msgId 索引淘汰，群聊下回退使用单调递增的 msgSeq 查询。
     if (conversation.chatType !== CHAT_GROUP || !sequence || !service.getMsgsBySeqAndCount) return null
     log('info', `native API start name=getMsgsBySeqAndCount(message) conversation=${conversation.id} sequence=${sequence}`)
     const bySequence = await retryHistoryCall(
@@ -2163,10 +2046,7 @@ export class QQKernelBridge {
         count: loaded?.count ?? loaded?.stickers.length,
       })
     }
-    // Direct pack lookup is how the relay resolves a persisted installed set.
-    // QQNT can expose an empty bottom-table snapshot in headless mode, so keep
-    // every successfully resolved market pack in this process' catalog. The
-    // relay remains authoritative about which catalog rows are installed.
+    // 无头模式下底部表情栏快照可能为空，需合并进程内已直接加载过的商城表情包。
     for (const loaded of this.stickerPacks.values()) {
       if (loaded.packId === FAVORITE_STICKER_PACK_ID) continue
       packsById.set(loaded.packId, {
@@ -2176,10 +2056,6 @@ export class QQKernelBridge {
       })
     }
     const packs = [...packsById.values()]
-    // The QQ favorites collection is account-scoped and conceptually always
-    // exists, even when the current native snapshot is empty. Expose it as a
-    // stable pack so clients can render the collection and observe later
-    // additions without requiring an unrelated market pack refresh.
     packs.unshift({
       packId: favoritePack.packId,
       title: favoritePack.title,
@@ -2271,10 +2147,6 @@ export class QQKernelBridge {
         mimeType: reference.mimeType,
         width: reference.width,
         height: reference.height,
-        // Telegram's document metadata must advertise the exact number of
-        // bytes that the sticker endpoint can serve. Market sticker paths are
-        // already materialized by getMarketEmoticonPaths above, so derive the
-        // size without opening or decrypting the asset.
         size: [dynamicPath, staticPath]
           .map((path) => path && existsSync(path) ? statSync(path).size : undefined)
           .find((size): size is number => size !== undefined),
@@ -2328,11 +2200,7 @@ export class QQKernelBridge {
   }> {
     const service = this.requireMsgService()
     if (!service.fetchFavEmojiList) return { stickers: [] }
-    // QQNT can retain an empty favorite snapshot when the kernel service was
-    // attached after the desktop client performed its initial collection
-    // load. Force a native refresh for the first page, matching QQNT's own UI
-    // and compatible clients. Continuing pages must not refresh or the cursor
-    // can be reset.
+    // 首页强制 forceRefresh，避免在客户端完成初始加载后才挂载时读到空快照；后续分页不刷新以免重置游标。
     const result = await service.fetchFavEmojiList(
       cursor ?? '', clamp(limit, 1, 200), true, cursor === undefined || cursor === '',
     )
@@ -2375,8 +2243,6 @@ export class QQKernelBridge {
       if (!entry) throw new Error(`QQ system face resource is unavailable: ${reference.faceId}`)
       reference.width ??= entry.width
       reference.height ??= entry.height
-      // Face bundles arrive as ZIP archives; the entry always carries the
-      // wrapped image, so clients never receive an archive to decode.
       return {
         stream: entry.kind === 'path'
           ? fileStream(entry.path, false)
@@ -2386,9 +2252,6 @@ export class QQKernelBridge {
       }
     }
     if (reference.kind === 'favorite') {
-      // A forced collection refresh may replace an earlier unresolved entry
-      // with a real local file. Prefer that authoritative path before
-      // consulting the short negative cache.
       if (reference.path && existsSync(reference.path)) {
         const mimeType = this.resolveFavoriteStickerMimeType(reference)
         return {
@@ -2595,9 +2458,7 @@ export class QQKernelBridge {
     }
     const protocolParts: DirectMessagePart[] = []
     if (manifest.replyToId) protocolParts.push(await this.directReplyPart(conversation, manifest.replyToId))
-    // Elements of an ordered body are collected in slots and appended once the
-    // whole body has been read, so their order comes from the request while the
-    // bytes still stream in media order.
+    // 图文混排消息先按槽位收集，等请求体中的媒体流按顺序读取完毕后再按 `content.order` 组装。
     const textSlots: DirectMessagePart[][] | undefined = content.order
       ? content.textParts.map(() => [])
       : undefined
@@ -2975,8 +2836,6 @@ export class QQKernelBridge {
           },
         })
       }
-      // As in a protocol send, an ordered body collects its elements in slots
-      // and appends them once the media bytes have been staged.
       const textSlots: MsgElement[][] | undefined = content.order
         ? content.textParts.map(() => [])
         : undefined
@@ -3164,8 +3023,6 @@ export class QQKernelBridge {
         waveAmplitudes: QQ_VOICE_WAVE_AMPLITUDES,
         fileSubId: '',
         playState: 1,
-        // Ask QQNT to run its native speech-to-text pipeline. Any resulting
-        // text is surfaced later through the voice-transcript event.
         autoConvertText: 1,
         storeID: 0,
         otherBusinessInfo: { aiVoiceType: 0 },
@@ -3276,8 +3133,6 @@ export class QQKernelBridge {
         waveAmplitudes: [...QQ_VOICE_WAVE_AMPLITUDES],
         fileSubId: '',
         playState: 1,
-        // Ask QQNT to run its native speech-to-text pipeline. Any resulting
-        // text is surfaced later through the voice-transcript event.
         autoConvertText: 1,
         storeID: 0,
         otherBusinessInfo: { aiVoiceType: 0 },
@@ -3370,8 +3225,6 @@ export class QQKernelBridge {
       }).join('|')
       log('info', `native API complete name=getABatchOfContactMsgBoxInfo contacts=${conversations.length} markers=${found}`)
     } catch (error) {
-      // Allow the next request to retry instead of permanently caching a
-      // transient native failure.
       this.unreadBatchState = ''
       this.unreadBatchPromise = undefined
       log('warn', 'QQ batch unread lookup failed', error)
@@ -3399,15 +3252,12 @@ export class QQKernelBridge {
         return undefined
       }
     }
-    // Match QQ's ChatMsgArea.getRangeMsgs: it fetches both sides of msgSeq
-    // concurrently. Waiting for them serially doubles cold roaming latency.
     const [before, after] = await withTimeout(
       Promise.all([call(true), call(false)]),
       450,
       'QQ unread history request timed out',
     )
-    // QQ returns kNoMoreMsg (2004000) together with the final non-empty
-    // page. The official client consumes that page instead of discarding it.
+    // QQ 在返回最后一页非空消息的同时会带上 kNoMoreMsg (2004000)，只要 msgList 非空即视为有效。
     const successful = [before, after].filter((item) => item && (item.result === 0 || item.msgList.length > 0))
     if (!successful.length) {
       return ( before ?? after ?? { result: -1, errMsg: 'unread history unavailable', msgList: [], }
@@ -3517,11 +3367,7 @@ export class QQKernelBridge {
         log('error', `QQ profile resolve failed uid=${uid}; using cached fallback`, error))
       cached = this.seenUsers.get(uid) ?? this.users.get(uid)
     }
-    // Plain QQ numbers (Satori mention targets) that missed the cache resolve
-    // through the UID conversion service. The cache is checked first because
-    // plain-number IDs are not always QQ numbers: a record without senderUid
-    // falls back to senderUin as the user ID, so a cached entry keyed by the
-    // plain number is already the right user.
+    // 先查缓存（无 senderUid 的消息会直接以 senderUin 作为用户 ID 缓存），未命中时再将纯数字 QQ 号转换为 UID。
     if (!cached && /^\d+$/.test(uid)) {
       try {
         const converted = await retryTransientInvalidArgument(
@@ -3591,9 +3437,6 @@ export class QQKernelBridge {
     if (resource.path) {
       if (!existsSync(resource.path)) return
     } else if (resource.url) {
-      // Serving is also a cache-validation point: after the metadata TTL the
-      // archive may have changed, and a stale payload must not be served under
-      // the previous document identity.
       const meta = await this.resolveReactionAssetMeta(reactionKey).catch(() => undefined)
       let cached = this.reactionRemoteCache.get(reactionKey)
       if (cached && meta && cached.version !== meta.version) {
@@ -3606,8 +3449,6 @@ export class QQKernelBridge {
         bytes = await this.fetchReactionAssetPayload(reactionKey, resource.url)
         if (!bytes) return
       }
-      // Runtime faces are fetched from QQ's CDN, so the advertised catalog type
-      // is a guess until the payload has been inspected at least once.
       const sniffed = sniffFaceImage(bytes)
       if (sniffed) resource.mimeType = sniffed.mimeType
       this.rememberReactionAssetMetadata(reactionKey, {
@@ -3646,15 +3487,7 @@ export class QQKernelBridge {
     }
   }
 
-  /**
-   * Returns the size and content identity of the bytes a reaction key serves.
-   *
-   * QQ writes the entry sizes and CRC-32 in the bundle's central directory, so
-   * a small ranged read of the archive tail is enough; clients need the exact
-   * EOF length to schedule a download, and Telegram caches custom emoji by
-   * document id, which is derived from the version. Re-resolving after the TTL
-   * picks up remote changes without re-downloading the whole archive.
-   */
+  /** 解析回应表情资源的字节长度与版本（ZIP 包优先通过尾部 Range 请求读取 central directory）。 */
   async resolveReactionAssetMeta(
     reactionKey: string,
     options: { maxAgeMs?: number } = {},
@@ -3677,28 +3510,16 @@ export class QQKernelBridge {
     return meta
   }
 
-  /**
-   * Asset target of a reaction cell.
-   *
-   * A reaction renders the square icon a face ships for inline use, so the
-   * target deliberately carries no canvas geometry: without one a wide canvas
-   * face resolves its canonical `<id>.png` entry instead of the `<id>_0.png`
-   * artwork that only belongs in a message.
-   */
+  /** 回应栏使用无画布宽高的方形小图标（`<id>.png`），不选宽幅大表情（`<id>_0.png`）。 */
   private reactionAssetTarget(reactionKey: string): FaceAssetTarget {
     return this.faceIconTarget(systemFaceIdFromReactionKey(reactionKey))
   }
 
-  /**
-   * Asset target of a face rendered as a message sticker, which uses the wide
-   * canvas QQ advertises whenever the catalog carries one.
-   */
   private faceCanvasTarget(faceId: string): FaceAssetTarget {
     const canvas = this.faceCanvasGeometry.get(faceId)
     return { faceId, width: canvas?.width, height: canvas?.height }
   }
 
-  /** Asset target of a face rendered inline, which always prefers the square icon. */
   private faceIconTarget(faceId: string | undefined): FaceAssetTarget {
     return { faceId }
   }
@@ -3715,7 +3536,6 @@ export class QQKernelBridge {
     }
   }
 
-  /** Geometry the published catalog advertises for a reaction resource. */
   private reactionAssetGeometry(reactionKey: string): { width?: number, height?: number } {
     const definition = this.reactionByKey.get(reactionKey)
     const resource = definition?.presentation.type === 'custom' ? definition.presentation.resource : undefined
@@ -3754,12 +3574,7 @@ export class QQKernelBridge {
     }
   }
 
-  /**
-   * Reads only the archive tail: QQ's CDN answers range requests with the last
-   * bytes of the file, which is where the central directory lives. A CDN that
-   * ignores the range hands us the whole archive instead, which is unwrapped
-   * and cached for serving.
-   */
+  /** 请求 ZIP 包尾部以读取 central directory；若 CDN 忽略 Range 返回全量包则顺带解压并缓存。 */
   private async fetchReactionBundleTail(
     url: string,
     reactionKey: string,
@@ -3803,12 +3618,6 @@ export class QQKernelBridge {
     this.reactionAssetMetadata.set(reactionKey, { meta, resolvedAt: Date.now() })
   }
 
-  /**
-   * Runtime QQ system faces are delivered as ZIP bundles that wrap the actual
-   * image next to a larger canvas variant. Relaying the archive verbatim makes
-   * every client drop the face, so unwrap the entry matching the advertised
-   * geometry and keep the payload untouched when it already is a plain image.
-   */
   private resolveReactionAssetPayload(reactionKey: string, payload: Buffer): Buffer {
     const image = resolveFaceAssetImage(payload, this.reactionAssetTarget(reactionKey))
     if (image) return image.bytes
@@ -3818,16 +3627,6 @@ export class QQKernelBridge {
     return payload
   }
 
-  /**
-   * Publishes the exact size and content identity of the image a QQ system face
-   * serves, so Telegram documents can schedule the right download.
-   *
-   * Telegram reads Document.size to schedule sticker and custom-emoji downloads
-   * and caches the bytes by document identity. QQ hands faces out as ZIP
-   * archives that no client can decode, and it exposes newer faces only through
-   * the runtime panel catalog, so the relay resolves both the wrapped image and
-   * its length here instead of trusting the advertised catalog metadata.
-   */
   async resolveStickerAssetMeta(reference: QQStickerReference): Promise<{
     size: number
     version: number
@@ -3854,7 +3653,6 @@ export class QQKernelBridge {
     }
   }
 
-  /** Diagnostics: the system faces this process resolves today, and from where. */
   async listFaceCatalog(): Promise<Array<{
     faceId: string
     name?: string
@@ -3887,15 +3685,7 @@ export class QQKernelBridge {
     return faces.sort((left, right) => Number(left.faceId) - Number(right.faceId))
   }
 
-  /**
-   * Resolves the image of a QQ system face, wherever QQ currently keeps it.
-   *
-   * QQ exposes face images through three unrelated places and a client can send
-   * a face that only one of them knows about: the shipped sysface_res tree, the
-   * account's downloaded EmojiSystermResource cache, and CDN ZIP bundles whose
-   * addresses come from the system-face catalog. Every lookup funnels through
-   * here so message stickers and reaction cells always describe the same bytes.
-   */
+  /** 按内置 `sysface_res`、账号缓存目录 `EmojiSystermResource`、CDN ZIP 包的顺序查找系统表情资源。 */
   private async resolveFaceAssetEntry(
     faceId: string,
     options: { animated?: boolean, url?: string } = {},
@@ -3918,7 +3708,6 @@ export class QQKernelBridge {
     faceId: string,
     options: { animated?: boolean, url?: string },
   ): Promise<FaceAssetEntry | undefined> {
-    // The catalog carries the canvas geometry a message face is drawn with.
     if (!this.reactionDefinitions.length) await this.getReactionCatalog().catch(() => undefined)
     const target = this.faceCanvasTarget(faceId)
     const local = this.localFaceAsset(faceId, target)
@@ -3940,10 +3729,6 @@ export class QQKernelBridge {
     return undefined
   }
 
-  /**
-   * Serves the face images already on disk, preferring the shipped resource
-   * tree and the account's own download cache over any network round trip.
-   */
   private localFaceAsset(faceId: string, target: FaceAssetTarget = {}): FacePathAsset | undefined {
     let fallback: FacePathAsset | undefined
     for (const path of this.localFaceFileCandidates(faceId, target)) {
@@ -3960,16 +3745,13 @@ export class QQKernelBridge {
         ...(sniffed.width === undefined ? {} : { width: sniffed.width }),
         ...(sniffed.height === undefined ? {} : { height: sniffed.height }),
       }
-      // The shipped `apng` directory sometimes holds a plain PNG while the
-      // account cache has the real animation: keep looking for an animated
-      // file before settling for the first static one.
+      // 内置 `apng` 目录偶有静态 PNG 占位，优先继续查找真正的 APNG 动图。
       if (asset.mimeType === 'image/apng') return asset
       fallback ??= asset
     }
     return fallback
   }
 
-  /** Candidate face files on disk, most authoritative first. */
   private localFaceFileCandidates(faceId: string, target: FaceAssetTarget = {}): string[] {
     if (!/^\d{1,12}$/.test(faceId)) return []
     const variant = faceGeometryIsSquare(target.width, target.height) ? '' : '_0'
@@ -3993,15 +3775,6 @@ export class QQKernelBridge {
     return candidates.filter((path) => existsSync(path))
   }
 
-  /**
-   * CDN addresses to try for a face.
-   *
-   * The catalog only lists the faces this QQ build knows, so the batches the
-   * account already downloaded are rebuilt for the requested id as well: QQ
-   * publishes face bundles in batches that share one path and timestamp, which
-   * is how a face sent by a newer client than the headless QQ relay stays
-   * reachable.
-   */
   private faceResourceUrls(
     faceId: string,
     options: { animated?: boolean, url?: string },
@@ -4017,8 +3790,7 @@ export class QQKernelBridge {
       this.reactionAssets.get(reactionKey('1', faceId))?.url,
     ]) {
       if (!source) continue
-      // QQ wraps the animated face in an `adv` bundle and its static fallback
-      // in the `base` bundle, so the requested flavor is tried first.
+      // `adv` 包为动图，`base` 包为静态图。
       const animatedUrl = advancedFaceResourceUrl(source)
       if (animated) push(animatedUrl)
       push(source)
@@ -4061,10 +3833,7 @@ export class QQKernelBridge {
     }
     add(process.env.XDG_CONFIG_HOME)
     add(process.env.HOME ? join(process.env.HOME, '.config') : undefined)
-    // Linux QQ can omit userPath from the session config, and the account
-    // download cache lives under a per-account `nt_qq_<hash>` directory that
-    // the fixed prefixes above never reach. Scan the injected profile roots
-    // for those account directories so their cached faces stay servable.
+    // Linux QQ 可能不提供 `userPath`，扫描配置目录下的 `nt_qq_<hash>` 账号目录以定位缓存。
     for (const base of [process.env.XDG_CONFIG_HOME, process.env.HOME ? join(process.env.HOME, '.config') : undefined]) {
       if (!base) continue
       for (const profile of ['qqnt-bridge-injection', 'QQ']) {
@@ -4095,11 +3864,6 @@ export class QQKernelBridge {
     }
   }
 
-  /**
-   * Downloads a face bundle and unwraps the image it wraps. QQ serves the same
-   * resources as ZIP archives whose entries are named <id>/<format>/<id>.png,
-   * so relaying the archive verbatim leaves clients unable to decode the face.
-   */
   private async fetchFaceResourceImage(
     faceId: string,
     url: string,
@@ -4115,8 +3879,6 @@ export class QQKernelBridge {
       if (!payload.length) return undefined
       image = resolveFaceAssetImage(payload, { ...target, faceId })
       if (!image && !isZipPayload(payload)) {
-        // Non-archive payloads stay opaque: QQ occasionally serves a bare image
-        // whose type only the transport knows.
         image = sniffFaceImage(payload) ?? {
           bytes: payload,
           mimeType: faceResponseMimeType(url, response.headers.get('content-type')),
@@ -4161,10 +3923,6 @@ export class QQKernelBridge {
       message.reactionContext = previous.reactionContext
     }
     if (message.reactionContext) {
-      // Explicit reaction refreshes back the complete actor set. History and
-      // push updates still use the bounded preview path, while
-      // `messages.getMessagesReactions` is also used to warm the full
-      // reaction list after a user opens the reaction details.
       message.reactionContext = await this.withReactionActors(conversation, record, message.reactionContext)
     }
     this.rememberMessage(message)
@@ -4369,17 +4127,12 @@ export class QQKernelBridge {
     const service = this.requireMsgService()
     if (!service.setMsgEmojiLikes) throw new Error('QQ reactions are unavailable in this QQNT build')
     const cached = (this.messages.get(conversation.id) ?? []).find((item) => item.id === messageId)
-    // onAddSendMsg may expose a temporary group msgSeq at sendStatus=1. The
-    // stable msgId can already be returned to callers, but reaction writes must
-    // refresh the record and use QQ's final msgSeq.
+    // `onAddSendMsg` 在 sendStatus=1 时可能携带临时群 msgSeq，写入回应前需轮询至 sendStatus >= 2 的最终记录。
     let record = await withTimeout(
       this.getMessageRecord(conversation, messageId, messageSequence),
       5_000,
       'QQ reaction target refresh timed out',
     ).catch(() => null)
-    // Both getMsgsByMsgId and the first-view cache can briefly retain the
-    // optimistic record. Poll the database view until QQ publishes the final
-    // sendStatus/msgSeq, bounded to keep older builds responsive.
     for (let attempt = 0; record?.sendStatus === 1 && attempt < 8; attempt++) {
       const latest = await this.latestRecords(conversation, 20).catch(() => [])
       const candidate = latest.find((item) => item.msgId === messageId)
@@ -4419,8 +4172,7 @@ export class QQKernelBridge {
           const native = Promise.resolve().then(() => service.setMsgEmojiLikes!(
             contact(conversation), message.msgSeq ?? message.id, emojiId, emojiType, desired.has(key),
           )).then((result) => {
-            // QQ reports an idempotent add as an error even though the desired
-            // state has already been reached (commonly after a retry).
+            // 重复添加已存在的回应会返回 65002，视为幂等成功。
             if (result.result === 65002 && desired.has(key)) return
             if (result.result !== 0) throw new Error(`setMsgEmojiLikes: ${result.errMsg} (${result.result})`)
           })
@@ -4453,9 +4205,6 @@ export class QQKernelBridge {
       })
       message.reactionContext = { reactions, maxSelected: 20 }
       this.rememberMessage(message)
-      // Some QQNT builds apply setMsgEmojiLikes without emitting
-      // onMsgInfoListUpdate. Publish the confirmed local state immediately;
-      // a later native snapshot remains authoritative and harmlessly repeats it.
       if (stateChanged) this.dispatch({
         type: 'message-reactions',
         eventId: `reaction-local:${message.id}:${Date.now()}`,
@@ -4490,8 +4239,6 @@ export class QQKernelBridge {
       ? undefined
       : await this.getMessageRecord(conversation, messageId).catch(() => undefined)
     const msgSeq = messageSequence || record?.msgSeq || messageId
-    // clickInlineKeyboardButton expects the native peer ID (UID for C2C and
-    // group ID for groups), not the display UIN used by some contact APIs.
     const peerId = conversation.peerUid || conversation.peerUin
     log('info', `native API start name=clickInlineKeyboardButton conversation=${conversation.id} message=${messageId} seq=${msgSeq} button=${buttonId}`)
     const result = await service.clickInlineKeyboardButton({
@@ -4532,12 +4279,7 @@ export class QQKernelBridge {
       this.memberScenes.get(scene)!.lastUsed = Date.now()
     }
     const requested = clamp(limit, 1, 500)
-    // QQ's own member-list UI requests at least 30. Current native builds can
-    // return a false terminal empty page for smaller `num` values, so prefetch
-    // the native minimum and expose only the caller's requested window.
-    // Keep native work bounded even when Telegram asks for a 100-200 member
-    // window. Returning fewer rows than requested is valid for a cursor page,
-    // and lets the next Telegram offset advance from the emitted cursor.
+    // `getNextMemberList` 在 `num < 30` 时可能误判为最后一页并返回空，固定按 30 条拉取后再按请求窗口切片。
     const nativeLimit = 30
     log('info', `native API start name=getNextMemberList conversation=${conversation.id} scene=${scene} cursor=${cursor ?? ''} limit=${requested} nativeLimit=${nativeLimit}`)
     const listenerPage = deferred<NativeMemberPage>()
@@ -4548,11 +4290,7 @@ export class QQKernelBridge {
       const response = await service.getNextMemberList(scene, nativeStart, nativeLimit)
       if (response.errCode !== 0) throw new Error(`getNextMemberList: ${response.errMsg} (${response.errCode})`)
       let result = response.result
-      // Some QQNT builds return the member IDs immediately but populate the
-      // corresponding info map only in onMemberListChange. If we project the
-      // first response as-is, those IDs are silently dropped and Telegram's
-      // mention/search scan can never find them. Wait briefly for the callback
-      // and merge both payloads when any ID lacks details.
+      // 部分版本首次返回仅含成员 uid 列表，详细资料在 `onMemberListChange` 中异步下发，需等待合并。
       const missingInfos = result.ids.some(({ uid }) => !result.infos.has(uid))
       const shouldAwaitCallback = missingInfos
         || (!result.ids.length && (conversation.participantCount ?? 0) > 0)
@@ -4577,10 +4315,7 @@ export class QQKernelBridge {
       })
       const hasMore = selectedIds.length < result.ids.length || !result.finish
       const last = selectedIds.at(-1)
-      // A native scene is stateful. Recreating it for every HTTP page makes
-      // current QQNT builds restart at page one even when lastId is supplied.
-      // Also refuse a non-advancing native cursor so a caller cannot spin on
-      // the same page forever.
+      // 复用原生 scene 以保持分页状态，并检查游标是否前进以防死循环。
       const advances = Boolean(last && (last.uid !== start.uid || last.index !== start.index))
       keepScene = hasMore && advances
       return {
@@ -4759,8 +4494,7 @@ export class QQKernelBridge {
       ...media,
       name,
       mimeType: 'audio/ogg',
-      // Silk and OGG sizes differ. Do not publish the source size as the final
-      // Telegram document size before the lazy conversion has happened.
+      // Silk 与转码后的 OGG 大小不同，延迟转码时不提前暴露原始文件大小。
       size: undefined,
       locator: {
         ...media.locator,
@@ -4842,9 +4576,6 @@ export class QQKernelBridge {
     let changed = false
     const sender = message.sender
     if (sender && !sender.avatar && sender.id) {
-      // History records often carry an opaque sender UID without a numeric QQ
-      // number. Resolve the UID-scoped avatar through QQNT's avatar API so
-      // these virtual Telegram users still render their real profile photo.
       const avatar = await this.userAvatar(sender.id, false).catch((error) => {
         log('warn', `history sender avatar lookup failed uid=${sender.id}`, error)
         return undefined
@@ -5007,8 +4738,7 @@ export class QQKernelBridge {
       onBuddyInfoChange: (value: Map<string, ProfileSimpleInfo> | { infos: Map<string, ProfileSimpleInfo> }) => {
         const infos = value instanceof Map ? value : value.infos
         log('info', `buddy info update received: ${infos.size} users`)
-        // QQ emits profile changes for strangers that merely appeared in a
-        // group or message. Only the full buddy snapshot may add contacts.
+        // `onBuddyInfoChange` 也会推送群成员等非好友资料，仅在已存在于 `this.users` 时更新联系人。
         for (const buddy of infos.values()) {
           this.rememberSeenUser({
             id: buddy.uid,
@@ -5461,9 +5191,7 @@ export class QQKernelBridge {
     if (!callId) return
     try {
       this.mediaGateway?.revokeCallLeases(callId)
-    } catch {
-      // Lease revocation must not alter native call handling.
-    }
+    } catch {}
   }
 
   private dispatchCallSignal(signal: QQCallSignalEvent['signal']): void {
@@ -5700,7 +5428,6 @@ export class QQKernelBridge {
       const raw = value as BuddyRequest
       if (!isNativeRequestId(raw.friendUid) || !isNativeRequestId(raw.reqTime)) continue
       const id = opaqueRequestId('friend', raw.friendUid, raw.reqTime)
-      // Only native, incoming, undecided requests can be approved by this account.
       if (raw.isInitiator === false && raw.isDecide === false) {
         pending.add(id)
         const request: QQRequest = {
@@ -5716,7 +5443,6 @@ export class QQKernelBridge {
         this.removePendingRequest(id)
       }
     }
-    // getBuddyReq and onBuddyReqChange both provide the complete native list.
     for (const [id, cached] of this.requests) {
       if (cached.kind === 'friend' && cached.source !== 'doubt' &&
         cached.request.status === 'pending' && !pending.has(id)) {
@@ -5782,14 +5508,13 @@ export class QQKernelBridge {
       const raw = value as GroupNotify
       if (!isNativeRequestId(raw.seq) || raw.type !== 7) continue
       const id = opaqueRequestId('group-join', doubt, raw.seq)
-      // QQNT group notify statuses: 1 unhandled, 2 agreed, 3 refused.
+      // 群通知 status：1 未处理，2 已同意，3 已拒绝；type 7 为加群申请。
       if (raw.status === 2 || raw.status === 3) {
         this.updateNativeRequestStatus(id, raw.status === 2 ? 'accepted' : 'rejected')
         continue
       }
       const groupCode = raw.group?.groupCode
       const requester = raw.user1?.uid
-      // QQNT uses type 7/status 1 for administrator-pending group admission only.
       if (raw.status !== 1 || !nonEmptyString(groupCode) || !nonEmptyString(requester)) {
         this.removePendingRequest(id)
         continue
@@ -5828,7 +5553,6 @@ export class QQKernelBridge {
 
   private cachePendingRequest(next: CachedRequest): void {
     const previous = this.requests.get(next.request.id)
-    // A stale listener refresh must not undo a resolution completed locally.
     if (previous?.request.status !== undefined && previous.request.status !== 'pending') return
     this.requests.set(next.request.id, next)
     if (!previous || JSON.stringify(previous.request) !== JSON.stringify(next.request)) {
@@ -5894,8 +5618,6 @@ export class QQKernelBridge {
     try {
       log('info', 'native API start name=getRobotUinRange')
       const result = await service.getRobotUinRange({ justFetchMsgConfig: '1', type: 1, version: 0, aioKeywordVersion: 0 })
-      // The response shape is undocumented, so keep the whole payload in the
-      // log until live captures confirm which fields carry the ranges.
       log('info', `native API complete name=getRobotUinRange raw=${debugJson(result)}`)
       this.robotUinRanges = parseRobotUinRanges(result?.response?.robotUinRanges)
       log('info', `robot UIN ranges loaded count=${this.robotUinRanges.length} ranges=${this.robotUinRanges.map((range) => `${range.min}-${range.max}`).join(',')}`)
@@ -5908,7 +5630,6 @@ export class QQKernelBridge {
     return this.robotFlag(uid, uin) ? { bot: true } : {}
   }
 
-  /** Whether a QQ account is a robot; only ever returns true or undefined. */
   private robotFlag(uid: string | undefined, uin: string | undefined): true | undefined {
     if (uid && this.robotUids.has(uid)) return true
     if (!uin || !/^\d+$/.test(uin)) return undefined
@@ -5982,21 +5703,11 @@ export class QQKernelBridge {
     }
   }
 
-  /**
-   * Load the reaction catalog, sharing one bounded attempt across callers.
-   *
-   * A native step inside the loader can stop responding without ever rejecting.
-   * Only the bounded attempt is shared: once its deadline passes the promise is
-   * cleared, so the next request starts a fresh load instead of reusing the
-   * same stuck one. Without that, a single hung load kept every group's
-   * reaction catalog empty until the bridge was restarted.
-   */
+  /** 合并并发的回应目录加载请求，超时后清除 Promise 以便下次重试。 */
   private async loadReactionCatalogOnce(): Promise<void> {
     if (this.reactionDefinitions.length) return
     if (this.reactionCatalogPromise) return this.reactionCatalogPromise
     const pending = this.loadReactionCatalog()
-    // The attempt may still settle after we abandoned it, so observe it to keep
-    // a late rejection from surfacing as an unhandled rejection.
     pending.catch(() => undefined)
     const attempt = withTimeout(
       pending, this.reactionCatalogLoadTimeoutMs, 'QQ reaction catalog request timed out',
@@ -6177,21 +5888,13 @@ export class QQKernelBridge {
             || element.videoElement?.fileName === item.expectedMediaName
             || element.pttElement?.fileName === item.expectedMediaName)
             || item.expectedMediaKind === 'image'))
-        // Current QQNT builds can return no usable ID from getMsgUniqueId().
-        // Their first onAddSendMsg callback for images and stickers also omits
-        // the completed media element, so content matching cannot identify the
-        // pending send yet. Claim the oldest same-conversation send while this
-        // authoritative add callback is in flight; later status updates then
-        // keep using the assigned native ID instead of publishing an originless
-        // local echo before the HTTP send response completes.
+        // 图片和表情在首次 `onAddSendMsg` 时可能尚未包含媒体元素，按会话顺序认领最早的待确认发送。
         if (index < 0 && outgoing && source === 'onAddSendMsg' && record.sendStatus >= 1) {
           index = this.pendingUnassigned.findIndex((item) =>
             !item.assignedMessageId
             && item.conversationId === id)
         }
-        // A failure callback can contain only a placeholder or no media
-        // element. Associate it with the oldest same-conversation request so
-        // the HTTP send fails immediately instead of waiting for a timeout.
+        // 发送失败回调可能不含媒体元素，同样关联到同会话最早的待确认请求以立即报错返回。
         if (index < 0 && outgoing && record.sendStatus === 0) {
           index = this.pendingUnassigned.findIndex((item) =>
             !item.assignedMessageId
@@ -6243,8 +5946,7 @@ export class QQKernelBridge {
           pendingIntent.keys,
         )
       }
-      // Some info updates only mutate delivery/media metadata and omit the
-      // reaction field altogether. Absence is not an authoritative clear.
+      // 部分更新事件仅修改投递或媒体状态而不携带 `emojiLikesList`，此时保留之前的回应状态。
       if (record.emojiLikesList === undefined && previous?.reactionContext) {
         message.reactionContext = previous.reactionContext
       } else if (source === 'onMsgInfoListUpdate' && message.reactionContext) {
@@ -6281,10 +5983,7 @@ export class QQKernelBridge {
       }
       if (!previous) {
         this.dispatch({ type: 'message', conversation, message })
-        // A first-seen info update can target a message already persisted by
-        // Crossgram before this QQNT bridge process started. The duplicate
-        // message delivery is journal-deduplicated there, so send the mutation
-        // explicitly as well instead of losing its reaction state.
+        // 首次在进程内见到的 `onMsgInfoListUpdate` 可能针对重启前已落盘的消息，需同时补发 `message-reactions` 事件。
         if (source === 'onMsgInfoListUpdate' && record.emojiLikesList !== undefined) {
           this.dispatch({
             type: 'message-reactions',
@@ -6305,9 +6004,6 @@ export class QQKernelBridge {
       } else if (reactionsChanged) {
         this.dispatch({
           type: 'message-reactions',
-          // msgSeq is immutable, so it cannot identify successive mutations.
-          // A process-local suffix keeps the delivery journal from suppressing
-          // the second reaction update on the same QQ message.
           eventId: `reaction:${message.id}:${Date.now()}:${++this.reactionEventSequence}`,
           conversation,
           target: { conversationId: conversation.id, messageId: message.id, targetId: message.id },
@@ -6548,9 +6244,7 @@ export class QQKernelBridge {
     signal: AbortSignal,
     sequenceHint?: string,
   ): Promise<MsgRecord> {
-    // Some QQ groups omit the final listener notification. Text sends are
-    // accepted at kSending=1, while media must reach kSuccess=2 so an upload
-    // failure cannot escape as a successful HTTP response.
+    // 部分群聊不触发最终发送完成回调：纯文本在 kSending(1) 即接受，含媒体时需等待至 kSuccess(2)。
     await new Promise((resolve) => setTimeout(resolve, 300))
     const service = this.requireMsgService()
     while (true) {
@@ -6634,10 +6328,7 @@ export class QQKernelBridge {
       avatarUrl: user?.avatarUrl || group?.avatarUrl || item.avatarUrl,
       groupMsgMask: item.chatType === CHAT_GROUP ? this.groupMsgMasks.get(item.peerUin || item.peerUid) : undefined,
       unreadCount: Number(item.unreadCnt) || 0,
-      // abstractContent is only QQ's lossy UI summary (for example `[图片]`).
-      // Never expose it as a QQMessage: getDialogs hydrates msgId through the
-      // message service, while a delayed recent callback cannot replace a
-      // newer real message already received from the message listener.
+      // `abstractContent` 仅为有损文本摘要，lastMessage 统一通过 msgId 从消息服务拉取真实记录。
       lastMessage: current?.lastMessage,
       firstUnread: Number(item.unreadCnt) > 0 ? current?.firstUnread : undefined,
       readInboxMaxMessage: Number(item.unreadCnt) > 0 ? current?.readInboxMaxMessage : undefined,
@@ -6655,13 +6346,10 @@ export class QQKernelBridge {
     this.users.set(buddy.uid, user)
     this.rememberSeenUser({
       ...user,
-      // A QQ nickname is global; the local buddy remark remains contact-only.
       name: buddy.nick || buddy.remark || buddy.uin,
     })
     const id = conversationId(CHAT_C2C, buddy.uid)
     const current = this.contacts.get(id)
-    // Do not project the complete friend list as dialogs. Buddy updates only
-    // enrich conversations introduced by RecentContact or explicit resolve.
     if (!current) return
     this.mergeConversation({
       id, kind: 'direct', title: user.name, peerUid: buddy.uid, peerUin: buddy.uin,
@@ -6684,9 +6372,6 @@ export class QQKernelBridge {
       avatarUrl: profileAvatarUrl || previous?.avatarUrl,
       signature: profileSignature !== undefined ? profileSignature : previous?.signature,
     }
-    // ProfileService is authoritative for the global QQ nickname. Message
-    // records and buddy remarks must not make the same user oscillate between
-    // account number, contact remark, and nickname.
     this.seenUsers.set(profile.uid, user)
     if (profile.uid === this.config?.selfUid || this.users.has(profile.uid)) {
       const contact = this.users.get(profile.uid)
@@ -6928,7 +6613,6 @@ export class QQKernelBridge {
     return { reactions, maxSelected: incoming?.maxSelected ?? previous?.maxSelected ?? 20 }
   }
 
-  /** Consume a packet captured by the native receive hook. */
   handleNativeReceivePacket(value: unknown): void {
     const reaction = decodeGroupReactionPush(value)
     if (reaction) void this.onReactionPush(reaction).catch((error) =>
@@ -6992,8 +6676,6 @@ export class QQKernelBridge {
     const parts: QQMessage['parts'] = []
     let replyToId: string | undefined
     let serviceAction: QQMessage['serviceAction']
-    // Join notices name themselves: the message belongs to the joined member
-    // even though QQ stores the notice under a placeholder sender.
     let noticeSenderName: string | undefined
     let useRecordSenderFields = true
     for (const element of record.elements ?? []) {
@@ -7047,14 +6729,11 @@ export class QQKernelBridge {
           },
         })
       } else if (element.markdownElement?.content || element.inlineKeyboardElement) {
-        // QQ may expose the markdown body and its inline keyboard either as
-        // separate elements or co-located on one element. Preserve both.
         if (element.markdownElement?.content) {
           parts.push({ type: 'markdown', content: element.markdownElement.content })
         }
         if (element.inlineKeyboardElement) {
           parts.push({ type: 'inline-keyboard', keyboard: element.inlineKeyboardElement })
-          // Only QQ robots can attach an inline keyboard to their messages.
           if (element.inlineKeyboardElement.botAppid && !context.sender && record.senderUid
             && record.senderUid !== this.config?.selfUid) {
             this.robotUids.add(record.senderUid)
@@ -7095,9 +6774,7 @@ export class QQKernelBridge {
             ? { type: 'members-joined', text: action.text, ...action.join }
             : { type: 'custom', text: action.text }
           if (action.join) {
-            // A join notice is attributed to the member QQ names, not to the
-            // gray tip's own placeholder sender, so the record sender fields
-            // (uin, nick, member name) must not follow the new sender id.
+            // 入群灰条本身的 sender 是占位值，这里改挂到实际入群成员并忽略原记录的 sender 字段。
             if (action.senderId) senderId = action.senderId
             noticeSenderName = joinMemberName(action.join, senderId)
             useRecordSenderFields = false
@@ -7141,8 +6818,7 @@ export class QQKernelBridge {
       outgoing: context.outgoing
         ?? (SEND_FROM_SELF.has(record.sendType) || record.senderUid === this.config?.selfUid),
       msgSeq: record.msgSeq,
-      // Service messages reuse the msgSeq of related content, so only content
-      // messages can claim msgSeq as their Telegram megagroup message ID.
+      // 系统通知可能复用关联普通消息的 msgSeq，仅普通消息可将 msgSeq 映射为 Telegram 消息 ID。
       telegramMessageId: record.chatType === CHAT_GROUP && !serviceAction
         ? telegramMessageId(record.msgSeq)
         : undefined,
@@ -7260,9 +6936,6 @@ export class QQKernelBridge {
     const reactions = (record.emojiLikesList ?? []).flatMap((item) => {
       const nativeKey = reactionKey(item.emojiType, item.emojiId)
       const key = this.reactionByKey.get(nativeKey)?.key ?? nativeKey
-      // Cloud-control catalogs can lag behind the message payload. Never turn
-      // a real native reaction into an empty state merely because its visual
-      // definition is not present in this QQNT build.
       return [{ key, count: Number(item.likesCnt) || 0, selected: item.isClicked || undefined }]
     })
     return { reactions, maxSelected: 20 }
@@ -7349,11 +7022,7 @@ export class QQKernelBridge {
       const filePath = join(facePath, 'static', `s${item.QSid}.png`)
       if (!existsSync(filePath)) continue
       const animatedPath = join(facePath, 'apng', `s${item.QSid}.png`)
-      // QQ ships some plain PNG fallbacks inside sysface_res/apng. Treating
-      // directory membership as proof of animation makes desktop clients
-      // route those files through FFmpeg, where the APNG-only demuxer option
-      // rejects them and leaves empty reaction cells. Trust the PNG acTL
-      // chunk instead and fall back to the authoritative static asset.
+      // `sysface_res/apng` 中混有普通静态 PNG，需实际检查 acTL chunk 判断是否为 APNG。
       const animated = existsSync(animatedPath)
         && sniffStickerFileMimeType(animatedPath, false, true) === 'image/apng'
       const resourcePath = animated ? animatedPath : filePath
@@ -7367,8 +7036,6 @@ export class QQKernelBridge {
         title: cleanFaceName(item.QDes),
         presentation: {
           type: 'custom',
-          // Telegram expects CustomEmoji.alt to be a fallback emoji, not a
-          // localized label. The QQ title remains available separately.
           alt: '🙂',
           resource: {
             version: Math.trunc(info.mtimeMs),
@@ -7376,10 +7043,6 @@ export class QQKernelBridge {
             mimeType: animated ? 'video/webm' : 'image/png',
             width: dimensions?.width ?? 128,
             height: dimensions?.height ?? 128,
-            // The HTTP resource is the raw APNG file even though the wire
-            // catalog keeps the legacy video/webm marker for compatibility.
-            // Telegram clients refuse to schedule zero-sized custom emoji
-            // documents, so always expose the actual on-disk byte length.
             size: info.size,
             locator: { reactionKey: key },
           },
@@ -7390,31 +7053,19 @@ export class QQKernelBridge {
         mimeType: animated ? 'image/apng' : 'image/png',
       })
     }
-    // Publish what the local resources already describe before the optional
-    // native enrichment. A native catalog that stops responding then costs a
-    // few extra faces instead of leaving every client with none.
+    // 先发布本地资源已构建的目录，防止后续原生拉取卡死导致整个目录为空。
     this.publishReactionCatalog(definitions, aliases, assets)
-    // QQ's packet catalog contains newer system faces that may not yet be
-    // listed in face_config.json (or have no local sysface_res asset). Expose
-    // those faces too, backed by their native CDN URL, so messages such as
-    // `/续标识` and `/不是吧` do not degrade to literal slash labels.
+    // 补充 `face_config.json` 未收录的新版系统表情。
     const nativeFaces = await this.loadNativeSysFaces()
     const runtimeFaces = await this.fetchRuntimeSysFaces()
     const knownKeys = new Set(definitions.map((definition) => definition.key))
     for (const face of [...nativeFaces, ...runtimeFaces]) {
       if (!face.faceId) continue
       const key = reactionKey('1', face.faceId)
-      // The catalog geometry sizes the face's message canvas; an inline
-      // reaction renders the square icon instead, so it keeps the default
-      // until QQ has downloaded that icon for this account.
       const canvas = faceCatalogCanvasGeometry(face)
       if (canvas) this.faceCanvasGeometry.set(face.faceId, canvas)
       if (knownKeys.has(key) || !face.url) continue
       knownKeys.add(key)
-      // Faces hidden from face_config.json still ship their animation in the
-      // resource tree or the account's download cache. Serve those bytes and
-      // advertise their real format: the CDN `base` bundle only carries the
-      // static icon, and a local APNG published as a PNG never animates.
       const icon = this.localFaceAsset(face.faceId, this.faceIconTarget(face.faceId))
       const animated = icon?.mimeType === 'image/apng'
       definitions.push({
@@ -7438,11 +7089,7 @@ export class QQKernelBridge {
         ? { path: icon.path, mimeType: icon.mimeType }
         : { url: face.url, mimeType: 'image/png' })
     }
-    // QQ renders the base emoji system resources from its own download cache
-    // under the account directory, in the same <id>/<format>/<id>.png layout
-    // the CDN bundles wrap. Those files are the authoritative bytes for faces
-    // newer than the shipped face_config.json, so a face the account already
-    // downloaded is served from disk instead of from its CDN address.
+    // 扫描账号已下载的系统表情缓存目录，补充或更新为本地资源。
     for (const cacheRoot of this.localFaceCacheRoots()) {
       for (const faceId of await localFaceCacheIds(cacheRoot)) {
         const key = reactionKey('1', faceId)
@@ -7466,9 +7113,6 @@ export class QQKernelBridge {
             presentation: { type: 'custom', alt: '🙂', resource },
           })
         } else {
-          // The asset below switches to these bytes, so a definition an
-          // earlier source published must describe them too; a cached APNG
-          // advertised as a static PNG never animates.
           const index = definitions.findIndex((definition) => definition.key === key)
           const existing = definitions[index]
           if (existing?.presentation.type === 'custom') {
@@ -7482,13 +7126,6 @@ export class QQKernelBridge {
     log('info', `loaded ${definitions.length} QQ reaction definitions`)
   }
 
-  /**
-   * Install one immutable snapshot of the reaction catalog.
-   *
-   * The loader publishes the snapshot the local resources already describe and
-   * republishes it once the optional native enrichment finishes, so consumers
-   * always read a consistent catalog.
-   */
   private publishReactionCatalog(
     definitions: readonly QQReactionDefinition[],
     aliases: ReadonlyMap<string, QQReactionDefinition>,
@@ -7504,13 +7141,6 @@ export class QQKernelBridge {
     for (const [key, definition] of aliases) this.reactionByKey.set(key, definition)
   }
 
-  /**
-   * Native system-face directory, bounded because it only enriches the catalog.
-   *
-   * The packet layer has a timeout of its own, but that budget is longer than a
-   * catalog request may spend, so the catalog applies a smaller one and keeps
-   * the definitions it already has.
-   */
   private async loadNativeSysFaces(): Promise<NativeSysFace[]> {
     try {
       return await withTimeout(
@@ -7560,9 +7190,7 @@ export class QQKernelBridge {
     addGlobalRoot(process.env.XDG_CONFIG_HOME)
     addGlobalRoot(process.env.HOME ? join(process.env.HOME, '.config') : undefined)
 
-    // QQNT has used both the account directory and its nt_data directory as
-    // userPath across Linux releases. Walk a bounded set of parents so the
-    // sibling global resource directory is found without a recursive scan.
+    // 不同 Linux 版本下 `userPath` 可能是账号目录或其下的 `nt_data` 目录，向上回溯父目录查找 `face_config.json`。
     let current = userPath
     for (let depth = 0; depth < 8; depth++) {
       addGlobalRoot(current)
@@ -7736,9 +7364,7 @@ export class QQKernelBridge {
           ELEMENT_IMAGE, 1, true,
         )
         if (nativeDir) return join(nativeDir, '.qqnt-bridge-staging')
-      } catch {
-        // Fall through to the account-private staging directory.
-      }
+      } catch {}
     }
     return this.config?.userPath
       ? join(this.config.userPath, '.qqnt-bridge-staging')
@@ -7840,10 +7466,7 @@ export class QQKernelBridge {
         segment = table.segmentFlag
       }
       if (this.stickerPackInfo.size) return
-      // Some QQNT builds expose fetchBottomEmojiTableList but return an empty
-      // business-specific table for a headless kernel session. The older roam
-      // API still returns the account's installed market packs, so do not let
-      // the presence of the newer method suppress that compatible fallback.
+      // 无头会话下 `fetchBottomEmojiTableList` 可能返回空表，继续回退调用旧版漫游接口。
     }
     if (!service.fetchMarketEmoticonList) return
     let timestamp = 0
@@ -7861,9 +7484,7 @@ export class QQKernelBridge {
       timestamp = tab.timesTamp
       if (tab.segmentFlag === -1) return
       sameSegmentTimes = tab.segmentFlag === segment ? sameSegmentTimes + 1 : 0
-      // Current QQ clients accept several pages with the same segment marker. The
-      // timestamp still advances, while the marker may only change after a batch.
-      // Match their bounded retry behavior so a stuck native response cannot loop.
+      // `timesTamp` 递增期间 `segmentFlag` 可能连续多页不变，限制连续相同次数防止死循环。
       if (sameSegmentTimes >= 4) return
       segment = tab.segmentFlag
     }
@@ -8027,10 +7648,7 @@ export class QQKernelBridge {
       return { path: dynamic.path, encrypted: true, animated: true }
     }
     if (service.fetchMarketEmoticonAioImage) {
-      // QQ accepts concurrent requests but processes market assets through one
-      // internal download slot. Giving every Telegram prefetch its own timeout
-      // makes later stickers expire while they are merely waiting in QQ's
-      // queue. Serialize the complete native fetch + path observation instead.
+      // QQ 内部仅通过单个下载槽串行处理商城表情下载，串行排队避免并发预取在队列中超时。
       const previous = this.marketStickerDownloadTail.catch(() => undefined)
       let release!: () => void
       this.marketStickerDownloadTail = new Promise<void>((resolve) => { release = resolve })
@@ -8276,9 +7894,7 @@ export class QQKernelBridge {
         !before.has(record.msgId)
         && Number(record.msgTime) >= startedAt - 1
         && (SEND_FROM_SELF.has(record.sendType) || record.senderUid === this.config?.selfUid)
-        // onAddSendMsg can expose the previous group msgSeq while status=1.
-        // Wait for QQ's authoritative success record so replies target the
-        // finalized sequence rather than a neighboring message.
+        // `onAddSendMsg` 在 sendStatus=1 时可能携带上一条群消息的 msgSeq，需等待 sendStatus >= 2。
         && record.sendStatus >= 2
         && (!requireMergedCard || isMultiForwardRecord(record)),
       )
@@ -8589,29 +8205,18 @@ class FramedUploadReader {
   }
 }
 
-/** One element of a send body, naming the text or media item it holds. */
 interface SendBodyElement {
   type: 'text' | 'media'
   index: number
 }
 
-/** Content of a send, whichever shape the caller used. */
 interface SendBody {
   textParts: QQTextPart[]
   media: QQSendMediaSpec[]
   uploadedMedia?: QQPreparedMedia[]
-  /** Element order; absent for a legacy body, which is text first, then media. */
   order?: SendBodyElement[]
 }
 
-/**
- * Content of a send, normalized.
- *
- * An ordered body names the text and media elements it contains, so it replaces
- * the flat `text`/`textParts` and `media`/`uploadedMedia` fields instead of
- * reordering them; a legacy body keeps the shape of one text block followed by
- * every media item.
- */
 function normalizeSendBody(manifest: SendManifest): SendBody {
   if (!manifest.parts?.length) {
     const media = manifest.media ?? []
@@ -8640,15 +8245,12 @@ function normalizeSendBody(manifest: SendManifest): SendBody {
     media.push(part.media)
     if (part.prepared) prepared.push(part.prepared)
   }
-  // Prepared bytes replace the whole request body, so they either cover every
-  // media item or none of them.
   if (prepared.length && prepared.length !== media.length) {
     throw new Error('prepared media parts must cover every media item')
   }
   return { textParts, media, order, ...(prepared.length ? { uploadedMedia: prepared } : {}) }
 }
 
-/** Text a sent message carries, used to recognize QQ's echo of it. */
 function sendBodyText(body: SendBody): string | undefined {
   return body.textParts.map((part) => part.text).join('') || undefined
 }
@@ -8719,8 +8321,7 @@ async function probeRemoteStickerMetadata(url: string): Promise<FavoriteStickerM
       const prefix = Buffer.concat(chunks, length)
       dimensions = encodedImageDimensions(prefix)
       sniffedMimeType = sniffStickerBytesMimeType(prefix)
-      // PNG and APNG share the same signature. Keep reading until acTL/IDAT
-      // identifies the actual format instead of trusting image/png too early.
+      // PNG 与 APNG 文件头相同，需继续读取直到解析出 acTL 或 IDAT chunk。
       if (dimensions && (sniffedMimeType || (headerMimeType && headerMimeType !== 'image/png'))) break
     }
     if (!dimensions) return
@@ -8797,8 +8398,6 @@ function mapMedia(record: MsgRecord, element: MsgElement): QQMedia | undefined {
     const animated = isAnimatedPicture(picture)
     const locator: QQMediaLocator = {
       ...base, kind: 'image', fileName: picture.fileName, fileSize: picture.fileSize,
-      // Keep sourcePath only when QQ did not provide a remote identity. When a
-      // CDN locator exists, every image tier must stay on the direct-link path.
       filePath: picture.originImageUrl ? undefined : picture.sourcePath,
       fileUuid: picture.fileUuid, fileSubId: picture.fileSubId,
       fileBizId: picture.fileBizId, md5: normalizeNativeHash(picture.md5HexStr),
@@ -8831,9 +8430,6 @@ function mapMedia(record: MsgRecord, element: MsgElement): QQMedia | undefined {
       name: video.fileName,
       mimeType: videoMimeType(video.fileName, video.fileFormat),
       size: numberOrUndefined(video.fileSize),
-      // QQ exposes both original video dimensions and thumbnail dimensions.
-      // Use the original dimensions for Telegram's layout; thumbnail sizes
-      // can be tiny/letterboxed and make the message bubble collapse.
       width: video.fileWidth || video.thumbWidth || undefined,
       height: video.fileHeight || video.thumbHeight || undefined,
       duration: Number.isFinite(video.fileTime) && video.fileTime >= 0 ? video.fileTime : undefined,
@@ -9120,8 +8716,6 @@ function sysFaceStickerId(faceId: string): string {
 
 function extractRuntimeSysFaces(value: unknown): NativeSysFace[] {
   const objects = collectRuntimeObjects(value)
-  // Panel download lists carry addresses for faces described elsewhere, so the
-  // address map is built first and every face falls back to it.
   const urls = new Map<string, string>()
   for (const object of objects) {
     const faceId = runtimeFaceId(object)
@@ -9135,8 +8729,6 @@ function extractRuntimeSysFaces(value: unknown): NativeSysFace[] {
     const name = firstNonEmptyString(
       object.describe, object.Describe, object.qDes, object.QDes, object.name, object.Name,
     )
-    // Records without a label only contribute an address for a face that is
-    // described elsewhere in the panel payload.
     if (!faceId || !name) continue
     const entry: NativeSysFace = {
       faceId,
@@ -9167,7 +8759,6 @@ function extractRuntimeSysFaces(value: unknown): NativeSysFace[] {
   return [...faces.values()]
 }
 
-/** Every object reachable from a runtime panel response. */
 function collectRuntimeObjects(value: unknown): Array<Record<string, unknown>> {
   const objects: Array<Record<string, unknown>> = []
   const visit = (node: unknown): void => {
@@ -9183,13 +8774,11 @@ function collectRuntimeObjects(value: unknown): Array<Record<string, unknown>> {
   return objects
 }
 
-/** The face id a runtime panel record describes, when it describes one. */
 function runtimeFaceId(object: Record<string, unknown>): string | undefined {
   for (const value of [object.emojiId, object.emojiID, object.QSid, object.qSid]) {
     if (typeof value === 'string' && value.length) return value.trim()
     if (typeof value === 'number' && Number.isFinite(value)) return String(value)
   }
-  // Some panels only carry the anonymous face id, which QQ keeps numeric.
   for (const value of [object.faceId, object.FaceId]) {
     if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) return String(value)
     if (typeof value === 'string' && /^\d{1,12}$/.test(value)) return value
@@ -9197,7 +8786,6 @@ function runtimeFaceId(object: Record<string, unknown>): string | undefined {
   return undefined
 }
 
-/** The download address a runtime panel record advertises. */
 function runtimeFaceUrl(object: Record<string, unknown>): string | undefined {
   for (const nested of [object.downloadBaseEmojiInfo, object.url]) {
     if (!nested || typeof nested !== 'object') continue
@@ -9230,13 +8818,8 @@ function firstFiniteNumber(...values: unknown[]): number {
 }
 
 /**
- * Rebuilds the CDN addresses of faces this QQ build no longer lists.
- *
- * QQ publishes face bundles in batches whose members share one path and
- * timestamp (a <prefix>/<id>_adv_<ts>.zip address), so the newest batches the
- * account already knows are enough to rebuild the address of a face it has
- * never seen. Faces sent by newer clients than the headless relay runs are
- * exactly that case, and the probe is what keeps them reachable.
+ * 根据已知表情 URL 的 `<prefix>/<id>_<base|adv>_<ts>.zip` 批次前缀与时间戳，
+ * 推算当前 QQNT 版本未收录的新版系统表情 CDN 地址。
  */
 function faceResourceProbeUrls(
   faceId: string,
@@ -9264,12 +8847,10 @@ function faceResourceProbeUrls(
   return candidates
 }
 
-/** The animated variant of a face bundle address, when there is one. */
 function advancedFaceResourceUrl(url: string): string | undefined {
   return /_base_\d+\.zip$/i.test(url) ? url.replace(/_base_(\d+)\.zip$/i, '_adv_$1.zip') : undefined
 }
 
-/** Sniffed type and intrinsic size of a face image already on disk. */
 function faceImageMimeType(path: string): {
   mimeType: FaceAssetMimeType
   width?: number
@@ -9288,7 +8869,6 @@ function faceImageMimeType(path: string): {
   }
 }
 
-/** Numeric ids QQ downloaded into its own system-emoji resource cache. */
 async function localFaceCacheIds(root: string): Promise<string[]> {
   try {
     return (await readdir(root)).filter((entry) => /^\d{1,12}$/.test(entry))
@@ -9297,13 +8877,11 @@ async function localFaceCacheIds(root: string): Promise<string[]> {
   }
 }
 
-/** True when a face advertises square geometry, which selects the inline entry. */
 function faceGeometryIsSquare(width: number | undefined, height: number | undefined): boolean {
   if (!width || !height || width <= 0 || height <= 0) return true
   return Math.abs(Math.log(width / height)) < 0.05
 }
 
-/** Image type of a face payload, mirroring QQ's own transport hints. */
 function faceResponseMimeType(url: string, contentType: string | null | undefined): FaceAssetMimeType {
   const normalized = contentType?.split(';', 1)[0]?.trim().toLowerCase()
   if (normalized === 'image/png' || normalized === 'image/apng'
@@ -9375,7 +8953,6 @@ function mergeNativeMemberPages(primary: NativeMemberPage, callback: NativeMembe
   return {
     ids: [...ids.values()],
     infos,
-    // The callback is the authoritative completion signal when it exists.
     finish: callback.finish,
   }
 }
@@ -9420,12 +8997,7 @@ function parseGroupFileCursor(cursor: string | undefined): number {
   return value
 }
 
-/** Normalize QQNT hash fields before they enter JSON/JSONB storage.
- *
- * QQNT exposes some digests as a binary string. PostgreSQL rejects JSON
- * strings containing NUL or lone UTF-16 surrogates, so encode non-hex native
- * values as bytes while preserving already canonical hexadecimal digests.
- */
+/** 将 QQNT 可能以二进制字符串形式返回的哈希统一转为小写 hex（避免含 NUL 或孤立 UTF-16 代理项导致 JSONB 写入报错）。 */
 export function normalizeNativeHash(value: unknown): string | undefined {
   if (typeof value !== 'string' || value.length === 0) return undefined
   if (value.length % 2 === 0 && /^[0-9a-fA-F]+$/.test(value)) return value.toLowerCase()
@@ -9447,13 +9019,6 @@ function positiveInteger(value: number | undefined, fallback: number): number {
   return Number.isSafeInteger(value) && value! > 0 ? value! : fallback
 }
 
-/**
- * Wide canvas geometry a face catalog entry advertises, when it has one.
- *
- * QQ reports the size of the 大表情 canvas a face is sent with; the shipped
- * face_config.json spells it `AniSticker*` while the runtime panel uses
- * `Animation*` or a plain width/height pair.
- */
 function faceCatalogCanvasGeometry(entry: {
   AniStickerWidth?: unknown, AniStickerHeight?: unknown,
   AnimationWidth?: unknown, AnimationHeigh?: unknown,
@@ -9706,9 +9271,7 @@ function isAnimatedPicture(
 }
 
 function isStickerPicture(picture: NonNullable<MsgElement['picElement']>): boolean {
-  // QQ renders only normal pictures (0) and QZone pictures (5) as regular
-  // photos. Every other current/future subtype is an expression. Animated
-  // pictures are rendered as animated expressions even when their subtype is 0.
+  // picSubType 0（普通图片）与 5（空间图片）按普通照片展示，其余子类型及动图均按表情包处理。
   const subtype = picture.picSubType ?? 0
   return isAnimatedPicture(picture) || (subtype !== 0 && subtype !== 5)
 }
@@ -9940,8 +9503,6 @@ function asUint8Array(value: unknown): Uint8Array | undefined {
 function callSignalStringBytes(
   value: string, maxBytes: number, minBytes: number, rejectNul = true,
 ): Buffer | undefined {
-  // The UTF-16 guard is O(1); the fixed buffer prevents allocation from an
-  // untrusted string's full size before encodeInto validates it.
   if (value.length > maxBytes) return undefined
   const destination = new Uint8Array(maxBytes)
   const { read, written } = new TextEncoder().encodeInto(value, destination)
@@ -10119,15 +9680,10 @@ function makeListener(
   Constructor: (new (handlers: Record<string, (...args: never[]) => unknown>) => unknown) | undefined,
   handlers: Record<string, (...args: never[]) => unknown>,
 ): unknown {
-  // QQNT 6.9.96 exports listener wrapper constructors. QQNT 6.9.98 accepts a
-  // plain callback object directly and no longer exports those constructors.
+  // QQNT 6.9.96 导出 listener 包装类构造函数，6.9.98 起不再导出而直接接受普通回调对象。
   const rawPushDiagnostics = process.env.QQNT_BRIDGE_LOG_RAW_PUSH === '1'
   let rawPushCount = 0
   const protectedHandlers = Object.fromEntries(Object.entries(handlers).map(([event, handler]) => [event, (...args: unknown[]) => {
-    // QQNT's onRecvS2CMsg is expected to be the raw online-push stream, but
-    // that has to be verified against the running client.  Keep an opt-in,
-    // rate-limited counter so production diagnostics can prove whether this
-    // callback is firing without dumping packet contents or user data.
     if (event === 'onRecvS2CMsg') {
       rawPushCount++
       if (rawPushDiagnostics && (rawPushCount <= 3 || rawPushCount % 1000 === 0)) {
@@ -10194,10 +9750,7 @@ function multiForwardPreview(
     .matchAll(/<summary\b[^>]*>(?:<!\[CDATA\[([\s\S]*?)\]\]>|([\s\S]*?))<\/summary>/gi)]
     .map((match) => normalizeMultiForwardPreview(match[1] ?? match[2] ?? ''))
     .filter(Boolean)
-  // QQ's `<summary>` is the card footer ("查看N条转发消息"), not content. The
-  // preview lines live in the `<title>` rows after the header. Only real
-  // content may become a preview: with none, the relay builds one from the
-  // archived records instead of repeating QQ's footer.
+  // `<summary>` 通常为卡片底部文案（“查看N条转发消息”），实际预览行位于标题之后的 `<title>` 节点中。
   const titles = [...(element.xmlContent ?? '')
     .matchAll(/<title\b([^>]*)>(?:<!\[CDATA\[([\s\S]*?)\]\]>|([\s\S]*?))<\/title>/gi)]
     .map((match) => ({
@@ -10212,7 +9765,6 @@ function multiForwardPreview(
   return [...new Set(detailed)].join('\n') || undefined
 }
 
-/** QQ's card footer or placeholder text, which describes no forwarded content. */
 export function isGenericMultiForwardSummary(value: string): boolean {
   const compact = value.replace(/\s+/g, '')
   return /^(?:点击)?查看(?:[xX×\d]+条)?(?:消息的)?(?:合并)?转发(?:消息)?$/.test(compact)
@@ -10301,16 +9853,10 @@ function fallbackElementText(element: MsgElement, selfUid?: string): string {
   return `[暂不支持的消息 ${element.elementType}]`
 }
 
-/**
- * Telegram-facing projection of a QQ gray tip: the wording QQ itself shows plus
- * the native join notice it maps to, when both are available.
- */
 interface GrayTipAction {
   text: string
   actorId?: string
-  /** Member the notice is about, used as the message sender. */
   senderId?: string
-  /** Group join details Telegram renders as a native join service message. */
   join?: {
     members: QQServiceMember[]
     actor?: QQServiceMember
@@ -10400,9 +9946,7 @@ function xmlAttribute(attributes: string, name: string): string {
 
 interface GrayTipGroupNotice {
   text: string
-  /** Member the notice is about, used as the message sender when known. */
   senderId?: string
-  /** Join details Telegram renders natively instead of the QQ wording. */
   join?: {
     members: QQServiceMember[]
     actor?: QQServiceMember
@@ -10410,14 +9954,7 @@ interface GrayTipGroupNotice {
   }
 }
 
-/**
- * QQ group notices (`groupElement`) carry the wording QQ itself renders plus,
- * for member joins, the members involved. Telegram can render those natively as
- * a join service message, so the structured form is kept next to the wording.
- *
- * `memberAdd.showType` follows QQ's own MemberAddShowType enum, which is not
- * numbered in the order the QQ client renders its variants.
- */
+/** 解析群灰条通知（`groupElement`），`memberAdd.showType` 对应 QQ 原生 `MemberAddShowType` 枚举。 */
 function groupGrayTipNotice(
   group: NonNullable<MsgElement['grayTipElement']>['groupElement'],
   selfUid?: string,
@@ -10497,7 +10034,6 @@ function groupGrayTipNotice(
       }
     }
     if (add.showType !== undefined && add.showType !== 0) {
-      // An unrecognized variant: keep QQ's wording instead of guessing.
       return { text: `${name(add.otherAdd) || '有新成员'}加入了群聊。` }
     }
     const invited = ref(add.otherAdd)
@@ -10525,7 +10061,6 @@ function groupGrayTipNotice(
   return { text: '' }
 }
 
-/** Name QQ attached to the member a join notice is attributed to. */
 function joinMemberName(join: GrayTipAction['join'], memberId: string): string | undefined {
   if (!join || !memberId) return undefined
   for (const member of [join.actor, ...join.members]) {
@@ -10576,13 +10111,7 @@ function structuredContentSummary(value: string | undefined): string {
   }
 }
 
-/**
- * Text of a QQ group announcement share (`com.tencent.mannounce`).
- *
- * The announcement is content, not a link: QQ renders it as a header label and
- * the full body, and it has no jump target. With `encode: 1` both fields are
- * base64 UTF-8, which a generic card would otherwise surface verbatim.
- */
+/** 解析群公告 Ark 卡片（`com.tencent.mannounce`，`encode: 1` 时标题与正文为 Base64 UTF-8）。 */
 function arkAnnouncementText(bytesData: string): string | undefined {
   try {
     return announcementText(JSON.parse(bytesData) as unknown)
@@ -10610,7 +10139,6 @@ function announcementText(value: unknown): string | undefined {
   return text ? `[${title}]\n${text}` : `[${title}]`
 }
 
-/** Decodes base64 UTF-8, keeping the raw value when it is not valid base64 text. */
 function decodeBase64Text(raw: string): string {
   const compact = raw.replace(/\s+/g, '')
   if (!compact || !/^[A-Za-z0-9+/_-]+={0,2}$/.test(compact)) return raw
@@ -10621,14 +10149,8 @@ function decodeBase64Text(raw: string): string {
   }
 }
 
-/** Hash fingerprints of Ark payloads already archived; history syncs replay cards. */
 const archivedArkPayloads = new Set<string>()
 
-/**
- * Archives every raw Ark payload to the log so card types the parser does not
- * fully support (missing jump links, unseen fields) can be fixed later from
- * the actual data instead of guessing at field names.
- */
 function logArkPayload(bytesData: string): void {
   const fingerprint = createHash('md5').update(bytesData).digest('hex')
   if (archivedArkPayloads.has(fingerprint)) return
@@ -10642,18 +10164,14 @@ function structuredCard(element: MsgElement): QQCard | undefined {
     try {
       const card = arkCard(JSON.parse(element.arkElement.bytesData) as unknown)
       if (card) return card
-    } catch {
-      // Malformed Ark payloads keep using the conservative text fallback.
-    }
+    } catch {}
   }
   const xml = element.structLongMsgElement?.xmlContent || element.structMsgElement?.xmlContent
   return xml ? xmlCard(xml) : undefined
 }
 
-/** URL field names QQ cards use for their jump target, most preferred first. */
 const URL_KEYS = [
   'qqdocurl', 'pcJumpUrl', 'jumpUrl', 'url', 'webUrl', 'shareUrl',
-  // QQ group-invite cards: the universal join link is the only web target.
   'group_qqlink_universal', 'group_qqlink',
 ]
 
@@ -11034,7 +10552,6 @@ function reactionKey(emojiType: string, emojiId: string): string {
   return `${emojiType}:${emojiId}`
 }
 
-/** `1:424` names runtime system face 424; other reaction families have no bundle ids. */
 function systemFaceIdFromReactionKey(reactionKey: string): string | undefined {
   const separator = reactionKey.indexOf(':')
   if (separator <= 0) return undefined
@@ -11080,9 +10597,7 @@ function replyTargetId(
 ): string | undefined {
   const direct = directReplyTargetId(reply)
   if (direct) return direct
-  // sourceMsgIdInRecords identifies QQNT's nested snapshot, which can have a
-  // different msgId from the real top-level source. Keep it only as a legacy
-  // fallback when the corresponding nested record was not actually supplied.
+  // `sourceMsgIdInRecords` 指向嵌套快照记录（其 msgId 可能与外层原消息不同），仅在未携带对应嵌套记录时作为回退使用。
   if (reply.sourceMsgIdInRecords && reply.sourceMsgIdInRecords !== '0'
     && !record.records?.some((item) => item.msgId === reply.sourceMsgIdInRecords)) {
     return reply.sourceMsgIdInRecords
@@ -11132,7 +10647,6 @@ function telegramMessageId(value?: string): number | undefined {
   return Number.isSafeInteger(id) && id > 0 && id <= 0x7fffffff ? id : undefined
 }
 
-/** Poke notices are either a poke face element or QQ's JSON poke gray tip. */
 function isPokeNoticeRecord(record: MsgRecord): boolean {
   return (record.elements ?? []).some((element) =>
     element.faceElement?.faceType === 5
@@ -11164,9 +10678,7 @@ function arkMultiForwardTitle(bytesData: string): string {
   try {
     const value = JSON.parse(bytesData) as { prompt?: unknown }
     if (typeof value.prompt === 'string' && value.prompt.trim()) return value.prompt.trim()
-  } catch {
-    // Keep an addressable card even if a future QQ build changes the payload.
-  }
+  } catch {}
   return '聊天记录'
 }
 
@@ -11184,9 +10696,7 @@ function arkMultiForwardPreview(bytesData: string): string | undefined {
       }).filter(Boolean)
       if (lines.length) return lines.join('\n')
     }
-  } catch {
-    // Future QQ payloads can omit or reshape the native preview list.
-  }
+  } catch {}
   return undefined
 }
 

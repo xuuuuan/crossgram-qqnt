@@ -1,16 +1,7 @@
-/**
- * Version of the HTTP protocol this bridge speaks.
- *
- * The relay gates on this number: `platform-qqnt` refuses a bridge older than
- * its minimum and uses each capability only from the version that introduced
- * it, while a newer bridge is accepted as-is. So raise it only for additive
- * changes, and keep the two sides in sync — a new version must not need a relay
- * change just for the account to keep working, and the relay's minimum must be
- * deployable together with the matching bridge.
- */
+/** HTTP 协议版本号，仅在新增能力时递增，供 `platform-qqnt` 按版本协商兼容。 */
 export const PROTOCOL_VERSION = 35
 
-/** Local Unix-socket PCM media protocol. Audio frames use a 1-byte type plus a 4-byte big-endian length. */
+/** 本地 Unix socket PCM 音频流协议，帧头为 1 字节类型 + 4 字节大端长度。 */
 export const PCM_MEDIA_PROTOCOL_VERSION = 1
 export const PCM_MEDIA_SAMPLE_RATE = 48_000
 export const PCM_MEDIA_CHANNELS = 1
@@ -22,7 +13,6 @@ export const PCM_MEDIA_FRAME_BYTES =
     2 *
     PCM_MEDIA_FRAME_DURATION_MS) /
   1_000
-/** Wire values for a 1-byte type plus a 4-byte big-endian payload length. */
 export const PCM_MEDIA_FRAME_TYPES = {
   auth: 1,
   uplink: 2,
@@ -33,11 +23,11 @@ export const PCM_MEDIA_FRAME_TYPES = {
 export type QQPCMMediaFrameType = keyof typeof PCM_MEDIA_FRAME_TYPES
 export interface QQPCMMediaFrame {
   type: QQPCMMediaFrameType
-  /** Auth and ready payloads contain the protocol version; audio payloads are fixed 20 ms PCM frames. */
+  /** auth/ready 载荷包含协议版本；uplink/downlink 为固定 20ms PCM 帧。 */
   payload: Uint8Array
 }
 
-/** QQ buddy/group chats plus the desktop/mobile data-line device sessions. */
+/** 1 私聊，2 群聊，8 电脑数据线，134 手机数据线。 */
 export type QQChatType = 1 | 2 | 8 | 134
 
 export interface QQContact {
@@ -56,7 +46,7 @@ export interface QQMediaLocator {
   kind: 'image' | 'file' | 'voice'
   fileName: string
   fileSize?: string
-  /** For prepared voice media, the trusted original PTT identity. */
+  /** 延迟转码语音的原始 PTT 路径。 */
   sourcePath?: string
   sourceSize?: number
   sourceMtimeMs?: number
@@ -67,35 +57,34 @@ export interface QQMediaLocator {
   md5?: string
   sha?: string
   sha3?: string
-  /** MD5 of the first 10 MiB, required by QQ's private-file URL API. */
+  /** 前 10 MiB 数据的 MD5，私聊文件下载直链必填。 */
   file10MMd5?: string
-  /** QQ's original CDN URL. The bridge replaces its expired RKey through OIDB. */
+  /** 原始图片 CDN URL，需通过 OIDB 刷新过期 RKey。 */
   originImageUrl?: string
-  /** QQ image CDN tier. 0 is original; 198 and 720 are QQ's native thumbnail specifications. */
+  /** QQ 图片 CDN 规格：0 原图，198/720 缩略图。 */
   imageSpec?: 0 | 198 | 720
-  /** Present only for native QQ video elements. 0 h264, 1 h265. */
+  /** 仅原生视频元素包含：0 H.264，1 H.265。 */
   videoCodecFormat?: number
-  /** Numeric QQ account used to fetch a user avatar from the fixed qlogo endpoint. */
+  /** 用于拼接 qlogo 头像接口的 QQ 号。 */
   avatarUin?: string
-  /** UID-scoped avatar URL returned by QQNT when the legacy UIN endpoint has no image. */
+  /** QQNT 返回的按 UID 索引的头像 URL。 */
   avatarUrl?: string
 }
 
 export interface QQMedia {
   id: string
   kind: 'image' | 'file'
-  /** Recorded PTT rather than an ordinary audio file. */
+  /** 是否为录制的 PTT 语音。 */
   voice?: boolean
   name?: string
   mimeType?: string
   size?: number
   width?: number
   height?: number
-  /** Playback duration in seconds. Present for native QQ video elements. */
+  /** 视频或语音时长（秒）。 */
   duration?: number
-  /** QQ's native speech-to-text result for recorded PTT messages, when available. */
+  /** PTT 语音转文字结果。 */
   transcript?: string
-  /** Native QQ thumbnail that can be fetched without downloading the full media. */
   preview?: {
     mimeType?: string
     size: number
@@ -168,7 +157,6 @@ export type QQStickerReference =
       animated: boolean
       mimeType?: 'image/gif' | 'image/apng' | 'image/png'
       staticPath?: string
-      /** Exact byte size of the static (lowest-tier) preview, when present. */
       staticSize?: number
       dynamicPath?: string
       favoriteResId?: string
@@ -212,11 +200,9 @@ export interface QQStickerPack extends QQStickerPackSummary {
   stickers: QQSticker[]
 }
 
-/** Member named by a QQ service notice, such as a member joining a group. */
 export interface QQServiceMember {
-  /** Relay-side QQ user id (UID) of the member. */
+  /** 成员 UID。 */
   id: string
-  /** Display name carried by the notice, used until the profile is resolved. */
   name?: string
 }
 
@@ -224,18 +210,11 @@ export type QQServiceAction =
   | { type: 'custom', text: string }
   | { type: 'phone-call' }
   | {
-      /**
-       * Group member join notice (QQ gray tip `groupElement.memberAdd`), which
-       * Telegram renders natively as a join service message.
-       */
+      /** 群成员入群通知（对应灰条 `groupElement.memberAdd`）。 */
       type: 'members-joined'
-      /** QQ wording, used when the relay cannot project a native join action. */
       text: string
-      /** Members the notice says joined. */
       members: QQServiceMember[]
-      /** Member that invited or added them; absent when QQ names nobody. */
       actor?: QQServiceMember
-      /** The members joined through a shared invite link or QR code. */
       viaInviteLink?: true
     }
 
@@ -252,19 +231,16 @@ export interface QQMessage {
     name: string
     alias?: string
     avatar?: QQMedia
-    /** QQ robot account, from member flags, robot UIN ranges, or bot keyboards. */
     bot?: true
   }
   msgSeq?: string
-  /** Telegram megagroup message ID; QQ group msgSeq is conversation-scoped and monotonic. */
+  /** 群聊单调递增的 msgSeq，直接映射为 Telegram megagroup 消息 ID。 */
   telegramMessageId?: number
-  /** Telegram megagroup reply fallback taken directly from QQ replayMsgSeq. */
+  /** 从 `replayMsgSeq` 提取的群聊回复目标消息 ID。 */
   telegramReplyToMessageId?: number
-  /** Adapter-generated correlation token used to suppress only its own listener echo. */
+  /** 发送方生成的关联 token，用于过滤本端 listener 回显。 */
   originRequestId?: string
-  /** Opaque QQ msgId referenced by a native reply element. */
   replyToId?: string
-  /** QQ service message rendered by the relay as a Telegram MessageService. */
   serviceAction?: QQServiceAction
   parts: Array<
     | QQTextPart
@@ -275,7 +251,6 @@ export interface QQMessage {
     | { type: 'multi-forward', title: string, preview?: string, locator: QQMultiForwardLocator }
     | { type: 'card', card: QQCard }
   >
-  /** Per-message state only. The shared definition catalog has its own endpoint. */
   reactionContext?: QQReactionState
 }
 
@@ -299,24 +274,22 @@ export interface QQInlineKeyboardButton {
   specifyTinyids: string[]
 }
 
-/** Structured QQ Ark/XML share rendered as a native preview by the relay. */
+/** Ark/XML 卡片消息的解析结果。 */
 export interface QQCard {
   kind: 'mini-app' | 'link' | 'music' | 'contact' | 'location' | 'application'
   title: string
   description?: string
   source?: string
-  /** Browser-compatible jump target. QQ-only deep links stay in the native payload. */
+  /** 仅保留 HTTP/HTTPS 链接，忽略 QQ 私有 scheme。 */
   url?: string
-  /** Remote cover retained for clients that can materialize preview artwork. */
   thumbnailUrl?: string
 }
 
 export interface QQMultiForwardLocator {
-  /** Physical QQ conversation containing the outermost merged-forward message. */
   conversationId: string
-  /** Outermost QQ message ID; unchanged while opening nested forwards. */
+  /** 最外层合并转发的 msgId，打开嵌套转发时保持不变。 */
   rootMessageId: string
-  /** Nested merged-forward message ID. Omitted for the outermost level. */
+  /** 嵌套合并转发的父消息 ID，最外层不填。 */
   parentMessageId?: string
 }
 
@@ -350,26 +323,22 @@ export interface QQConversation {
   chatType: QQChatType
   avatarUrl?: string
   avatar?: QQMedia
-  /** Native group size, when present in QQ's group profile snapshot. */
   participantCount?: number
-  /** Current account's native group role (2 member, 3 admin, 4 owner). */
+  /** 当前账号在群内的角色（原生值：2 成员，3 管理员，4 群主）。 */
   selfRole?: 'owner' | 'administrator' | 'member'
-  /** Raw QQ GroupMsgMask value; no notification behavior is inferred from it. */
+  /** 原生 GroupMsgMask 值。 */
   groupMsgMask?: number
   unreadCount?: number
   lastMessage?: QQMessage
-  /** QQ's native cursor for the first unread message. */
   firstUnread?: { msgSeq: string, msgTime: string }
-  /** Last message read before QQ's first unread message. */
+  /** 首条未读消息之前的最后一条已读消息。 */
   readInboxMaxMessage?: QQMessage
 }
 
 export type QQRequestKind = 'friend' | 'group-join'
 export type QQRequestStatus = 'pending' | 'accepted' | 'rejected'
 
-/** Native QQ friend and administrator-approved group admission request. */
 export interface QQRequest {
-  /** Stable opaque identifier; it does not expose QQNT's action payload. */
   id: string
   kind: QQRequestKind
   status: QQRequestStatus
@@ -377,27 +346,22 @@ export interface QQRequest {
   group?: { id: string, name?: string }
   message?: string
   timestamp?: string | number
-  /** `doubt` requests come from QQ's filtered-notification channel. */
+  /** 来自被过滤的好友申请通道。 */
   source?: 'doubt'
-  /** QQ's original reason for filtering a doubt friend request. */
+  /** 被过滤好友申请的拦截原因。 */
   reason?: string
 }
 
-/** Body of `POST /v1/conversations/:id/pokes`. */
 export interface QQPokeRequest {
-  /** Relay-side QQ user id (UID) of the poked account; defaults to the peer itself. */
+  /** 被戳用户的 UID，默认为会话对端。 */
   userId?: string
-  /** How many poke notices to send, 1..10; defaults to one. */
+  /** 连戳次数（1..10），默认为 1。 */
   count?: number
 }
 
 export interface QQPokeResult {
-  /** Poke notices QQ accepted for this request. */
   count: number
-  /**
-   * The notice QQ appended to the conversation. Only present when the bridge
-   * confirmed it; a missing notice is not an error.
-   */
+  /** QQ 写入会话的戳一戳灰条消息（若已捕获）。 */
   message?: QQMessage
 }
 
@@ -421,7 +385,6 @@ export interface QQCallSignalEvent {
   timestamp: number
 }
 
-/** Emitted when QQNT exposes (or updates) a native PTT speech-to-text result. */
 export interface QQVoiceTranscriptEvent {
   type: 'voice-transcript'
   eventId: string
@@ -463,7 +426,6 @@ export interface QQReactionDefinition {
           height: number
           size?: number
           locator: {
-            /** Opaque catalog key accepted only by the dedicated reaction asset endpoint. */
             reactionKey: string
           }
         }
@@ -485,7 +447,6 @@ export interface QQReactionSummary {
   key: string
   count: number
   selected?: boolean
-  /** QQNT exposes no reaction timestamp, so only the opaque actor ID is available. */
   recentActors?: Array<{ userId: string }>
 }
 
@@ -500,17 +461,15 @@ export interface QQSendMediaSpec {
   name: string
   mimeType?: string
   size?: number
-  /** Full-file hashes supplied by the relay so protocol upload needs no local staging pass. */
   md5?: string
   sha1?: string
-  /** QQ cumulative SHA-1 states for each 1 MiB boundary, followed by the final digest. */
+  /** 每 1 MiB 边界处的 SHA-1 中间状态及最终摘要。 */
   sha1Checkpoints?: string[]
-  /** MD5 of the first min(10 MiB, file size), used by private-file upload. */
+  /** 前 min(10 MiB, 文件大小) 的 MD5，用于私聊文件上传。 */
   file10MMd5?: string
   width?: number
   height?: number
   duration?: number
-  /** Relay-extracted JPEG frame used by QQ's native video element. */
   thumbnail?: {
     size: number
     md5: string
@@ -554,12 +513,11 @@ export interface QQHighwayUpload {
 
 export interface QQMediaUploadPlan {
   prepared: QQPreparedMedia
-  /** Absent when QQ reports that the bytes already exist on its CDN. */
+  /** 秒传命中时为空。 */
   highway?: QQHighwayUpload
-  /** Small bridge-owned companion assets, such as a video's thumbnail. */
   auxiliaryHighways?: Array<{
     role: 'thumbnail'
-    /** Present only when the bridge must provide its generic fallback thumbnail. */
+    /** 仅在使用默认兜底缩略图时返回字节数据。 */
     bytes?: string
     highway: QQHighwayUpload
   }>
@@ -573,41 +531,32 @@ export interface SendManifest {
   replyToSequence?: string
   originRequestId?: string
   sticker?: QQStickerReference
-  /** Length-prefixed chunks terminated by a zero-length frame for each media item. */
+  /** 每个媒体流以长度前缀分块传输，并以 0 长度帧结尾。 */
   mediaFraming?: 'length-prefixed-v1'
   media?: QQSendMediaSpec[]
-  /** CDN metadata returned by /uploads/prepare after the platform uploaded Highway bytes directly. */
+  /** 调用方直传 Highway 后，由 `/uploads/prepare` 返回的 CDN 元数据。 */
   uploadedMedia?: QQPreparedMedia[]
   /**
-   * Ordered body: the message as the text and media elements it contains, in
-   * their final order.
-   *
-   * `parts` describes the content itself, so it replaces `text`/`textParts` and
-   * `media`/`uploadedMedia` rather than reordering them. Media bytes are still
-   * read in the order the media parts appear. Without `parts` the message keeps
-   * the legacy shape of one text block followed by every media item.
+   * 按顺序排列的图文混排内容，设置后替代 `text`/`textParts` 与 `media`/`uploadedMedia`；
+   * 请求体中的媒体流仍按此处 `media` 出现的顺序读取。
    */
   parts?: QQSendPart[]
 }
 
-/** One element of an ordered {@link SendManifest} body. */
 export type QQSendPart =
   | { type: 'text', text: string, entities?: QQTextPart['entities'] }
   | {
       type: 'media'
       media: QQSendMediaSpec
-      /** CDN metadata for this item, when the platform already uploaded its bytes. */
       prepared?: QQPreparedMedia
     }
 
-/** One file uploaded from the caller into a QQ Flash Transfer file set. */
 export interface QQFlashTransferUploadFile {
   source: 'upload'
   name: string
   size: number
 }
 
-/** One file whose bytes were already streamed into QQ's file CDN. */
 export interface QQFlashTransferUploadedFile {
   source: 'uploaded'
   name: string
@@ -616,7 +565,6 @@ export interface QQFlashTransferUploadedFile {
   sha1: string
 }
 
-/** One existing QQ media file reused through QQ's remote MD5/SHA-1 identity. */
 export interface QQFlashTransferQQMediaFile {
   source: 'qq-media'
   name: string
@@ -630,11 +578,8 @@ export type QQFlashTransferFile =
   | QQFlashTransferQQMediaFile
 
 /**
- * Hybrid reuse/upload contract for POST /v1/flash-transfers.
- *
- * Only `source: 'upload'` entries consume a length-prefixed body item. Existing
- * QQ media and preflight-uploaded bytes are reused through QQ's protocol-level
- * fast-upload identity without reading local cache bytes or crossing the body.
+ * 闪传创建清单。仅 `source: 'upload'` 会从请求体读取对应媒体流；
+ * `uploaded` 与 `qq-media` 直接通过 MD5/SHA-1 走秒传复用。
  */
 export interface QQFlashTransferManifest {
   name?: string
@@ -645,7 +590,6 @@ export interface QQFlashTransferManifest {
 export interface QQFlashTransferResult {
   fileSetId: string
   shareLink: string
-  /** Absolute Unix timestamp in milliseconds when QQ exposes one. */
   expiresAt?: number
 }
 
@@ -654,9 +598,9 @@ export interface HistoryQuery {
   limit?: number
   beforeId?: string
   afterId?: string
-  /** Native QQ sequence used only to open a chat around its unread boundary. */
+  /** 围绕未读边界加载历史消息的起始 msgSeq。 */
   aroundUnreadSeq?: string
-  /** Open an unanchored page at the newest message rather than the unread boundary. */
+  /** 未指定锚点时直接加载最新一页，忽略未读边界。 */
   latest?: boolean
 }
 
@@ -681,7 +625,7 @@ export interface MemberPage {
       id: string
       numericId?: string
       name: string
-      /** Conversation-scoped group card; never overwrite the global name with it. */
+      /** 群名片（仅限当前群，不覆盖全局昵称）。 */
       alias?: string
       avatarUrl?: string
       avatar?: QQMedia
@@ -702,16 +646,13 @@ export interface BridgeStatus {
 
 export function conversationId(chatType: QQChatType, peerUid: string): string {
   if (chatType === 8 || chatType === 134) return `device:${chatType}:${peerUid}`
-  // QQ UID and group code are already stable opaque identifiers. Keeping the
-  // native value also makes a direct conversation line up with its IM user.
   return peerUid
 }
 
 export function parseConversationId(value: string): { chatType: QQChatType, peerUid: string } {
   const device = /^device:(8|134):(.+)$/.exec(value)
   if (device) return { chatType: Number(device[1]) as QQChatType, peerUid: device[2] }
-  // Accept IDs emitted by older builds during a rolling restart. New responses
-  // never add a synthetic chat-type prefix.
+  // 兼容旧版本带 `1:` / `2:` 前缀的会话 ID。
   const match = /^(1|2):(.+)$/.exec(value)
   if (match) return { chatType: Number(match[1]) as QQChatType, peerUid: match[2] }
   if (!value) throw new Error('invalid empty QQ conversation ID')

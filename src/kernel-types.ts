@@ -11,7 +11,7 @@ export interface ProfileSimpleInfo {
   remark: string
   avatarUrl: string
   longNick?: string
-  /** QQNT 6.9.99 moved global profile fields under coreInfo. */
+  /** QQNT 6.9.99 起将全局资料字段移至 coreInfo 下。 */
   coreInfo?: {
     nick?: string
     avatarUrl?: string
@@ -66,11 +66,9 @@ export interface MemberInfo {
   cardName: string
   role: number
   avatarPath: string
-  /** Kernel-provided QQ robot flag carried by group member snapshots. */
   isRobot?: boolean
 }
 
-/** Result of one native group-member removal request. */
 export interface KickMemberResponse {
   errCode: number
   errMsg: string
@@ -78,31 +76,23 @@ export interface KickMemberResponse {
 }
 
 /**
- * Group notification behavior verified live on QQ Linux 3.2.32.
- *
- * `getGroupMsgMask()` takes no arguments and succeeds with the Promise-like
- * `{ result: 0, errMsg: 'success' }`; values arrive through the single
- * `onGroupsMsgMaskResult(GroupMsgMaskInfo[])` argument, whose entries are
- * `{ groupCode: string, msgMask: number }`. Native chatType 7 is
- * KCHATTYPEGROUPHELPER, the group-assistant container. Do not confuse it with
- * ServiceAssistant (118) or its child entries (201).
+ * 群消息通知设置。`getGroupMsgMask()` 结果通过 `onGroupsMsgMaskResult` 异步下发。
+ * 原生群助手容器为 chatType 7（KCHATTYPEGROUPHELPER），勿与 ServiceAssistant (118/201) 混淆。
  */
 export enum GroupMsgMask {
-  /** 0 UNSPECIFIED: 未指定. */
   UNSPECIFIED = 0,
-  /** 1 NOTIFY: 接收并提醒. */
+  /** 接收并提醒 */
   NOTIFY = 1,
-  /** 2 ASSISTANT: 收进群助手且不提醒. */
+  /** 收进群助手且不提醒 */
   ASSISTANT = 2,
-  /** 3 SHIELD: 屏蔽群消息. */
+  /** 屏蔽群消息 */
   SHIELD = 3,
-  /** 4 RECEIVE: 接收但不提醒. */
+  /** 接收但不提醒 */
   RECEIVE = 4,
 }
 
 export interface GroupMsgMaskInfo {
   groupCode: string
-  /** Raw native value; it may be a newer value outside GroupMsgMask. */
   msgMask: number
 }
 
@@ -114,7 +104,6 @@ export interface GroupProfileInfo {
   memberNum?: number
   memberRole?: number
   cmdUinPrivilege?: number
-  /** Raw native value; it may be a newer value outside GroupMsgMask. */
   cmdUinMsgMask?: number
 }
 
@@ -235,13 +224,12 @@ export interface MsgElement {
     fileName: string
     videoMd5?: string
     thumbMd5?: string
-    /** Duration in seconds. */
+    /** 时长（秒）。 */
     fileTime: number
-    /** Original video dimensions (thumbnail dimensions may differ). */
     fileWidth?: number
     fileHeight?: number
     thumbSize?: number
-    /** 1 avi, 2 mp4, 3 wmv, 4 mkv, 5 rmvb, 6 rm, 7 asf, 8 mov, 9 mod, 10 ts, 11 mts. */
+    /** 1 avi, 2 mp4, 3 wmv, 4 mkv, 5 rmvb, 6 rm, 7 asf, 8 mov, 9 mod, 10 ts, 11 mts */
     fileFormat?: number
     fileSize?: string
     thumbWidth?: number
@@ -251,7 +239,7 @@ export interface MsgElement {
     fileSubId?: string
     fileBizId?: number
     originVideoMd5?: string
-    /** Native QQ video codec enum: 0 h264, 1 h265. */
+    /** 0 H.264，1 H.265。 */
     sourceVideoCodecFormat?: number
   }
   arkElement?: { bytesData: string }
@@ -390,20 +378,15 @@ export interface MsgRecord {
   sendRemarkName: string
   sendMemberName: string
   sendNickName: string
-  /** Per-record avatar identity retained by QQ for imported/forwarded messages. */
+  /** 导入或转发消息保留的发送者头像标识。 */
   avatarMeta?: string
   avatarFlag?: number
-  /**
-   * Provenance QQ keeps for the records of one merged forward.  The record's
-   * own sender account is a placeholder shared by unrelated authors, so the
-   * archived author avatar travels here instead.
-   */
+  /** 合并转发子消息的原始元信息（子消息自身 sender 为共享占位账号，需从此字段取真实头像）。 */
   multiTransInfo?: {
     status?: number
     msgId?: number | string
     friendFlag?: number
     fromAnonId?: string
-    /** Avatar of the archived author of this record. */
     fromFaceUrl?: string
   }
   elements: MsgElement[]
@@ -417,7 +400,6 @@ export interface MsgRecord {
 }
 
 export interface EmojiLikesUserInfo {
-  /** Opaque QQ user identifier returned by the reaction member-list API. */
   tinyId: string
   nickName: string
   headUrl: string
@@ -688,10 +670,7 @@ export interface KernelMsgService {
     result: number
     errMsg: string
     marketEmoticonInfo: {
-      /**
-       * QQ 9.9.33 may return the installed market tabs through the legacy
-       * roam table while leaving emojiNewTabs empty.
-       */
+      /** QQ 9.9.33 可能将已安装的商城表情包放在旧版 roamEmojiTab 中，而 emojiNewTabs 为空。 */
       roamEmojiTab?: {
         timesTamp: number
         segmentFlag: number
@@ -724,7 +703,7 @@ export interface KernelMsgService {
   fetchMarketEmoticonAuthDetail?(request: {
     epId: number
     eId: string
-    /** 0 = add to favorites, 1 = single-forward authorization. */
+    /** 0 添加收藏，1 单条转发鉴权。 */
     scene: number
   }): Promise<{ result: number, errMsg: string }>
   getMarketEmoticonPath?(
@@ -837,7 +816,7 @@ export interface KernelBuddyService {
   addKernelBuddyListener(listener: unknown): string
   removeKernelBuddyListener(listenerId: string): void
   getBuddyList(force: boolean): Promise<{ result: number, errMsg: string }>
-  /** QQNT request data may arrive through onBuddyReqChange rather than this call's return value. */
+  /** 列表数据可能通过 `onBuddyReqChange` 回调下发，而非直接返回。 */
   getBuddyReq?(): Promise<unknown>
   getDoubtBuddyReq?(reqId: string, count: number, cookie: string): Promise<unknown>
   approvalFriendRequest?(request: {
@@ -875,7 +854,7 @@ export interface KernelGroupService {
   addKernelGroupListener(listener: unknown): string
   removeKernelGroupListener(listenerId: string): void
   getGroupList(force: boolean): Promise<{ result: number, errMsg: string }>
-  /** QQNT request data may arrive through the group listener rather than this call's return value. */
+  /** 通知数据可能通过群 listener 回调下发，而非直接返回。 */
   getSingleScreenNotifies?(doubt: boolean, startSeq: string, count: number): Promise<unknown>
   operateSysNotify?(doubt: boolean, request: {
     operateType: 1 | 2
@@ -883,20 +862,10 @@ export interface KernelGroupService {
   }): Promise<unknown>
   getGroupDetailInfo?(groupCode: string, source: number): Promise<{ result: number, errMsg: string }>
   getGroupMsgMask?(): Promise<{ result: number, errMsg: string }>
-  /**
-   * Sets the group notification mask for a single group. Return shape mirrors
-   * getGroupMsgMask exposes `(groupCode: string, mask: GroupMsgMask)`
-   * resolving to `{ result: 0, errMsg: 'success' }`; a non-zero result indicates
-   * a native failure. Verified against the public stub signature only.
-   */
   setGroupMsgMask?(groupCode: string, mask: GroupMsgMask): Promise<{ result: number, errMsg: string }>
-  /** Set or revoke QQ group administrator status. Native roles are Member=2 and Admin=3. */
+  /** 设置或取消群管理员（2 普通成员，3 管理员）。 */
   modifyMemberRole?(groupCode: string, uid: string, role: 2 | 3): Promise<{ result: number, errMsg: string }>
-  /**
-   * Removes group members. The native method asserts four arguments, so the
-   * reason string must always be supplied; `errCode` covers the request and
-   * `resultList` reports each target on its own.
-   */
+  /** 踢出群成员。原生绑定强制校验 4 个参数，`reason` 不可省略。 */
   kickMember?(groupCode: string, uids: string[], refuseForever: boolean, reason: string): Promise<KickMemberResponse>
   setMemberShutUp?(groupCode: string, members: Array<{ uid: string, timeStamp: number }>): Promise<{ result: number, errMsg: string }>
   createMemberListScene(groupCode: string, scene: string): string
@@ -906,7 +875,7 @@ export interface KernelGroupService {
     errMsg: string
     result: { ids: Array<{ uid: string, index: number }>, infos: Map<string, MemberInfo>, finish: boolean, hasRobot?: boolean }
   }>
-  /** Fetches one or more group members; details arrive through onMemberInfoChange. */
+  /** 结果通过 `onMemberInfoChange` 回调下发。 */
   getMemberInfo?(groupCode: string, uids: string[], forceFetch: boolean): Promise<{ result: number, errMsg: string }>
 }
 
@@ -937,10 +906,7 @@ export interface KernelBaseEmojiService {
 }
 
 export interface KernelRobotService {
-  /**
-   * Returns the UIN ranges QQ reserves for robot accounts. The element shape
-   * is not documented; NapCat shows `{ minUin, maxUin }` entries.
-   */
+  /** 获取 QQ 机器人账号的 UIN 号段（元素结构形如 `{ minUin, maxUin }`）。 */
   getRobotUinRange?(request: {
     justFetchMsgConfig: string
     type: number
@@ -1040,8 +1006,6 @@ export interface KernelModule {
 export interface InitSessionConfig {
   selfUin: string
   selfUid: string
-  // Some Linux QQ builds omit userPath at runtime even though the native
-  // declaration historically exposed it. Callers must retain a separate
-  // trusted root instead of assuming this field is always present.
+  // 部分 Linux QQ 构建在运行时不提供 userPath，不能假定该字段一定存在。
   userPath?: string
 }

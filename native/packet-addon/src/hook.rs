@@ -118,9 +118,8 @@ mod windows {
             return unsafe { original(task) };
         }
 
-        // QQNT's generated promise callback owns a shared state pointer at
-        // +0x10. The state contains napi_env/+0x18 and napi_deferred/+0x20;
-        // the response carries result/+0x18, errMsg/+0x20 and bytes/+0x38.
+        // task+0x10 为共享状态指针（含 +0x18 napi_env 与 +0x20 napi_deferred）；
+        // task 自身携带 +0x18 result、+0x20 errMsg 与 +0x38 原始响应字节。
         let state = unsafe { task.add(0x10).cast::<*mut u8>().read_unaligned() };
         if state.is_null() {
             return unsafe { original(task) };
@@ -244,10 +243,7 @@ mod windows {
             return unsafe { original(destination, env, value) };
         }
 
-        // Let QQNT's original converter allocate and initialize its private
-        // string representation, then replace the same-length ASCII payload
-        // with the Buffer bytes. This keeps allocation and destruction on
-        // QQNT's own ABI without relying on a version-specific malloc RVA.
+        // 先用等长 ASCII 占位字符串调用原 converter 完成内部 string 分配，再原地覆写为 Buffer 原始字节，避免依赖特定版本的 malloc RVA。
         let mut placeholder: Vec<u8> = Vec::new();
         if placeholder.try_reserve_exact(length).is_err() {
             return unsafe { original(destination, env, value) };
@@ -342,24 +338,9 @@ mod windows {
     }
 }
 
-// Linux inline-hook installer.
-//
-// Two function-entry patches are installed before wrapper.node's exports are
-// handed back to QQNT (during `process.dlopen`), so no thread is executing
-// these functions while their prologue is being rewritten:
-//
-//  * converter (0x63f47b0) -> shim_converter: preserves a Node Buffer's raw
-//    bytes when QQNT's argument converter would otherwise coerce it to a UTF-8
-//    string. The shim delegates to the original via a relocated trampoline.
-//  * resolver (0x34b9e30) -> shim_resolver: replaces QQNT's promise resolver
-//    (which runs on the libuv JS thread) so the protobuf `rsp` field is exposed
-//    as a binary `rspbuffer` Buffer instead of a lossy UTF-8 string. The
-//    original is not called back; the deferred is nulled after resolve.
-//
-// The XRef locator verifies both targets against the on-disk image before the
-// hook is installed. Both targets begin with `push r15; push r14; push rbx`
-// (41 57 41 56 53), which contains no RIP-relative addressing and therefore
-// relocates verbatim into a trampoline.
+// Linux inline hook：在 `process.dlopen` 阶段替换两个函数入口（开头均为 `41 57 41 56 53`，无 RIP 相对寻址，可直接搬迁至 trampoline）：
+// - converter -> shim_converter：保留入参 Node Buffer 的原始二进制内容，避免被强制转为 UTF-8。
+// - resolver -> shim_resolver：将 Promise 回调中的 protobuf `rsp` 字段封装为 `rspbuffer` Buffer，避免按 UTF-8 截断损坏。
 #[cfg(target_os = "linux")]
 mod linux {
     use super::HookError;
@@ -378,12 +359,11 @@ mod linux {
     type Converter = unsafe extern "C" fn(*mut u8, napi_env, napi_value);
     const PAGE_SIZE: usize = 0x1000;
     const MAP_FIXED_NOREPLACE: libc::c_int = 0x100_0000;
-    // Stay inside a 32-bit signed displacement so a 5-byte `jmp rel32` from the
-    // target always reaches the near-page stub.
+    // 限制在 32 位有符号偏移范围内，确保 5 字节 `jmp rel32` 可直达跳板页。
     const NEAR_LIMIT: u64 = 0x7FFF_F000;
     const PROLOGUE: [u8; 5] = [0x41, 0x57, 0x41, 0x56, 0x53];
-    const OFF_CONV_TRAMP: usize = 0; // 5 relocated bytes + E9 rel32 = 10
-    const OFF_CONV_STUB: usize = 16; // FF 25 .. + abs ptr = 14
+    const OFF_CONV_TRAMP: usize = 0; // 5 字节原始指令 + E9 rel32 = 10
+    const OFF_CONV_STUB: usize = 16; // FF 25 .. + 8 字节绝对地址 = 14
     const OFF_RESOLVER_STUB: usize = 32; // 14
 
     static INSTALL_LOCK: Mutex<()> = Mutex::new(());
@@ -509,17 +489,12 @@ mod linux {
         if rec.is_null() {
             return None;
         }
-        // The receive callback runs on QQ's networking threads.  A malformed
-        // or already-released packet must not turn into a process crash, so all
-        // memory originating from QQ is copied through process_vm_readv.  The
-        // syscall returns EFAULT for an invalid range instead of faulting us.
+        // 收包回调在 QQ 网络线程执行，通过 `process_vm_readv` 安全拷贝内存，遇到非法地址返回 EFAULT 而不触发段错误。
         let mut record = [0u8; 64];
         if !read_process_memory(rec.cast_const(), &mut record) {
             return None;
         }
-        // Current QQNT wraps the receive record in an outer pointer.  The
-        // pointed-to object stores command at +0x20 and the byte range at
-        // +0x38.  Keep the older direct layout as a fallback for other builds.
+        // 新版 QQNT 外层包了一级指针，内部对象在 +0x20 存 command、+0x38 存数据起止指针；同时保留旧版平铺布局兜底。
         let inner = usize::from_ne_bytes(record[0..8].try_into().ok()?) as *const u8;
         if !inner.is_null() {
             let mut inner_record = [0u8; 0x48];
@@ -662,13 +637,10 @@ mod linux {
         verify_prologue(converter)?;
         verify_prologue(resolver)?;
 
-        // The two targets sit ~50 MiB apart, so a single page within 2 GiB of
-        // the converter is also within reach of the resolver.
+        // 两个目标相距约 50 MiB，在 converter 附近 2 GiB 内分配单个跳板页即可同时覆盖两者。
         let near = alloc_near(converter, PAGE_SIZE)?;
         let page = near as *mut u8;
         unsafe {
-            // Converter trampoline: original 5 bytes + jmp rel32 back to the
-            // instruction after the patched prologue.
             std::ptr::copy_nonoverlapping(converter as *const u8, page.add(OFF_CONV_TRAMP), 5);
             let jmp_at = page.add(OFF_CONV_TRAMP + 5);
             *jmp_at = 0xE9;
@@ -692,8 +664,6 @@ mod linux {
                 e
             })?;
 
-        // Publish the trampoline before rewiring the target so the shim always
-        // sees a valid original.
         ORIGINAL_CONVERTER.store(near + OFF_CONV_TRAMP, Ordering::Release);
 
         if let Err(error) = patch_rel32_jmp(converter, near + OFF_CONV_STUB) {
@@ -748,8 +718,6 @@ mod linux {
     }
 
     fn mprotect_rx(addr: usize, len: usize) -> Result<(), HookError> {
-        // The freshly-mapped stub page must end executable; force READ|EXEC
-        // rather than restoring its mmap-time RW protection.
         if unsafe { libc::mprotect(addr as *mut c_void, len, libc::PROT_READ | libc::PROT_EXEC) }
             != 0
         {
@@ -766,8 +734,7 @@ mod linux {
         unsafe { std::ptr::copy_nonoverlapping(value.to_ne_bytes().as_ptr(), at, 4) };
     }
 
-    /// Writes `jmp qword ptr [rip+0]; <abs>` (14 bytes) — an absolute indirect
-    /// jump used by the in-range stubs to reach the Rust shim wherever it lands.
+    /// 写入 14 字节绝对间接跳转 `jmp qword ptr [rip+0]; <abs>`。
     fn write_abs_jmp(at: *mut u8, target: usize) {
         unsafe {
             std::ptr::copy_nonoverlapping([0xFFu8, 0x25, 0, 0, 0, 0].as_ptr(), at, 6);
@@ -785,7 +752,6 @@ mod linux {
             let rel = (stub as isize).wrapping_sub((target as isize) + 5);
             write_i32(at.add(1), rel as i32);
         }
-        // Restore the original protection (W^X): never leave .text writable.
         if unsafe { libc::mprotect(page as *mut c_void, PAGE_SIZE, original) } != 0 {
             let _ = unsafe {
                 libc::mprotect(
@@ -815,8 +781,6 @@ mod linux {
         Ok(())
     }
 
-    /// Parses /proc/self/maps to recover the protection bits of the page that
-    /// owns `addr`, so the hook can restore (not widen) the original mapping.
     fn prot_of(addr: usize) -> Option<libc::c_int> {
         let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
         for line in maps.lines() {
@@ -851,8 +815,7 @@ mod linux {
         None
     }
 
-    /// Allocates a private page within `jmp rel32` range of `target` by hunting
-    /// /proc/self/maps for a gap and mapping it with MAP_FIXED_NOREPLACE.
+    /// 扫描 `/proc/self/maps` 空隙并用 `MAP_FIXED_NOREPLACE` 在 `target` 的 `jmp rel32` 范围内分配内存页。
     fn alloc_near(target: usize, size: usize) -> Result<usize, HookError> {
         let lo = target
             .checked_sub(NEAR_LIMIT as usize)
@@ -911,8 +874,7 @@ mod linux {
         ))
     }
 
-    /// QQNT internal libc++ `basic_string` payload slot for a string of
-    /// `expected_length` bytes (SSO tag at +0, long layout when LSB is set).
+    /// 解析 libc++ `basic_string` 数据指针（+0 最低位为 0 时为 SSO 短字符串，否则 +8 为长度、+16 为堆指针）。
     unsafe fn qq_string_payload(value: *mut u8, expected_length: usize) -> Option<*mut u8> {
         if value.is_null() {
             return None;
@@ -961,9 +923,7 @@ mod linux {
             return unsafe { original(dest, env, value) };
         }
 
-        // Let QQNT allocate its string for a same-length ASCII placeholder,
-        // then overwrite the payload with the Buffer bytes. This keeps the
-        // allocation/destruction on QQNT's own ABI.
+        // 先用等长 ASCII 占位字符串由 QQNT 分配内部 string，再覆写为 Buffer 原始字节。
         let placeholder = vec![b'A'; length];
         let mut placeholder_value: napi_value = std::ptr::null_mut();
         if unsafe {
@@ -1185,10 +1145,6 @@ mod linux {
             assert_eq!(packet.payload, payload);
         }
 
-        // End-to-end mechanism check without QQNT: synthesize an executable
-        // page whose function has the validated prologue, hook it through a
-        // test shim, and confirm the shim runs and the trampoline reaches the
-        // original body.
         static TEST_SHIM_RAN: AtomicUsize = AtomicUsize::new(0);
 
         unsafe extern "C" fn test_shim(arg: *mut u8, env: napi_env, value: napi_value) {

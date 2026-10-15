@@ -101,9 +101,7 @@ export class QQLoginController {
       const service = candidate && typeof candidate.get === 'function' ? candidate.get() : candidate
       if (service) this.attachService(service, kernel)
     } catch (error) {
-      // QQ normally creates the singleton itself. The wrapped constructor will
-      // call attachService when that happens, so an eager attach failure is not
-      // fatal on builds that forbid direct construction.
+      // 部分构建禁止直接构造单例，后续由包装后的构造函数在宿主初始化时调用 attachService。
       log('info', 'QQNT login service will be attached by the application', error)
     }
   }

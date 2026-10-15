@@ -19,8 +19,7 @@ const processType = (process as NodeJS.Process & { type?: string }).type
 const bootstrapKey = Symbol.for('qqnt-bridge.bootstrap')
 const bootstrapState = globalThis as typeof globalThis & { [bootstrapKey]?: boolean }
 
-// NODE_OPTIONS is inherited by Electron child processes. Only initialize in
-// Electron's browser (main) process; plain Node remains useful for diagnostics.
+// Electron 子进程会继承 NODE_OPTIONS，仅在主进程（browser）或纯 Node 下初始化。
 if ((processType === undefined || processType === 'browser') && !bootstrapState[bootstrapKey]) {
   bootstrapState[bootstrapKey] = true
   const electron = loadElectron()
@@ -95,11 +94,8 @@ function startLocalPCMMediaGateway(
 }
 
 /**
- * Native QQNT classes expose read-only prototypes, so assigning
- * NodeIQQNTWrapperSession.prototype.init is not possible. Intercept CommonJS
- * module loading instead and return a copy of the native export object whose
- * session constructor is a construct proxy. The proxy wraps each new session
- * instance and observes init() without mutating the native object.
+ * QQNT 原生类的 prototype 为只读，无法直接覆写 `NodeIQQNTWrapperSession.prototype.init`。
+ * 通过拦截模块加载并包装导出对象的构造函数，在实例创建时拦截 `init()`。
  */
 function installKernelRequireHook(bridge: QQKernelBridge, login: QQLoginController): void {
   type Loader = (request: string, parent: NodeModule | null, isMain: boolean) => unknown
@@ -124,9 +120,7 @@ function installKernelRequireHook(bridge: QQKernelBridge, login: QQLoginControll
     return wrapped
   }
 
-  // QQ's webpack node-loader invokes process.dlopen(module, path) directly,
-  // bypassing Module._load. Wrap module.exports immediately after the native
-  // addon populates it.
+  // QQ 的 webpack node-loader 会绕过 `Module._load` 直接调用 `process.dlopen`。
   process.dlopen = function qqntBridgeDlopen(module, filename, flags) {
     const result = originalDlopen.apply(this, arguments as unknown as Parameters<typeof originalDlopen>)
     const nativeModule = module as { exports: unknown }
@@ -343,8 +337,7 @@ export function wrapSession(
           return (avsdkServiceFacade = teeAVSDKService(nativeService))
         }
       }
-      // Native methods reject a JS Proxy as their receiver. Always bind them
-      // back to the real native instance.
+      // 原生 N-API 方法拒绝以 JS Proxy 作为 this，需绑定回原始实例。
       return typeof value === 'function' ? value.bind(target) : value
     },
   })

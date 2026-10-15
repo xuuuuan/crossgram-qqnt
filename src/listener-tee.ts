@@ -10,7 +10,6 @@ const services = new WeakMap<object, object>()
 const bridgeListeners = new WeakSet<object>()
 let avsdkActionObserver: ((payload: Uint8Array) => void) | undefined
 
-/** Install the single process-local observer owned by QQKernelBridge. */
 export function observeAVSDKActions(observer: ((payload: Uint8Array) => void) | undefined): void {
   avsdkActionObserver = observer
 }
@@ -25,9 +24,8 @@ export function markBridgeListener<T>(listener: T): T {
 export const markBridgeMessageListener = markBridgeListener
 
 /**
- * QQNT 6.9.98 does not reliably broadcast callbacks to multiple native
- * listeners. Keep QQ's listener as the sole native registration for every
- * service and fan the same callback out to bridge taps in JavaScript.
+ * QQNT 6.9.98 起不再可靠地向多个原生 listener 广播回调。
+ * 仅向原生层注册 QQ 自身的 listener，并在 JS 层将回调分发给附加的 tap。
  */
 export function teeMsgService(nativeService: KernelMsgService): KernelMsgService {
   return teeListenerService(nativeService, 'message', 'addKernelMsgListener', 'removeKernelMsgListener')
@@ -61,9 +59,7 @@ export function teeAVSDKService(nativeService: KernelAVSDKService): KernelAVSDKS
         if (action === 2 && ArrayBuffer.isView(payload)) {
           try {
             avsdkActionObserver?.(new Uint8Array(payload.buffer, payload.byteOffset, payload.byteLength))
-          } catch {
-            // Observation must never alter QQ's own call-control path.
-          }
+          } catch {}
         }
         return Reflect.apply(value as (...args: unknown[]) => unknown, target, [action, payload])
       }

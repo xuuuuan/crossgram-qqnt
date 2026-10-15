@@ -20,14 +20,8 @@ interface CallControlResult {
 }
 
 /**
- * Invoke QQ's own mounted call component handlers. These names and selectors
- * come from QQ 3.2.31-51102's compiled renderer source:
- *
- * - PickupBtn.onPickupClick / AVCallStatus.onAcceptClick
- * - HangupBtn.onHangupClick / AVCallStatus.onHangupClick
- *
- * QQ remains responsible for constructing QRTC commands, room IDs, sequence
- * numbers, reject reasons, and every native state transition.
+ * 调用 QQ 渲染进程挂载的通话组件方法（`PickupBtn.onPickupClick` / `HangupBtn.onHangupClick` 等），
+ * 由 QQ 自身完成 QRTC 信令构造与原生状态流转。
  */
 export class ElectronCallController implements QQCallController {
   private readonly attempts: number

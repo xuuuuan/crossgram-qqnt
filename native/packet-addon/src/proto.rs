@@ -373,13 +373,7 @@ pub struct PrivateFileResult {
     pub url: String,
 }
 
-/**
- * Private and group poke (the QQ "nudge" notice) request body.
- *
- * A single body shape serves both flavors: a group poke fills `group_uin` and
- * a private poke fills `friend_uin`, while `uin` is always the account being
- * poked. `ext` stays zero; QQ reserves it for newer poke sub-types.
- */
+/** 私聊与群聊戳一戳请求体：群聊填 `group_uin`，私聊填 `friend_uin`，`uin` 为被戳对象。 */
 #[derive(Clone, PartialEq, Message)]
 pub struct PokeRequest {
     #[prost(uint32, tag = "1")]
@@ -693,10 +687,6 @@ pub fn decode_private_file_download(bytes: &[u8]) -> Result<DirectUrl, DecodePac
     })
 }
 
-/**
- * Build a poke request for a private (chat type 1) or group (chat type 2)
- * conversation. `peer` is the group code or the friend's UIN.
- */
 pub fn poke_packet(chat_type: u32, peer: &str, target_uin: &str) -> Result<OidbEnvelope, String> {
     let target = parse_uin(target_uin, "poke target")?;
     let peer_uin = parse_uin(peer, "poke peer")?;
@@ -722,7 +712,6 @@ pub fn poke_packet(chat_type: u32, peer: &str, target_uin: &str) -> Result<OidbE
     })
 }
 
-/** A poke response carries no body; only the envelope's error code matters. */
 pub fn decode_poke(bytes: &[u8]) -> Result<(), DecodePacketError> {
     decode_envelope(bytes).map(|_body| ())
 }

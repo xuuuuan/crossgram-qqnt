@@ -15,7 +15,6 @@ export const VIDEO_THUMBNAIL_HEIGHT = 180
 export const VIDEO_THUMBNAIL_MD5 = createHash('md5').update(VIDEO_THUMBNAIL_BYTES).digest('hex')
 export const VIDEO_THUMBNAIL_SHA1 = createHash('sha1').update(VIDEO_THUMBNAIL_BYTES).digest('hex')
 
-/** QQ permanently rejected the submitted media metadata before Highway upload. */
 export class QQMediaUploadRejectedError extends Error {
   constructor(message: string) {
     super(message)
@@ -185,7 +184,6 @@ export interface DirectMessageSendResponse {
   sendTime: number
 }
 
-/** QQ permanently rejected a message that should not be retried unchanged. */
 export class QQMessageSendRejectedError extends Error {
   constructor(readonly result: number, readonly detail: string) {
     super(`QQ message send rejected: ${detail} (${result})`)
@@ -970,10 +968,7 @@ export function encodeDirectMessageRequest(
       routing,
       content: { field1: 1, field2: 0, field3: 0, field4: 0 },
       body,
-      // QQNT uses a short per-send client sequence (the official client
-      // clients use 10000..99998). Arbitrary int64 values are parsed by SSO
-      // but PbSendMsg then returns no usable sequence and never publishes the
-      // outgoing message.
+      // 官方客户端使用 10000..99998 范围内的短整型 clientSequence；若传任意 64 位整数会导致 PbSendMsg 不返回有效 sequence。
       clientSequence: options.clientSequence ?? randomClientSequence(),
       random: options.random ?? randomBytes(4).readUInt32BE(),
     }),

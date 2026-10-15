@@ -131,10 +131,7 @@ fn response_callback_from_send_wrapper(
     })?[1]
         .0;
 
-    // The generated wrapper keeps its promise-state helper immediately after
-    // the wrapper body. This ties response discovery to the already located
-    // send binding instead of choosing among hundreds of result/errMsg/rsp
-    // wrappers in the module.
+    // 生成的 wrapper 函数体之后紧邻其 promise-state 辅助函数，可据此直接定位对应的响应回调。
     let nearby_end = send_wrapper.end.saturating_add(0x1000);
     let promise_helper = calls
         .iter()

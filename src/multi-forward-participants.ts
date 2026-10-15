@@ -7,21 +7,13 @@ export interface MultiForwardParticipant {
   name: string
   alias?: string
   avatarUin?: string
-  /** Avatar QQ archived for this author inside the merged forward. */
   avatarUrl?: string
 }
 
 /**
- * Resolve the authors of one downloaded merged-forward transcript without
- * trusting its native sender IDs. QQ assigns the same placeholder account to
- * unrelated authors in many imported bundles, so an identity is derived from
- * the record-owned name and avatar evidence instead.  That evidence includes
- * the per-record `multiTransInfo.fromFaceUrl` avatar, which is the only image
- * QQ keeps for an archived author.
- *
- * IDs are deterministic within one transcript and intentionally differ across
- * transcripts. They can therefore be exposed as temporary peers without ever
- * colliding with the live QQ address book.
+ * 解析合并转发子消息的发送者。QQ 在许多导入的合并转发中会给不同发送者分配相同的占位账号，
+ * 因此需根据消息自身的昵称与头像（`avatarMeta`、`multiTransInfo.fromFaceUrl`）派生虚拟发送者 ID，
+ * 并按转发作用域隔离，避免与真实通讯录冲突。
  */
 export function resolveMultiForwardParticipants(
   locator: QQMultiForwardLocator,
@@ -38,10 +30,6 @@ export function resolveMultiForwardParticipants(
   for (const record of records) {
     const name = participantName(record)
     const faceUrl = archivedFaceUrl(record)
-    // avatarMeta and the archived face URL are the per-author identity QQ
-    // retains for imported records. A qlogo reference is still avatar evidence
-    // when a real UIN is available; the name prevents a shared placeholder
-    // avatar from merging unrelated people.
     const avatarIdentity = [record.avatarMeta?.trim(), faceUrl].filter(Boolean).join('|')
       || (/^\d+$/.test(record.senderUin) ? `qlogo:${record.senderUin}` : '')
     const fingerprint = JSON.stringify([
@@ -76,11 +64,6 @@ function participantName(record: MsgRecord): string {
     || 'QQ用户'
 }
 
-/**
- * Avatar URL QQ archived next to one merged-forward record.  It identifies the
- * original author even though the record's own sender account is a placeholder
- * shared with every other author of the same transcript.
- */
 function archivedFaceUrl(record: MsgRecord): string | undefined {
   const value = record.multiTransInfo?.fromFaceUrl?.trim()
   if (!value) return

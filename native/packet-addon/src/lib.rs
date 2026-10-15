@@ -89,8 +89,6 @@ pub struct ReceivedPacket {
     pub payload: Buffer,
 }
 
-/// Calls QQNT's bound sendSsoCmdReqByContend function from the addon so the
-/// TypeScript layer never needs to know its native implementation details.
 #[napi]
 pub fn send_packet<'scope>(
     send: Function<'scope, FnArgs<(String, Buffer)>, Unknown<'scope>>,
@@ -405,8 +403,7 @@ static CACHED_PROBE: std::sync::Mutex<Option<elf::PacketBindingProbe>> =
 
 #[cfg(target_os = "linux")]
 fn install_send_hook_impl() -> Result<SendBindingLocation> {
-    // Cache the probe because installation patches the converter and resolver
-    // bytes that the locator compares with the on-disk wrapper.
+    // 安装 hook 会改写 converter 与 resolver 入口指令，需缓存探测结果避免后续与磁盘镜像比对失败。
     let mut cache = CACHED_PROBE
         .lock()
         .map_err(|_| Error::from_reason("QQNT packet probe cache poisoned"))?;

@@ -153,11 +153,7 @@ pub fn containing_function(functions: &[RuntimeFunction], address: u32) -> Optio
     })
 }
 
-/// Finds the first pair of nearby direct calls that share a target.
-///
-/// Generated N-API wrappers convert adjacent arguments with adjacent calls to
-/// the same conversion function. Looking through the owning function keeps the
-/// locator independent of QQNT's version-specific RVAs.
+/// 查找函数内首对相邻且调用同一目标的 `call rel32`（N-API wrapper 会连续调用同一参数转换函数转换相邻参数）。
 pub fn first_nearby_repeated_call_target(image: &[u8], function: RuntimeFunction) -> Option<u32> {
     let calls = direct_calls(image, function);
     calls.windows(2).find_map(|pair| {
@@ -217,8 +213,7 @@ pub fn read_u64(image: &[u8], rva: u32) -> Option<u64> {
     Some(u64::from_le_bytes(bytes.try_into().ok()?))
 }
 
-/// Resolves the compiler thunk used by QQNT's async response dispatcher:
-/// `mov rcx, [rcx]; jmp rel32`.
+/// 解析异步响应分发器使用的编译器 thunk：`mov rcx, [rcx]; jmp rel32`（`48 8b 09 e9`）。
 pub fn indirect_rcx_jump_target(image: &[u8], thunk_rva: u32) -> Option<u32> {
     let bytes = image.get(thunk_rva as usize..thunk_rva as usize + 8)?;
     if bytes[..4] != [0x48, 0x8b, 0x09, 0xe9] {

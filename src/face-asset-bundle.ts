@@ -1,22 +1,12 @@
 import { crc32 as nodeCrc32, inflateRawSync } from 'node:zlib'
 
 /**
- * QQ hands out several face resources as ZIP bundles. The archive wraps the
- * real image inside an `<id>/<type>/<name>.png` tree (the same layout QQNT
- * keeps under `nt_data/Emoji/emoji-resource`), so relaying the archive verbatim
- * makes every Telegram client fail to decode the face.
+ * QQ 的部分系统表情资源以 ZIP 包形式下发，内部结构为 `<id>/<type>/<name>.png`
+ *（与 `nt_data/Emoji/emoji-resource` 一致）。
  *
- * These helpers expose two views of a bundle:
- *
- * - {@link resolveFaceAssetMetaFromDirectory} reads only the end of the archive
- *   (end-of-central-directory record plus the central directory). QQ writes the
- *   real sizes and CRC-32 there and keeps data descriptors in the local
- *   headers, so a small ranged read is enough to learn the exact size and
- *   content identity of the image without downloading it.
- * - {@link resolveFaceAssetImage} inflates the chosen entry for serving.
- *
- * Both use {@link pickFaceAssetEntry} so the announced metadata always matches
- * the bytes that are served.
+ * - {@link resolveFaceAssetMetaFromDirectory} 仅解析 ZIP 尾部的 central directory，
+ *   配合 Range 请求即可在不下载完整包的情况下获取解压后的大小与 CRC-32。
+ * - {@link resolveFaceAssetImage} 解压出目标表情图片供直接下发。
  */
 
 const END_OF_CENTRAL_DIRECTORY = 0x06054b50
@@ -41,29 +31,21 @@ export interface FaceAssetImage {
   height?: number
 }
 
-/** Identity of the archive entry a bundle offers for one face. */
 export interface FaceAssetMeta {
-  /** Entry name inside the archive, for diagnostics. */
   name: string
-  /** Uncompressed image length in bytes. */
+  /** 解压后的字节长度。 */
   size: number
-  /** CRC-32 of the uncompressed image; changes whenever the remote asset does. */
+  /** 解压后数据的 CRC-32，用于标识资源版本。 */
   version: number
-  /** ZIP compression method, so callers can tell whether inflating is needed. */
+  /** ZIP 压缩方式。 */
   method: number
 }
 
-/** Geometry and animation the caller advertises for the requested face. */
 export interface FaceAssetTarget {
-  /** Face id the caller asked for, for example `424` for the key `1:424`. */
   faceId?: string
   width?: number
   height?: number
-  /**
-   * Whether the caller expects an animated face. When the value is known,
-   * entries under an `apng/` directory win (or lose) so the bytes that are
-   * served carry the animation the catalog advertises.
-   */
+  /** 是否优先选择 `apng/` 目录下的动图资源。 */
   animated?: boolean
 }
 
@@ -90,17 +72,13 @@ export function isZipPayload(bytes: Uint8Array): boolean {
     && bytes[0] === 0x50 && bytes[1] === 0x4b && bytes[2] === 0x03 && bytes[3] === 0x04
 }
 
-/** CRC-32 of an image, used as the content identity of a face resource. */
 export function faceAssetVersion(bytes: Uint8Array): number {
   if (typeof nodeCrc32 === 'function') return nodeCrc32(bytes) >>> 0
   return crc32Fallback(bytes)
 }
 
 /**
- * Ranks the archive entries that could represent `target`. The square
- * `<id>.png` entry is the inline face; canvas variants carry an underscore
- * suffix (`<id>_0.png`) and match the geometry QQ advertises for faces that
- * animate on a wider canvas.
+ * 对候选条目按匹配度排序：方形小表情对应 `<id>.png`，宽幅大表情画布对应带后缀的 `<id>_0.png`。
  */
 export function rankFaceAssetEntries<T extends FaceAssetCandidate>(
   candidates: readonly T[],
@@ -113,14 +91,11 @@ export function rankFaceAssetEntries<T extends FaceAssetCandidate>(
     const suffixed = /_\d+$/.test(stem)
     const related = !faceId || stem === faceId || stem.startsWith(`${faceId}_`)
     const canonical = faceId ? stem === faceId : !suffixed
-    // Bundles wrap the animated face under `apng/` and its static fallback
-    // under `png/`; the advertised animation decides between them.
+    // 动图位于 `apng/`，静态图位于 `png/`。
     const animated = /(?:^|\/)apng\//i.test(candidate.name)
     return {
       candidate,
       related,
-      // A square face is served by its canonical entry, a wide one by the
-      // canvas variant; without a known geometry prefer the canonical entry.
       preferred: square ? canonical : related && suffixed,
       canonical,
       format: target.animated === undefined || target.animated === animated ? 0 : 1,
@@ -136,7 +111,6 @@ export function rankFaceAssetEntries<T extends FaceAssetCandidate>(
   return ranked.map((item) => item.candidate)
 }
 
-/** Alias kept for callers that only need the single best entry. */
 export function pickFaceAssetEntry<T extends FaceAssetCandidate>(
   candidates: readonly T[],
   target: FaceAssetTarget = {},
@@ -144,12 +118,7 @@ export function pickFaceAssetEntry<T extends FaceAssetCandidate>(
   return rankFaceAssetEntries(candidates, target)[0]
 }
 
-/**
- * Reads the central directory of a bundle, which is enough for the size and
- * content identity of the served image. `directory` may be a tail of the
- * archive (as returned by a ranged request) because the central directory never
- * needs the file payload.
- */
+/** 从 ZIP 尾部（central directory）解析目标表情的解压大小与 CRC-32。 */
 export function resolveFaceAssetMetaFromDirectory(
   directory: Buffer,
   target: FaceAssetTarget = {},
@@ -172,7 +141,6 @@ export function resolveFaceAssetMetaFromDirectory(
   return undefined
 }
 
-/** Detects the image type and intrinsic size of a raw image payload. */
 export function sniffFaceImage(bytes: Buffer): FaceAssetImage | undefined {
   const png = sniffPng(bytes)
   if (png) return png
@@ -181,7 +149,6 @@ export function sniffFaceImage(bytes: Buffer): FaceAssetImage | undefined {
   return sniffWebp(bytes)
 }
 
-/** Returns the image a ZIP face bundle serves for `target`. */
 export function resolveFaceAssetImage(
   payload: Buffer,
   target: FaceAssetTarget = {},
@@ -203,7 +170,6 @@ export function resolveFaceAssetImage(
   return undefined
 }
 
-/** Returns true when the entry name looks like an image this module can serve. */
 export function isFaceAssetEntryName(name: string): boolean {
   return IMAGE_ENTRY_PATTERN.test(name) && !name.endsWith('/')
 }

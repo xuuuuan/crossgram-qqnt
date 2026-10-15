@@ -18,17 +18,11 @@ const rotatingLogSizes = new Map<string, number>()
 const DEFAULT_LOG_MAX_BYTES = 64 * 1024 * 1024
 const DEFAULT_LOG_BACKUPS = 3
 
-// Electron keeps stdout/stderr inherited from the process that launched QQ.
-// Once a short-lived launcher closes its pipe, console.* emits EPIPE on the
-// stream. An unhandled stream error would otherwise surface as an uncaught
-// exception in QQ's browser process.
+// 启动器退出关闭管道后，console 写入会触发 EPIPE，需吞掉错误防止宿主进程崩溃。
 export function guardConsoleStream(stream: Pick<EventEmitter, 'on'> | undefined): void {
   if (!stream || guardedConsoleStreams.has(stream)) return
   guardedConsoleStreams.add(stream)
-  stream.on('error', () => {
-    // File logging remains available; losing an optional console must never
-    // destabilize the injected host process.
-  })
+  stream.on('error', () => {})
 }
 
 guardConsoleStream(process.stdout)
@@ -53,18 +47,13 @@ export function log(level: 'info' | 'warn' | 'error', message: string, ...detail
   ].join(' ')
   try {
     appendRotatingLog(logPath, `${rendered}\n`)
-  } catch {
-    // QQ logging must never make the host process fail.
-  }
+  } catch {}
   const output = consoleOutput(level, message)
   try {
     if (level === 'error') console.error(output, ...details)
     else if (level === 'warn') console.warn(output, ...details)
     else console.log(output, ...details)
-  } catch {
-    // Some console implementations throw synchronously instead of emitting an
-    // error event when their backing pipe has already closed.
-  }
+  } catch {}
 }
 
 export function appendRotatingLog(path: string, content: string, options: {
@@ -163,9 +152,7 @@ export function recordSlowHttpRequest(entry: {
   try {
     mkdirSync(dirname(path), { recursive: true })
     appendFileSync(path, `${line}\n`)
-  } catch {
-    // Performance diagnostics must never make the host process fail.
-  }
+  } catch {}
   return true
 }
 
@@ -179,13 +166,9 @@ function slowHttpKeysFor(path: string): Set<string> {
       try {
         const value = JSON.parse(line) as { key?: unknown }
         if (typeof value.key === 'string') keys.add(value.key)
-      } catch {
-        // Keep valid records usable if a previous write was interrupted.
-      }
+      } catch {}
     }
-  } catch {
-    // The file is expected not to exist on first launch.
-  }
+  } catch {}
   slowHttpKeys.set(path, keys)
   return keys
 }

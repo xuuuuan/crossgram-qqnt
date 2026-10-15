@@ -79,10 +79,7 @@ interface MediaSession {
   childrenStopped: boolean
 }
 
-/**
- * Local-only PCM gateway. Each connection exchanges 20 ms, 48 kHz mono s16le
- * PCM frames after authenticating with a single-use, short-lived lease.
- */
+/** 本地 PCM 媒体网关，使用一次性短期 lease 鉴权后收发 20ms、48kHz 单声道 s16le PCM 帧。 */
 export class LocalPCMMediaGateway {
   private server?: Server
   private session?: MediaSession
@@ -127,9 +124,7 @@ export class LocalPCMMediaGateway {
     const leaseIdBytes = randomBytes(LEASE_ID_BYTES)
     const leaseId = leaseIdBytes.toString('hex')
     const token = randomBytes(LEASE_TOKEN_BYTES)
-    // The lease is serialized over JSON and consumed by Crossgram as a
-    // protocol integer. performance.now() is fractional on real hosts, so
-    // round the deadline up while retaining the monotonic clock internally.
+    // `performance.now()` 含小数，向上取整以适配协议层的整数时间戳。
     const expiry = Math.ceil(this.now() + LEASE_TTL_MS)
     const expiryTimer = setTimeout(() => this.revokeLease(leaseId), LEASE_TTL_MS)
     expiryTimer.unref()
@@ -345,7 +340,6 @@ export class LocalPCMMediaGateway {
   private closeSession(socket?: Socket): void {
     const session = this.session
     if (!session || (socket && session.socket !== socket)) return
-    // Disconnect first so delayed child events cannot affect a replacement session.
     this.session = undefined
     clearTimeout(session.authTimeout)
     session.input.fill(0)
@@ -477,9 +471,7 @@ function sameCallIdentity(left: Buffer | undefined, right: Buffer): boolean {
 function stopProcess(process: MediaProcess | undefined): void {
   try {
     process?.kill('SIGTERM')
-  } catch {
-    // Cleanup must not keep the gateway session alive.
-  }
+  } catch {}
 }
 
 async function refuseExistingSocket(socketPath: string): Promise<void> {
@@ -489,7 +481,5 @@ async function refuseExistingSocket(socketPath: string): Promise<void> {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
     throw error
   }
-  // This pathname is configured outside the gateway, so no existing entry can
-  // be proven ours. Fail closed rather than racing a listener or replacement.
   throw new Error('PCM media socket path already exists')
 }

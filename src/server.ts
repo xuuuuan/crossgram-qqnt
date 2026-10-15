@@ -1077,8 +1077,7 @@ function httpLogTarget(_method: string, target: string): string {
   try {
     const path = new URL(target, 'http://localhost').pathname
     if (path === '/v1/calls/media-lease') return '/v1/calls/media-lease'
-    // Redact group-join targets for every HTTP method, including percent-encoded
-    // route separators, so future writes never log identifiers or query values.
+    // 脱敏加群路由参数，防止在日志中记录群号或加群凭据。
     if (isGroupJoinRoute(path)) return '/v1/groups/join'
   } catch {
     if (target === '/v1/calls/media-lease' || target.startsWith('/v1/calls/media-lease?')) {
@@ -1098,11 +1097,9 @@ function isGroupJoinRoute(path: string): boolean {
       if (decoded === normalized) return false
       normalized = decoded
     } catch {
-      // Any malformed percent-encoded target is unsafe to log verbatim.
       return path.includes('%')
     }
   }
-  // Excessive nesting is unsafe to log verbatim.
   return true
 }
 
@@ -1255,7 +1252,6 @@ function optionalNumberParam(url: URL, name: string): number | undefined {
   return value
 }
 
-/** Content summary of a send, whichever shape its manifest uses. */
 function sendContentSummary(manifest: SendManifest): string {
   if (manifest.parts?.length) {
     return `parts=${manifest.parts.map((part) => part.type === 'text'

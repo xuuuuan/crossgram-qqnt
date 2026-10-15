@@ -1,105 +1,44 @@
-# Headless QQNT deployment
+# Linux 无头部署说明
 
-The default deployment is intentionally not a container. QQ already bundles a
-large Electron runtime; adding a container does not reduce that cost. The
-service runs QQ as an unprivileged user under `dbus-run-session` and Xvfb. Xvfb
-is the only always-on GUI helper and normally uses only a few MiB.
+`qqnt-bridge` 以独立低权限用户 `qqnt-bridge` 在 `dbus-run-session` 与 `Xvfb` 下运行官方 Linux QQ，监听 `127.0.0.1:18767` 并自动生成随机 Bearer Token（保存在 `/etc/qqnt-bridge.env`）。
 
-## One-line install (Linux x86_64 with systemd)
+## 1. 一键安装
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/xuuuuan/crossgram-qqnt/master/deploy/install.sh | sudo sh
 ```
 
-On Debian/Ubuntu, the installer downloads Tencent's current official `.deb`.
-On Fedora/RHEL, Arch and openSUSE, install Linux QQ from
-<https://im.qq.com/linuxqq/index.shtml> first; the script installs the small
-runtime dependencies, finds QQ, creates a dedicated `qqnt-bridge` user, and
-enables the systemd unit.
+- Debian/Ubuntu 会自动下载并安装官方 Linux QQ `.deb`。
+- Fedora/RHEL、Arch、openSUSE 请先从 <https://im.qq.com/linuxqq/index.shtml> 安装 Linux QQ（不要使用无法原地注入的 AppImage），再执行安装脚本。
+- 若 QQ 安装在非标准路径（默认自动检测 `/opt/QQ/qq`、`/usr/local/bin/qq`、`/usr/bin/qq`），可显式指定：
+  ```sh
+  curl -fsSL https://raw.githubusercontent.com/xuuuuan/crossgram-qqnt/master/deploy/install.sh \
+    | sudo env QQNT_BINARY=/path/to/qq QQNT_RESOURCES_DIR=/path/to/resources sh
+  ```
 
-The usual `/opt/QQ/qq`, `/usr/local/bin/qq` and `/usr/bin/qq` locations are
-detected automatically. For a custom installation, specify the executable
-and, only when it is not beside the executable, its resources directory:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/xuuuuan/crossgram-qqnt/master/deploy/install.sh \
-  | sudo env QQNT_BINARY=/path/to/qq QQNT_RESOURCES_DIR=/path/to/resources sh
-```
-
-The QQ executable and resources must be readable by the dedicated
-`qqnt-bridge` service user. AppImages are not injectable in place; install an
-unpacked/native package or point the variables at an extracted QQ tree.
-The installer also installs `ffmpeg`, which is required for recorded QQ voice-message (PTT) conversion. The API listens on `127.0.0.1:18767` with a random bearer token by default.
+## 2. 日常管理（`qqntctl`）
 
 ```sh
-sudo qqntctl qr
+sudo qqntctl qr                    # 终端打印登录二维码
 sudo qqntctl qr --png /tmp/qqnt-login.png
-sudo qqntctl status
-sudo qqntctl logs
-sudo qqntctl update
+sudo qqntctl status                # 查看服务与登录状态
+sudo qqntctl logs                  # 查看实时日志
+sudo qqntctl logout                # 登出并切换账号（移走登录票据与恢复快照，保留聊天数据库）
+sudo qqntctl update                # 下载最新 Release 并原地升级（失败自动回滚登录快照）
+sudo qqntctl update debug          # 切换到 Debug 构建包
 ```
 
-`sudo qqntctl qr` prints the native QQ login QR directly in the terminal. A
-fresh installation does this automatically when no account is logged in; set
-`QQNT_BRIDGE_SHOW_QR=0` only for unattended provisioning.
+## 3. 自动登录与会话恢复
 
-To switch QQ accounts, run `sudo qqntctl logout` (alias:
-`sudo qqntctl switch-account`). It does not depend on the bridge HTTP API to
-remove the old session: it stops the service, moves QQNT's encrypted
-`auth/login.enc*` ticket files into `/var/lib/qqnt-bridge/backups/login`, starts
-the service, and prints the new account QR. Chat databases and Crossgram data
-are not removed.
+- 扫码登录成功后，桥接端会自动调用 `setAutoLoginSwitch(true)` 开启自动登录。
+- 账号稳定就绪 15 秒后，启动脚本会将 `auth`、全局登录库和 MMKV 配置备份为最近可用快照（Last-Known-Good），并自动关闭主窗口以节省内存（后台内核保持运行）。
+- 若后续重启卡在二维码界面超过 2 分钟，启动脚本会自动恢复该快照并重试一次。
+- systemd 服务默认限制内存上限为 `800M`（`MemoryMax=800M`），每 7 天自动周期性重启一次（`RuntimeMaxSec=7d`）。
 
-After a successful scan, the bridge calls QQNT's native
-`setAutoLoginSwitch(true)` setting and reads it back before reporting automatic
-login as enabled. Once the account remains ready for 15 seconds, the launcher
-saves a restricted last-known-good snapshot containing only `auth`, QQ's global
-login database, login markers and MMKV settings. If a later restart stays on the
-QR screen for two minutes, the launcher restores that snapshot and retries once.
-`qqntctl logout` moves both the active ticket and this recovery snapshot out of
-the way, so switching accounts cannot silently restore the old account.
+## 4. 登录 HTTP 接口
 
-In headless mode the bridge also closes the largest visible QQ window 15 seconds
-after the account session becomes ready, while keeping QQ's background/kernel
-processes alive. These behaviors are gated by `QQNT_BRIDGE_HEADLESS=1`; ordinary
-Windows injection does not enable them.
-
-The systemd unit restarts QQ every seven days (`RuntimeMaxSec=7d`) and also
-restarts it if the whole service cgroup exceeds 800 MiB (`MemoryMax=800M`).
-
-The Linux native packet hook has no QQ version profile or RVA allowlist. It
-locates the send wrapper from the assertion-string XRef, uses GNU unwind data
-for function boundaries, follows the response table relocation/call chain, and
-requires the `result`, `errMsg` and `rsp` XRefs to converge on the resolver.
-Ambiguous or malformed binaries fail closed.
-
-`sudo qqntctl update` downloads the latest release, stops QQ before replacing
-the injection, snapshots a currently ready account, preserves the existing
-`/etc/qqnt-bridge.env` and backups, then restarts the service. If the account no
-longer becomes ready, the installer restores the pre-update login snapshot and
-restarts once more.
-Running the one-line installer again performs the same in-place upgrade. Use
-`sudo qqntctl update debug` to switch to the latest debug package. Set
-`QQNT_BRIDGE_ARCHIVE_URL` when running the installer to use a local/custom
-build, or `QQNT_PACKAGE_URL` to pin an official QQ package.
-
-`qqntctl update` executes a temporary copy of the currently installed bootstrap
-instead of overwriting the script that is still running. The installer copies
-all helper files shipped in the release payload, so later releases can add a
-helper without requiring a second repair pass.
-
-Release and debug archives are built and tested by GitHub Actions. Production
-VPS hosts only download those release assets; they should not compile QQNT
-bridge locally because native builds can starve the other services on a small
-server.
-
-## HTTP login endpoints
-
-All endpoints use the same bearer token as the bridge API:
-
+与主 API 共用同一个 Bearer Token：
 - `GET /v1/login/status`
 - `GET /v1/login/qrcode.png`
 - `GET /v1/login/qrcode/url`
 - `POST /v1/login/qrcode/refresh`
-
-Keep the API on localhost and use an SSH tunnel when remote access is needed.

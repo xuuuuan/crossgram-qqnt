@@ -69,7 +69,6 @@ export interface PreparedDirectVideoUpload extends PreparedDirectUpload<Prepared
   thumbnailHighway?: DirectHighwayUpload
 }
 
-/** Sends OIDB packets through QQNT's native message-service binding. */
 export class QQPacketClient {
   private readonly loadAddon: () => PacketAddon
   private readonly now: () => number
@@ -109,7 +108,7 @@ export class QQPacketClient {
     const upload = plan.upload
     const chunks = exactBlocks(source, spec.size, HIGHWAY_BLOCK_SIZE, signal)
     if (!plan.highway) {
-      for await (const _chunk of chunks) { /* drain a fast-upload request body */ }
+      for await (const _chunk of chunks) { /* 秒传命中时消费完请求流 */ }
       return upload
     }
     const { session, extendInfo, commandId, sequenceStart } = plan.highway
@@ -159,7 +158,7 @@ export class QQPacketClient {
     const upload = plan.upload
     const chunks = exactBlocks(source, spec.size, HIGHWAY_BLOCK_SIZE, signal)
     if (!plan.highway) {
-      for await (const _chunk of chunks) { /* drain a fast-upload request body */ }
+      for await (const _chunk of chunks) { /* 秒传命中时消费完请求流 */ }
     } else {
       const { session, extendInfo, commandId, sequenceStart } = plan.highway
       let offset = 0
@@ -249,7 +248,7 @@ export class QQPacketClient {
     if (plan.highway) {
       await this.uploadHighwaySource(plan.highway, selfUin, spec.size, spec.md5, chunks, signal)
     } else {
-      for await (const _chunk of chunks) { /* drain a fast-upload request body */ }
+      for await (const _chunk of chunks) { /* 秒传命中时消费完请求流 */ }
     }
     if (plan.thumbnailHighway) {
       await this.uploadHighwaySource(
@@ -303,10 +302,7 @@ export class QQPacketClient {
     return { published: true }
   }
 
-  /**
-   * Send one poke (nudge) notice. QQ answers with an empty OIDB body, so only
-   * the envelope's error code is inspected; callers space repeated pokes.
-   */
+  /** 发送戳一戳（OIDB 响应体为空，仅校验外层错误码）。 */
   async poke(chatType: 1 | 2, peer: string, targetUin: string): Promise<void> {
     const addon = this.loadAddon()
     addon.decodePokeResponse(
@@ -442,9 +438,7 @@ export class QQPacketClient {
   async getImageDirectUrl(locator: QQMediaLocator): Promise<string | undefined> {
     if (locator.kind !== 'image' || !locator.originImageUrl) return
     try {
-      // Current QQNT builds expose originImageUrl as /download?... while some
-      // older builds include the multimedia host. Normalize both shapes before
-      // selecting and appending the refreshed RKey.
+      // 兼容相对路径 `/download?...` 与带完整域名的 `originImageUrl`。
       const original = new URL(locator.originImageUrl, QQ_IMAGE_ORIGIN)
       if (locator.imageSpec !== undefined) {
         original.searchParams.set('spec', String(locator.imageSpec))
@@ -585,8 +579,7 @@ export class QQPacketClient {
       expiresAt = Math.min(expiresAt, createdAt + ttlSeconds * 1_000)
     }
     if (!values.size) throw new Error('FetchRkey response contained no usable keys')
-    // Expire all keys together at the shortest server-provided TTL. A small
-    // safety window avoids returning a key while it is expiring at the CDN.
+    // 按最短 TTL 统一过期，并提前预留安全窗口避免临界失效。
     const remaining = Math.max(0, expiresAt - now)
     const safetyWindow = Math.min(30_000, Math.floor(remaining / 10))
     const cache = { values, expiresAt: Math.max(now, expiresAt - safetyWindow) }
