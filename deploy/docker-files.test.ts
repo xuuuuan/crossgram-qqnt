@@ -126,6 +126,17 @@ describe('Container image files', () => {
     expect(workflow).toContain('QQ_DEB_URL=${{ inputs.qq-deb-url || vars.QQ_DEB_URL')
   })
 
+  it('runs on release tags instead of every branch push', () => {
+    const workflow = readFileSync(join(root, '.github', 'workflows', 'release.yml'), 'utf8')
+    const trigger = workflow.slice(0, workflow.indexOf('\npermissions:'))
+    // A branch push must not start a release: the mirror rewrites the history
+    // and force-pushes its default branch on every sync, which would rebuild
+    // every version each time.
+    expect(trigger).toContain('tags:')
+    expect(trigger).not.toContain('branches:')
+    expect(workflow).toContain('concurrency:')
+  })
+
   it('gates publishing on a variable instead of a repository name', () => {
     const workflow = readFileSync(join(root, '.github', 'workflows', 'release.yml'), 'utf8')
     // A fork has neither the variable nor the images, so it keeps publishing

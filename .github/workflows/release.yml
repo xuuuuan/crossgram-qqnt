@@ -8,10 +8,12 @@ on:
         description: Linux QQ .deb to bundle instead of the default
         required: false
   push:
-    branches:
-      - main
     tags:
       - 'v*'
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: write
