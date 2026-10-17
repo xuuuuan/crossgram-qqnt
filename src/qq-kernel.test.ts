@@ -3114,6 +3114,40 @@ it('drops zero-peer sidecars while preserving the paired group service message',
     await expect(bridge.acceptGroupInvite({ groupCode: 'abc', msgSeq: '123' })).rejects.toThrow('invalid group invite')
   })
 
+  it('drops blank placeholder siblings of invite cards in history and live pushes', async () => {
+    const f = fixture()
+    const inviteCard: MsgRecord = {
+      ...f.message,
+      msgId: 'invite-card', msgSeq: '716', chatType: 1, sendType: 0,
+      peerUid: 'u_4urhkgTuiHeLXktAGtN73Q', peerUin: '3402182471',
+      elements: [{ elementType: 10, elementId: 'ark', arkElement: { bytesData: JSON.stringify({
+        app: 'com.tencent.tuwen.lua', bizsrc: 'qun.invite', prompt: '[链接]邀请你加入群聊',
+        meta: { news: {
+          title: '邀请你加入群聊', desc: '邀请你加入群聊“测试群聊”，进入可查看详情。', tag: '邀请加群',
+          jumpUrl: 'mqqapi://group/invite_join?groupcode=123456789&msgseq=1791449541900000',
+          preview: 'https://p.qlogo.cn/gh/123456789/123456789/?t=1',
+        } },
+      }) } }],
+    }
+    const blankSibling: MsgRecord = { ...inviteCard, msgId: 'invite-blank', msgSeq: '717', elements: [] }
+    f.msg.getLatestDbMsgs.mockResolvedValue({ result: 0, errMsg: '', msgList: [blankSibling, inviteCard] })
+
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const history = await bridge.getHistory(bridge.getConversation('u_4urhkgTuiHeLXktAGtN73Q'))
+    expect(history.messages.map((message) => message.id)).toEqual(['invite-card'])
+
+    const queue = bridge.subscribe()
+    const events = queue[Symbol.asyncIterator]()
+    f.emitReceived([{ ...blankSibling, msgId: 'invite-blank-live', msgSeq: '718' }])
+    const live = await Promise.race([
+      events.next().then((result) => result.done ? 'ended' : result.value),
+      new Promise((resolve) => setTimeout(() => resolve('none'), 25)),
+    ])
+    expect(live).toBe('none')
+    bridge.unsubscribe(queue)
+  })
+
   it('renders QQ group announcement shares as their decoded announcement text', async () => {
     const f = fixture()
     const encode = (value: string) => Buffer.from(value, 'utf8').toString('base64')

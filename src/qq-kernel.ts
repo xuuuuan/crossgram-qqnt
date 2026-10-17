@@ -1352,7 +1352,7 @@ export class QQKernelBridge {
     await this.resolveReplyTargets(visibleRecords)
     await this.resolveGrayTipUsers(visibleRecords)
     await Promise.all(visibleRecords.map((record) => this.enrichGroupMessageSender(record)))
-    const messages = await mapConcurrent(visibleRecords, 8, async (record) => {
+    const mapped = await mapConcurrent(visibleRecords, 8, async (record) => {
       const message = await this.mapMessagePrepared(record)
       // `MsgRecord` 仅包含回应计数，总数 <= 3 时顺带拉取前 3 个回应用户供客户端预览。
       const total = message.reactionContext?.reactions.reduce((sum, reaction) => sum + reaction.count, 0) ?? 0
@@ -1363,13 +1363,20 @@ export class QQKernelBridge {
       }
       return message
     })
+    const messages = mapped.filter((message) => {
+      if (isBlankPlaceholderMessage(message)) {
+        log('info', `blank message dropped id=${message.id} conversation=${conversation.id} source=history`)
+        return false
+      }
+      return true
+    })
     for (const message of messages) this.rememberMessage(message)
     if (!messages.length && !query.beforeId && !query.afterId && !query.cursor) {
       const cached = this.messages.get(conversation.id) ?? []
       return { messages: cached.slice(-limit).reverse() }
     }
     const last = response.msgList.at(-1)
-    return { messages, nextCursor: messages.length === limit ? last?.msgId : undefined }
+    return { messages, nextCursor: mapped.length === limit ? last?.msgId : undefined }
   }
 
   async getGroupFiles(
@@ -5990,6 +5997,11 @@ export class QQKernelBridge {
         log('info', receivedMessageSummary(conversation, message))
       }
       const previous = (this.messages.get(message.conversationId) ?? []).find((item) => item.id === message.id)
+      // 群邀请等分享会伴随一条无任何内容的占位消息，投影出去只会是客户端的空消息占位符，直接丢弃。
+      if (!previous && isBlankPlaceholderMessage(message)) {
+        log('info', `blank message dropped id=${message.id} conversation=${conversation.id} source=${source}`)
+        continue
+      }
       const pendingIntent = this.pendingReactionDesired.get(`${conversation.id}\u0000${message.id}`)
       if (pendingIntent && pendingIntent.expiresAt > Date.now()
         && (record.emojiLikesList === undefined || record.emojiLikesList.length === 0)) {
@@ -10419,6 +10431,15 @@ function summarizeCallbackArgs(args: unknown[]): string {
     return `${typeof value}(${String(value).slice(0, 80)})`
   })
   return `argc=${args.length} args=[${summary.join(';')}]`
+}
+
+/**
+ * 群邀请等部分分享会伴随一条无任何内容的占位消息（无部件、无服务动作、无回复目标），
+ * 投影到客户端只会得到空消息占位符，视为占位消息丢弃。
+ */
+function isBlankPlaceholderMessage(message: QQMessage): boolean {
+  return message.parts.length === 0 && !message.serviceAction && !message.replyToId
+    && !(message.reactionContext?.reactions.length)
 }
 
 function receivedMessageSummary(conversation: QQConversation, message: QQMessage): string {
