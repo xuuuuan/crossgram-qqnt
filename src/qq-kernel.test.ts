@@ -3111,6 +3111,10 @@ it('drops zero-peer sidecars while preserving the paired group service message',
       operateType: 1,
       targetMsg: { seq: '1791449541900000', type: 1, groupCode: '123456789', postscript: ' ' },
     })
+    // 开启审核的群返回非 0 但邀请已提交，不能当作失败。
+    f.group.operateSysNotify.mockResolvedValueOnce({ result: 1, errMsg: 'pending review' })
+    await expect(bridge.acceptGroupInvite({ groupCode: '123456789', msgSeq: '1791449541900001' }))
+      .resolves.toBeUndefined()
     await expect(bridge.acceptGroupInvite({ groupCode: 'abc', msgSeq: '123' })).rejects.toThrow('invalid group invite')
   })
 

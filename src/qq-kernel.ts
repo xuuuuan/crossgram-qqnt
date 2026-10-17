@@ -1181,7 +1181,9 @@ export class QQKernelBridge {
       if (error instanceof QQRequestApiUnavailableError) throw error
       throw new QQRequestResolutionError('operateSysNotify', -1, 'native request rejected')
     }
-    assertNativeRequestResolutionSuccess('operateSysNotify', result)
+    // 开启入群审核的群会以非 0 返回码上报“待审核”，但邀请已被提交，
+    // 仅记录返回值，不当作失败（与 NapCat 的处理一致）。
+    log('info', `group invite accept submitted group=${invite.groupCode} seq=${invite.msgSeq} result=${JSON.stringify(result)}`)
   }
 
   private async resolveRequestOnce(id: string, action: 'accept' | 'reject'): Promise<QQRequest> {
