@@ -6,7 +6,7 @@ import type { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import WebSocket, { WebSocketServer } from 'ws'
 import {
-  PROTOCOL_VERSION, type QQFlashTransferManifest, type QQMediaLocator, type QQMultiForwardLocator, type QQPokeRequest, type QQSendMediaSpec, type QQStickerReference, type SendManifest,
+  PROTOCOL_VERSION, type QQFlashTransferManifest, type QQGroupInvite, type QQMediaLocator, type QQMultiForwardLocator, type QQPokeRequest, type QQSendMediaSpec, type QQStickerReference, type SendManifest,
 } from './protocol.js'
 import { GroupMsgMask } from './kernel-types.js'
 import { QQMediaUploadRejectedError } from './upload-protocol.js'
@@ -799,6 +799,13 @@ export class QQBridgeServer {
       )
       log('info', `HTTP API inline keyboard click id=${requestId} conversation=${body.conversationId} message=${body.messageId} button=${body.buttonId} status=${result.status}`)
       json(response, 200, result)
+      return
+    }
+    if (request.method === 'POST' && path === '/v1/group-invites/accept') {
+      const body = await readJson<QQGroupInvite>(request)
+      await this.bridge.acceptGroupInvite(body)
+      log('info', `HTTP API group invite accept id=${requestId} group=${body.groupCode} seq=${body.msgSeq}`)
+      json(response, 200, {})
       return
     }
     if (request.method === 'POST' && path === '/v1/messages/multi-forward') {

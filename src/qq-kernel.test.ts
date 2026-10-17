@@ -3062,36 +3062,24 @@ it('drops zero-peer sidecars while preserving the paired group service message',
     })
   })
 
-  it('parses group-invite Ark cards with their universal join link', async () => {
+  it('parses official group-invite Ark cards with their join parameters', async () => {
+    // Payload shape captured from a live qun.invite card; ids sanitized.
     const f = fixture()
     f.message.elements = [{
       elementType: 10, elementId: 'group-invite', arkElement: { bytesData: JSON.stringify({
-        app: 'com.tencent.groupinvite', prompt: '[邀请加群]邀请你加入群聊',
-        meta: { detail_1: {
+        app: 'com.tencent.tuwen.lua', bizsrc: 'qun.invite', prompt: '[链接]邀请你加入群聊',
+        meta: { news: {
           title: '邀请你加入群聊',
-          desc: '邀请你加入群聊“2026 ICPC 成都赛站”，进入可查看详情。',
-          source: '邀请加群',
-          avatar: 'https://p.qlogo.cn/gh/557665508/557665508/100',
-          group_qqlink_universal: 'https://qm.qq.com/cgi-bin/qm/qr?k=AbcDef123&from=app',
+          desc: '邀请你加入群聊“测试群聊”，进入可查看详情。',
+          tag: '邀请加群',
+          jumpUrl: 'mqqapi://group/invite_join?src_type=internal&version=1&groupcode=123456789&msgseq=1791449541900000&groupname=%e6%b5%8b%e8%af%95%e7%be%a4%e8%81%8a&senderuin=10001&receiveruin=10002',
+          preview: 'https://p.qlogo.cn/gh/123456789/123456789/?t=1791449541',
         } },
       }) },
     }, {
-      elementType: 10, elementId: 'group-invite-link-elsewhere', arkElement: { bytesData: JSON.stringify({
-        app: 'com.tencent.groupinvite', prompt: '[邀请加群]邀请你加入群聊',
-        meta: {
-          detail_1: { title: '邀请你加入群聊', desc: '邀请你加入群聊“测试群”，进入可查看详情。', source: '邀请加群' },
-          groupinvite: { group_qqlink_universal: 'https://qm.qq.com/cgi-bin/qm/qr?k=Elsewhere9' },
-        },
-      }) },
-    }, {
-      elementType: 10, elementId: 'group-invite-no-link', arkElement: { bytesData: JSON.stringify({
-        app: 'com.tencent.groupinvite', prompt: '[邀请加群]邀请你加入群聊',
-        meta: { detail_1: {
-          title: '邀请你加入群聊',
-          desc: '邀请你加入群聊“无链接群”，进入可查看详情。',
-          source: '邀请加群',
-          avatar: 'https://p.qlogo.cn/gh/123456/123456/100',
-        } },
+      elementType: 10, elementId: 'group-invite-malformed', arkElement: { bytesData: JSON.stringify({
+        app: 'com.tencent.tuwen.lua', bizsrc: 'qun.invite',
+        meta: { news: { title: '邀请你加入群聊', jumpUrl: 'mqqapi://group/invite_join?groupcode=123456789' } },
       }) },
     }]
     const bridge = new QQKernelBridge()
@@ -3099,19 +3087,31 @@ it('drops zero-peer sidecars while preserving the paired group service message',
 
     await expect(bridge.getHistory(bridge.getConversation('uid-1715311957'))).resolves.toMatchObject({
       messages: [{ parts: [{ type: 'card', card: {
-        kind: 'link', source: '邀请加群', title: '邀请你加入群聊',
-        description: '邀请你加入群聊“2026 ICPC 成都赛站”，进入可查看详情。',
-        url: 'https://qm.qq.com/cgi-bin/qm/qr?k=AbcDef123&from=app',
-        thumbnailUrl: 'https://p.qlogo.cn/gh/557665508/557665508/100',
-      } }, { type: 'card', card: {
-        kind: 'link', title: '邀请你加入群聊',
-        url: 'https://qm.qq.com/cgi-bin/qm/qr?k=Elsewhere9',
+        kind: 'application', source: '邀请加群', title: '邀请你加入群聊',
+        description: '邀请你加入群聊“测试群聊”，进入可查看详情。\n群号 123456789',
+        thumbnailUrl: 'https://p.qlogo.cn/gh/123456789/123456789/?t=1791449541',
+        groupInvite: { groupCode: '123456789', msgSeq: '1791449541900000' },
       } }, { type: 'card', card: {
         kind: 'application', title: '邀请你加入群聊',
-        description: '邀请你加入群聊“无链接群”，进入可查看详情。',
-        thumbnailUrl: 'https://p.qlogo.cn/gh/123456/123456/100',
       } }] }],
     })
+    const malformed = await bridge.getHistory(bridge.getConversation('uid-1715311957'))
+    expect(malformed.messages[0]?.parts[1]?.type === 'card'
+      && malformed.messages[0]?.parts[1]?.card.groupInvite).toBeUndefined()
+  })
+
+  it('accepts a group-invite card through operateSysNotify', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.acceptGroupInvite({ groupCode: '123456789', msgSeq: '1791449541900000' }))
+      .resolves.toBeUndefined()
+    expect(f.group.operateSysNotify).toHaveBeenCalledWith(false, {
+      operateType: 1,
+      targetMsg: { seq: '1791449541900000', type: 1, groupCode: '123456789', postscript: ' ' },
+    })
+    await expect(bridge.acceptGroupInvite({ groupCode: 'abc', msgSeq: '123' })).rejects.toThrow('invalid group invite')
   })
 
   it('renders QQ group announcement shares as their decoded announcement text', async () => {
@@ -7698,6 +7698,24 @@ describe('QQBridgeServer', () => {
     vi.unstubAllEnvs()
     vi.restoreAllMocks()
     await Promise.all(tempPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })))
+  })
+
+  it('accepts group invites over the HTTP API', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/v1/group-invites/accept`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ groupCode: '123456789', msgSeq: '1791449541900000' }),
+    })
+    expect(response.status).toBe(200)
+    expect(f.group.operateSysNotify).toHaveBeenCalledWith(false, {
+      operateType: 1,
+      targetMsg: { seq: '1791449541900000', type: 1, groupCode: '123456789', postscript: ' ' },
+    })
   })
 
   it('serves the reactions catalog over HTTP while a native catalog step is stuck', async () => {

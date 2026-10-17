@@ -283,6 +283,15 @@ export interface QQCard {
   /** 仅保留 HTTP/HTTPS 链接，忽略 QQ 私有 scheme。 */
   url?: string
   thumbnailUrl?: string
+  /** Official group-invite cards (bizsrc=qun.invite): accepts the invite via operateSysNotify. */
+  groupInvite?: QQGroupInvite
+}
+
+/** Parameters of an official "邀请你加入群聊" card's mqqapi jump link. */
+export interface QQGroupInvite {
+  groupCode: string
+  /** Notify seq; operateSysNotify resolves the invitation by it. */
+  msgSeq: string
 }
 
 export interface QQMultiForwardLocator {

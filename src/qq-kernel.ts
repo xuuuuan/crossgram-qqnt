@@ -33,6 +33,7 @@ import {
 import {
   conversationId, parseConversationId, type HistoryQuery, type MemberPage, type QQCallSignalEvent, type QQCard, type QQConversation, type QQEvent, type QQGroupFilePage, type QQMedia, type QQMediaLocator, type QQMediaUploadPlan, type QQMessage, type QQMultiForwardLocator, type QQReactionActorPage, type QQReactionContext, type QQReactionDefinition, type QQReactionState,
   type QQFlashTransferManifest, type QQFlashTransferResult, type QQPokeResult, type QQRequest, type QQRequestKind, type QQRequestPage, type QQRequestStatus, type QQSendMediaSpec, type QQServiceMember, type QQSticker, type QQStickerPack, type QQStickerPackSummary, type QQStickerReference, type QQTextPart, type SearchPage, type SearchQuery, type SendManifest,
+  type QQGroupInvite,
 } from './protocol.js'
 
 const REACTION_ASSET_META_TTL_MS = 10 * 60_000
@@ -1161,6 +1162,26 @@ export class QQKernelBridge {
         this.requestResolutionFlights.delete(id)
       }
     }
+  }
+
+  /** Accepts an official group-invite card (bizsrc=qun.invite) via its notify seq. */
+  async acceptGroupInvite(invite: QQGroupInvite): Promise<void> {
+    if (!/^\d+$/.test(invite.groupCode) || !/^\d+$/.test(invite.msgSeq)) {
+      throw new Error('invalid group invite')
+    }
+    const method = this.groupService?.operateSysNotify
+    if (!method) throw new QQRequestApiUnavailableError()
+    let result: unknown
+    try {
+      result = await method.call(this.groupService, false, {
+        operateType: 1,
+        targetMsg: { seq: invite.msgSeq, type: 1, groupCode: invite.groupCode, postscript: ' ' },
+      })
+    } catch (error) {
+      if (error instanceof QQRequestApiUnavailableError) throw error
+      throw new QQRequestResolutionError('operateSysNotify', -1, 'native request rejected')
+    }
+    assertNativeRequestResolutionSuccess('operateSysNotify', result)
   }
 
   private async resolveRequestOnce(id: string, action: 'accept' | 'reject'): Promise<QQRequest> {
@@ -10209,7 +10230,6 @@ function structuredCard(element: MsgElement): QQCard | undefined {
 
 const URL_KEYS = [
   'qqdocurl', 'pcJumpUrl', 'jumpUrl', 'url', 'webUrl', 'shareUrl',
-  'group_qqlink_universal', 'group_qqlink',
 ]
 
 function arkCard(value: unknown): QQCard | undefined {
@@ -10240,7 +10260,6 @@ function arkCard(value: unknown): QQCard | undefined {
   if (!title) return
   const description = legacyMiniApp ? '' : firstString(record, ['desc', 'description', 'summary', 'brief'])
   const url = firstWebUrl(record, URL_KEYS)
-    || candidates.map(({ record }) => record).map((other) => firstWebUrl(other, URL_KEYS)).find(Boolean)
     || firstWebUrl(root, ['jumpUrl', 'url'])
   const thumbnailUrl = firstWebUrl(record, [
     'preview', 'previewUrl', 'imageUrl', 'image', 'cover', 'coverUrl', 'icon', 'iconUrl', 'avatar',
@@ -10250,7 +10269,29 @@ function arkCard(value: unknown): QQCard | undefined {
       : key.includes('contact') ? 'contact'
         : key.includes('location') ? 'location'
           : url ? 'link' : 'application'
-  return compactCard({ kind, title, description, source, url, thumbnailUrl })
+  const groupInvite = groupInviteFromArk(root, record)
+  const described = description && groupInvite
+    ? `${description}\n群号 ${groupInvite.groupCode}`
+    : description
+  return compactCard({ kind, title, description: described, source, url, thumbnailUrl, groupInvite })
+}
+
+/**
+ * Parameters of an official "邀请你加入群聊" card (bizsrc=qun.invite). Its only
+ * jump target is the mqqapi deep link, whose groupcode/msgseq are exactly what
+ * operateSysNotify needs to accept the invitation.
+ */
+function groupInviteFromArk(
+  root: Record<string, unknown>,
+  record: Record<string, unknown>,
+): QQGroupInvite | undefined {
+  if (stringValue(root.bizsrc) !== 'qun.invite') return
+  const jump = stringValue(record.jumpUrl)
+  const query = new URLSearchParams(jump.slice(jump.indexOf('?') + 1))
+  const groupCode = query.get('groupcode') ?? ''
+  const msgSeq = query.get('msgseq') ?? ''
+  if (!/^\d+$/.test(groupCode) || !/^\d+$/.test(msgSeq)) return
+  return { groupCode, msgSeq }
 }
 
 function xmlCard(xml: string): QQCard | undefined {
@@ -10285,6 +10326,7 @@ function compactCard(card: QQCard): QQCard {
     ...(card.source && card.source !== card.title ? { source: card.source } : {}),
     ...(card.url ? { url: card.url } : {}),
     ...(card.thumbnailUrl ? { thumbnailUrl: card.thumbnailUrl } : {}),
+    ...(card.groupInvite ? { groupInvite: card.groupInvite } : {}),
   }
 }
 
