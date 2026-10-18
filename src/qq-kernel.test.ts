@@ -1081,6 +1081,28 @@ describe('QQKernelBridge', () => {
     expect(f.uix.getUid).toHaveBeenCalledWith(new Set(['1715311957']))
   })
 
+  it('answers a plain-number QQ id from the buddy cache without a UID conversion', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.emitBuddyList([{ buddyList: [{
+      uid: 'uid-1715311957', uin: '1715311957', nick: 'Numbered Friend', remark: '', avatarUrl: '',
+    }] }])
+
+    await expect(bridge.getUser('1715311957')).resolves.toMatchObject({
+      id: 'uid-1715311957', numericId: '1715311957',
+    })
+    expect(f.uix.getUid).not.toHaveBeenCalled()
+  })
+
+  it('rejects a plain QQ number that no cache entry or conversion resolves', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.getUser('888999000')).rejects.toThrow('could not be resolved to a UID')
+  })
+
   it('answers a plain-number user ID from the cache without a UID conversion', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
@@ -5557,6 +5579,50 @@ it('drops zero-peer sidecars while preserving the paired group service message',
     expect(f.group.kickMember).toHaveBeenCalledWith('1058754719', ['member'], true, '')
     expect(f.buddy.setBlock).toHaveBeenNthCalledWith(1, 123456789, true)
     expect(f.buddy.setBlock).toHaveBeenNthCalledWith(2, 123456789, false)
+  })
+
+  it('resolves numeric member and block ids through the user cache before native calls', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    f.emitBuddyList([{ buddyList: [{
+      uid: 'uid-1715311957', uin: '1715311957', nick: 'Numbered Friend', remark: '', avatarUrl: '',
+    }] }])
+    const group = bridge.getConversation('1058754719')
+
+    await bridge.moderateMember(group, '1715311957', 'mute')
+    await bridge.setUserBlocked('uid-1715311957', true)
+
+    expect(f.group.setMemberShutUp).toHaveBeenCalledWith('1058754719', [
+      { uid: 'uid-1715311957', timeStamp: 0 },
+    ])
+    expect(f.buddy.setBlock).toHaveBeenCalledWith(1715311957, true)
+    expect(f.uix.getUid).not.toHaveBeenCalled()
+    expect(f.uix.getUin).not.toHaveBeenCalled()
+  })
+
+  it('falls back to UixConvertService when a numeric member id is not cached', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const group = bridge.getConversation('1058754719')
+
+    await bridge.moderateMember(group, '1715311957', 'kick')
+
+    expect(f.uix.getUid).toHaveBeenCalledWith(new Set(['1715311957']))
+    expect(f.group.kickMember).toHaveBeenCalledWith('1058754719', ['uid-1715311957'], false, '')
+  })
+
+  it('resolves a direct conversation from a numeric QQ id via conversion', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    const conversation = await bridge.resolveConversation(1, '1715311957')
+    expect(conversation).toMatchObject({
+      id: 'uid-1715311957', kind: 'direct', peerUid: 'uid-1715311957', peerUin: '1715311957',
+    })
+    expect(f.uix.getUid).toHaveBeenCalledWith(new Set(['1715311957']))
   })
 
   it('always supplies the fourth native kick argument, including the caller reason', async () => {

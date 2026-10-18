@@ -1270,20 +1270,17 @@ export class QQKernelBridge {
         log('error', `group profile resolve failed group=${numericId}`, error))
       return this.withConversationAvatar(this.contacts.get(created.id) ?? created)
     }
-    const buddy = [...this.users.values()].find((user) => user.numericId === numericId)
+    const buddy = [...this.users.values(), ...this.seenUsers.values()]
+      .find((user) => user.numericId === numericId || user.id === numericId)
     if (buddy) {
       const created: QQConversation = {
-        id: conversationId(CHAT_C2C, buddy.id), kind: 'direct', title: buddy.name,
-        peerUid: buddy.id, peerUin: numericId, chatType: CHAT_C2C,
+        id: conversationId(CHAT_C2C, buddy.id), kind: 'direct', title: buddy.name || numericId,
+        peerUid: buddy.id, peerUin: buddy.numericId ?? numericId, chatType: CHAT_C2C,
       }
       this.mergeConversation(created)
       return this.withConversationAvatar(created)
     }
-    const converted = await retryTransientInvalidArgument(
-      () => this.requireSession().getUixConvertService().getUid(new Set([numericId])),
-    )
-    const peerUid = converted.uidInfo.get(numericId)
-    if (!peerUid) throw new Error(`QQ user ${numericId} could not be resolved to a UID`)
+    const peerUid = await this.resolveUserId(numericId)
     const created: QQConversation = {
       id: conversationId(CHAT_C2C, peerUid), kind: 'direct', title: numericId,
       peerUid, peerUin: numericId, chatType: CHAT_C2C,
@@ -1604,15 +1601,15 @@ export class QQKernelBridge {
     role: 'administrator' | 'member',
   ): Promise<void> {
     if (conversation.chatType !== CHAT_GROUP) throw new Error('member roles are only supported for group conversations')
-    if (!userId) throw new Error('member user id is required')
+    const uid = await this.resolveUserId(userId)
     const groupService = this.requireGroupService()
     const method = groupService.modifyMemberRole
     if (!method) throw new Error('QQNT does not expose modifyMemberRole')
     const nativeRole = role === 'administrator' ? MEMBER_ADMIN : 2
     const groupCode = conversation.peerUin || conversation.peerUid
-    log('info', `native API start name=modifyMemberRole group=${groupCode} user=${userId} role=${nativeRole}`)
-    const result = await method.call(groupService, groupCode, userId, nativeRole)
-    log('info', `native API complete name=modifyMemberRole group=${groupCode} user=${userId} role=${nativeRole} result=${result.result} err=${JSON.stringify(result.errMsg)}`)
+    log('info', `native API start name=modifyMemberRole group=${groupCode} user=${uid} role=${nativeRole}`)
+    const result = await method.call(groupService, groupCode, uid, nativeRole)
+    log('info', `native API complete name=modifyMemberRole group=${groupCode} user=${uid} role=${nativeRole} result=${result.result} err=${JSON.stringify(result.errMsg)}`)
     if (result.result !== 0) {
       throw new Error(`modifyMemberRole: ${result.errMsg} (${result.result})`)
     }
@@ -1631,7 +1628,7 @@ export class QQKernelBridge {
     if (!Number.isFinite(requested) || requested < 1 || requested > QQ_POKE_MAX_COUNT) {
       throw new Error(`QQ poke count must be between 1 and ${QQ_POKE_MAX_COUNT}`)
     }
-    const target = userId?.trim() || conversation.peerUid
+    const target = userId?.trim() ? await this.resolveUserId(userId) : conversation.peerUid
     if (!target) throw new Error('QQ poke target user id is required')
     const targetUin = await this.resolvePokeUin(
       target,
@@ -1708,20 +1705,20 @@ export class QQKernelBridge {
     reason = '',
   ): Promise<void> {
     if (conversation.chatType !== CHAT_GROUP) throw new Error('member moderation is only supported for group conversations')
-    if (!userId) throw new Error('member user id is required')
+    const uid = await this.resolveUserId(userId)
     const groupService = this.requireGroupService()
     const groupCode = conversation.peerUin || conversation.peerUid
     if (action === 'kick') {
       const method = groupService.kickMember
       if (!method) throw new Error('QQNT does not expose kickMember')
-      const response = await method.call(groupService, groupCode, [userId], rejectAddRequest, reason)
+      const response = await method.call(groupService, groupCode, [uid], rejectAddRequest, reason)
       if (isNativeFailureResult(response)) {
         throw new Error(`kickMember: ${response.errMsg} (${response.result})`)
       }
       if (typeof response?.errCode === 'number' && response.errCode !== 0) {
         throw new Error(`kickMember: ${response.errMsg || 'native request failed'} (${response.errCode})`)
       }
-      const rejected = response?.resultList?.find((item) => item.uid === userId) ?? response?.resultList?.[0]
+      const rejected = response?.resultList?.find((item) => item.uid === uid) ?? response?.resultList?.[0]
       if (rejected && rejected.result !== 0) {
         throw new Error(`kickMember: ${response?.errMsg || 'member was not removed'} (${rejected.result})`)
       }
@@ -1730,7 +1727,7 @@ export class QQKernelBridge {
     const method = groupService.setMemberShutUp
     if (!method) throw new Error('QQNT does not expose setMemberShutUp')
     const timestamp = action === 'mute' ? Math.max(0, Math.trunc(untilDate)) : 0
-    const result = await method.call(groupService, groupCode, [{ uid: userId, timeStamp: timestamp }])
+    const result = await method.call(groupService, groupCode, [{ uid, timeStamp: timestamp }])
     if (result.result !== 0) throw new Error(`setMemberShutUp: ${result.errMsg} (${result.result})`)
   }
 
@@ -1738,14 +1735,18 @@ export class QQKernelBridge {
     if (!userId) throw new Error('user id is required')
     const service = this.requireBuddyService()
     if (!service.setBlock) throw new Error('QQNT does not expose setBlock')
-    let uin = Number(userId)
-    if (!Number.isSafeInteger(uin) || uin <= 0) {
-      const converted = await this.requireSession().getUixConvertService().getUin(new Set([userId]))
-      const value = converted.uinInfo.get(userId)
-      uin = Number(value)
+    let uin = /^\d+$/.test(userId)
+      ? userId
+      : this.users.get(userId)?.numericId ?? this.seenUsers.get(userId)?.numericId
+    if (!uin || !/^\d+$/.test(uin)) {
+      const converted = await retryTransientInvalidArgument(
+        () => this.requireSession().getUixConvertService().getUin(new Set([userId])),
+      )
+      uin = converted.uinInfo.get(userId)
+      if (uin && uin !== userId) this.rememberSeenUser({ id: userId, numericId: uin, name: userId })
     }
-    if (!Number.isSafeInteger(uin) || uin <= 0) throw new Error(`QQ user ${userId} could not be resolved to a UIN`)
-    await service.setBlock(uin, blocked)
+    if (!uin || !/^\d+$/.test(uin)) throw new Error(`QQ user ${userId} could not be resolved to a UIN`)
+    await service.setBlock(Number(uin), blocked)
   }
 
   private async hydrateRecentTopMessage(conversation: QQConversation): Promise<QQConversation> {
@@ -3387,59 +3388,51 @@ export class QQKernelBridge {
     }
   }
 
+  /** 入参归一化：纯数字视为 QQ 号，先查内部缓存反查 uid，未命中再用 UixConvertService 转换并回写缓存；其余输入视为 uid 原样通过。 */
+  private async resolveUserId(input: string): Promise<string> {
+    const trimmed = input?.trim()
+    if (!trimmed) throw new Error('user id is required')
+    if (!/^\d+$/.test(trimmed)) return trimmed
+    for (const user of this.users.values()) {
+      if (user.numericId === trimmed || user.id === trimmed) return user.id
+    }
+    for (const user of this.seenUsers.values()) {
+      if (user.numericId === trimmed || user.id === trimmed) return user.id
+    }
+    const converted = await retryTransientInvalidArgument(
+      () => this.requireSession().getUixConvertService().getUid(new Set([trimmed])),
+    )
+    const uid = converted.uidInfo.get(trimmed)
+    if (!uid) throw new Error(`QQ number ${trimmed} could not be resolved to a UID`)
+    if (uid !== trimmed) this.rememberSeenUser({ id: uid, numericId: trimmed, name: trimmed })
+    return uid
+  }
+
   /**
   * Satori's id space is numeric QQ numbers, but the wire mention element needs
   * the NT uid. Rewrite every plain-number mention userId to its uid in place
   * (keeping the number as numericId) before the send parts are built.
   */
   private async resolveNumericMentions(part: QQTextPart): Promise<void> {
-    const numbers = new Set<string>()
     for (const entity of part.entities ?? []) {
       if (entity.type === 'mention' && /^\d+$/.test(entity.userId)) {
         if (!entity.numericId) entity.numericId = entity.userId
-        numbers.add(entity.userId)
+        entity.userId = await this.resolveUserId(entity.userId)
       }
-    }
-    if (!numbers.size) return
-    const uidByNumber = new Map<string, string>()
-    await Promise.all([...numbers].map(async (number) => {
-      try {
-        const converted = await retryTransientInvalidArgument(
-          () => this.requireSession().getUixConvertService().getUid(new Set([number])),
-        )
-        const resolvedUid = converted.uidInfo.get(number)
-        if (resolvedUid && resolvedUid !== number) uidByNumber.set(number, resolvedUid)
-      } catch (error) {
-        log('error', `mention QQ number ${number} could not be resolved to a UID`, error)
-      }
-    }))
-    for (const entity of part.entities ?? []) {
-      if (entity.type === 'mention' && uidByNumber.has(entity.userId)) entity.userId = uidByNumber.get(entity.userId)!
     }
   }
 
-  async getUser(uid: string): Promise<{
+  async getUser(uidInput: string): Promise<{
     id: string, numericId?: string, name: string, avatarUrl?: string, signature?: string,
     avatar?: QQMedia, bot?: true
   } | undefined> {
-    if (!uid.trim()) return undefined
+    if (!uidInput.trim()) return undefined
+    const uid = await this.resolveUserId(uidInput)
     let cached = this.seenUsers.get(uid) ?? this.users.get(uid)
     if (cached && (isFallbackUserName(cached) || cached.signature === undefined)) {
       await this.ensureUserProfiles([uid]).catch((error) =>
         log('error', `QQ profile resolve failed uid=${uid}; using cached fallback`, error))
       cached = this.seenUsers.get(uid) ?? this.users.get(uid)
-    }
-    // 先查缓存（无 senderUid 的消息会直接以 senderUin 作为用户 ID 缓存），未命中时再将纯数字 QQ 号转换为 UID。
-    if (!cached && /^\d+$/.test(uid)) {
-      try {
-        const converted = await retryTransientInvalidArgument(
-          () => this.requireSession().getUixConvertService().getUid(new Set([uid])),
-        )
-        const resolvedUid = converted.uidInfo.get(uid)
-        if (resolvedUid && resolvedUid !== uid) return this.getUser(resolvedUid)
-      } catch (error) {
-        log('error', `QQ number ${uid} could not be resolved to a UID`, error)
-      }
     }
     if (cached) { return { ...cached,
         name: firstUsefulTitle(
