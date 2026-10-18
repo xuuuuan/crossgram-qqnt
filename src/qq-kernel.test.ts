@@ -4386,7 +4386,7 @@ it('drops zero-peer sidecars while preserving the paired group service message',
     expect(firstPack).not.toBeNull()
     const firstStickers = firstPack!.stickers
     expect(firstStickers).toMatchObject([
-      { stickerId: 'favorite:gif-favorite', format: 'animated', mimeType: 'image/gif', reference: { mimeType: 'image/gif', animated: true } },
+      { stickerId: 'favorite:gif-md5', format: 'animated', mimeType: 'image/gif', reference: { mimeType: 'image/gif', animated: true } },
       { stickerId: 'favorite:jpeg-favorite', format: 'static', mimeType: 'image/jpeg', reference: { mimeType: 'image/jpeg', animated: false } },
       { stickerId: 'favorite:png-favorite', format: 'static', mimeType: 'image/png', reference: { mimeType: 'image/png', animated: false } },
       { stickerId: 'favorite:apng-favorite', format: 'animated', mimeType: 'image/apng', reference: { mimeType: 'image/apng', animated: true } },
@@ -4439,7 +4439,7 @@ it('drops zero-peer sidecars while preserving the paired group service message',
     })
     await expect(second.getStickerPack('qq-favorites')).resolves.toMatchObject({
       stickers: [
-        { stickerId: 'favorite:gif-favorite', format: 'animated', mimeType: 'image/gif' },
+        { stickerId: 'favorite:gif-md5', format: 'animated', mimeType: 'image/gif' },
         { stickerId: 'favorite:jpeg-favorite', format: 'static', mimeType: 'image/jpeg' },
         { stickerId: 'favorite:png-favorite', format: 'static', mimeType: 'image/png' },
         { stickerId: 'favorite:apng-favorite', format: 'animated', mimeType: 'image/apng' },
@@ -4688,7 +4688,7 @@ it('drops zero-peer sidecars while preserving the paired group service message',
 
     const page = await bridge.getSavedStickers()
     expect(page.stickers).toMatchObject([{
-      stickerId: 'favorite:fav-res', format: 'static', width: 1, height: 1,
+      stickerId: 'favorite:fav-md5', format: 'static', width: 1, height: 1,
     }])
     expect(f.msg.fetchFavEmojiList).toHaveBeenCalledWith('', 200, true, true)
     const reference = page.stickers[0].reference
@@ -4699,6 +4699,63 @@ it('drops zero-peer sidecars while preserving the paired group service message',
     }))
     await bridge.setSavedSticker(reference, false)
     expect(f.msg.deleteFavEmoji).toHaveBeenCalledWith(['fav-res'])
+  })
+
+  it('identifies a favorite sticker by its content so messages and the collection agree', async () => {
+    const f = fixture()
+    const directory = await mkdtemp(join(tmpdir(), 'qqnt-favorite-identity-'))
+    tempPaths.push(directory)
+    const path = join(directory, 'favorite.png')
+    await writeFile(path, Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+      'base64',
+    ))
+    f.msg.fetchFavEmojiList.mockResolvedValue({
+      result: 0, errMsg: '', emojiInfoList: [{
+        emoPath: path, isExist: true,
+        resId: '1715311957_0_0_0_6D08089772D24F738EB24FE80271208A_0_0',
+        url: '', md5: '6D08089772D24F738EB24FE80271208A',
+        emoOriginalPath: path, thumbPath: path, isAPNG: false, isMarkFace: false,
+        eId: '', epId: '', desc: 'Saved image',
+      }],
+    })
+    // 同一条收藏在收藏列表里带 resId，在消息元素里只带小写 md5；两边必须派生同一个 sticker id，
+    // 否则同一个表情会拿到两个 document id（最近使用出现重复、旧的那个还发不出去）。
+    f.message.elements = [{
+      elementType: 2, elementId: 'favorite-image',
+      picElement: {
+        fileName: 'favorite.png', fileSize: '4', picWidth: 1, picHeight: 1,
+        md5HexStr: '6d08089772d24f738eb24fe80271208a',
+        fileUuid: 'favorite-uuid', fileSubId: '', picSubType: 1, sourcePath: path,
+      },
+    }]
+    const attach = () => {
+      const bridge = new QQKernelBridge()
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: directory })
+      return bridge
+    }
+
+    // 每种历史 id 形态都在冷缓存下各自解析一次，避免靠前一次调用留下的别名蒙混过关。
+    for (const stickerId of [
+      'favorite:6d08089772d24f738eb24fe80271208a',
+      'favorite:6D08089772D24F738EB24FE80271208A',
+      'favorite:1715311957_0_0_0_6D08089772D24F738EB24FE80271208A_0_0',
+    ]) {
+      await expect(attach().getSticker(stickerId)).resolves.toMatchObject({
+        stickerId: 'favorite:6d08089772d24f738eb24fe80271208a',
+        reference: { md5: '6D08089772D24F738EB24FE80271208A' },
+      })
+    }
+
+    const bridge = attach()
+    const [message] = (await bridge.getHistory(bridge.getConversation('uid-1715311957'))).messages
+    expect(message.parts).toContainEqual(expect.objectContaining({
+      type: 'sticker',
+      sticker: expect.objectContaining({ stickerId: 'favorite:6d08089772d24f738eb24fe80271208a' }),
+    }))
+    await expect(bridge.getStickerPack('qq-favorites')).resolves.toMatchObject({
+      stickers: [{ stickerId: 'favorite:6d08089772d24f738eb24fe80271208a', packId: 'qq-favorites' }],
+    })
   })
 
   it('probes and caches missing remote favorite dimensions without downloading the full asset', async () => {
@@ -4738,11 +4795,11 @@ it('drops zero-peer sidecars while preserving the paired group service message',
     const second = await bridge.getSavedStickers()
 
     expect(first.stickers).toMatchObject([{
-      stickerId: 'favorite:remote-png', format: 'static', mimeType: 'image/png',
+      stickerId: 'favorite:png-md5', format: 'static', mimeType: 'image/png',
       width: 512, height: 286, size: 12_345, version: 2,
       reference: { width: 512, height: 286, size: 12_345, mimeType: 'image/png' },
     }, {
-      stickerId: 'favorite:remote-gif', format: 'animated', mimeType: 'image/gif',
+      stickerId: 'favorite:gif-md5', format: 'animated', mimeType: 'image/gif',
       width: 320, height: 180, size: 98_765, version: 2,
       reference: { width: 320, height: 180, size: 98_765, mimeType: 'image/gif' },
     }])
@@ -8743,7 +8800,7 @@ describe('QQBridgeServer', () => {
     expect(response.status).toBe(200)
     await expect(response.json()).resolves.toMatchObject({
       stickers: [{
-        stickerId: 'favorite:wide-favorite', width: 640, height: 360, size: 54_321, version: 2,
+        stickerId: 'favorite:wide-md5', width: 640, height: 360, size: 54_321, version: 2,
         reference: { width: 640, height: 360, size: 54_321, mimeType: 'image/png' },
       }],
     })

@@ -2076,11 +2076,15 @@ export class QQKernelBridge {
         ) ?? null
       )
     }
-    if (stickerId.startsWith('favorite:')) {
+    const favorite = parseFavoriteStickerId(stickerId)
+    if (favorite) {
+      // 收藏表情同时存在内容（md5）形态与历史 `resId` 形态的 id，冷缓存下也要解析到同一条收藏，
+      // 否则客户端缓存的旧 document id 会在 bridge 重启后变成「发不出去」。
+      const wanted = favorite.toLowerCase()
       let cursor: string | undefined
       do {
         const page = await this.getSavedStickers(cursor, 200)
-        const found = page.stickers.find((item) => item.stickerId === stickerId)
+        const found = page.stickers.find((item) => matchesFavoriteStickerId(item, wanted))
         if (found) return found
         cursor = page.nextCursor
       } while (cursor)
@@ -2090,11 +2094,15 @@ export class QQKernelBridge {
 
   private rememberSticker(sticker: QQSticker): void {
     this.stickers.set(sticker.stickerId, sticker)
-    if (sticker.reference.kind !== 'favorite' || !sticker.reference.md5) return
-    const md5 = sticker.reference.md5
-    this.stickers.set(favoriteStickerId(md5), sticker)
-    this.stickers.set(favoriteStickerId(md5.toLowerCase()), sticker)
-    this.stickers.set(favoriteStickerId(md5.toUpperCase()), sticker)
+    if (sticker.reference.kind !== 'favorite') return
+    const { resId, md5 } = sticker.reference
+    // 旧投影曾用 `resId` 形态下发收藏表情 id，保留别名让历史 document id 仍可解析。
+    if (resId) this.stickers.set(`favorite:${resId}`, sticker)
+    const content = md5?.trim()
+    if (!content) return
+    this.stickers.set(favoriteStickerId(content), sticker)
+    this.stickers.set(`favorite:${content.toLowerCase()}`, sticker)
+    this.stickers.set(`favorite:${content.toUpperCase()}`, sticker)
   }
 
   async getSavedStickers(cursor?: string, limit = 200): Promise<{
@@ -2226,7 +2234,12 @@ export class QQKernelBridge {
       if (!resId) return
       const result = await service.deleteFavEmoji([resId])
       if (result.result !== 0) throw new Error(`deleteFavEmoji: ${result.errMsg} (${result.result})`)
-      this.stickers.delete(favoriteStickerId(resId))
+      // 一条收藏有内容（md5）与 `resId` 两个 id 形态，删掉后所有别名都不能再解析到它。
+      for (const [key, sticker] of this.stickers) {
+        if (sticker.reference.kind === 'favorite' && sticker.reference.resId === resId) {
+          this.stickers.delete(key)
+        }
+      }
       this.invalidateFavoriteStickerPack()
       return
     }
@@ -7493,7 +7506,7 @@ export class QQKernelBridge {
     }
     const mimeType = this.resolveFavoriteStickerMimeType(reference)
     return {
-      stickerId: favoriteStickerId(item.resId), title: item.desc || undefined,
+      stickerId: favoriteStickerId(item.resId, item.md5 || undefined), title: item.desc || undefined,
       format: reference.animated ? 'animated' : 'static', mimeType,
       width: reference.width, height: reference.height, size: reference.size,
       version: FAVORITE_STICKER_VERSION, reference,
@@ -8472,7 +8485,7 @@ function mapSticker(record: MsgRecord, element: MsgElement): QQSticker | undefin
   reference.mimeType = normalizeStickerImageMimeType(mimeType)
   reference.animated = isAnimatedStickerMimeType(mimeType)
   return {
-    stickerId: favoriteStickerId(resId), format: reference.animated ? 'animated' : 'static',
+    stickerId: favoriteStickerId(resId, picture.md5HexStr || undefined), format: reference.animated ? 'animated' : 'static',
     mimeType, width: reference.width,
     height: reference.height, size: reference.size, version: 1, reference,
   }
@@ -8505,7 +8518,7 @@ function stickerFromReference(reference: QQStickerReference): QQSticker {
     }
   }
   return {
-    stickerId: favoriteStickerId(reference.resId),
+    stickerId: favoriteStickerId(reference.resId, reference.md5),
     title: reference.name,
     format: reference.animated ? 'animated' : 'static',
     mimeType: reference.mimeType ?? imageMimeType(reference.name, reference.animated),
@@ -8935,8 +8948,26 @@ function parseMarketStickerId(value: string): { packageId: string, stickerId: st
   return { packageId: value.slice('market:'.length, separator), stickerId: value.slice(separator + 1) }
 }
 
-function favoriteStickerId(resId: string): string {
-  return `favorite:${resId}`
+/**
+ * QQ 收藏表情的稳定身份按内容（md5）取值。
+ *
+ * 同一条收藏在「收藏列表」里带的是 `resId`（`<uin>_0_0_0_<MD5>_0_0`），而消息元素里只有
+ * `md5`；两边必须落到同一个 sticker id，否则同一个表情会派生两个 document id
+ * （消息里一个、贴纸包/最近使用里另一个），客户端「最近使用」就会出现看着一样的重复项，
+ * 且消息里那个 id 依赖内存别名缓存才能解析。没有 md5 时才回退到 `resId`。
+ */
+function favoriteStickerId(resId: string, md5?: string): string {
+  const content = md5?.trim()
+  return `favorite:${content ? content.toLowerCase() : resId}`
+}
+
+/** 收藏表情的历史 `resId` 形态与内容（md5）形态都要能解析到同一条收藏。 */
+function matchesFavoriteStickerId(sticker: QQSticker, wanted: string): boolean {
+  if (sticker.stickerId.toLowerCase().slice('favorite:'.length) === wanted) return true
+  const reference = sticker.reference
+  if (reference.kind !== 'favorite') return false
+  if (reference.resId && reference.resId.toLowerCase() === wanted) return true
+  return Boolean(reference.md5 && reference.md5.toLowerCase() === wanted)
 }
 
 function parseFavoriteStickerId(value: string): string | undefined {
