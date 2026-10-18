@@ -1,5 +1,5 @@
 /** HTTP 协议版本号，仅在新增能力时递增，供 `platform-qqnt` 按版本协商兼容。 */
-export const PROTOCOL_VERSION = 35
+export const PROTOCOL_VERSION = 36
 
 /** 本地 Unix socket PCM 音频流协议，帧头为 1 字节类型 + 4 字节大端长度。 */
 export const PCM_MEDIA_PROTOCOL_VERSION = 1
@@ -611,21 +611,21 @@ export interface HistoryQuery {
   aroundUnreadSeq?: string
   /** 未指定锚点时直接加载最新一页，忽略未读边界。 */
   latest?: boolean
+  /** 按 msgSeq 向更早方向加载（含该 seq），用于服务端回填历史空洞。 */
+  beforeSeq?: string
 }
 
-export interface SearchQuery {
-  query: string
-  cursor?: string
-  limit?: number
-  fromUserId?: string
-  minTimestamp?: number
-  maxTimestamp?: number
-  mediaKind?: 'image' | 'file'
+/** 本页原始记录（过滤撤回、灰条之前）覆盖的 msgSeq 区间，均为十进制字符串。 */
+export interface HistorySequenceRange {
+  min: string
+  max: string
 }
 
-export interface SearchPage {
+export interface HistoryPage {
   messages: QQMessage[]
   nextCursor?: string
+  /** 仅按 `beforeSeq` 加载时返回；区间内缺失的 seq 已确认不存在或不可见。 */
+  sequenceRange?: HistorySequenceRange
 }
 
 export interface MemberPage {

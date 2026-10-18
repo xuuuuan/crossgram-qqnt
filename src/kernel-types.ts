@@ -745,40 +745,6 @@ export interface KernelRecentService {
   getRecentContactInfos(): Promise<{ result: number, errMsg: string, relation: RecentContactInfo[] }>
 }
 
-export interface SearchChatMsgsParams {
-  chatInfo: { chatType: number, peerUid: string }
-  searchFields: number
-  filterMsgType: Array<{ type: number, subType: number[] }>
-  filterSendersUid: string[]
-  filterMsgFromTime: string
-  filterMsgToTime: string
-  pageLimit: number
-}
-
-export interface SearchMsgItem {
-  msgId: string
-  msgSeq: string
-  msgTime: string
-  senderUid: string
-  senderUin: string
-  senderNick: string
-  msgRecord?: MsgRecord
-}
-
-export interface SearchMsgKeywordsResult {
-  searchId: number
-  hasMore: boolean
-  resultItems: SearchMsgItem[]
-}
-
-export interface KernelSearchService {
-  addKernelSearchListener(listener: unknown): string
-  removeKernelSearchListener(listenerId: string): void
-  searchChatMsgs(keywords: string[], params: SearchChatMsgsParams): number
-  searchMoreChatMsgs(searchId: number): void
-  cancelSearchChatMsgs(searchId: number, code: number, reason: string): void
-}
-
 export interface BuddyRequest {
   friendUid?: string
   reqTime?: string | number
@@ -921,7 +887,6 @@ export interface KernelSession {
   getBuddyService(): KernelBuddyService
   getProfileService?(): KernelProfileService
   getGroupService(): KernelGroupService
-  getSearchService?(): KernelSearchService
   getAVSDKService?(): KernelAVSDKService
   getRobotService?(): KernelRobotService
   getBaseEmojiService?(): KernelBaseEmojiService

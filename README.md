@@ -111,9 +111,8 @@ pnpm test:e2e                    # 针对运行中的 bridge 执行端到端测�
 | `POST` | `/v1/users/:userId/block` | 拉黑或解除拉黑用户 |
 | `GET` | `/v1/conversations/resolve` | 按 QQ 号/群号解析会话 |
 | `GET` | `/v1/conversations/:id` | 会话详情 |
-| `GET` | `/v1/conversations/:id/history` | 历史消息 |
+| `GET` | `/v1/conversations/:id/history` | 历史消息；`beforeSeq` 按 msgSeq 向前读取并返回原始 `sequenceRange`（协议 36 起） |
 | `GET` | `/v1/conversations/:id/members` | 群成员分页 |
-| `GET` | `/v1/conversations/:id/search` | 会话内搜索 |
 | `GET` | `/v1/conversations/:id/files` | 群文件列表 |
 | `POST` | `/v1/conversations/:id/members/:userId/moderate` | 群成员管理（管理员/禁言/踢人） |
 | `POST` | `/v1/conversations/1\|2/:peerUin/notification-mask` | 设置群消息通知策略 |

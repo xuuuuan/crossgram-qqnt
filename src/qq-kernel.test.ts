@@ -175,7 +175,6 @@ function fixture() {
   let profileHandlers: Record<string, (...args: unknown[]) => unknown> = {}
   let groupHandlers: Record<string, (...args: unknown[]) => unknown> = {}
   const groupHandlerHistory: Array<Record<string, (...args: unknown[]) => unknown>> = []
-  let searchHandlers: Record<string, (...args: unknown[]) => unknown> = {}
   let avsdkHandlers: Record<string, (...args: unknown[]) => unknown> = {}
   let avsdkAvailable = true
   const profileInfos = new Map<string, {
@@ -355,18 +354,6 @@ function fixture() {
       },
     })),
   }
-  const search = {
-    addKernelSearchListener: vi.fn((listener: { handlers?: typeof searchHandlers }) => {
-      searchHandlers = listener.handlers ?? listener as unknown as typeof searchHandlers
-      return 'search-listener'
-    }),
-    removeKernelSearchListener: vi.fn(),
-    searchChatMsgs: vi.fn((
-      _keywords: string[], _params: import('./kernel-types.js').SearchChatMsgsParams,
-    ) => 71),
-    searchMoreChatMsgs: vi.fn((_searchId: number) => {}),
-    cancelSearchChatMsgs: vi.fn((_searchId: number, _code: number, _reason: string) => {}),
-  }
   const avsdk = {
     addKernelAVSDKListener: vi.fn((listener: { handlers?: typeof avsdkHandlers }) => {
       avsdkHandlers = listener.handlers ?? listener as unknown as typeof avsdkHandlers
@@ -406,7 +393,6 @@ function fixture() {
     NodeIKernelBuddyListener: Listener,
     NodeIKernelProfileListener: Listener,
     NodeIKernelGroupListener: Listener,
-    NodeIKernelSearchListener: Listener,
     NodeIAVSDKListener: Listener,
   } as unknown as KernelModule
   const session = {
@@ -415,7 +401,6 @@ function fixture() {
     getBuddyService: () => buddy,
     getProfileService: () => profile,
     getGroupService: () => group,
-    getSearchService: () => search,
     getAVSDKService: vi.fn(() => avsdkAvailable ? avsdk : undefined),
     getRobotService: () => robot,
     getRichMediaService: () => richMedia,
@@ -478,7 +463,7 @@ function fixture() {
   const flashApplyUpload = vi.spyOn(QQPacketClient.prototype, 'applyFlashTransferUpload').mockResolvedValue()
   const flashSetReady = vi.spyOn(QQPacketClient.prototype, 'setFlashTransferFilesetReady').mockResolvedValue()
   return {
-    kernel, session, msg, recent, buddy, profile, group, search, avsdk, richMedia, uix, robot, message, sentBodies,
+    kernel, session, msg, recent, buddy, profile, group, avsdk, richMedia, uix, robot, message, sentBodies,
     forceDownloadAvatar,
     imageUpload, fileUpload, protocolSend, groupFilePublish, poke,
     flashApplyFileset, flashCommitFiles, flashCompleteFileset, flashPrepareUpload,
@@ -568,9 +553,6 @@ function fixture() {
     },
     emitMemberInfo(groupCode: string, members: Map<string, unknown>) {
       groupHandlers.onMemberInfoChange?.(groupCode, 0, members)
-    },
-    emitSearch(result: import('./kernel-types.js').SearchMsgKeywordsResult) {
-      searchHandlers.onSearchMsgKeywordsResult?.(result)
     },
     emitGroupFiles(result: import('./kernel-types.js').GroupFileListResult) {
       msgHandlers.onGroupFileInfoUpdate?.(result)
@@ -953,6 +935,54 @@ describe('QQKernelBridge', () => {
     }), '1684', 1, true, true)
     expect(f.msg.getLatestDbMsgs).not.toHaveBeenCalled()
     expect(f.msg.sendMsg).not.toHaveBeenCalled()
+  })
+
+  it('loads history by sequence and reports the raw sequence range before hiding recalls', async () => {
+    const f = fixture()
+    const recalled = {
+      ...f.message, msgId: 'recalled-seq', msgSeq: '97',
+      elements: [{ elementType: 8, elementId: 'revoke', grayTipElement: { revokeElement: { operatorUid: 'self' } } }],
+    }
+    f.msg.getMsgsBySeqAndCount.mockResolvedValueOnce({
+      result: 0, errMsg: '', msgList: [
+        { ...f.message, msgId: 'seq-96', msgSeq: '96' },
+        recalled,
+        { ...f.message, msgId: 'seq-100', msgSeq: '100' },
+      ],
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    const page = await bridge.getHistory(bridge.getConversation('uid-1715311957'), { beforeSeq: '100', limit: 5 })
+
+    expect(f.msg.getMsgsBySeqAndCount).toHaveBeenCalledWith(expect.objectContaining({
+      chatType: 1, peerUid: 'uid-1715311957',
+    }), '100', 5, true, true)
+    expect(page.messages.map((message) => message.id)).toEqual(['seq-96', 'seq-100'])
+    expect(page.sequenceRange).toEqual({ min: '96', max: '100' })
+    expect(page.nextCursor).toBeUndefined()
+  })
+
+  it('omits the sequence range when a sequence page is empty and rejects malformed sequences', async () => {
+    const f = fixture()
+    f.msg.getMsgsBySeqAndCount.mockResolvedValueOnce({ result: 0, errMsg: '', msgList: [] })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const conversation = bridge.getConversation('uid-1715311957')
+
+    await expect(bridge.getHistory(conversation, { beforeSeq: '3', limit: 50 })).resolves.toEqual({ messages: [] })
+    await expect(bridge.getHistory(conversation, { beforeSeq: 'abc' })).rejects.toThrow('invalid beforeSeq')
+    await expect(bridge.getHistory(conversation, { beforeSeq: '0' })).rejects.toThrow('invalid beforeSeq')
+  })
+
+  it('surfaces native sequence history failures instead of returning cached messages', async () => {
+    const f = fixture()
+    f.msg.getMsgsBySeqAndCount.mockResolvedValue({ result: 5, errMsg: 'denied', msgList: [] })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.getHistory(bridge.getConversation('uid-1715311957'), { beforeSeq: '9' }))
+      .rejects.toThrow('getMsgsBySeqAndCount: denied (5)')
   })
 
   it.each([
@@ -1438,147 +1468,6 @@ describe('QQKernelBridge', () => {
       md5HexStr: createHash('md5').update(png).digest('hex'), original: true,
     })
     expect(await readFile(image!.sourcePath!)).toEqual(png)
-  })
-
-  it('searches a conversation with native filters and preserves buffered pagination', async () => {
-    const f = fixture()
-    const bridge = new QQKernelBridge()
-    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
-    const conversation = bridge.getConversation('uid-1715311957')
-    const records = [
-      { ...f.message, msgId: 'search-1', msgTime: '1700000020' },
-      { ...f.message, msgId: 'search-2', msgTime: '1700000010' },
-    ]
-    f.search.searchChatMsgs.mockImplementation((keywords, params) => {
-      expect(keywords).toEqual(['needle'])
-      expect(params).toMatchObject({
-        chatInfo: { chatType: 1, peerUid: 'uid-1715311957' },
-        filterSendersUid: ['sender'], filterMsgFromTime: '100', filterMsgToTime: '200', pageLimit: 1,
-      })
-      queueMicrotask(() => f.emitSearch({
-        searchId: 71, hasMore: false,
-        resultItems: records.map((msgRecord) => ({
-          msgId: msgRecord.msgId, msgSeq: msgRecord.msgSeq ?? '', msgTime: msgRecord.msgTime,
-          senderUid: msgRecord.senderUid, senderUin: msgRecord.senderUin, senderNick: msgRecord.sendNickName,
-          msgRecord,
-        })),
-      }))
-      return 71
-    })
-
-    const first = await bridge.searchMessages(conversation, {
-      query: 'needle', limit: 1, fromUserId: 'sender', minTimestamp: 100, maxTimestamp: 200,
-    })
-    expect(first.messages.map((message) => message.id)).toEqual(['search-1'])
-    expect(first.nextCursor).toEqual(expect.any(String))
-
-    const second = await bridge.searchMessages(conversation, {
-      query: 'needle', cursor: first.nextCursor, limit: 1,
-      fromUserId: 'sender', minTimestamp: 100, maxTimestamp: 200,
-    })
-    expect(second).toMatchObject({ messages: [{ id: 'search-2' }] })
-    expect(second.nextCursor).toBeUndefined()
-    expect(f.search.searchMoreChatMsgs).not.toHaveBeenCalled()
-    expect(f.search.cancelSearchChatMsgs).toHaveBeenCalledWith(71, 2, 'search completed')
-  })
-
-  it('accepts a cold native search callback that arrives after five seconds', async () => {
-    vi.useFakeTimers()
-    const f = fixture()
-    const bridge = new QQKernelBridge()
-    try {
-      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
-      const record = { ...f.message, msgId: 'slow-search', msgTime: '1700000030' }
-      f.search.searchChatMsgs.mockImplementation(() => {
-        setTimeout(() => f.emitSearch({
-          searchId: 72, hasMore: false,
-          resultItems: [{
-            msgId: record.msgId, msgSeq: record.msgSeq ?? '', msgTime: record.msgTime,
-            senderUid: record.senderUid, senderUin: record.senderUin,
-            senderNick: record.sendNickName, msgRecord: record,
-          }],
-        }), 6_000)
-        return 72
-      })
-
-      const search = bridge.searchMessages(bridge.getConversation('uid-1715311957'), {
-        query: 'gpt', limit: 20,
-      })
-      const result = expect(search).resolves.toMatchObject({
-        messages: [{ id: 'slow-search' }], nextCursor: undefined,
-      })
-      await vi.advanceTimersByTimeAsync(6_000)
-      await result
-    } finally {
-      bridge.detach()
-      vi.useRealTimers()
-    }
-  })
-
-  it('continues native search until a requested media result is found', async () => {
-    const f = fixture()
-    const bridge = new QQKernelBridge()
-    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
-    const conversation = bridge.getConversation('uid-1715311957')
-    f.search.searchChatMsgs.mockImplementation(() => {
-      queueMicrotask(() => f.emitSearch({
-        searchId: 71, hasMore: true,
-        resultItems: [{
-          msgId: 'text-only', msgSeq: '1', msgTime: '10', senderUid: 'self', senderUin: '10000',
-          senderNick: 'Self', msgRecord: { ...f.message, msgId: 'text-only' },
-        }],
-      }))
-      return 71
-    })
-    f.search.searchMoreChatMsgs.mockImplementation(() => {
-      queueMicrotask(() => f.emitSearch({
-        searchId: 71, hasMore: false,
-        resultItems: [{
-          msgId: 'image', msgSeq: '2', msgTime: '20', senderUid: 'self', senderUin: '10000',
-          senderNick: 'Self', msgRecord: { ...f.message, msgId: 'image', elements: [{
-            elementType: 2, elementId: 'picture', picElement: {
-              fileName: 'result.png', fileSize: '4', picWidth: 16, picHeight: 16,
-              md5HexStr: 'md5', fileUuid: 'uuid', fileSubId: '', picSubType: 0,
-            },
-          }] },
-        }],
-      }))
-    })
-
-    const page = await bridge.searchMessages(conversation, {
-      query: '', limit: 1, mediaKind: 'image',
-    })
-    expect(page).toMatchObject({ messages: [{ id: 'image', parts: [{ type: 'media' }] }] })
-    expect(page.nextCursor).toBeUndefined()
-    expect(f.search.searchMoreChatMsgs).toHaveBeenCalledWith(71)
-  })
-
-  it('normalizes hashes on generic searched file messages before persistence', async () => {
-    const f = fixture()
-    const record = { ...f.message, msgId: 'binary-file-search', elements: [{
-      elementType: 3, elementId: 'binary-file-element', fileElement: {
-        fileName: 'binary.bin', fileSize: '3', filePath: '', fileUuid: 'binary-file', fileSubId: '',
-        fileMd5: '\u0000\u0014\ud800', fileSha: 'A0b1', fileSha3: '', file10MMd5: '',
-      },
-    }] }
-    f.search.searchChatMsgs.mockImplementation(() => {
-      queueMicrotask(() => f.emitSearch({
-        searchId: 74, hasMore: false,
-        resultItems: [{ msgId: record.msgId, msgSeq: '1', msgTime: '10',
-          senderUid: record.senderUid, senderUin: record.senderUin, senderNick: record.sendNickName,
-          msgRecord: record }],
-      }))
-      return 74
-    })
-    const bridge = new QQKernelBridge()
-    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
-
-    const page = await bridge.searchMessages(bridge.getConversation('uid-1715311957'), {
-      query: '的', limit: 1,
-    })
-    expect(page.messages[0]?.parts[0]).toMatchObject({
-      type: 'media', media: { locator: { md5: '0014efbfbd', sha: 'a0b1' } },
-    })
   })
 
   it('lists native QQ group folders and files with downloadable media locators', async () => {
@@ -8022,32 +7911,6 @@ describe('QQBridgeServer', () => {
     } })
   })
 
-  it('keeps the HTTP search request open for a cold native callback', async () => {
-    const f = fixture()
-    f.search.searchChatMsgs.mockImplementation(() => {
-      setTimeout(() => f.emitSearch({
-        searchId: 73, hasMore: false, resultItems: [{
-          msgId: 'http-slow-search', msgSeq: '8', msgTime: '1700000001', senderUid: 'self',
-          senderUin: '10000', senderNick: 'Self',
-          msgRecord: { ...f.message, msgId: 'http-slow-search' },
-        }],
-      }), 6_000)
-      return 73
-    })
-    const bridge = new QQKernelBridge()
-    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
-    server = new QQBridgeServer(bridge, { port: 0 })
-    await server.start()
-    const base = `http://127.0.0.1:${server.address().port}/v1`
-
-    const response = await fetch(`${base}/conversations/uid-1715311957/search?q=gpt&limit=20`)
-
-    expect(response.status).toBe(200)
-    await expect(response.json()).resolves.toMatchObject({
-      messages: [{ id: 'http-slow-search' }],
-    })
-  }, 10_000)
-
   it('reuses QQ remote identities and streams only new files through the flash slice protocol', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'qqnt-flash-server-'))
     tempPaths.push(directory)
@@ -8135,7 +7998,7 @@ describe('QQBridgeServer', () => {
     const base = `http://127.0.0.1:${server.address().port}/v1`
 
     await expect(fetch(`${base}/status`).then((response) => response.json())).resolves.toMatchObject({
-      protocolVersion: 35, ready: true, flashTransferSupported: true,
+      protocolVersion: 36, ready: true, flashTransferSupported: true,
     })
     const manifest = {
       name: 'remote reuse', framing: 'length-prefixed-v1',
@@ -8637,15 +8500,6 @@ describe('QQBridgeServer', () => {
 
   it('serves status, dialogs, and a chunked send endpoint', async () => {
     const f = fixture()
-    f.search.searchChatMsgs.mockImplementation(() => {
-      queueMicrotask(() => f.emitSearch({
-        searchId: 71, hasMore: false, resultItems: [{
-          msgId: 'http-search', msgSeq: '7', msgTime: '1700000000', senderUid: 'self',
-          senderUin: '10000', senderNick: 'Self', msgRecord: { ...f.message, msgId: 'http-search' },
-        }],
-      }))
-      return 71
-    })
     const bridge = new QQKernelBridge()
     bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
     server = new QQBridgeServer(bridge, { port: 0 })
@@ -8653,7 +8507,7 @@ describe('QQBridgeServer', () => {
     const { port } = server.address()
     const base = `http://127.0.0.1:${port}/v1`
     await expect(fetch(`${base}/status`).then((response) => response.json())).resolves.toMatchObject({
-      protocolVersion: 35, ready: true, selfUin: '10000',
+      protocolVersion: 36, ready: true, selfUin: '10000',
     })
     const dialogs = await fetch(`${base}/dialogs`)
     expect(dialogs.status).toBe(200)
@@ -8681,10 +8535,16 @@ describe('QQBridgeServer', () => {
     expect(unchangedHistory.status).toBe(304)
     expect(unchangedHistory.headers.get('etag')).toBe(historyEtag)
     expect(await unchangedHistory.text()).toBe('')
-    await expect(fetch(`${base}/conversations/uid-1715311957/search?q=hello&limit=10`)
-      .then((response) => response.json())).resolves.toMatchObject({
-      messages: [{ id: 'http-search' }],
+    expect((await fetch(`${base}/conversations/uid-1715311957/search?q=hello&limit=10`)).status).toBe(404)
+    f.msg.getMsgsBySeqAndCount.mockResolvedValueOnce({
+      result: 0, errMsg: '', msgList: [{ ...f.message, msgId: 'http-seq', msgSeq: '41' }],
     })
+    const bySequence = await fetch(`${base}/conversations/uid-1715311957/history?beforeSeq=42&limit=5`)
+    expect(bySequence.status).toBe(200)
+    await expect(bySequence.json()).resolves.toMatchObject({
+      messages: [{ id: 'http-seq' }], sequenceRange: { min: '41', max: '41' },
+    })
+    expect(f.msg.getMsgsBySeqAndCount).toHaveBeenLastCalledWith(expect.anything(), '42', 5, true, true)
     await expect(fetch(`${base}/conversations/${encodeURIComponent('2:1058754719')}/group-files?limit=20`)
       .then((response) => response.json())).resolves.toEqual({ items: [], total: 0 })
     expect(f.richMedia.getGroupFileList).toHaveBeenCalledWith('1058754719', expect.objectContaining({

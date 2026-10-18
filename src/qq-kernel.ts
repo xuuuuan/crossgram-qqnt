@@ -28,11 +28,11 @@ import {
   GroupMsgMask,
   type BuddyRequest, type CustomEmotionData, type DoubtBuddyReqChange, type DoubtBuddyRequest, type EmojiLikesUserInfo, type FileTransNotifyInfo, type GroupFileListResult, type GroupMsgMaskInfo, type GroupNotify, type GroupProfileInfo,
   type InitSessionConfig, type KernelAVSDKService, type KernelGroupService, type KernelModule, type KernelSession, type MarketStickerPackInfo, type MemberInfo, type MsgElement,
-  type MsgRecord, type ProfileSimpleInfo, type RecentContactInfo, type SearchMsgKeywordsResult,
+  type MsgRecord, type ProfileSimpleInfo, type RecentContactInfo,
 } from './kernel-types.js'
 import {
-  conversationId, parseConversationId, type HistoryQuery, type MemberPage, type QQCallSignalEvent, type QQCard, type QQConversation, type QQEvent, type QQGroupFilePage, type QQMedia, type QQMediaLocator, type QQMediaUploadPlan, type QQMessage, type QQMultiForwardLocator, type QQReactionActorPage, type QQReactionContext, type QQReactionDefinition, type QQReactionState,
-  type QQFlashTransferManifest, type QQFlashTransferResult, type QQPokeResult, type QQRequest, type QQRequestKind, type QQRequestPage, type QQRequestStatus, type QQSendMediaSpec, type QQServiceMember, type QQSticker, type QQStickerPack, type QQStickerPackSummary, type QQStickerReference, type QQTextPart, type SearchPage, type SearchQuery, type SendManifest,
+  conversationId, parseConversationId, type HistoryPage, type HistoryQuery, type MemberPage, type QQCallSignalEvent, type QQCard, type QQConversation, type QQEvent, type QQGroupFilePage, type QQMedia, type QQMediaLocator, type QQMediaUploadPlan, type QQMessage, type QQMultiForwardLocator, type QQReactionActorPage, type QQReactionContext, type QQReactionDefinition, type QQReactionState,
+  type QQFlashTransferManifest, type QQFlashTransferResult, type QQPokeResult, type QQRequest, type QQRequestKind, type QQRequestPage, type QQRequestStatus, type QQSendMediaSpec, type QQServiceMember, type QQSticker, type QQStickerPack, type QQStickerPackSummary, type QQStickerReference, type QQTextPart, type SendManifest,
   type QQGroupInvite,
 } from './protocol.js'
 
@@ -151,7 +151,6 @@ const FAVORITE_STICKER_VERSION = 2
 const STICKER_METADATA_PROBE_BYTES = 256 * 1024
 const STICKER_METADATA_PROBE_TIMEOUT_MS = 5_000
 const MESSAGE_MEMBER_PROFILE_TIMEOUT_MS = 200
-const SEARCH_PAGE_TIMEOUT_MS = 15_000
 const REQUEST_PAGE_LIMIT = 100
 // Telegram 标准内置回应集合，集合外的 QQ 表情作为自定义表情下发。
 const TELEGRAM_STANDARD_REACTIONS = new Set([
@@ -292,15 +291,6 @@ type CachedRequest =
       raw: { seq: string | number, type: number, groupCode: string, postscript: string }
     }
 
-interface SearchContext {
-  searchId: number
-  fingerprint: string
-  buffer: QQMessage[]
-  hasMore: boolean
-  lastUsed: number
-  busy: boolean
-}
-
 interface MessageMappingContext {
   multiForwardRootId?: string
   multiForwardConversationId?: string
@@ -379,7 +369,6 @@ export class QQKernelBridge {
   private profileService?: NonNullable<ReturnType<NonNullable<KernelSession['getProfileService']>>>
   private groupService?: ReturnType<KernelSession['getGroupService']>
   private recentService?: ReturnType<KernelSession['getRecentContactService']>
-  private searchService?: NonNullable<ReturnType<NonNullable<KernelSession['getSearchService']>>>
   private avsdkService?: KernelAVSDKService
   private avatarService?: NonNullable<ReturnType<NonNullable<KernelSession['getAvatarService']>>>
   private packetClient?: QQPacketClient
@@ -500,12 +489,8 @@ export class QQKernelBridge {
   private profileListenerId?: string
   private groupListenerId?: string
   private recentListenerId?: string
-  private searchListenerId?: string
   private avsdkListenerId?: string
   private readonly pendingRecentListUpdates = new Set<() => void>()
-  private readonly pendingSearchPages = new Map<number, ReturnType<typeof deferred<SearchMsgKeywordsResult>>>()
-  private readonly earlySearchPages = new Map<number, SearchMsgKeywordsResult>()
-  private readonly searchContexts = new Map<string, SearchContext>()
   private listenerRetry?: NodeJS.Timeout
   private avsdkListenerRetry?: NodeJS.Timeout
   private readonly tempPath: string
@@ -856,10 +841,9 @@ export class QQKernelBridge {
     const profileService = this.profileService
     const groupService = this.groupService
     const recentService = this.recentService
-    const searchService = this.searchService
     const avsdkService = this.avsdkService
-    if (this.listenerId || this.buddyListenerId || this.profileListenerId || this.groupListenerId || this.recentListenerId || this.searchListenerId || this.avsdkListenerId) {
-      log('info', `bridge detach listeners msg=${this.listenerId ?? ''} buddy=${this.buddyListenerId ?? ''} profile=${this.profileListenerId ?? ''} group=${this.groupListenerId ?? ''} recent=${this.recentListenerId ?? ''} search=${this.searchListenerId ?? ''} avsdk=${this.avsdkListenerId ?? ''}`)
+    if (this.listenerId || this.buddyListenerId || this.profileListenerId || this.groupListenerId || this.recentListenerId || this.avsdkListenerId) {
+      log('info', `bridge detach listeners msg=${this.listenerId ?? ''} buddy=${this.buddyListenerId ?? ''} profile=${this.profileListenerId ?? ''} group=${this.groupListenerId ?? ''} recent=${this.recentListenerId ?? ''} avsdk=${this.avsdkListenerId ?? ''}`)
     }
     if (msgService && this.listenerId) safeRemoveListener('message', this.listenerId, () => msgService.removeKernelMsgListener(this.listenerId!))
     if (buddyService && this.buddyListenerId) safeRemoveListener('buddy', this.buddyListenerId, () => buddyService.removeKernelBuddyListener(this.buddyListenerId!))
@@ -868,27 +852,20 @@ export class QQKernelBridge {
     if (recentService?.removeKernelRecentContactListener && this.recentListenerId) {
       safeRemoveListener('recent', this.recentListenerId, () => recentService.removeKernelRecentContactListener!(this.recentListenerId!))
     }
-    if (searchService && this.searchListenerId) {
-      safeRemoveListener('search', this.searchListenerId, () => searchService.removeKernelSearchListener(this.searchListenerId!))
-    }
     if (avsdkService && this.avsdkListenerId) {
       safeRemoveListener('avsdk', this.avsdkListenerId, () => avsdkService.removeKernelAVSDKListener(this.avsdkListenerId!))
-    }
-    for (const context of this.searchContexts.values()) {
-      safeCancelSearch(searchService, context.searchId, 'session detached')
     }
     if (groupService) {
       for (const scene of this.memberScenes.keys()) this.destroyMemberScene(groupService, scene)
     }
     this.memberScenes.clear()
     this.listenerId = this.buddyListenerId = this.profileListenerId = this.groupListenerId = undefined
-    this.searchListenerId = this.avsdkListenerId = undefined
+    this.avsdkListenerId = undefined
     this.msgService = undefined
     this.buddyService = undefined
     this.profileService = undefined
     this.groupService = undefined
     this.recentService = undefined
-    this.searchService = undefined
     this.avsdkService = undefined
     this.avatarService = undefined
     this.packetClient = undefined
@@ -902,15 +879,11 @@ export class QQKernelBridge {
       item.pending.reject(new Error('QQNT session detached'))
       item.accepted.resolve()
     }
-    for (const pending of this.pendingSearchPages.values()) pending.reject(new Error('QQNT session detached'))
     this.pendingMessages.clear()
     this.pendingAcceptances.clear()
     this.pendingMinimumStatuses.clear()
     this.pendingForwards.splice(0)
     this.pendingUnassigned.splice(0)
-    this.pendingSearchPages.clear()
-    this.earlySearchPages.clear()
-    this.searchContexts.clear()
     for (const pending of this.pendingReactions.values()) pending.reject(new Error('QQNT session detached'))
     this.pendingReactions.clear()
     this.pendingReactionDesired.clear()
@@ -1289,7 +1262,8 @@ export class QQKernelBridge {
     return this.withConversationAvatar(created)
   }
 
-  async getHistory(conversation: QQConversation, query: HistoryQuery = {}): Promise<{ messages: QQMessage[], nextCursor?: string }> {
+  async getHistory(conversation: QQConversation, query: HistoryQuery = {}): Promise<HistoryPage> {
+    if (query.beforeSeq) return this.historyBySequence(conversation, query.beforeSeq, clamp(query.limit ?? 50, 1, 200))
     const service = this.requireMsgService()
     const limit = clamp(query.limit ?? 50, 1, 200)
     const anchor = query.beforeId ?? query.afterId ?? query.cursor ?? '0'
@@ -1347,7 +1321,55 @@ export class QQKernelBridge {
       throw new Error(`getMsgs: ${response.errMsg} (${response.result})`)
     }
     log('info', `native API complete name=history conversation=${conversation.id} result=${response.result} err=${JSON.stringify(response.errMsg)} messages=${response.msgList.length}`)
-    const visibleRecords = response.msgList.filter((record) => !isRecalledRecord(record))
+    const { messages, mapped } = await this.mapHistoryRecords(conversation, response.msgList)
+    if (!messages.length && !query.beforeId && !query.afterId && !query.cursor) {
+      const cached = this.messages.get(conversation.id) ?? []
+      return { messages: cached.slice(-limit).reverse() }
+    }
+    const last = response.msgList.at(-1)
+    return { messages, nextCursor: mapped === limit ? last?.msgId : undefined }
+  }
+
+  /**
+   * 按 msgSeq 向更早方向读取一页（含 `beforeSeq`），并返回原始记录覆盖的 seq 区间。
+   * 区间在过滤撤回记录之前计算，调用方据此确认区间内缺失的 seq 无需再次拉取。
+   */
+  private async historyBySequence(
+    conversation: QQConversation,
+    beforeSeq: string,
+    limit: number,
+  ): Promise<HistoryPage> {
+    if (!/^\d+$/.test(beforeSeq) || beforeSeq === '0') throw new Error(`invalid beforeSeq: ${beforeSeq}`)
+    const service = this.requireMsgService()
+    if (!service.getMsgsBySeqAndCount) throw new Error('getMsgsBySeqAndCount is unavailable in this QQNT build')
+    const peer = contact(conversation)
+    log('info', `native API start name=getMsgsBySeqAndCount(history) conversation=${conversation.id} beforeSeq=${beforeSeq} limit=${limit}`)
+    const response = await withTimeout(
+      retryHistoryCall(() => service.getMsgsBySeqAndCount!(peer, beforeSeq, limit, true, true)),
+      5_000,
+      'QQ history request timed out',
+    )
+    log('info', `native API complete name=getMsgsBySeqAndCount(history) conversation=${conversation.id} result=${response.result} err=${JSON.stringify(response.errMsg)} records=${response.msgList.length}`)
+    if (response.result !== 0) throw new Error(`getMsgsBySeqAndCount: ${response.errMsg} (${response.result})`)
+    const upper = BigInt(beforeSeq)
+    const sequences = response.msgList
+      .map((record) => record.msgSeq)
+      .filter((value): value is string => typeof value === 'string' && /^\d+$/.test(value))
+      .map((value) => BigInt(value))
+      .filter((value) => value > 0n && value <= upper)
+    const { messages } = await this.mapHistoryRecords(conversation, response.msgList)
+    if (!sequences.length) return { messages }
+    const min = sequences.reduce((left, right) => left < right ? left : right)
+    const max = sequences.reduce((left, right) => left > right ? left : right)
+    return { messages, sequenceRange: { min: String(min), max: String(max) } }
+  }
+
+  /** 映射一页原始记录；`mapped` 是去掉空白占位消息之前的条数，用于判断是否还有下一页。 */
+  private async mapHistoryRecords(
+    conversation: QQConversation,
+    records: readonly MsgRecord[],
+  ): Promise<{ messages: QQMessage[], mapped: number }> {
+    const visibleRecords = records.filter((record) => !isRecalledRecord(record))
     await this.resolveReplyTargets(visibleRecords)
     await this.resolveGrayTipUsers(visibleRecords)
     await Promise.all(visibleRecords.map((record) => this.enrichGroupMessageSender(record)))
@@ -1370,12 +1392,7 @@ export class QQKernelBridge {
       return true
     })
     for (const message of messages) this.rememberMessage(message)
-    if (!messages.length && !query.beforeId && !query.afterId && !query.cursor) {
-      const cached = this.messages.get(conversation.id) ?? []
-      return { messages: cached.slice(-limit).reverse() }
-    }
-    const last = response.msgList.at(-1)
-    return { messages, nextCursor: mapped.length === limit ? last?.msgId : undefined }
+    return { messages, mapped: mapped.length }
   }
 
   async getGroupFiles(
@@ -1768,151 +1785,6 @@ export class QQKernelBridge {
     } catch (error) {
       log('warn', `recent top message hydration failed conversation=${conversation.id} message=${target.id}`, error)
       return conversation
-    }
-  }
-
-  async searchMessages(conversation: QQConversation, query: SearchQuery): Promise<SearchPage> {
-    const service = this.requireSearchService()
-    const limit = clamp(query.limit ?? 50, 1, 200)
-    const fingerprint = JSON.stringify({
-      conversationId: conversation.id,
-      query: query.query,
-      fromUserId: query.fromUserId ?? '',
-      minTimestamp: query.minTimestamp ?? 0,
-      maxTimestamp: query.maxTimestamp ?? 0,
-      mediaKind: query.mediaKind ?? '',
-    })
-    this.pruneSearchContexts(service)
-
-    let token = query.cursor
-    let context = token ? this.searchContexts.get(token) : undefined
-    if (token && !context) throw new Error('QQ search cursor is invalid or expired')
-    if (context && context.fingerprint !== fingerprint) throw new Error('QQ search cursor does not match this query')
-    if (context?.busy) throw new Error('QQ search cursor is already in use')
-
-    let firstPage: SearchMsgKeywordsResult | undefined
-    if (!context) {
-      log('info', `native API start name=searchChatMsgs conversation=${conversation.id} query=${JSON.stringify(query.query)} limit=${limit}`)
-      const searchId = service.searchChatMsgs(query.query ? [query.query] : [], {
-        chatInfo: { chatType: conversation.chatType, peerUid: conversation.peerUid },
-        searchFields: 0,
-        filterMsgType: [],
-        filterSendersUid: query.fromUserId ? [query.fromUserId] : [],
-        filterMsgFromTime: String(query.minTimestamp ?? 0),
-        filterMsgToTime: String(query.maxTimestamp ?? 0),
-        pageLimit: limit,
-      })
-      firstPage = await this.waitForSearchPage(searchId)
-      context = {
-        searchId, fingerprint, buffer: [], hasMore: firstPage.hasMore,
-        lastUsed: Date.now(), busy: false,
-      }
-      token = randomUUID()
-      this.searchContexts.set(token, context)
-    }
-
-    context.busy = true
-    try {
-      let page = firstPage
-      const messages: QQMessage[] = []
-      for (let requestCount = 0; requestCount < 100 && messages.length < limit; requestCount++) {
-        if (page) {
-          context.hasMore = page.hasMore
-          const mapped = await this.mapSearchResult(conversation, page)
-          context.buffer.push(...mapped.filter((message) => matchesSearchMedia(message, query.mediaKind)))
-          page = undefined
-        }
-        while (context.buffer.length && messages.length < limit) messages.push(context.buffer.shift()!)
-        if (messages.length >= limit || !context.hasMore) break
-        page = await this.waitForSearchPage(context.searchId, () => {
-          service.searchMoreChatMsgs(context!.searchId)
-        })
-      }
-      context.lastUsed = Date.now()
-      const hasMore = context.buffer.length > 0 || context.hasMore
-      if (!hasMore) {
-        this.searchContexts.delete(token!)
-        safeCancelSearch(service, context.searchId, 'search completed')
-      }
-      log('info', `native API complete name=searchChatMsgs conversation=${conversation.id} searchId=${context.searchId} messages=${messages.length} more=${hasMore}`)
-      return { messages, nextCursor: hasMore ? token : undefined }
-    } finally {
-      context.busy = false
-    }
-  }
-
-  private async mapSearchResult(
-    conversation: QQConversation,
-    result: SearchMsgKeywordsResult,
-  ): Promise<QQMessage[]> {
-    const records = new Map<string, MsgRecord>()
-    const missing: string[] = []
-    for (const item of result.resultItems) {
-      if (item.msgRecord?.msgId) records.set(item.msgId, item.msgRecord)
-      else if (item.msgId) missing.push(item.msgId)
-    }
-    if (missing.length) {
-      const loaded = await retryTransientInvalidArgument(
-        () => this.requireMsgService().getMsgsByMsgId(contact(conversation), missing),
-      )
-      if (loaded.result !== 0) throw new Error(`getMsgsByMsgId(search): ${loaded.errMsg} (${loaded.result})`)
-      for (const record of loaded.msgList) records.set(record.msgId, record)
-    }
-    const ordered = result.resultItems.flatMap((item) => {
-      const record = records.get(item.msgId)
-      return record && !isRecalledRecord(record) ? [record] : []
-    })
-    await this.resolveReplyTargets(ordered)
-    await this.resolveGrayTipUsers(ordered)
-    return Promise.all(ordered.map(async (record) => {
-      const message = await this.mapMessagePrepared(record)
-      this.rememberMessage(message)
-      return message
-    }))
-  }
-
-  private async waitForSearchPage(
-    searchId: number,
-    trigger?: () => void,
-  ): Promise<SearchMsgKeywordsResult> {
-    const early = this.earlySearchPages.get(searchId)
-    if (early) {
-      this.earlySearchPages.delete(searchId)
-      return early
-    }
-    const pending = deferred<SearchMsgKeywordsResult>()
-    if (this.pendingSearchPages.has(searchId)) throw new Error(`QQ search ${searchId} already has a pending page`)
-    this.pendingSearchPages.set(searchId, pending)
-    try {
-      trigger?.()
-      return await withTimeout(pending.promise, SEARCH_PAGE_TIMEOUT_MS, 'QQ search request timed out')
-    } finally {
-      if (this.pendingSearchPages.get(searchId) === pending) this.pendingSearchPages.delete(searchId)
-    }
-  }
-
-  private onSearchPage(result: SearchMsgKeywordsResult): void {
-    const pending = this.pendingSearchPages.get(result.searchId)
-    if (pending) {
-      this.pendingSearchPages.delete(result.searchId)
-      pending.resolve(result)
-      return
-    }
-    this.earlySearchPages.delete(result.searchId)
-    this.earlySearchPages.set(result.searchId, result)
-    while (this.earlySearchPages.size > 64) {
-      const oldest = this.earlySearchPages.keys().next().value as number | undefined
-      if (oldest === undefined) break
-      this.earlySearchPages.delete(oldest)
-    }
-  }
-
-  private pruneSearchContexts(service: NonNullable<typeof this.searchService>): void {
-    const expiredBefore = Date.now() - 5 * 60_000
-    for (const [token, context] of this.searchContexts) {
-      if (context.lastUsed >= expiredBefore && this.searchContexts.size <= 64) continue
-      this.searchContexts.delete(token)
-      safeCancelSearch(service, context.searchId, 'search cursor expired')
     }
   }
 
@@ -4726,11 +4598,6 @@ export class QQKernelBridge {
     } catch {
       this.avatarService = undefined
     }
-    try {
-      this.searchService = session.getSearchService?.()
-    } catch {
-      this.searchService = undefined
-    }
     const msgListener = markBridgeListener(makeListener(
       'NodeIKernelMsgListener',
       kernel.NodeIKernelMsgListener,
@@ -4971,19 +4838,6 @@ export class QQKernelBridge {
       )
       this.recentListenerId = recentService.addKernelRecentContactListener(recentListener)
       log('info', `native listener registered service=recent id=${this.recentListenerId || '<empty>'}`)
-    }
-    if (this.searchService) {
-      const searchListener = markBridgeListener(makeListener(
-        'NodeIKernelSearchListener',
-        kernel.NodeIKernelSearchListener,
-        {
-          onSearchMsgKeywordsResult: (
-            value: SearchMsgKeywordsResult | { result: SearchMsgKeywordsResult },
-          ) => this.onSearchPage('resultItems' in value ? value : value.result),
-        },
-      ))
-      this.searchListenerId = this.searchService.addKernelSearchListener(searchListener)
-      log('info', `native listener registered service=search id=${this.searchListenerId || '<empty>'}`)
     }
       try {
         if (!this.registerAVSDKListener()) this.scheduleAVSDKListenerRegistration(2)
@@ -7473,12 +7327,6 @@ export class QQKernelBridge {
     return (this.groupService ??= this.requireSession().getGroupService())
   }
 
-  private requireSearchService(): NonNullable<ReturnType<NonNullable<KernelSession['getSearchService']>>> {
-    const service = this.searchService ?? this.requireSession().getSearchService?.()
-    if (!service) throw new Error('QQ message search is unavailable in this QQNT build')
-    return (this.searchService = service)
-  }
-
   private getAvatarService(): NonNullable<ReturnType<NonNullable<KernelSession['getAvatarService']>>> | undefined {
     if (this.avatarService) return this.avatarService
     try {
@@ -8025,29 +7873,6 @@ function numericSequence(value: string | undefined): bigint | undefined {
 function validTimestamp(value: string | undefined): number {
   const timestamp = Number(value)
   return Number.isFinite(timestamp) && timestamp > 0 ? Math.trunc(timestamp) : 0
-}
-
-function matchesSearchMedia(
-  message: QQMessage, kind: SearchQuery['mediaKind'],
-): boolean {
-  return ( !kind ||
-    message.parts.some(
-      (part) => part.type === 'media' && part.media.kind === kind,
-    )
-  )
-}
-
-function safeCancelSearch(
-  service: NonNullable<ReturnType<NonNullable<KernelSession['getSearchService']>>> | undefined,
-  searchId: number,
-  reason: string,
-): void {
-  if (!service) return
-  try {
-    service.cancelSearchChatMsgs(searchId, 2, reason)
-  } catch (error) {
-    log('error', `cancelSearchChatMsgs failed searchId=${searchId}`, error)
-  }
 }
 
 function delay(milliseconds: number): Promise<void> {

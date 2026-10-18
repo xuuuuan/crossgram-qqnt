@@ -590,7 +590,7 @@ export class QQBridgeServer {
       return
     }
 
-    const conversationMatch = /^\/v1\/conversations\/([^/]+)(?:\/(history|members|search|group-files))?$/.exec(path)
+    const conversationMatch = /^\/v1\/conversations\/([^/]+)(?:\/(history|members|group-files))?$/.exec(path)
     if (request.method === 'GET' && conversationMatch) {
       const conversation = this.bridge.getConversation(decodeURIComponent(conversationMatch[1]))
       if (!conversationMatch[2]) {
@@ -604,27 +604,11 @@ export class QQBridgeServer {
           afterId: url.searchParams.get('afterId') ?? undefined,
           aroundUnreadSeq: url.searchParams.get('aroundUnreadSeq') ?? undefined,
           latest: url.searchParams.get('latest') === '1',
+          beforeSeq: url.searchParams.get('beforeSeq') || undefined,
           limit: numberParam(url, 'limit', 50),
         })
         log('info', `HTTP API history id=${requestId} conversation=${conversation.id} count=${page.messages.length} next=${page.nextCursor ?? ''}`)
         conditionalJson(request, response, page)
-      } else if (conversationMatch[2] === 'search') {
-        const requestedKind = url.searchParams.get('mediaKind')
-        if (requestedKind && requestedKind !== 'image' && requestedKind !== 'file') {
-          json(response, 400, { error: 'invalid mediaKind' })
-          return
-        }
-        const page = await this.bridge.searchMessages(conversation, {
-          query: url.searchParams.get('q') ?? '',
-          cursor: url.searchParams.get('cursor') ?? undefined,
-          limit: numberParam(url, 'limit', 50),
-          fromUserId: url.searchParams.get('fromUserId') ?? undefined,
-          minTimestamp: optionalNumberParam(url, 'minTimestamp'),
-          maxTimestamp: optionalNumberParam(url, 'maxTimestamp'),
-          mediaKind: (requestedKind as 'image' | 'file' | null) ?? undefined,
-        })
-        log('info', `HTTP API search id=${requestId} conversation=${conversation.id} query=${JSON.stringify(url.searchParams.get('q') ?? '')} count=${page.messages.length} next=${page.nextCursor ?? ''}`)
-        json(response, 200, page)
       } else if (conversationMatch[2] === 'group-files') {
         const page = await this.bridge.getGroupFiles(conversation, {
           folderId: url.searchParams.get('folderId') ?? undefined,
@@ -1248,14 +1232,6 @@ function requiredParam(url: URL, name: string): string {
 function numberParam(url: URL, name: string, fallback: number): number {
   const value = Number(url.searchParams.get(name) ?? fallback)
   if (!Number.isFinite(value)) throw new Error(`query parameter ${name} must be numeric`)
-  return value
-}
-
-function optionalNumberParam(url: URL, name: string): number | undefined {
-  const raw = url.searchParams.get(name)
-  if (raw === null || raw === '') return
-  const value = Number(raw)
-  if (!Number.isFinite(value)) throw new Error(`invalid ${name}`)
   return value
 }
 
