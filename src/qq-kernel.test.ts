@@ -4758,6 +4758,39 @@ it('drops zero-peer sidecars while preserving the paired group service message',
     })
   })
 
+  it('derives a favorite sticker id from the md5 embedded in its resId', async () => {
+    const f = fixture()
+    const directory = await mkdtemp(join(tmpdir(), 'qqnt-favorite-resid-md5-'))
+    tempPaths.push(directory)
+    const path = join(directory, 'favorite.png')
+    await writeFile(path, Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+      'base64',
+    ))
+    // QQ 不一定会填 `md5` 字段，但 resId 的 `<uin>_0_0_0_<MD5>_0_0` 中间那段就是它。
+    f.msg.fetchFavEmojiList.mockResolvedValue({
+      result: 0, errMsg: '', emojiInfoList: [{
+        emoPath: path, isExist: true,
+        resId: '1715311957_0_0_0_6D08089772D24F738EB24FE80271208A_0_0', url: '', md5: '',
+        emoOriginalPath: path, thumbPath: path, isAPNG: false, isMarkFace: false,
+        eId: '', epId: '', desc: 'Saved image',
+      }],
+    })
+    const attach = () => {
+      const bridge = new QQKernelBridge()
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: directory })
+      return bridge
+    }
+
+    await expect(attach().getSavedStickers()).resolves.toMatchObject({
+      stickers: [{ stickerId: 'favorite:6d08089772d24f738eb24fe80271208a' }],
+    })
+    // 冷缓存下拿历史 resId 形态来查，也要靠 resId 里的 md5 命中同一条收藏。
+    await expect(attach().getSticker(
+      'favorite:1715311957_0_0_0_6D08089772D24F738EB24FE80271208A_0_0',
+    )).resolves.toMatchObject({ stickerId: 'favorite:6d08089772d24f738eb24fe80271208a' })
+  })
+
   it('probes and caches missing remote favorite dimensions without downloading the full asset', async () => {
     const f = fixture()
     const png = completePng(512, 286)

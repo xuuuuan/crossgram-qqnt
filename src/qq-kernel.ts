@@ -2098,10 +2098,9 @@ export class QQKernelBridge {
     const { resId, md5 } = sticker.reference
     // 旧投影曾用 `resId` 形态下发收藏表情 id，保留别名让历史 document id 仍可解析。
     if (resId) this.stickers.set(`favorite:${resId}`, sticker)
-    const content = md5?.trim()
+    const content = favoriteContentKey(resId, md5)
     if (!content) return
-    this.stickers.set(favoriteStickerId(content), sticker)
-    this.stickers.set(`favorite:${content.toLowerCase()}`, sticker)
+    this.stickers.set(`favorite:${content}`, sticker)
     this.stickers.set(`favorite:${content.toUpperCase()}`, sticker)
   }
 
@@ -8951,23 +8950,32 @@ function parseMarketStickerId(value: string): { packageId: string, stickerId: st
 /**
  * QQ 收藏表情的稳定身份按内容（md5）取值。
  *
- * 同一条收藏在「收藏列表」里带的是 `resId`（`<uin>_0_0_0_<MD5>_0_0`），而消息元素里只有
- * `md5`；两边必须落到同一个 sticker id，否则同一个表情会派生两个 document id
+ * 同一条收藏在「收藏列表」里带的是 `resId`（`<uin>_0_0_0_<MD5>_0_0`，中间那段就是文件 md5），
+ * 而消息元素里只有 `md5`；两边必须落到同一个 sticker id，否则同一个表情会派生两个 document id
  * （消息里一个、贴纸包/最近使用里另一个），客户端「最近使用」就会出现看着一样的重复项，
- * 且消息里那个 id 依赖内存别名缓存才能解析。没有 md5 时才回退到 `resId`。
+ * 且消息里那个 id 依赖内存别名缓存才能解析。因此 md5 既可以从 `resId` 里直接取出来，也不依赖
+ * QQ 是否另外给了 `md5` 字段；两者都没有时才回退到原样的 `resId`。
  */
 function favoriteStickerId(resId: string, md5?: string): string {
-  const content = md5?.trim()
-  return `favorite:${content ? content.toLowerCase() : resId}`
+  return `favorite:${favoriteContentKey(resId, md5) ?? resId}`
+}
+
+/** 收藏表情的内容（md5）形态：优先用显式 md5，否则从 `resId` 中间那段取。 */
+function favoriteContentKey(resId: string, md5?: string): string | undefined {
+  const explicit = md5?.trim().toLowerCase()
+  if (explicit) return explicit
+  const embedded = resId.split('_').find((segment) => /^[0-9a-f]{32}$/i.test(segment))
+  return embedded?.toLowerCase()
 }
 
 /** 收藏表情的历史 `resId` 形态与内容（md5）形态都要能解析到同一条收藏。 */
 function matchesFavoriteStickerId(sticker: QQSticker, wanted: string): boolean {
-  if (sticker.stickerId.toLowerCase().slice('favorite:'.length) === wanted) return true
+  const key = wanted.toLowerCase()
+  if (sticker.stickerId.toLowerCase().slice('favorite:'.length) === key) return true
   const reference = sticker.reference
   if (reference.kind !== 'favorite') return false
-  if (reference.resId && reference.resId.toLowerCase() === wanted) return true
-  return Boolean(reference.md5 && reference.md5.toLowerCase() === wanted)
+  if (reference.resId && reference.resId.toLowerCase() === key) return true
+  return favoriteContentKey(reference.resId, reference.md5) === key
 }
 
 function parseFavoriteStickerId(value: string): string | undefined {
