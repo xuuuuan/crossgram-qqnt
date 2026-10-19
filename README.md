@@ -47,8 +47,11 @@ curl -fsSL https://raw.githubusercontent.com/xuuuuan/crossgram-qqnt/main/deploy/
 ```sh
 nix build .#qqnt-bridge-assets
 # 参数依次为：[DATA_DIR] [DISPLAY] [VNC_PORT] [NOVNC_PORT] [MEDIA_SOCKET] [BRIDGE_ENV]
-nix run .#qqnt -- /srv/qqnt/primary 99 5900 6080 /run/qqnt-media/primary/qqnt-media.sock
+# VNC_PORT=0 关闭 VNC（默认）；需要排障时再改成 5900
+nix run .#qqnt -- /srv/qqnt/primary 99 0 6080 /run/qqnt-media/primary/qqnt-media.sock
 ```
+
+VNC 默认关闭（`QQNT_VNC_PORT=0`，端口 0 即禁用）：扫码登录走 `qqntctl qr`，VNC 只是无显示器时看界面/排障（比如好友请求弹窗）的兜底。需要时用 `QQNT_VNC_PORT=5900 nix run .#qqnt -- ...` 打开（也可以直接传第 3 个位置参数），默认只监听 `127.0.0.1`（x11vnc 没有密码）；要从其它机器访问再用 `QQNT_VNC_BIND` 覆盖，并自行加防火墙或 VNC 密码。
 
 ### Windows 本地调试
 

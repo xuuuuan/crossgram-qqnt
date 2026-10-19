@@ -93,10 +93,11 @@
       };
       runtime = pkgs.writeShellScriptBin "qqnt-runtime" ''
         display=$1
-        vnc_port=$2
+        vnc_port="''${2:-0}"
         novnc_port=$3
         media_socket=$4
         bridge_env=$5
+        vnc_bind="''${6:-127.0.0.1}"
 
         create_service() {
           mkdir -p "/services/$1"
@@ -131,8 +132,23 @@
         # LibVNCServer counts free descriptors by walking 0..RLIMIT_NOFILE with
         # fcntl() on every incoming connection, so an inherited "infinity" soft
         # limit (pm2, systemd) wedges the accept path at 100% CPU. Cap it.
-        create_service x11vnc "ulimit -Sn 1024; exec x11vnc -forever -shared -display :$display -rfbport $vnc_port"
-        create_service novnc "novnc --vnc localhost:$vnc_port --listen $novnc_port --file-only"
+        # x11vnc has no password and is only a UI fallback (friend-request
+        # dialogs, rendering/login anomalies). Login uses the CLI QR flow, so
+        # VNC is off by default: port 0 disables it. When a real port is set,
+        # bind loopback unless QQNT_VNC_BIND widens it. -localhost pins both
+        # AF_INET and AF_INET6 to loopback (a bare "-listen 127.0.0.1" still
+        # leaves the IPv6 socket on [::]).
+        if [ "$vnc_port" != 0 ]; then
+          if [ "$vnc_bind" = 127.0.0.1 ] || [ "$vnc_bind" = localhost ]; then
+            x11vnc_listen=-localhost
+          elif [ "$vnc_bind" = 0.0.0.0 ]; then
+            x11vnc_listen=
+          else
+            x11vnc_listen="-listen $vnc_bind"
+          fi
+          create_service x11vnc "ulimit -Sn 1024; exec x11vnc -forever -shared $x11vnc_listen -display :$display -rfbport $vnc_port"
+          create_service novnc "novnc --vnc localhost:$vnc_port --listen $vnc_bind:$novnc_port --file-only"
+        fi
         create_service dbus 'dbus-daemon --nofork --config-file=/etc/dbus/system.conf'
         create_service dunst 'dunst'
 
@@ -178,10 +194,14 @@
         text = ''
           data_dir="''${1:-$PWD/data}"
           display="''${2:-99}"
-          vnc_port="''${3:-5900}"
+          # VNC port 0 (the default) disables VNC/noVNC. It is a UI fallback,
+          # not the login path (login uses the CLI QR flow); when enabled it
+          # listens on loopback by default because x11vnc has no password.
+          vnc_port="''${3:-''${QQNT_VNC_PORT:-0}}"
           novnc_port="''${4:-6080}"
           media_socket="''${5:-}"
           bridge_env="/root/''${6:-qqnt-bridge.env}"
+          vnc_bind="''${QQNT_VNC_BIND:-127.0.0.1}"
 
           mkdir -p -- "$data_dir"
           bwrap_args=(
@@ -211,7 +231,7 @@
           fi
           exec ${pkgs.bubblewrap}/bin/bwrap "''${bwrap_args[@]}" \
             ${runtime}/bin/qqnt-runtime \
-            "$display" "$vnc_port" "$novnc_port" "$media_socket" "$bridge_env"
+            "$display" "$vnc_port" "$novnc_port" "$media_socket" "$bridge_env" "$vnc_bind"
         '';
       };
     in {
