@@ -128,11 +128,21 @@
         export DBUS_SESSION_BUS_ADDRESS='unix:path=/run/dbus/system_bus_socket'
         export DISPLAY=:$display
         create_service xvfb "Xvfb :$display"
-        # LibVNCServer counts free descriptors by walking 0..RLIMIT_NOFILE with
-        # fcntl() on every incoming connection, so an inherited "infinity" soft
-        # limit (pm2, systemd) wedges the accept path at 100% CPU. Cap it.
-        create_service x11vnc "ulimit -Sn 1024; exec x11vnc -forever -shared -display :$display -rfbport $vnc_port"
-        create_service novnc "novnc --vnc localhost:$vnc_port --listen $novnc_port --file-only"
+        # VNC/noVNC listen specs are [host:]port; a bare port binds 127.0.0.1,
+        # and vnc_port=0 disables both services.
+        vnc_listen=$vnc_port
+        novnc_listen=$novnc_port
+        case $vnc_listen in *:*) ;; *) vnc_listen="127.0.0.1:$vnc_listen" ;; esac
+        case $novnc_listen in *:*) ;; *) novnc_listen="127.0.0.1:$novnc_listen" ;; esac
+        if [ "$vnc_port" != 0 ]; then
+          # LibVNCServer counts free descriptors by walking 0..RLIMIT_NOFILE with
+          # fcntl() on every incoming connection, so an inherited "infinity" soft
+          # limit (pm2, systemd) wedges the accept path at 100% CPU. Cap it.
+          create_service x11vnc "ulimit -Sn 1024; exec x11vnc -forever -shared -display :$display -listen ''${vnc_listen%%:*} -rfbport ''${vnc_listen##*:}"
+          if [ "$novnc_port" != 0 ]; then
+            create_service novnc "novnc --vnc $vnc_listen --listen $novnc_listen --file-only"
+          fi
+        fi
         create_service dbus 'dbus-daemon --nofork --config-file=/etc/dbus/system.conf'
         create_service dunst 'dunst'
 

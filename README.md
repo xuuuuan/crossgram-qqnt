@@ -46,7 +46,8 @@ curl -fsSL https://raw.githubusercontent.com/xuuuuan/crossgram-qqnt/main/deploy/
 
 ```sh
 nix build .#qqnt-bridge-assets
-# 参数依次为：[DATA_DIR] [DISPLAY] [VNC_PORT] [NOVNC_PORT] [MEDIA_SOCKET] [BRIDGE_ENV]
+# 参数依次为：[DATA_DIR] [DISPLAY] [VNC] [NOVNC] [MEDIA_SOCKET] [BRIDGE_ENV]
+# VNC/NOVNC 为 [HOST:]PORT，纯端口默认绑定 127.0.0.1，设为 0 关闭
 nix run .#qqnt -- /srv/qqnt/primary 99 5900 6080 /run/qqnt-media/primary/qqnt-media.sock
 ```
 
