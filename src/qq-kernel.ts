@@ -457,6 +457,8 @@ export class QQKernelBridge {
     expectedText?: string
     expectedMediaName?: string
     expectedMediaKind?: 'image' | 'video' | 'file' | 'voice' | 'sticker'
+    /** 群文件走 0x6d9_4 发布后，回包消息用文件 UUID 指认，文件名可能已被 QQ 改名。 */
+    expectedFileUuid?: string
     originRequestId?: string
     assignedMessageId?: string
   }> = []
@@ -2624,6 +2626,9 @@ export class QQKernelBridge {
       const pending = deferred<MsgRecord>()
       const accepted = deferred<void>()
       const minimumStatus = content.media.length || manifest.sticker ? 2 : 1
+      const groupFilePart = conversation.chatType === CHAT_GROUP
+        ? protocolParts.find((part) => part.kind === 'file')
+        : undefined
       this.pendingUnassigned.push({
         conversationId: conversation.id,
         pending,
@@ -2633,11 +2638,11 @@ export class QQKernelBridge {
         expectedText: text,
         expectedMediaName: content.media[0]?.kind === 'voice' ? undefined : content.media[0]?.name,
         expectedMediaKind: manifest.sticker ? 'sticker' : content.media[0]?.kind,
+        // 群文件重名时 QQ 会把落地的名字改成 `名字.1`，回包再按名字就永远对不上；
+        // 发布用的是文件 UUID，回包消息里也带同一个 UUID，用它指认这条发送。
+        expectedFileUuid: groupFilePart?.upload.fileUuid,
         originRequestId: manifest.originRequestId,
       })
-      const groupFilePart = conversation.chatType === CHAT_GROUP
-        ? protocolParts.find((part) => part.kind === 'file')
-        : undefined
       const protocolName = voicePtt
         ? 'KernelMsgService.sendMsg'
         : groupFilePart
@@ -2666,10 +2671,13 @@ export class QQKernelBridge {
       const pollController = new AbortController()
       const confirmationPoll = this.pollSentMessage(
         conversation,
-        text,
+        {
+          expectedText: text,
+          expectedMediaKind: manifest.sticker ? 'sticker' : content.media[0]?.kind,
+          expectedMediaName: content.media[0]?.kind === 'voice' ? undefined : content.media[0]?.name,
+          expectedFileUuid: groupFilePart?.upload.fileUuid,
+        },
         startedAt,
-        manifest.sticker ? 'sticker' : content.media[0]?.kind,
-        content.media[0]?.kind === 'voice' ? undefined : content.media[0]?.name,
         minimumStatus,
         pollController.signal,
         !voicePtt && sendResponse && 'sequence' in sendResponse
@@ -2692,12 +2700,18 @@ export class QQKernelBridge {
       this.rememberMessageOrigin(record.msgId, manifest.originRequestId)
       const message = await this.mapMessagePrepared(record)
       log('info', `protocol API confirmed name=${protocolName} conversation=${conversation.id} requestedMessage=${id} confirmedMessage=${message.id} status=${record.sendStatus}`)
-      if (content.media.length && sentMediaPaths.length) {
+      if (content.media.length) {
         const mediaParts = message.parts.filter((part) => part.type === 'media')
         for (const [index, media] of mediaParts.entries()) {
           const spec = content.media[index]
+          if (!spec || media.type !== 'media' || spec.kind === 'voice') continue
+          // 群文件重名落库时 QQ 把名字改成了 `名字.1`；发送方看到的应当还是自己选的名字。
+          if (spec.kind === 'file' && spec.name) {
+            media.media.name = spec.name
+            media.media.locator.fileName = spec.name
+          }
           const path = sentMediaPaths[index]
-          if (!spec || !path || media.type !== 'media' || spec.kind === 'voice') continue
+          if (!path) continue
           media.media.locator.filePath = path
           media.media.size ??= spec.size
           media.media.width ??= spec.width
@@ -2705,7 +2719,7 @@ export class QQKernelBridge {
           media.media.duration ??= spec.duration
           media.media.mimeType ??= spec.mimeType
         }
-        preserveUntil = Date.now() + 10 * 60_000
+        if (sentMediaPaths.length) preserveUntil = Date.now() + 10 * 60_000
       }
       return message
     } finally {
@@ -2990,10 +3004,12 @@ export class QQKernelBridge {
         pending.promise,
         this.pollSentMessage(
           conversation,
-          text,
+          {
+            expectedText: text,
+            expectedMediaKind: manifest.sticker ? 'sticker' : content.media[0]?.kind,
+            expectedMediaName: content.media[0]?.kind === 'voice' ? undefined : content.media[0]?.name,
+          },
           startedAt,
-          manifest.sticker ? 'sticker' : content.media[0]?.kind,
-          content.media[0]?.kind === 'voice' ? undefined : content.media[0]?.name,
           minimumStatus,
           pollController.signal,
         ),
@@ -5801,14 +5817,7 @@ export class QQKernelBridge {
           && item.conversationId === id
           && Number(record.msgTime) >= item.startedAt - 2
           && (!item.expectedText || recordTextContent(record) === item.expectedText)
-          && (!item.expectedMediaKind || record.elements.some((element) =>
-            matchesElementKind(element, item.expectedMediaKind!)))
-          && (!item.expectedMediaName || record.elements.some((element) =>
-            element.fileElement?.fileName === item.expectedMediaName
-            || element.picElement?.fileName === item.expectedMediaName
-            || element.videoElement?.fileName === item.expectedMediaName
-            || element.pttElement?.fileName === item.expectedMediaName)
-            || item.expectedMediaKind === 'image'))
+          && matchesPendingMedia(record, item))
         // 图片和表情在首次 `onAddSendMsg` 时可能尚未包含媒体元素，按会话顺序认领最早的待确认发送。
         if (index < 0 && outgoing && source === 'onAddSendMsg' && record.sendStatus >= 1) {
           index = this.pendingUnassigned.findIndex((item) =>
@@ -6162,10 +6171,8 @@ export class QQKernelBridge {
 
   private async pollSentMessage(
     conversation: QQConversation,
-    expectedText: string | undefined,
+    expected: PendingSendExpectation,
     startedAt: number,
-    expectedMediaKind: 'image' | 'video' | 'file' | 'voice' | 'sticker' | undefined,
-    expectedMediaName: string | undefined,
     minimumStatus: number,
     signal: AbortSignal,
     sequenceHint?: string,
@@ -6204,13 +6211,8 @@ export class QQKernelBridge {
       const found = response.msgList.find((record) =>
         Number(record.msgTime) >= startedAt - 2
         && (record.senderUid === this.config?.selfUid || SEND_FROM_SELF.has(record.sendType))
-        && (expectedText === undefined || recordTextContent(record) === expectedText)
-        && (expectedMediaKind === undefined || record.elements.some((element) =>
-          matchesElementKind(element, expectedMediaKind)))
-        && (expectedMediaName === undefined || expectedMediaKind === 'image' || record.elements.some((element) =>
-          element.fileElement?.fileName === expectedMediaName
-          || element.videoElement?.fileName === expectedMediaName
-          || element.pttElement?.fileName === expectedMediaName)))
+        && (expected.expectedText === undefined || recordTextContent(record) === expected.expectedText)
+        && matchesPendingMedia(record, expected))
       if (found?.sendStatus === 0) throw new Error(`QQ send failed: ${found.msgId}`)
       if (found && found.sendStatus >= minimumStatus) return found
       await new Promise((resolve) => setTimeout(resolve, 500))
@@ -8994,6 +8996,48 @@ function favoritePackVersion(stickers: QQSticker[]): number {
     }
   }
   return hash >>> 0
+}
+
+/** 一条待确认发送的媒体期望：种类 + 发送时的名字 + （群文件）发布用的文件 UUID。 */
+interface PendingSendExpectation {
+  expectedText?: string
+  expectedMediaKind?: 'image' | 'video' | 'file' | 'voice' | 'sticker'
+  expectedMediaName?: string
+  expectedFileUuid?: string
+}
+
+function matchesPendingMedia(record: MsgRecord, expected: PendingSendExpectation): boolean {
+  if (!expected.expectedMediaKind) return true
+  return record.elements.some((element) => mediaElementMatches(
+    element, expected.expectedMediaKind!, expected.expectedMediaName, expected.expectedFileUuid,
+  ))
+}
+
+function mediaElementMatches(
+  element: MsgElement,
+  kind: 'image' | 'video' | 'file' | 'voice' | 'sticker',
+  name?: string,
+  fileUuid?: string,
+): boolean {
+  if (!matchesElementKind(element, kind)) return false
+  // 群文件重名时 QQ 改的是落地名，UUID 才是发送时那一个文件的身份。
+  if (fileUuid && element.fileElement?.fileUuid === fileUuid) return true
+  if (name === undefined || kind === 'image') return true
+  const candidates = [
+    element.fileElement?.fileName,
+    element.picElement?.fileName,
+    element.videoElement?.fileName,
+    element.pttElement?.fileName,
+  ]
+  return candidates.some((candidate) => typeof candidate === 'string'
+    && isSameOrRenamedFile(candidate, name))
+}
+
+/** QQ 群文件遇到重名会把新文件保存成 `名字.1`（继续重名仍是 `.1`）。 */
+function isSameOrRenamedFile(actual: string, expected: string): boolean {
+  if (actual === expected) return true
+  if (!actual.startsWith(expected)) return false
+  return /^(?:\.\d{1,3}|\(\d{1,3}\))$/.test(actual.slice(expected.length))
 }
 
 function matchesElementKind(

@@ -3801,6 +3801,108 @@ it('drops zero-peer sidecars while preserving the paired group service message',
     expect(f.sentBodies).toEqual([])
   })
 
+  it('confirms a group file send that QQ renamed, matching the published file UUID', async () => {
+    const f = fixture()
+    const file = Buffer.from([4, 5, 6, 7])
+    const publisher = vi.spyOn(QQPacketClient.prototype, 'publishGroupFile')
+      .mockImplementation(async (peerUin, fileUuid) => {
+        // 群里已有同名文件时 QQ 会把落地的名字改成 `名字.1`，回包消息只能靠 UUID 认人。
+        queueMicrotask(() => f.emitReceived([{
+          ...f.message,
+          msgId: 'm-renamed-file', msgSeq: '13056', chatType: 2,
+          peerUid: peerUin, peerUin, sendStatus: 2, elements: [{
+            elementType: 3, elementId: 'file-element', fileElement: {
+              fileName: 'direct.bin.1', fileSize: '4', filePath: '', fileUuid, fileSubId: '',
+              fileMd5: '', fileSha: '', fileSha3: '', file10MMd5: '',
+            },
+          }],
+        }]))
+        return { published: true }
+      })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    const sent = await bridge.send({
+      conversationId: '1058754719',
+      media: [{
+        kind: 'file', name: 'direct.bin', size: file.length,
+        md5: 'a6b8537b97d58b417d3dfdd1030b15d2', sha1: '13a936c521299ecb9702d0b63e6458171f926bba',
+        file10MMd5: 'a6b8537b97d58b417d3dfdd1030b15d2',
+      }],
+    }, Readable.from([file]))
+
+    expect(publisher).toHaveBeenCalledWith('1058754719', 'direct.bin')
+    expect(sent.id).toBe('m-renamed-file')
+    // 发送方看到的仍然是自己选的文件名，而不是 QQ 落库的 `direct.bin.1`。
+    expect(sent.parts).toMatchObject([{
+      type: 'media',
+      media: { kind: 'file', name: 'direct.bin', locator: { fileName: 'direct.bin' } },
+    }])
+  })
+
+  it('confirms a group file send whose echo only carries the QQ-renamed name', async () => {
+    const f = fixture()
+    const file = Buffer.from([4, 5, 6, 7])
+    vi.spyOn(QQPacketClient.prototype, 'publishGroupFile')
+      .mockImplementation(async (peerUin, fileUuid) => {
+        // 老版本回包只给出落库后的名字（`.1`），没有可用的 UUID。
+        queueMicrotask(() => f.emitReceived([{
+          ...f.message,
+          msgId: 'm-renamed-only', msgSeq: '13057', chatType: 2,
+          peerUid: peerUin, peerUin, sendStatus: 2, elements: [{
+            elementType: 3, elementId: 'file-element', fileElement: {
+              fileName: 'direct.bin.1', fileSize: '4', filePath: '', fileUuid: `${fileUuid}-other`,
+              fileSubId: '', fileMd5: '', fileSha: '', fileSha3: '', file10MMd5: '',
+            },
+          }],
+        }]))
+        return { published: true }
+      })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    const sent = await bridge.send({
+      conversationId: '1058754719',
+      media: [{
+        kind: 'file', name: 'direct.bin', size: file.length,
+        md5: 'a6b8537b97d58b417d3dfdd1030b15d2', sha1: '13a936c521299ecb9702d0b63e6458171f926bba',
+        file10MMd5: 'a6b8537b97d58b417d3dfdd1030b15d2',
+      }],
+    }, Readable.from([file]))
+
+    expect(sent.id).toBe('m-renamed-only')
+  })
+
+  it('does not confirm a group file send when the echo is an unrelated file', async () => {
+    const f = fixture()
+    const file = Buffer.from([4, 5, 6, 7])
+    vi.spyOn(QQPacketClient.prototype, 'publishGroupFile')
+      .mockImplementation(async (peerUin, fileUuid) => {
+        queueMicrotask(() => f.emitReceived([{
+          ...f.message,
+          msgId: 'm-other-file', msgSeq: '13058', chatType: 2,
+          peerUid: peerUin, peerUin, sendStatus: 2, elements: [{
+            elementType: 3, elementId: 'file-element', fileElement: {
+              fileName: 'other.bin', fileSize: '4', filePath: '', fileUuid: `${fileUuid}-other`,
+              fileSubId: '', fileMd5: '', fileSha: '', fileSha3: '', file10MMd5: '',
+            },
+          }],
+        }]))
+        return { published: true }
+      })
+    const bridge = new QQKernelBridge({ sendTimeoutMs: 150 })
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.send({
+      conversationId: '1058754719',
+      media: [{
+        kind: 'file', name: 'direct.bin', size: file.length,
+        md5: 'a6b8537b97d58b417d3dfdd1030b15d2', sha1: '13a936c521299ecb9702d0b63e6458171f926bba',
+        file10MMd5: 'a6b8537b97d58b417d3dfdd1030b15d2',
+      }],
+    }, Readable.from([file]))).rejects.toThrow('QQ did not confirm message 0')
+  })
+
   it('rejects group file captions before uploading to QQ CDN', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()
@@ -8525,6 +8627,66 @@ describe('QQBridgeServer', () => {
       parts: [{ type: 'text', text: 'saved over HTTP' }],
     })
     expect(f.protocolSend).not.toHaveBeenCalled()
+  })
+
+  it('E2E: sends a group file whose QQ echo was renamed to `名字.1` over the HTTP API', async () => {
+    const f = fixture()
+    const name = '再见云运动-3.6.7-xposed模块.apk'
+    const size = 4497953
+    const md5 = 'a6b8537b97d58b417d3dfdd1030b15d2'
+    const sha1 = '13a936c521299ecb9702d0b63e6458171f926bba'
+    vi.spyOn(QQPacketClient.prototype, 'prepareFileUpload').mockResolvedValue({
+      upload: { fileUuid: '/uuid-file-1', exists: true, commandId: 71 },
+    })
+    vi.spyOn(QQPacketClient.prototype, 'completeFileUpload').mockResolvedValue()
+    vi.spyOn(QQPacketClient.prototype, 'publishGroupFile').mockImplementation(async (peerUin, fileUuid) => {
+      // 群里已有同名文件：QQ 落库时把它改名成 `名字.1`，并照常产生一条自己的消息。
+      queueMicrotask(() => f.emitReceived([{
+        ...f.message,
+        msgId: 'm-renamed-group-file', msgSeq: '13056', chatType: 2,
+        peerUid: peerUin, peerUin, sendStatus: 2, elements: [{
+          elementType: 3, elementId: 'file-element', fileElement: {
+            fileName: `${name}.1`, fileSize: String(size), filePath: '', fileUuid, fileSubId: '',
+            fileMd5: '', fileSha: '', fileSha3: '', file10MMd5: '',
+          },
+        }],
+      }]))
+      return { published: true }
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    server = new QQBridgeServer(bridge, { port: 0 })
+    await server.start()
+    const base = `http://127.0.0.1:${server.address().port}/v1`
+
+    const prepared = await fetch(`${base}/uploads/prepare`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        conversationId: '1058754719',
+        media: { kind: 'file', name, size, md5, sha1, file10MMd5: md5 },
+      }),
+    })
+    expect(prepared.status, await prepared.clone().text()).toBe(200)
+    const plan = await prepared.json() as { prepared: { kind: string, fileUuid: string } }
+    expect(plan).toMatchObject({ prepared: { kind: 'file', fileUuid: '/uuid-file-1' } })
+    expect(plan).not.toHaveProperty('highway')
+
+    const sendResponse = await fetch(`${base}/messages`, {
+      method: 'POST',
+      headers: {
+        'x-qqnt-manifest': Buffer.from(JSON.stringify({
+          conversationId: '1058754719',
+          parts: [{ type: 'media', media: { kind: 'file', name, size, md5, sha1, file10MMd5: md5 }, prepared: plan.prepared }],
+        })).toString('base64url'),
+      },
+      body: new Uint8Array(),
+    })
+    expect(sendResponse.status, await sendResponse.clone().text()).toBe(200)
+    // 发送方拿回的是自己选的文件名，而不是 QQ 落库时改出来的 `名字.1`。
+    await expect(sendResponse.json()).resolves.toMatchObject({
+      id: 'm-renamed-group-file',
+      parts: [{ type: 'media', media: { kind: 'file', name, locator: { fileName: name } } }],
+    })
   })
 
   it('E2E: keeps the group-files HTTP request open until the native callback after a numeric dispatch token', async () => {
