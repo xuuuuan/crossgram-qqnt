@@ -287,6 +287,8 @@ export interface QQCard {
   groupInvite?: QQGroupInvite
   /** 位置卡片（com.tencent.map LocationShare）携带的坐标。 */
   location?: QQLocation
+  /** ark 卡片的原始 JSON，新卡片类型的字段提取在 crossgram 侧完成即可，无需改本仓。 */
+  raw?: Record<string, unknown>
 }
 
 export interface QQLocation {

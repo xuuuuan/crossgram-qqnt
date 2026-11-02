@@ -10189,7 +10189,7 @@ function arkCard(value: unknown): QQCard | undefined {
   const described = description && groupInvite
     ? `${description}\n群号 ${groupInvite.groupCode}`
     : description
-  return compactCard({ kind, title, description: described, source, url, thumbnailUrl, groupInvite, location })
+  return compactCard({ kind, title, description: described, source, url, thumbnailUrl, groupInvite, location, raw: root })
 }
 
 /** com.tencent.map 位置卡片 meta["Location.Search"] 的 lat/lng 为字符串坐标。 */
@@ -10251,6 +10251,7 @@ function compactCard(card: QQCard): QQCard {
     ...(card.thumbnailUrl ? { thumbnailUrl: card.thumbnailUrl } : {}),
     ...(card.groupInvite ? { groupInvite: card.groupInvite } : {}),
     ...(card.location ? { location: card.location } : {}),
+    ...(card.raw ? { raw: card.raw } : {}),
   }
 }
 

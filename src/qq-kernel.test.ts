@@ -2995,6 +2995,7 @@ it('drops zero-peer sidecars while preserving the paired group service message',
         title: '如家精选酒店(上海陆家嘴羽山路源深体育中心地铁站店)',
         description: '上海市浦东新区羽山路166号',
         location: { lat: 31.230254, lng: 121.539386 },
+        raw: { app: 'com.tencent.map', meta: { 'Location.Search': { lat: '31.230254' } } },
       } }] }],
     })
   })
