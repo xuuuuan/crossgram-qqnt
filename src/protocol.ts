@@ -285,6 +285,13 @@ export interface QQCard {
   thumbnailUrl?: string
   /** Official group-invite cards (bizsrc=qun.invite): accepts the invite via operateSysNotify. */
   groupInvite?: QQGroupInvite
+  /** 位置卡片（com.tencent.map LocationShare）携带的坐标。 */
+  location?: QQLocation
+}
+
+export interface QQLocation {
+  lat: number
+  lng: number
 }
 
 /** Parameters of an official "邀请你加入群聊" card's mqqapi jump link. */

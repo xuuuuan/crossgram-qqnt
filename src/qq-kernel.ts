@@ -33,7 +33,7 @@ import {
 import {
   conversationId, parseConversationId, type HistoryPage, type HistoryQuery, type MemberPage, type QQCallSignalEvent, type QQCard, type QQConversation, type QQEvent, type QQGroupFilePage, type QQMedia, type QQMediaLocator, type QQMediaUploadPlan, type QQMessage, type QQMultiForwardLocator, type QQReactionActorPage, type QQReactionContext, type QQReactionDefinition, type QQReactionState,
   type QQFlashTransferManifest, type QQFlashTransferResult, type QQPokeResult, type QQRequest, type QQRequestKind, type QQRequestPage, type QQRequestStatus, type QQSendMediaSpec, type QQServiceMember, type QQSticker, type QQStickerPack, type QQStickerPackSummary, type QQStickerReference, type QQTextPart, type SendManifest,
-  type QQGroupInvite,
+  type QQGroupInvite, type QQLocation,
 } from './protocol.js'
 
 const REACTION_ASSET_META_TTL_MS = 10 * 60_000
@@ -10173,7 +10173,7 @@ function arkCard(value: unknown): QQCard | undefined {
     || stripCardPrompt(stringValue(root.prompt))
     || source
   if (!title) return
-  const description = legacyMiniApp ? '' : firstString(record, ['desc', 'description', 'summary', 'brief'])
+  const description = legacyMiniApp ? '' : firstString(record, ['desc', 'description', 'summary', 'brief', 'address'])
   const url = firstWebUrl(record, URL_KEYS)
     || firstWebUrl(root, ['jumpUrl', 'url'])
   const thumbnailUrl = firstWebUrl(record, [
@@ -10185,10 +10185,18 @@ function arkCard(value: unknown): QQCard | undefined {
         : key.includes('location') ? 'location'
           : url ? 'link' : 'application'
   const groupInvite = groupInviteFromArk(root, record)
+  const location = kind === 'location' ? cardLocation(record) : undefined
   const described = description && groupInvite
     ? `${description}\n群号 ${groupInvite.groupCode}`
     : description
-  return compactCard({ kind, title, description: described, source, url, thumbnailUrl, groupInvite })
+  return compactCard({ kind, title, description: described, source, url, thumbnailUrl, groupInvite, location })
+}
+
+/** com.tencent.map 位置卡片 meta["Location.Search"] 的 lat/lng 为字符串坐标。 */
+function cardLocation(record: Record<string, unknown>): QQLocation | undefined {
+  const lat = Number(record.lat)
+  const lng = Number(record.lng)
+  return Number.isFinite(lat) && Number.isFinite(lng) ? { lat, lng } : undefined
 }
 
 /**
@@ -10242,6 +10250,7 @@ function compactCard(card: QQCard): QQCard {
     ...(card.url ? { url: card.url } : {}),
     ...(card.thumbnailUrl ? { thumbnailUrl: card.thumbnailUrl } : {}),
     ...(card.groupInvite ? { groupInvite: card.groupInvite } : {}),
+    ...(card.location ? { location: card.location } : {}),
   }
 }
 

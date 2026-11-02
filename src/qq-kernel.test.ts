@@ -2973,6 +2973,32 @@ it('drops zero-peer sidecars while preserving the paired group service message',
     })
   })
 
+  it('parses location-share Ark cards with coordinates', async () => {
+    // Payload shape captured from a live com.tencent.map LocationShare card.
+    const f = fixture()
+    f.message.elements = [{
+      elementType: 10, elementId: 'location', arkElement: { bytesData: JSON.stringify({
+        app: 'com.tencent.map', prompt: '[位置]如家精选酒店(上海陆家嘴羽山路源深体育中心地铁站店)',
+        meta: { 'Location.Search': {
+          name: '如家精选酒店(上海陆家嘴羽山路源深体育中心地铁站店)',
+          address: '上海市浦东新区羽山路166号',
+          lat: '31.230254', lng: '121.539386',
+        } },
+      }) },
+    }]
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.getHistory(bridge.getConversation('uid-1715311957'))).resolves.toMatchObject({
+      messages: [{ parts: [{ type: 'card', card: {
+        kind: 'location',
+        title: '如家精选酒店(上海陆家嘴羽山路源深体育中心地铁站店)',
+        description: '上海市浦东新区羽山路166号',
+        location: { lat: 31.230254, lng: 121.539386 },
+      } }] }],
+    })
+  })
+
   it('parses official group-invite Ark cards with their join parameters', async () => {
     // Payload shape captured from a live qun.invite card; ids sanitized.
     const f = fixture()
