@@ -3634,6 +3634,38 @@ it('drops zero-peer sidecars while preserving the paired group service message',
     expect(f.msg.getMsgsIncludeSelf).toHaveBeenCalledOnce()
   })
 
+  it('serves the final page when QQ reports kNoMoreMsg instead of failing the request', async () => {
+    const f = fixture()
+    // QQ 在历史边界上返回 kNoMoreMsg (2004000) 并附上最后一页真实消息；
+    // 官方客户端照常消费这一页，bridge 也不能把它变成 500。
+    f.msg.getMsgsIncludeSelf = vi.fn(async () => ({
+      result: 2_004_000, errMsg: 'no any more msg!', msgList: [f.message],
+    }))
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const [conversation] = (await bridge.getDialogs()).conversations
+
+    await expect(bridge.getHistory(conversation, { beforeId: 'm2', limit: 1 })).resolves.toMatchObject({
+      messages: [{ id: 'm1' }],
+    })
+    // 已经到底了，不能再用游标让调用方继续往前翻。
+    expect((await bridge.getHistory(conversation, { beforeId: 'm2', limit: 1 })).nextCursor)
+      .toBeUndefined()
+  })
+
+  it('still fails an anchored page on a genuine QQ error', async () => {
+    const f = fixture()
+    f.msg.getMsgsIncludeSelf = vi.fn(async () => ({
+      result: 5, errMsg: 'native failure', msgList: [],
+    }))
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const [conversation] = (await bridge.getDialogs()).conversations
+
+    await expect(bridge.getHistory(conversation, { beforeId: 'm2', limit: 50 }))
+      .rejects.toThrow('getMsgs: native failure (5)')
+  })
+
   it('streams request bytes into QQ staging without collecting a body Buffer', async () => {
     const f = fixture()
     const bridge = new QQKernelBridge()

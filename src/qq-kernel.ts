@@ -151,6 +151,8 @@ const FAVORITE_STICKER_VERSION = 2
 const STICKER_METADATA_PROBE_BYTES = 256 * 1024
 const STICKER_METADATA_PROBE_TIMEOUT_MS = 5_000
 const MESSAGE_MEMBER_PROFILE_TIMEOUT_MS = 200
+// QQ 用 kNoMoreMsg (2004000) 表示这一方向已经到达历史终点；响应仍可能携带最后一页消息。
+const QQ_NO_MORE_MSG_RESULT = 2_004_000
 const REQUEST_PAGE_LIMIT = 100
 // Telegram 标准内置回应集合，集合外的 QQ 表情作为自定义表情下发。
 const TELEGRAM_STANDARD_REACTIONS = new Set([
@@ -1315,21 +1317,22 @@ export class QQKernelBridge {
       log('error', `QQ history request failed; using cache conversation=${conversation.id}`, error)
       response = { result: 0, errMsg: '', msgList: [] }
     }
-    if (response.result !== 0) {
+    const exhausted = response.result === QQ_NO_MORE_MSG_RESULT
+    if (response.result !== 0 && !exhausted) {
       if (!query.beforeId && !query.afterId && !query.cursor) {
         const cached = this.messages.get(conversation.id) ?? []
         return { messages: cached.slice(-limit).reverse() }
       }
       throw new Error(`getMsgs: ${response.errMsg} (${response.result})`)
     }
-    log('info', `native API complete name=history conversation=${conversation.id} result=${response.result} err=${JSON.stringify(response.errMsg)} messages=${response.msgList.length}`)
+    log('info', `native API complete name=history conversation=${conversation.id} result=${response.result} err=${JSON.stringify(response.errMsg)} messages=${response.msgList.length} exhausted=${exhausted}`)
     const { messages, mapped } = await this.mapHistoryRecords(conversation, response.msgList)
     if (!messages.length && !query.beforeId && !query.afterId && !query.cursor) {
       const cached = this.messages.get(conversation.id) ?? []
       return { messages: cached.slice(-limit).reverse() }
     }
     const last = response.msgList.at(-1)
-    return { messages, nextCursor: mapped === limit ? last?.msgId : undefined }
+    return { messages, nextCursor: !exhausted && mapped === limit ? last?.msgId : undefined }
   }
 
   /**
