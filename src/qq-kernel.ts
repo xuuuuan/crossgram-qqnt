@@ -375,6 +375,8 @@ export class QQKernelBridge {
   private avatarService?: NonNullable<ReturnType<NonNullable<KernelSession['getAvatarService']>>>
   private packetClient?: QQPacketClient
   private readonly contacts = new Map<string, QQConversation>()
+  private readonly pendingBulletins = new Map<string, { resolve: (value: unknown) => void }>()
+  private readonly pendingGroupDetails = new Map<string, { resolve: (value: unknown) => void }>()
   private readonly recentContactIds = new Map<string, string>()
   private readonly recentTopMessages = new Map<string, MessagePosition>()
   private recentContactOrder: string[] = []
@@ -4780,6 +4782,14 @@ export class QQKernelBridge {
         log('info', `group detail update received: group=${group.groupCode} name=${JSON.stringify(group.groupName || '')}`)
         this.upsertGroupProfile(group)
         this.pendingGroupProfiles.get(group.groupCode)?.resolve()
+        this.pendingGroupDetails.get(group.groupCode)?.resolve(group)
+      },
+      onGroupBulletinChange: (groupCode: string, value: unknown) => {
+        log('info', `group bulletin update received: group=${String(groupCode ?? '')}`)
+        if (typeof groupCode === 'string') this.pendingBulletins.get(groupCode)?.resolve(value)
+      },
+      onGetGroupBulletinListResult: (...args: unknown[]) => {
+        log('info', `group bulletin list result received: group=${String(args[0] ?? '')}`)
       },
       onGroupAllInfoChange: (value: GroupProfileInfo | { groupAll: GroupProfileInfo }) => {
         const group = value && 'groupAll' in value ? value.groupAll : value
@@ -7332,6 +7342,183 @@ export class QQKernelBridge {
     }
   }
 
+  /** 读取群公告列表：QQ 通过 `onGroupBulletinChange` 回调下发，这里转成等待中的 Promise。 */
+  async listGroupBulletins(groupCode: string): Promise<QQGroupBulletin> {
+    const service = this.requireGroupService()
+    const method = service.getGroupBulletin
+    if (typeof method !== 'function') throw new Error('getGroupBulletin is unavailable')
+    const pending = new Promise<unknown>((resolve) => this.pendingBulletins.set(groupCode, { resolve }))
+    try {
+      const result = await method.call(service, groupCode)
+      if (result?.result !== 0) {
+        throw new Error(`getGroupBulletin failed: ${result?.errMsg ?? ''} (${result?.result})`)
+      }
+      const delivered = await Promise.race([
+        pending,
+        new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 5_000)),
+      ])
+      if (delivered === undefined) throw new Error('getGroupBulletin timed out waiting for onGroupBulletinChange')
+      return normalizeGroupBulletin(groupCode, delivered)
+    } finally {
+      this.pendingBulletins.delete(groupCode)
+    }
+  }
+
+  /** 读取 qun.qq.com 的 pskey（发布、删除群公告都要带它）。 */
+  private async groupBulletinPsKey(): Promise<string> {
+    const session = this.requireSession() as unknown as { getTipOffService?: () => unknown }
+    const service = session.getTipOffService?.() as {
+      getPskey?: (domains: string[], isForNewPCQQ: boolean) => Promise<{
+        result?: number
+        errMsg?: string
+        domainPskeyMap?: unknown
+      }>
+    } | undefined
+    if (!service?.getPskey) throw new Error('getTipOffService().getPskey is unavailable')
+    const result = await service.getPskey(['qun.qq.com'], true)
+    if (typeof result?.result === 'number' && result.result !== 0) {
+      throw new Error(`getPskey failed: ${result.errMsg ?? ''} (${result.result})`)
+    }
+    const map = result?.domainPskeyMap
+    const value = map instanceof Map
+      ? map.get('qun.qq.com')
+      : (map as Record<string, unknown> | undefined)?.['qun.qq.com']
+    if (typeof value !== 'string' || !value) throw new Error('qun.qq.com pskey is missing in the response')
+    return value
+  }
+
+  /** 发布群公告；`pinned` 为 1 时置顶，0 为普通公告。 */
+  async publishGroupBulletin(groupCode: string, text: string, options: { pinned?: number } = {}): Promise<void> {
+    const service = this.requireGroupService()
+    const method = service.publishGroupBulletin
+    if (typeof method !== 'function') throw new Error('publishGroupBulletin is unavailable')
+    const psKey = await this.groupBulletinPsKey()
+    const result = await method.call(service, groupCode, psKey, { text, pinned: options.pinned ?? 1 })
+    if (result?.result !== 0) {
+      throw new Error(`publishGroupBulletin failed: ${result?.errMsg ?? ''} (${result?.result})`)
+    }
+  }
+
+  /** 删除群公告；不传 feedsIds 时删掉该群当前全部公告，返回真正删掉的 feedsId。 */
+  async deleteGroupBulletins(groupCode: string, feedsIds?: string[]): Promise<string[]> {
+    const service = this.requireGroupService()
+    const method = service.deleteGroupBulletin
+    if (typeof method !== 'function') throw new Error('deleteGroupBulletin is unavailable')
+    const targets = feedsIds ?? (await this.listGroupBulletins(groupCode)).feeds.map((feed) => feed.feedsId)
+    if (!targets.length) return []
+    const psKey = await this.groupBulletinPsKey()
+    const removed: string[] = []
+    for (const feedsId of targets) {
+      const result = await method.call(service, groupCode, psKey, feedsId)
+      if (result?.result !== 0) {
+        throw new Error(`deleteGroupBulletin failed for ${feedsId}: ${result?.errMsg ?? ''} (${result?.result})`)
+      }
+      removed.push(feedsId)
+    }
+    return removed
+  }
+
+  /** 读取群加群方式与入群问题（QQ 通过 `onGroupDetailInfoChange` 回调下发）。 */
+  async getGroupJoinOption(groupCode: string): Promise<QQGroupJoinOption> {
+    const service = this.requireGroupService()
+    const method = service.getGroupDetailInfo
+    if (typeof method !== 'function') throw new Error('getGroupDetailInfo is unavailable')
+    const pending = new Promise<unknown>((resolve) => this.pendingGroupDetails.set(groupCode, { resolve }))
+    try {
+      const result = await method.call(service, groupCode, 5)
+      if (result?.result !== 0) {
+        throw new Error(`getGroupDetailInfo failed: ${result?.errMsg ?? ''} (${result?.result})`)
+      }
+      const delivered = await Promise.race([
+        pending,
+        new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 5_000)),
+      ])
+      if (delivered === undefined) throw new Error('getGroupDetailInfo timed out waiting for onGroupDetailInfoChange')
+      const record = recordOf(delivered)
+      return {
+        addOption: numberField(record?.groupOption ?? record?.addOption),
+        question: typeof record?.groupQuestion === 'string' ? record.groupQuestion : '',
+        answer: typeof record?.groupAnswer === 'string' ? record.groupAnswer : '',
+      }
+    } finally {
+      this.pendingGroupDetails.delete(groupCode)
+    }
+  }
+
+  /**
+   * 设置加群方式（`addOption`：1 任何人可进，2 管理员审批，3 禁止加群，4 回答问题，5 回答问题且管理员审批）。
+   * 只有群主能改；用问题模式时 `question` 为入群问题。
+   */
+  async setGroupJoinOption(
+    groupCode: string,
+    option: { addOption: number, question?: string, answer?: string },
+  ): Promise<void> {
+    const service = this.requireGroupService()
+    const method = service.modifyGroupDetailInfoV2
+    if (typeof method !== 'function') throw new Error('modifyGroupDetailInfoV2 is unavailable')
+    const request = createGroupDetailInfoV2Request(groupCode)
+    request.filter.addOption = 1
+    request.modifyInfo.addOption = option.addOption
+    if (option.addOption === 4 || option.addOption === 5) {
+      request.filter.groupQuestion = 1
+      // 4 是「按答案自动通过」，5 是「问题 + 管理员审批」，后者答案位留空。
+      request.filter.groupAnswer = option.addOption === 4 ? 1 : 0
+      request.modifyInfo.groupQuestion = option.question ?? ''
+      request.modifyInfo.groupAnswer = option.addOption === 4 ? (option.answer ?? '') : ''
+    }
+    const result = await method.call(service, request, 0)
+    if (result?.result !== 0) {
+      throw new Error(`modifyGroupDetailInfoV2 failed: ${result?.errMsg ?? ''} (${result?.result})`)
+    }
+  }
+
+  /** 维护用：列出内核服务自身与原型上的方法名（只在 QQNT_BRIDGE_DEBUG_KERNEL=1 时由 HTTP 暴露）。 */
+  debugKernelServiceMethods(service: string): { own: string[], inherited: string[] } {
+    const target = this.debugKernelTarget(service)
+    if (!target) throw new Error(`unknown kernel service: ${service}`)
+    const own = Object.getOwnPropertyNames(target).sort()
+    const prototype = Object.getPrototypeOf(target) as object | null
+    const inherited = prototype
+      ? Object.getOwnPropertyNames(prototype).filter((name) => name !== 'constructor').sort()
+      : []
+    return { own, inherited }
+  }
+
+  /** 维护用：把 JSON 参数原样透传给内核方法，返回值转成可 JSON 化的结构。 */
+  async debugKernelCall(service: string, method: string, args: unknown[] = []): Promise<unknown> {
+    const target = this.debugKernelTarget(service)
+    if (!target) throw new Error(`unknown kernel service: ${service}`)
+    const candidate = Reflect.get(target, method)
+    if (typeof candidate !== 'function') throw new Error(`kernel method missing: ${service}.${method}`)
+    const result = await Reflect.apply(candidate, target, args)
+    return toDebugJson(result)
+  }
+
+  private debugKernelTarget(service: string): object | undefined {
+    const session = this.session
+    // `session/<getter>` 用来临时摸其他子服务，例如 session/getTipOffService。
+    if (service.startsWith('session/')) {
+      const getter = service.slice('session/'.length)
+      const factory = session ? Reflect.get(session, getter) : undefined
+      if (typeof factory !== 'function') return undefined
+      return Reflect.apply(factory, session, []) as object
+    }
+    switch (service) {
+      case 'session': return session
+      case 'group': return this.requireGroupService()
+      case 'msg': return this.requireMsgService()
+      case 'recent': return this.requireSession().getRecentContactService()
+      case 'buddy': return this.requireBuddyService()
+      case 'profile': return session?.getProfileService?.()
+      case 'avsdk': return session?.getAVSDKService?.()
+      case 'robot': return session?.getRobotService?.()
+      case 'richMedia': return session?.getRichMediaService()
+      case 'avatar': return session?.getAvatarService?.()
+      case 'uix': return session?.getUixConvertService()
+      default: return undefined
+    }
+  }
+
   private requireMsgService(): ReturnType<KernelSession['getMsgService']> {
     return (this.msgService ??= this.requireSession().getMsgService())
   }
@@ -9651,6 +9838,251 @@ function assertNativeRequestResolutionSuccess(method: string, result: unknown): 
   }
 }
 
+export interface QQGroupBulletinContent {
+  type: number
+  text?: string
+  picUrl?: string
+}
+
+export interface QQGroupBulletinFeed {
+  feedsId: string
+  feedsType: number
+  fromUid: string
+  createTime: number
+  modifyTime: number
+  feedsFlag: number
+  contents: QQGroupBulletinContent[]
+  text: string
+}
+
+export interface QQGroupBulletin {
+  groupCode: string
+  lastModifyTime?: number
+  unreadNum?: number
+  feeds: QQGroupBulletinFeed[]
+}
+
+export interface QQGroupJoinOption {
+  /** 1 任何人可进，2 管理员审批，3 禁止加群，4 回答问题，5 回答问题且管理员审批。 */
+  addOption: number
+  question: string
+  answer: string
+}
+
+interface GroupDetailInfoV2Request {
+  groupCode: string
+  filter: Record<string, number | string | Record<string, unknown>>
+  modifyInfo: Record<string, unknown>
+}
+
+/**
+ * `modifyGroupDetailInfoV2` 要求传完整结构：只有 `filter` 里置 1 的字段才会被 `modifyInfo` 覆盖，
+ * 其余字段留空即可（原生层按位读取，缺字段会读越界）。
+ */
+function createGroupDetailInfoV2Request(groupCode: string): GroupDetailInfoV2Request {
+  return {
+    groupCode,
+    filter: {
+      noCodeFingerOpenFlag: 0,
+      noFingerOpenFlag: 0,
+      groupName: 0,
+      classExt: 0,
+      classText: 0,
+      fingerMemo: 0,
+      richFingerMemo: 0,
+      tagRecord: 0,
+      groupGeoInfo: { ownerUid: 0, setTime: 0, cityId: 0, longitude: 0, latitude: 0, geoContent: 0, poiId: 0 },
+      groupExtAdminNum: 0,
+      flag: 0,
+      groupMemo: 0,
+      groupAioSkinUrl: 0,
+      groupBoardSkinUrl: 0,
+      groupCoverSkinUrl: 0,
+      groupGrade: 0,
+      activeMemberNum: 0,
+      certificationType: 0,
+      certificationText: 0,
+      groupNewGuideLines: { enabled: 0, content: 0 },
+      groupFace: 0,
+      addOption: 0,
+      shutUpTime: 0,
+      groupTypeFlag: 0,
+      appPrivilegeFlag: 0,
+      appPrivilegeMask: 0,
+      groupExtOnly: { tribeId: 0, moneyForAddGroup: 0 },
+      groupSecLevel: 0,
+      groupSecLevelInfo: 0,
+      subscriptionUin: 0,
+      subscriptionUid: '',
+      allowMemberInvite: 0,
+      groupQuestion: 0,
+      groupAnswer: 0,
+      groupFlagExt3: 0,
+      groupFlagExt3Mask: 0,
+      groupOpenAppid: 0,
+      rootId: 0,
+      msgLimitFrequency: 0,
+      hlGuildAppid: 0,
+      hlGuildSubType: 0,
+      hlGuildOrgId: 0,
+      groupFlagExt4: 0,
+      groupFlagExt4Mask: 0,
+      groupSchoolInfo: { location: 0, grade: 0, school: 0 },
+      groupCardPrefix: { introduction: 0, rptPrefix: 0 },
+      allianceId: 0,
+      groupFlagPro1: 0,
+      groupFlagPro1Mask: 0,
+    },
+    modifyInfo: {
+      noCodeFingerOpenFlag: 0,
+      noFingerOpenFlag: 0,
+      groupName: '',
+      classExt: 0,
+      classText: '',
+      fingerMemo: '',
+      richFingerMemo: '',
+      tagRecord: [],
+      groupGeoInfo: { ownerUid: '', SetTime: 0, CityId: 0, Longitude: '', Latitude: '', GeoContent: '', poiId: '' },
+      groupExtAdminNum: 0,
+      flag: 0,
+      groupMemo: '',
+      groupAioSkinUrl: '',
+      groupBoardSkinUrl: '',
+      groupCoverSkinUrl: '',
+      groupGrade: 0,
+      activeMemberNum: 0,
+      certificationType: 0,
+      certificationText: '',
+      groupNewGuideLines: { enabled: false, content: '' },
+      groupFace: 0,
+      addOption: 0,
+      shutUpTime: 0,
+      groupTypeFlag: 0,
+      appPrivilegeFlag: 0,
+      appPrivilegeMask: 0,
+      groupExtOnly: { tribeId: 0, moneyForAddGroup: 0 },
+      groupSecLevel: 0,
+      groupSecLevelInfo: 0,
+      subscriptionUin: '',
+      subscriptionUid: '',
+      allowMemberInvite: 0,
+      groupQuestion: '',
+      groupAnswer: '',
+      groupFlagExt3: 0,
+      groupFlagExt3Mask: 0,
+      groupOpenAppid: 0,
+      rootId: 0,
+      msgLimitFrequency: 0,
+      hlGuildAppid: 0,
+      hlGuildSubType: 0,
+      hlGuildOrgId: 0,
+      groupFlagExt4: 0,
+      groupFlagExt4Mask: 0,
+      groupSchoolInfo: { location: '', grade: 0, school: '' },
+      groupCardPrefix: { introduction: '', rptPrefix: '' },
+      allianceId: 0,
+      groupFlagPro1: 0,
+      groupFlagPro1Mask: 0,
+    },
+  }
+}
+
+function recordOf(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' ? value as Record<string, unknown> : undefined
+}
+
+function numberField(value: unknown): number {
+  return typeof value === 'number' ? value : Number(value) || 0
+}
+
+function normalizeGroupBulletin(groupCode: string, value: unknown): QQGroupBulletin {
+  const record = recordOf(value)
+  const records = Array.isArray(record?.feedsRecords) ? record.feedsRecords : []
+  const feeds: QQGroupBulletinFeed[] = []
+  for (const entry of records) {
+    const feed = recordOf(entry)
+    const message = recordOf(feed?.feedsMsg)
+    const rawContents = Array.isArray(message?.feedsContents) ? message.feedsContents : []
+    const contents: QQGroupBulletinContent[] = []
+    for (const item of rawContents) {
+      const content = recordOf(item)
+      if (!content) continue
+      contents.push({
+        type: numberField(content.contentType),
+        text: typeof content.contentValue === 'string' ? content.contentValue : undefined,
+        picUrl: typeof content.picUrl === 'string' ? content.picUrl : undefined,
+      })
+    }
+    feeds.push({
+      feedsId: typeof feed?.feedsId === 'string' ? feed.feedsId : '',
+      feedsType: numberField(feed?.feedsType),
+      fromUid: typeof feed?.fromUid === 'string' ? feed.fromUid : '',
+      createTime: numberField(feed?.createTime),
+      modifyTime: numberField(feed?.modifyTime),
+      feedsFlag: numberField(feed?.feedsFlag),
+      contents,
+      text: contents.map((content) => content.text ?? '').filter(Boolean).join('\n'),
+    })
+  }
+  return {
+    groupCode,
+    lastModifyTime: typeof record?.lastModifyTime === 'number' ? record.lastModifyTime : undefined,
+    unreadNum: typeof record?.unreadNum === 'number' ? record.unreadNum : undefined,
+    feeds,
+  }
+}
+
+/** 维护开关：开启后允许 /v1/debug/* 直接调用内核方法，并缓存原生回调参数。 */
+export function debugKernelEnabled(): boolean {
+  return process.env.QQNT_BRIDGE_DEBUG_KERNEL === '1'
+}
+
+export interface DebugKernelEvent {
+  seq: number
+  listener: string
+  event: string
+  args: unknown[]
+}
+
+const DEBUG_EVENT_LIMIT = 200
+let debugEventSequence = 0
+const debugEvents: DebugKernelEvent[] = []
+
+export function debugKernelEvents(): DebugKernelEvent[] {
+  return [...debugEvents]
+}
+
+export function clearDebugKernelEvents(): void {
+  debugEvents.splice(0)
+}
+
+function recordDebugKernelEvent(listener: string, event: string, args: unknown[]): void {
+  if (!debugKernelEnabled()) return
+  debugEvents.push({ seq: ++debugEventSequence, listener, event, args: toDebugJson(args) })
+  if (debugEvents.length > DEBUG_EVENT_LIMIT) debugEvents.splice(0, debugEvents.length - DEBUG_EVENT_LIMIT)
+}
+
+/** 把内核对象转成可 JSON 化的结构（Map/Set/TypedArray/BigInt 都要处理）。 */
+function toDebugJson(value: unknown, depth = 0): unknown {
+  if (depth > 14) return '<depth limit>'
+  if (value === null || value === undefined) return value
+  const type = typeof value
+  if (type === 'string') return (value as string).length > 20000 ? `${(value as string).slice(0, 20000)}<truncated>` : value
+  if (type === 'number' || type === 'boolean') return value
+  if (type === 'bigint') return `${value as bigint}n`
+  if (type === 'function') return '<function>'
+  if (value instanceof Map) {
+    return { '<map>': [...value.entries()].map(([key, item]) => [toDebugJson(key, depth + 1), toDebugJson(item, depth + 1)]) }
+  }
+  if (value instanceof Set) return { '<set>': [...value.values()].map((item) => toDebugJson(item, depth + 1)) }
+  if (ArrayBuffer.isView(value)) return { '<bytes>': Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString('base64') }
+  if (value instanceof ArrayBuffer) return { '<bytes>': Buffer.from(value).toString('base64') }
+  if (Array.isArray(value)) return value.map((item) => toDebugJson(item, depth + 1))
+  const record: Record<string, unknown> = {}
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) record[key] = toDebugJson(item, depth + 1)
+  return record
+}
+
 function makeListener(
   name: string,
   Constructor: (new (handlers: Record<string, (...args: never[]) => unknown>) => unknown) | undefined,
@@ -9660,6 +10092,7 @@ function makeListener(
   const rawPushDiagnostics = process.env.QQNT_BRIDGE_LOG_RAW_PUSH === '1'
   let rawPushCount = 0
   const protectedHandlers = Object.fromEntries(Object.entries(handlers).map(([event, handler]) => [event, (...args: unknown[]) => {
+    recordDebugKernelEvent(name, event, args)
     if (event === 'onRecvS2CMsg') {
       rawPushCount++
       if (rawPushDiagnostics && (rawPushCount <= 3 || rawPushCount % 1000 === 0)) {

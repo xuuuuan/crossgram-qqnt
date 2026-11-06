@@ -331,6 +331,16 @@ function fixture() {
     getSingleScreenNotifies: vi.fn<NonNullable<KernelGroupService['getSingleScreenNotifies']>>(async () => ({ notifies: [] })),
     operateSysNotify: vi.fn<NonNullable<KernelGroupService['operateSysNotify']>>(async () => ({ result: 0, errMsg: '' })),
     getGroupDetailInfo: vi.fn<NonNullable<KernelGroupService['getGroupDetailInfo']>>(async () => ({ result: 0, errMsg: '' })),
+    modifyGroupDetailInfoV2: vi.fn<NonNullable<KernelGroupService['modifyGroupDetailInfoV2']>>(async () => ({
+      result: 0, errMsg: '',
+    })),
+    getGroupBulletin: vi.fn<NonNullable<KernelGroupService['getGroupBulletin']>>(async () => ({ result: 0, errMsg: '' })),
+    publishGroupBulletin: vi.fn<NonNullable<KernelGroupService['publishGroupBulletin']>>(async () => ({
+      result: 0, errMsg: '',
+    })),
+    deleteGroupBulletin: vi.fn<NonNullable<KernelGroupService['deleteGroupBulletin']>>(async () => ({
+      result: 0, errMsg: '',
+    })),
     getGroupMsgMask: vi.fn<NonNullable<KernelGroupService['getGroupMsgMask']>>(async () => {
       queueMicrotask(() => groupHandlers.onGroupsMsgMaskResult?.([]))
       return { result: 0, errMsg: 'success' }
@@ -395,8 +405,15 @@ function fixture() {
     NodeIKernelGroupListener: Listener,
     NodeIAVSDKListener: Listener,
   } as unknown as KernelModule
+  // TipOff 服务只用来取 qun.qq.com 的 pskey（发布/删除群公告必需）。
+  const tipOff = {
+    getPskey: vi.fn(async () => ({
+      result: 0, errMsg: '', domainPskeyMap: new Map([['qun.qq.com', 'qun-pskey']]),
+    })),
+  }
   const session = {
     getMsgService: () => msg,
+    getTipOffService: () => tipOff,
     getRecentContactService: () => recent,
     getBuddyService: () => buddy,
     getProfileService: () => profile,
@@ -463,7 +480,8 @@ function fixture() {
   const flashApplyUpload = vi.spyOn(QQPacketClient.prototype, 'applyFlashTransferUpload').mockResolvedValue()
   const flashSetReady = vi.spyOn(QQPacketClient.prototype, 'setFlashTransferFilesetReady').mockResolvedValue()
   return {
-    kernel, session, msg, recent, buddy, profile, group, avsdk, richMedia, uix, robot, message, sentBodies,
+    kernel, session, msg, recent, buddy, profile, group, avsdk, richMedia, uix, robot, tipOff,
+    message, sentBodies,
     forceDownloadAvatar,
     imageUpload, fileUpload, protocolSend, groupFilePublish, poke,
     flashApplyFileset, flashCommitFiles, flashCompleteFileset, flashPrepareUpload,
@@ -542,6 +560,12 @@ function fixture() {
       memberRole?: number
     }) {
       groupHandlers.onGroupDetailInfoChange?.(group)
+    },
+    emitGroupDetailPayload(value: unknown) {
+      groupHandlers.onGroupDetailInfoChange?.(value)
+    },
+    emitGroupBulletin(groupCode: string, value: unknown) {
+      groupHandlers.onGroupBulletinChange?.(groupCode, value)
     },
     emitMemberList(info: {
       sceneId: string
@@ -5803,6 +5827,320 @@ it('drops zero-peer sidecars while preserving the paired group service message',
 
     f.group.kickMember.mockResolvedValueOnce({ result: 2, errMsg: 'no permission' } as never)
     await expect(bridge.moderateMember(group, 'member', 'kick')).rejects.toThrow('kickMember: no permission (2)')
+  })
+
+  it('读取群公告：等 onGroupBulletinChange 回调并把多段正文拼成整段文本', async () => {
+    const f = fixture()
+    f.group.getGroupBulletin.mockImplementationOnce(async (groupCode) => {
+      queueMicrotask(() => f.emitGroupBulletin(groupCode, {
+        lastModifyTime: 1_800_000_000,
+        unreadNum: 2,
+        feedsRecords: [{
+          feedsId: 'feed-1',
+          feedsType: 1,
+          fromUid: 'owner-uid',
+          createTime: 1_700_000_000,
+          modifyTime: 1_700_000_001,
+          feedsFlag: 0,
+          feedsMsg: { feedsContents: [
+            { contentType: 1, contentValue: '第一行' },
+            { contentType: 1, contentValue: '第二行' },
+            { contentType: 2, picUrl: 'https://cdn.example.com/notice.png' },
+          ] },
+        }],
+      }))
+      return { result: 0, errMsg: '' }
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    const bulletin = await bridge.listGroupBulletins('1058754719')
+
+    expect(f.group.getGroupBulletin).toHaveBeenCalledWith('1058754719')
+    expect(bulletin).toMatchObject({ groupCode: '1058754719', lastModifyTime: 1_800_000_000, unreadNum: 2 })
+    expect(bulletin.feeds).toHaveLength(1)
+    expect(bulletin.feeds[0]).toMatchObject({
+      feedsId: 'feed-1',
+      feedsType: 1,
+      fromUid: 'owner-uid',
+      createTime: 1_700_000_000,
+      modifyTime: 1_700_000_001,
+      feedsFlag: 0,
+      text: '第一行\n第二行',
+    })
+    // 图片段没有正文，只带 picUrl
+    expect(bulletin.feeds[0]?.contents).toEqual([
+      { type: 1, text: '第一行', picUrl: undefined },
+      { type: 1, text: '第二行', picUrl: undefined },
+      { type: 2, text: undefined, picUrl: 'https://cdn.example.com/notice.png' },
+    ])
+  })
+
+  it('群公告为空时返回空 feeds 列表', async () => {
+    const f = fixture()
+    f.group.getGroupBulletin.mockImplementationOnce(async (groupCode) => {
+      queueMicrotask(() => f.emitGroupBulletin(groupCode, { feedsRecords: [] }))
+      return { result: 0, errMsg: '' }
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    const bulletin = await bridge.listGroupBulletins('1058754719')
+
+    expect(bulletin.groupCode).toBe('1058754719')
+    expect(bulletin.feeds).toEqual([])
+    expect(bulletin.lastModifyTime).toBeUndefined()
+    expect(bulletin.unreadNum).toBeUndefined()
+  })
+
+  it('群公告回调 5 秒不来就超时，而且下一次读取还能重新等待', async () => {
+    vi.useFakeTimers()
+    try {
+      const f = fixture()
+      const bridge = new QQKernelBridge()
+      vi.spyOn(bridge as unknown as { initializePlatformData(): Promise<void> }, 'initializePlatformData').mockResolvedValue()
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+      let settled = false
+      const timedOut = bridge.listGroupBulletins('1058754719').finally(() => { settled = true })
+      const rejected = expect(timedOut).rejects.toThrow(
+        'getGroupBulletin timed out waiting for onGroupBulletinChange',
+      )
+      await vi.advanceTimersByTimeAsync(4_999)
+      expect(settled).toBe(false)
+      await vi.advanceTimersByTimeAsync(1)
+      await rejected
+
+      f.group.getGroupBulletin.mockImplementationOnce(async (groupCode) => {
+        queueMicrotask(() => f.emitGroupBulletin(groupCode, { feedsRecords: [] }))
+        return { result: 0, errMsg: '' }
+      })
+      await expect(bridge.listGroupBulletins('1058754719')).resolves.toMatchObject({ feeds: [] })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('读取群公告返回 result != 0 时抛错', async () => {
+    const f = fixture()
+    f.group.getGroupBulletin.mockResolvedValueOnce({ result: 120101005, errMsg: 'not owner' })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.listGroupBulletins('1058754719'))
+      .rejects.toThrow('getGroupBulletin failed: not owner (120101005)')
+  })
+
+  it('发布群公告时带 qun.qq.com 的 pskey，pinned 缺省为 1', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await bridge.publishGroupBulletin('1058754719', '普通公告', { pinned: 0 })
+    await bridge.publishGroupBulletin('1058754719', '置顶公告')
+
+    expect(f.tipOff.getPskey).toHaveBeenCalledWith(['qun.qq.com'], true)
+    expect(f.group.publishGroupBulletin).toHaveBeenNthCalledWith(
+      1, '1058754719', 'qun-pskey', { text: '普通公告', pinned: 0 },
+    )
+    expect(f.group.publishGroupBulletin).toHaveBeenNthCalledWith(
+      2, '1058754719', 'qun-pskey', { text: '置顶公告', pinned: 1 },
+    )
+  })
+
+  it('取不到 qun.qq.com 的 pskey 时不调用发布接口', async () => {
+    const f = fixture()
+    f.tipOff.getPskey.mockResolvedValueOnce({ result: 0, errMsg: '', domainPskeyMap: new Map() })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.publishGroupBulletin('1058754719', '内容'))
+      .rejects.toThrow('qun.qq.com pskey is missing in the response')
+    expect(f.group.publishGroupBulletin).not.toHaveBeenCalled()
+  })
+
+  it('不传 feedsIds 时按列表结果逐个删除公告，pskey 只取一次', async () => {
+    const f = fixture()
+    f.group.getGroupBulletin.mockImplementationOnce(async (groupCode) => {
+      queueMicrotask(() => f.emitGroupBulletin(groupCode, {
+        feedsRecords: [{ feedsId: 'feed-1' }, { feedsId: 'feed-2' }],
+      }))
+      return { result: 0, errMsg: '' }
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.deleteGroupBulletins('1058754719')).resolves.toEqual(['feed-1', 'feed-2'])
+
+    expect(f.tipOff.getPskey).toHaveBeenCalledTimes(1)
+    expect(f.group.deleteGroupBulletin.mock.calls).toEqual([
+      ['1058754719', 'qun-pskey', 'feed-1'],
+      ['1058754719', 'qun-pskey', 'feed-2'],
+    ])
+  })
+
+  it('单个公告删除失败时抛错并指出失败的 feedsId', async () => {
+    const f = fixture()
+    f.group.deleteGroupBulletin.mockImplementation(async (_groupCode, _psKey, feedsId) =>
+      feedsId === 'feed-2' ? { result: 120101005, errMsg: 'not owner' } : { result: 0, errMsg: '' })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.deleteGroupBulletins('1058754719', ['feed-1', 'feed-2']))
+      .rejects.toThrow('deleteGroupBulletin failed for feed-2: not owner (120101005)')
+    expect(f.group.deleteGroupBulletin.mock.calls.map((call) => call[2])).toEqual(['feed-1', 'feed-2'])
+  })
+
+  it('没有要删的公告时直接返回空数组且不取 pskey', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.deleteGroupBulletins('1058754719', [])).resolves.toEqual([])
+
+    expect(f.group.getGroupBulletin).not.toHaveBeenCalled()
+    expect(f.tipOff.getPskey).not.toHaveBeenCalled()
+    expect(f.group.deleteGroupBulletin).not.toHaveBeenCalled()
+  })
+
+  it('从 onGroupDetailInfoChange 回调取加群方式和入群问题', async () => {
+    const f = fixture()
+    f.group.getGroupDetailInfo.mockImplementationOnce(async (groupCode) => {
+      queueMicrotask(() => f.emitGroupDetailPayload({
+        groupDetail: {
+          groupCode, groupName: '公告测试群', groupOption: 4,
+          groupQuestion: '入群暗号是什么？', groupAnswer: '暗号',
+        },
+      }))
+      return { result: 0, errMsg: '' }
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.getGroupJoinOption('1058754719')).resolves.toEqual({
+      addOption: 4, question: '入群暗号是什么？', answer: '暗号',
+    })
+    // source=5 表示按加群方式取群资料
+    expect(f.group.getGroupDetailInfo).toHaveBeenCalledWith('1058754719', 5)
+  })
+
+  it('群资料回调缺入群问题时回落成空字符串', async () => {
+    const f = fixture()
+    f.group.getGroupDetailInfo.mockImplementationOnce(async (groupCode) => {
+      queueMicrotask(() => f.emitGroupDetailPayload({ groupCode, groupName: '公告测试群', addOption: 2 }))
+      return { result: 0, errMsg: '' }
+    })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.getGroupJoinOption('1058754719')).resolves.toEqual({
+      addOption: 2, question: '', answer: '',
+    })
+  })
+
+  it('群资料回调 5 秒不来就超时', async () => {
+    vi.useFakeTimers()
+    try {
+      const f = fixture()
+      const bridge = new QQKernelBridge()
+      vi.spyOn(bridge as unknown as { initializePlatformData(): Promise<void> }, 'initializePlatformData').mockResolvedValue()
+      bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+      const option = bridge.getGroupJoinOption('1058754719')
+      const rejected = expect(option).rejects.toThrow(
+        'getGroupDetailInfo timed out waiting for onGroupDetailInfoChange',
+      )
+      await vi.advanceTimersByTimeAsync(5_000)
+      await rejected
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('设置「回答问题后管理员审批」时置问题过滤位并把答案留空', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await bridge.setGroupJoinOption('1058754719', {
+      addOption: 5, question: '入群暗号是什么？', answer: '不该写入',
+    })
+
+    expect(f.group.modifyGroupDetailInfoV2).toHaveBeenCalledOnce()
+    const call = f.group.modifyGroupDetailInfoV2.mock.calls[0]
+    expect(call?.[1]).toBe(0)
+    const request = call?.[0] as {
+      groupCode: string
+      filter: Record<string, unknown>
+      modifyInfo: Record<string, unknown>
+    }
+    expect(request.groupCode).toBe('1058754719')
+    expect(request.filter).toMatchObject({ addOption: 1, groupQuestion: 1, groupAnswer: 0 })
+    expect(request.modifyInfo).toMatchObject({
+      addOption: 5, groupQuestion: '入群暗号是什么？', groupAnswer: '',
+    })
+    // 其它字段保持建请求时的默认值，没有被顺手置位
+    expect(request.filter.groupName).toBe(0)
+    expect(request.filter.groupGeoInfo).toEqual({
+      ownerUid: 0, setTime: 0, cityId: 0, longitude: 0, latitude: 0, geoContent: 0, poiId: 0,
+    })
+    expect(request.modifyInfo.tagRecord).toEqual([])
+  })
+
+  it('设置「任何人可进」时不碰入群问题字段', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await bridge.setGroupJoinOption('1058754719', { addOption: 1, question: '忽略', answer: '忽略' })
+
+    const request = f.group.modifyGroupDetailInfoV2.mock.calls[0]?.[0] as {
+      filter: Record<string, unknown>
+      modifyInfo: Record<string, unknown>
+    }
+    expect(request.filter).toMatchObject({ addOption: 1, groupQuestion: 0, groupAnswer: 0 })
+    expect(request.modifyInfo).toMatchObject({ addOption: 1, groupQuestion: '', groupAnswer: '' })
+  })
+
+  it('修改加群方式失败时抛错', async () => {
+    const f = fixture()
+    f.group.modifyGroupDetailInfoV2.mockResolvedValueOnce({ result: 120101005, errMsg: 'not owner' })
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    await expect(bridge.setGroupJoinOption('1058754719', { addOption: 2 }))
+      .rejects.toThrow('modifyGroupDetailInfoV2 failed: not owner (120101005)')
+  })
+
+  it('内核缺少公告或群资料方法时报错而不是静默成功', async () => {
+    const f = fixture()
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+
+    const service = f.group as unknown as Record<string, unknown>
+    const saved = {
+      getGroupBulletin: service.getGroupBulletin,
+      publishGroupBulletin: service.publishGroupBulletin,
+      deleteGroupBulletin: service.deleteGroupBulletin,
+      modifyGroupDetailInfoV2: service.modifyGroupDetailInfoV2,
+    }
+    Object.assign(service, {
+      getGroupBulletin: undefined,
+      publishGroupBulletin: undefined,
+      deleteGroupBulletin: undefined,
+      modifyGroupDetailInfoV2: undefined,
+    })
+    try {
+      await expect(bridge.listGroupBulletins('1058754719')).rejects.toThrow('getGroupBulletin is unavailable')
+      await expect(bridge.publishGroupBulletin('1058754719', '内容'))
+        .rejects.toThrow('publishGroupBulletin is unavailable')
+      await expect(bridge.deleteGroupBulletins('1058754719', ['feed-1']))
+        .rejects.toThrow('deleteGroupBulletin is unavailable')
+      await expect(bridge.setGroupJoinOption('1058754719', { addOption: 1 }))
+        .rejects.toThrow('modifyGroupDetailInfoV2 is unavailable')
+    } finally {
+      Object.assign(service, saved)
+    }
   })
 
   it('keeps native member cursors opaque and reports the group profile total on every page', async () => {

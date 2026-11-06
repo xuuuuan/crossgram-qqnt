@@ -843,6 +843,18 @@ export interface KernelGroupService {
   }>
   /** 结果通过 `onMemberInfoChange` 回调下发。 */
   getMemberInfo?(groupCode: string, uids: string[], forceFetch: boolean): Promise<{ result: number, errMsg: string }>
+  /** 群公告：结果通过 `onGroupBulletinChange` 回调下发。 */
+  getGroupBulletin?(groupCode: string): Promise<{ result: number, errMsg: string }>
+  /** 删除群公告，`psKey` 取自 qun.qq.com 的 pskey。 */
+  deleteGroupBulletin?(groupCode: string, psKey: string, feedsId: string): Promise<{ result: number, errMsg: string }>
+  /** 发布群公告，`pinned` 为 1 表示置顶。 */
+  publishGroupBulletin?(groupCode: string, psKey: string, request: {
+    text: string
+    pinned: number
+    oldFeedsId?: string
+  }): Promise<{ result: number, errMsg: string }>
+  /** 修改群资料（含加群方式 / 入群问题），`filter` 决定哪些字段生效。 */
+  modifyGroupDetailInfoV2?(request: unknown, operationType: number): Promise<{ result: number, errMsg: string }>
 }
 
 export interface KernelRichMediaService {

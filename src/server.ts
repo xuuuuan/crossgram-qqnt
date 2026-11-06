@@ -16,6 +16,7 @@ import {
   QQMediaLeaseUnavailableError, QQRequestApiUnavailableError, QQRequestConflictError, QQRequestCursorError,
   QQRequestRefreshError, QQRequestResolutionError, QQRequestSessionChangedError, QQRequestUnsupportedError,
   QQStickerAssetNotFoundError, QQ_POKE_MAX_COUNT,
+  clearDebugKernelEvents, debugKernelEnabled, debugKernelEvents,
 } from './qq-kernel.js'
 import { log, recordSlowHttpRequest, slowHttpLogPath } from './log.js'
 import type { QQLoginController } from './login-controller.js'
@@ -1000,6 +1001,116 @@ export class QQBridgeServer {
         entry: meta.entry,
         source: meta.source,
       })
+      return
+    }
+    const joinOptionMatch = /^\/v1\/groups\/([^/]+)\/join-option$/.exec(path)
+    if (joinOptionMatch) {
+      const conversation = this.bridge.getConversation(decodeURIComponent(joinOptionMatch[1]))
+      try {
+        if (request.method === 'GET') {
+          const option = await this.bridge.getGroupJoinOption(conversation.id)
+          log('info', `HTTP API group join option id=${requestId} group=${conversation.id} option=${option.addOption}`)
+          json(response, 200, { groupCode: conversation.id, ...option })
+          return
+        }
+        if (request.method === 'POST') {
+          const body = await readJson<{ addOption?: unknown, question?: unknown, answer?: unknown }>(request)
+          if (typeof body?.addOption !== 'number' || body.addOption < 1 || body.addOption > 5) {
+            json(response, 400, { error: 'addOption must be a number between 1 and 5' })
+            return
+          }
+          await this.bridge.setGroupJoinOption(conversation.id, {
+            addOption: body.addOption,
+            question: typeof body.question === 'string' ? body.question : undefined,
+            answer: typeof body.answer === 'string' ? body.answer : undefined,
+          })
+          log('info', `HTTP API group join option set id=${requestId} group=${conversation.id} option=${body.addOption}`)
+          json(response, 200, { ok: true, groupCode: conversation.id, addOption: body.addOption })
+          return
+        }
+      } catch (error) {
+        json(response, 502, { error: errorMessage(error) })
+        return
+      }
+      json(response, 404, { error: 'not found' })
+      return
+    }
+    const bulletinMatch = /^\/v1\/groups\/([^/]+)\/bulletin(\/delete)?$/.exec(path)
+    if (bulletinMatch) {
+      const conversation = this.bridge.getConversation(decodeURIComponent(bulletinMatch[1]))
+      try {
+        if (request.method === 'GET' && !bulletinMatch[2]) {
+          const bulletin = await this.bridge.listGroupBulletins(conversation.id)
+          log('info', `HTTP API group bulletin id=${requestId} group=${conversation.id} feeds=${bulletin.feeds.length}`)
+          json(response, 200, bulletin)
+          return
+        }
+        if (request.method === 'POST' && !bulletinMatch[2]) {
+          const body = await readJson<{ text?: unknown, pinned?: unknown }>(request)
+          if (typeof body?.text !== 'string' || !body.text.trim()) {
+            json(response, 400, { error: 'text must be a non-empty string' })
+            return
+          }
+          await this.bridge.publishGroupBulletin(conversation.id, body.text, { pinned: body.pinned === 0 ? 0 : 1 })
+          log('info', `HTTP API group bulletin publish id=${requestId} group=${conversation.id} chars=${body.text.length}`)
+          json(response, 200, { ok: true, groupCode: conversation.id })
+          return
+        }
+        if (request.method === 'POST' && bulletinMatch[2]) {
+          const body = await readJson<{ feedsIds?: unknown }>(request)
+          const feedsIds = Array.isArray(body?.feedsIds)
+            ? body.feedsIds.filter((id): id is string => typeof id === 'string' && Boolean(id))
+            : undefined
+          const removed = await this.bridge.deleteGroupBulletins(conversation.id, feedsIds)
+          log('info', `HTTP API group bulletin delete id=${requestId} group=${conversation.id} removed=${removed.length}`)
+          json(response, 200, { ok: true, groupCode: conversation.id, removed })
+          return
+        }
+      } catch (error) {
+        json(response, 502, { error: errorMessage(error) })
+        return
+      }
+      json(response, 404, { error: 'not found' })
+      return
+    }
+    // 维护口：只在 QQNT_BRIDGE_DEBUG_KERNEL=1 时存在，用于排查内核 API（生产默认关闭）。
+    if (path.startsWith('/v1/debug/kernel')) {
+      if (!debugKernelEnabled()) {
+        json(response, 404, { error: 'not found' })
+        return
+      }
+      if (request.method === 'GET' && path === '/v1/debug/kernel/methods') {
+        const service = new URL(request.url ?? '/', 'http://localhost').searchParams.get('service') ?? ''
+        json(response, 200, { service, ...this.bridge.debugKernelServiceMethods(service) })
+        return
+      }
+      if (request.method === 'POST' && path === '/v1/debug/kernel/call') {
+        const body = await readJson<{ service?: unknown, method?: unknown, args?: unknown }>(request)
+        if (typeof body?.service !== 'string' || typeof body?.method !== 'string') {
+          json(response, 400, { error: 'service and method must be strings' })
+          return
+        }
+        const args = Array.isArray(body.args) ? body.args : []
+        log('info', `HTTP API debug kernel call id=${requestId} ${body.service}.${body.method} argc=${args.length}`)
+        try {
+          json(response, 200, { result: await this.bridge.debugKernelCall(body.service, body.method, args) })
+        } catch (error) {
+          json(response, 502, { error: errorMessage(error) })
+        }
+        return
+      }
+      if (request.method === 'GET' && path === '/v1/debug/kernel/events') {
+        const requested = Number(new URL(request.url ?? '/', 'http://localhost').searchParams.get('since') ?? '0')
+        const since = Number.isFinite(requested) ? requested : 0
+        json(response, 200, { events: debugKernelEvents().filter((event) => event.seq > since) })
+        return
+      }
+      if (request.method === 'POST' && path === '/v1/debug/kernel/events/clear') {
+        clearDebugKernelEvents()
+        json(response, 200, { ok: true })
+        return
+      }
+      json(response, 404, { error: 'not found' })
       return
     }
     json(response, 404, { error: 'not found' })
