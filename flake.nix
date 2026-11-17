@@ -129,16 +129,41 @@
         export DISPLAY=:$display
         create_service xvfb "Xvfb :$display"
         # VNC/noVNC listen specs are [host:]port; a bare port binds 127.0.0.1,
-        # and vnc_port=0 disables both services.
+        # and vnc_port=0 disables both services. noVNC defaults to [::]:6080 so
+        # IPv6 clients (and IPv4, the socket is dual-stack) can reach it; set
+        # QQNT_NOVNC_BIND to any host (127.0.0.1, 0.0.0.0, ::1, ...) to change
+        # that. novnc's --listen is parsed as [host:]port, so an IPv6 literal
+        # must be bracketed: a bare "::" makes websockify fail with
+        # "Error parsing listen port".
         vnc_listen=$vnc_port
-        novnc_listen=$novnc_port
         case $vnc_listen in *:*) ;; *) vnc_listen="127.0.0.1:$vnc_listen" ;; esac
-        case $novnc_listen in *:*) ;; *) novnc_listen="127.0.0.1:$novnc_listen" ;; esac
+        novnc_bind="''${QQNT_NOVNC_BIND:-::}"
+        case $novnc_port in
+          *:*)
+            novnc_listen=$novnc_port ;;
+          *)
+            case $novnc_bind in
+              *:*) novnc_listen="[$novnc_bind]:$novnc_port" ;;
+              *) novnc_listen="$novnc_bind:$novnc_port" ;;
+            esac ;;
+        esac
         if [ "$vnc_port" != 0 ]; then
+          vnc_host=''${vnc_listen%%:*}
+          vnc_port_number=''${vnc_listen##*:}
+          case $vnc_host in
+            127.0.0.1|localhost)
+              # x11vnc 0.9.17 -listen 127.0.0.1 still binds [::], so loopback
+              # needs -localhost to pin both address families.
+              vnc_listen_opt="-localhost" ;;
+            0.0.0.0)
+              vnc_listen_opt="" ;;
+            *)
+              vnc_listen_opt="-listen $vnc_host" ;;
+          esac
           # LibVNCServer counts free descriptors by walking 0..RLIMIT_NOFILE with
           # fcntl() on every incoming connection, so an inherited "infinity" soft
           # limit (pm2, systemd) wedges the accept path at 100% CPU. Cap it.
-          create_service x11vnc "ulimit -Sn 1024; exec x11vnc -forever -shared -display :$display -listen ''${vnc_listen%%:*} -rfbport ''${vnc_listen##*:}"
+          create_service x11vnc "ulimit -Sn 1024; exec x11vnc -forever -shared -display :$display $vnc_listen_opt -rfbport $vnc_port_number"
           if [ "$novnc_port" != 0 ]; then
             create_service novnc "novnc --vnc $vnc_listen --listen $novnc_listen --file-only"
           fi

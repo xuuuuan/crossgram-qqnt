@@ -47,9 +47,14 @@ curl -fsSL https://raw.githubusercontent.com/xuuuuan/crossgram-qqnt/main/deploy/
 ```sh
 nix build .#qqnt-bridge-assets
 # 参数依次为：[DATA_DIR] [DISPLAY] [VNC] [NOVNC] [MEDIA_SOCKET] [BRIDGE_ENV]
-# VNC/NOVNC 为 [HOST:]PORT，纯端口默认绑定 127.0.0.1，设为 0 关闭
+# VNC/NOVNC 为 [HOST:]PORT，设为 0 关闭
+# VNC 纯端口默认绑 127.0.0.1（x11vnc 用 -localhost，两个协议栈都钉回环）
+# noVNC 纯端口默认绑 [::]（IPv6 可用，双栈所以 IPv4 也能进），
+# 想只给本机就用 QQNT_NOVNC_BIND=127.0.0.1，或把 NOVNC 写成 127.0.0.1:6080
 nix run .#qqnt -- /srv/qqnt/primary 99 5900 6080 /run/qqnt-media/primary/qqnt-media.sock
 ```
+
+noVNC 没有鉴权，能连上 6080 等于拿到一个已登录 QQ 的桌面。默认监听 `[::]` 是为了方便 IPv6 客户端，别把端口直接暴露到公网：用防火墙/IPv6 防火墙限源，或者 `QQNT_NOVNC_BIND=127.0.0.1` 配合 SSH 隧道。注意写监听地址时 IPv6 字面量要加方括号（`[::]:6080`），裸写 `::` 会让 websockify 报 `Error parsing listen port`。
 
 ### Windows 本地调试
 
