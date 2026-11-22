@@ -10295,7 +10295,7 @@ function grayTipAction(
     || '[系统消息]',
     actorId: json.actorId,
     senderId: group.senderId,
-    join: group.join,
+    join: group.join ?? json.join ?? xmlInviteJoin(gray.xmlElement),
   }
 }
 
@@ -10303,21 +10303,28 @@ function jsonGrayTipText(
   gray: { recentAbstract: string, jsonStr: string } | undefined,
   selfUid?: string,
   resolveUser: (uid: string) => string | undefined = () => undefined,
-): { text: string, actorId?: string } {
+): { text: string, actorId?: string, join?: GrayTipGroupNotice['join'] } {
   if (!gray) return { text: '' }
   try {
     const parsed = JSON.parse(gray.jsonStr) as {
       items?: Array<{ type?: unknown, uid?: unknown, txt?: unknown, nm?: unknown }>
     }
-    const actorId = parsed.items?.find((item) => item.type === 'qq' && typeof item.uid === 'string')?.uid as string | undefined
-    const text = parsed.items?.map((item) => {
+    const items = parsed.items ?? []
+    const actorId = items.find((item) => item.type === 'qq' && typeof item.uid === 'string')?.uid as string | undefined
+    const text = items.map((item) => {
       if (item.type === 'qq' && typeof item.uid === 'string') {
         return item.uid === selfUid ? '你' : resolveUser(item.uid) || (typeof item.nm === 'string' ? item.nm : '') || item.uid
       }
       return typeof item.txt === 'string' ? item.txt : typeof item.nm === 'string' ? item.nm : ''
     })
       .join('').trim()
-    return { text: text || gray.recentAbstract || structuredContentSummary(gray.jsonStr), actorId }
+    const join = invitedJoin(
+      items.filter((item): item is { type: 'qq', uid: string, nm?: unknown } =>
+        item.type === 'qq' && typeof item.uid === 'string')
+        .map((item) => ({ uid: item.uid, name: typeof item.nm === 'string' && item.nm ? item.nm : undefined })),
+      items.map((item) => typeof item.txt === 'string' ? item.txt : '').join(''),
+    )
+    return { text: text || gray.recentAbstract || structuredContentSummary(gray.jsonStr), actorId, ...(join ? { join } : {}) }
   } catch {
     return { text: gray.recentAbstract || structuredContentSummary(gray.jsonStr) }
   }
@@ -10351,6 +10358,31 @@ function xmlGrayTipText(xml?: { content: string, members?: Map<string, string> }
 function xmlAttribute(attributes: string, name: string): string {
   const match = new RegExp(`\\b${name}=(?:"([^"]*)"|'([^']*)')`, 'i').exec(attributes)
   return decodeXmlText(match?.[1] ?? match?.[2] ?? '')
+}
+
+/** 新版 QQ 把邀请入群灰条放进 json/xml 灰条而非 groupElement，按「A 邀请 B 加入了群聊」句式还原结构化入群信息。 */
+function invitedJoin(
+  qqs: Array<{ uid: string, name?: string }>,
+  joinedText: string,
+): GrayTipGroupNotice['join'] {
+  if (qqs.length !== 2 || !joinedText.includes('邀请') || !joinedText.includes('加入')) return
+  const member = (qq: { uid: string, name?: string }): QQServiceMember =>
+    ({ id: qq.uid, ...(qq.name ? { name: qq.name } : {}) })
+  return { members: [member(qqs[1]!)], actor: member(qqs[0]!) }
+}
+
+function xmlInviteJoin(xml?: { content: string, members?: Map<string, string> }): GrayTipGroupNotice['join'] {
+  if (!xml?.content) return
+  const qqs = [...xml.content.matchAll(/<qq\b([^>]*)\/?\s*>/gi)].map((match) => {
+    const attributes = match[1] ?? ''
+    const uid = xmlAttribute(attributes, 'uin')
+    return {
+      uid,
+      name: xml.members?.get(uid) || xmlAttribute(attributes, 'name')
+        || xmlAttribute(attributes, 'nick') || xmlAttribute(attributes, 'jp') || undefined,
+    }
+  }).filter((qq) => !!qq.uid)
+  return invitedJoin(qqs, xml.content)
 }
 
 interface GrayTipGroupNotice {

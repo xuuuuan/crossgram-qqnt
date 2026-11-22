@@ -2330,6 +2330,17 @@ describe('QQKernelBridge', () => {
           jsonStr: JSON.stringify({ items: [{ txt: '安全提醒：' }, { nm: '请修改密码' }] }),
         },
       } }),
+      record('json-invite', { elementType: 8, elementId: 'json-invite', grayTipElement: {
+        jsonGrayTipElement: {
+          recentAbstract: 'fallback',
+          jsonStr: JSON.stringify({ items: [
+            { type: 'qq', uid: 'alice', nm: 'Alice' },
+            { type: 'nor', txt: '邀请' },
+            { type: 'qq', uid: 'bob', nm: 'Bob' },
+            { type: 'nor', txt: '加入了群聊。' },
+          ] }),
+        },
+      } }),
       record('generic', { elementType: 8, elementId: 'generic', grayTipElement: {
         walletGrayTipElement: { receiverRichContent: '你领取了红包' },
       } as unknown as NonNullable<MsgRecord['elements'][number]['grayTipElement']> }),
@@ -2356,8 +2367,21 @@ describe('QQKernelBridge', () => {
       },
       { parts: [], serviceAction: { type: 'custom', text: '你被管理员禁言1小时1分钟1秒' } },
       { parts: [], serviceAction: { type: 'custom', text: '安全提醒：请修改密码' } },
+      {
+        parts: [],
+        serviceAction: {
+          type: 'members-joined', text: 'Alice邀请Bob加入了群聊。',
+          members: [{ id: 'bob', name: 'Bob' }], actor: { id: 'alice', name: 'Alice' },
+        },
+      },
       { parts: [], serviceAction: { type: 'custom', text: '你领取了红包' } },
-      { parts: [], serviceAction: { type: 'custom', text: 'Alice邀请Bob加入了群聊。' } },
+      {
+        parts: [],
+        serviceAction: {
+          type: 'members-joined', text: 'Alice邀请Bob加入了群聊。',
+          members: [{ id: 'bob', name: 'Bob' }], actor: { id: 'alice', name: 'Alice' },
+        },
+      },
     ])
     expect(messages[2]).toMatchObject({ senderId: 'alice', sender: { name: 'Alice' } })
     expect(messages.every((message) => message.telegramMessageId === undefined)).toBe(true)
