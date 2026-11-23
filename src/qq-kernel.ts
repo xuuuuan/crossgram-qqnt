@@ -28,7 +28,7 @@ import {
   GroupMsgMask,
   type BuddyRequest, type CustomEmotionData, type DoubtBuddyReqChange, type DoubtBuddyRequest, type EmojiLikesUserInfo, type FileTransNotifyInfo, type GroupFileListResult, type GroupMsgMaskInfo, type GroupNotify, type GroupProfileInfo,
   type InitSessionConfig, type KernelAVSDKService, type KernelGroupService, type KernelModule, type KernelSession, type MarketStickerPackInfo, type MemberInfo, type MsgElement,
-  type MsgRecord, type ProfileSimpleInfo, type RecentContactInfo,
+  type MsgRecord, type ProfileSimpleInfo, type RecentContactInfo, type UserProfileDetail,
 } from './kernel-types.js'
 import {
   conversationId, parseConversationId, type HistoryPage, type HistoryQuery, type MemberPage, type QQCallSignalEvent, type QQCard, type QQConversation, type QQEvent, type QQGroupFilePage, type QQMedia, type QQMediaLocator, type QQMediaUploadPlan, type QQMessage, type QQMultiForwardLocator, type QQReactionActorPage, type QQReactionContext, type QQReactionDefinition, type QQReactionState,
@@ -476,6 +476,9 @@ export class QQKernelBridge {
   }
   private groupFileQueryTail = Promise.resolve()
   private readonly pendingUserProfiles = new Map<string, ReturnType<typeof deferred<void>>>()
+  private readonly userLevels = new Map<string, number>()
+  private readonly userQqNumbers = new Map<string, string>()
+  private readonly pendingUserLevels = new Map<string, ReturnType<typeof deferred<void>>>()
   private readonly pendingMemberProfiles = new Map<string, ReturnType<typeof deferred<MemberInfo | undefined>>>()
   private readonly pendingMemberPages = new Map<string, ReturnType<typeof deferred<NativeMemberPage>>>()
   private readonly memberScenes = new Map<string, { conversationId: string, lastUsed: number }>()
@@ -4730,6 +4733,22 @@ export class QQKernelBridge {
             log('info', `profile update received: ${profiles.size} users`)
             for (const profile of profiles.values()) this.upsertProfile(profile)
           },
+          onUserDetailInfoChanged: (value: UserProfileDetail | { profiles?: UserProfileDetail[] } | UserProfileDetail[]) => {
+            const details = Array.isArray(value) ? value
+              : value && Array.isArray((value as { profiles?: UserProfileDetail[] }).profiles)
+                ? (value as { profiles: UserProfileDetail[] }).profiles
+                : [value as UserProfileDetail]
+            for (const detail of details) {
+              if (typeof detail?.uid !== 'string' || !detail.uid) continue
+              const level = detail.commonExt?.qqLevel
+              if (typeof level === 'number' && level > 0) this.userLevels.set(detail.uid, level)
+              if (typeof detail.uin === 'string' && /^\d+$/u.test(detail.uin) && detail.uin !== '0') {
+                this.userQqNumbers.set(detail.uid, detail.uin)
+              }
+              this.pendingUserLevels.get(detail.uid)?.resolve()
+              this.applyRequesterLevel(detail.uid)
+            }
+          },
         },
       ))
       this.profileListenerId = this.profileService.addKernelProfileListener(profileListener)
@@ -5471,7 +5490,12 @@ export class QQKernelBridge {
       }
       const request: QQRequest = {
         id, kind: 'group-join', status: 'pending',
-        requester: { id: requester, ...(nonEmptyString(raw.user1?.nickName) ? { name: raw.user1.nickName } : {}) },
+        requester: {
+          id: requester,
+          ...(nonEmptyString(raw.user1?.nickName) ? { name: raw.user1.nickName } : {}),
+          ...(this.userLevels.get(requester) ? { level: this.userLevels.get(requester) } : {}),
+          ...(this.userQqNumbers.get(requester) ? { uin: this.userQqNumbers.get(requester) } : {}),
+        },
         group: { id: groupCode, ...(nonEmptyString(raw.group?.groupName) ? { name: raw.group.groupName } : {}) },
         ...(nonEmptyString(raw.postscript) ? { message: raw.postscript } : {}),
         ...(raw.actionTime === undefined ? {} : { timestamp: raw.actionTime }),
@@ -5485,6 +5509,7 @@ export class QQKernelBridge {
           postscript: nonEmptyString(raw.postscript) ? raw.postscript : ' ',
         },
       })
+      void this.fetchRequesterLevel(requester)
     }
     return update
   }
@@ -5585,6 +5610,49 @@ export class QQKernelBridge {
     if (!uin || !/^\d+$/.test(uin)) return undefined
     const value = BigInt(uin)
     return this.robotUinRanges.some((range) => value >= range.min && value <= range.max) ? true : undefined
+  }
+
+  /** 入群申请到达时拉取申请人 QQ 等级；结果经 onUserDetailInfoChanged 回调写入并重发 request 事件。 */
+  private async fetchRequesterLevel(uid: string): Promise<void> {
+    if (this.userLevels.has(uid)) return this.applyRequesterLevel(uid)
+    const service = this.profileService
+    const method = service?.fetchUserDetailInfo
+    if (!service || typeof method !== 'function') return
+    if (!this.pendingUserLevels.has(uid)) {
+      const pending = deferred<void>()
+      this.pendingUserLevels.set(uid, pending)
+      try {
+        log('info', `native API start name=fetchUserDetailInfo user=${uid}`)
+        const result = await method.call(service, 'BuddyProfileStore', [uid], 1, [0])
+        log('info', `native API complete name=fetchUserDetailInfo result=${result.result} err=${JSON.stringify(result.errMsg)} user=${uid}`)
+        if (result.result !== 0) pending.reject(new Error(`fetchUserDetailInfo: ${result.errMsg} (${result.result})`))
+        else await withTimeout(pending.promise, this.userResolveTimeoutMs, 'QQ user level request timed out')
+      } catch (error) {
+        log('warn', `fetchUserDetailInfo failed user=${uid}`, error)
+      } finally {
+        this.pendingUserLevels.delete(uid)
+      }
+    } else {
+      await this.pendingUserLevels.get(uid)!.promise.catch(() => {})
+    }
+    this.applyRequesterLevel(uid)
+  }
+
+  private applyRequesterLevel(uid: string): void {
+    const level = this.userLevels.get(uid)
+    const uin = this.userQqNumbers.get(uid)
+    if (!level && !uin) return
+    for (const cached of this.requests.values()) {
+      if (cached.kind !== 'group-join' || cached.request.status !== 'pending') continue
+      if (cached.request.requester.id !== uid) continue
+      const { level: previousLevel, uin: previousUin, ...requester } = cached.request.requester
+      if (previousLevel === level && previousUin === uin) continue
+      cached.request = {
+        ...cached.request,
+        requester: { ...requester, ...(level ? { level } : {}), ...(uin ? { uin } : {}) },
+      }
+      this.dispatch({ type: 'request', request: cached.request })
+    }
   }
 
   private async ensureUserProfiles(uids: string[]): Promise<void> {

@@ -801,6 +801,15 @@ export interface KernelProfileService {
   removeKernelProfileListener(listenerId: string): void
   getUserSimpleInfo(force: boolean, uids: string[]): Promise<{ result: number, errMsg: string }>
   getCoreAndBaseInfo?(callFrom: string, uids: string[]): Promise<Map<string, ProfileCoreAndBaseInfo>>
+  /** source：0=KDB 缓存、1=KSERVER 强拉；bizList [0]=KALL。结果经 onUserDetailInfoChanged 回调下发。 */
+  fetchUserDetailInfo?(callFrom: string, uids: string[], source: number, bizList: number[]): Promise<{ result: number, errMsg: string }>
+}
+
+/** fetchUserDetailInfo 的结果载荷（NodeIKernelProfileListener/onUserDetailInfoChanged）。 */
+export interface UserProfileDetail {
+  uid?: string
+  uin?: string
+  commonExt?: { qqLevel?: number }
 }
 
 export interface GroupNotify {

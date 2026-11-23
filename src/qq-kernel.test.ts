@@ -177,6 +177,8 @@ function fixture() {
   const groupHandlerHistory: Array<Record<string, (...args: unknown[]) => unknown>> = []
   let avsdkHandlers: Record<string, (...args: unknown[]) => unknown> = {}
   let avsdkAvailable = true
+  const profileLevels = new Map<string, number>()
+  const profileQqNumbers = new Map<string, string>()
   const profileInfos = new Map<string, {
     uid: string, uin: string, nick: string, remark: string, avatarUrl: string
     longNick?: string
@@ -320,6 +322,14 @@ function fixture() {
         baseInfo: info.baseInfo,
       }]
     }))),
+    fetchUserDetailInfo: vi.fn(async (_callFrom: string, uids: string[]) => {
+      queueMicrotask(() => profileHandlers.onUserDetailInfoChanged?.({
+        uid: uids[0],
+        uin: profileQqNumbers.get(uids[0]!),
+        commonExt: { qqLevel: profileLevels.get(uids[0]!) },
+      }))
+      return { result: 0, errMsg: '' }
+    }),
   }
   const group = {
     addKernelGroupListener: vi.fn((listener: { handlers?: typeof groupHandlers }) => {
@@ -480,7 +490,7 @@ function fixture() {
   const flashApplyUpload = vi.spyOn(QQPacketClient.prototype, 'applyFlashTransferUpload').mockResolvedValue()
   const flashSetReady = vi.spyOn(QQPacketClient.prototype, 'setFlashTransferFilesetReady').mockResolvedValue()
   return {
-    kernel, session, msg, recent, buddy, profile, group, avsdk, richMedia, uix, robot, tipOff,
+    kernel, session, msg, recent, buddy, profile, profileLevels, profileQqNumbers, group, avsdk, richMedia, uix, robot, tipOff,
     message, sentBodies,
     forceDownloadAvatar,
     imageUpload, fileUpload, protocolSend, groupFilePublish, poke,
@@ -7624,6 +7634,34 @@ it('drops zero-peer sidecars while preserving the paired group service message',
     })
   })
 
+
+  it('enriches pending group-join requests with the requester QQ level', async () => {
+    const f = fixture()
+    f.profileLevels.set('join-uid', 58)
+    f.profileQqNumbers.set('join-uid', '1234567')
+    f.group.getSingleScreenNotifies.mockImplementation(async (doubt: boolean, startSeq: string) => (
+      !doubt && !startSeq
+        ? { notifies: [
+          { seq: '31', type: 7, status: 1, group: { groupCode: '123', groupName: 'Group' }, user1: { uid: 'join-uid', nickName: 'Joiner' }, postscript: 'let me in' },
+        ] }
+        : { notifies: [] }
+    ))
+    const bridge = new QQKernelBridge()
+    bridge.attach(f.kernel, f.session, { selfUin: '10000', selfUid: 'self', userPath: '/tmp' })
+    const events = bridge.subscribe()[Symbol.asyncIterator]()
+
+    const page = await bridge.getRequests()
+    expect(page.requests).toHaveLength(1)
+    // 初始 dispatch（无等级）与等级到达后的重发都会推送，等待带等级的那条。
+    for (let index = 0; index < 4; index++) {
+      const event = await events.next()
+      if (event.value?.type === 'request' && event.value.request.requester.level === 58) break
+    }
+    expect(f.profile.fetchUserDetailInfo).toHaveBeenCalledWith('BuddyProfileStore', ['join-uid'], 1, [0])
+    expect((await bridge.getRequests()).requests).toEqual([
+      expect.objectContaining({ requester: { id: 'join-uid', name: 'Joiner', level: 58, uin: '1234567' } }),
+    ])
+  })
 
   it('maps only native pending requests, publishes listener updates, and resolves them idempotently', async () => {
     const f = fixture()
